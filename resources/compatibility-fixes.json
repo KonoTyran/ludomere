@@ -1,0 +1,45 @@
+{
+  "fixes": [
+    {
+      "id": "gog_online_services",
+      "title": "GOG online services",
+      "description": "Start the authenticated GOG Galaxy-compatible helper for multiplayer and other online features.",
+      "operation": { "kind": "start_gog_online_services" }
+    },
+    {
+      "id": "native_galaxy_library_path",
+      "title": "Discover bundled Galaxy libraries",
+      "description": "Add directories containing the game's bundled Galaxy libraries to the native library search path.",
+      "operation": {
+        "kind": "add_bundled_library_directories",
+        "filename_prefix": "libGalaxy"
+      }
+    },
+    {
+      "id": "native_galaxy_clear_execstack",
+      "title": "Remove obsolete executable-stack requirement",
+      "description": "Use managed copies of bundled Galaxy libraries with their obsolete executable-stack flag removed for hardened Linux systems.",
+      "operation": {
+        "kind": "clear_bundled_library_executable_stack",
+        "filename_prefix": "libGalaxy"
+      }
+    },
+    {
+      "id": "native_galaxy_csharp_alias",
+      "title": "Galaxy C# library-name alias",
+      "description": "Provide an extensionless alias for native .NET bindings that request the Galaxy C# bridge without its .so suffix.",
+      "operation": {
+        "kind": "create_bundled_library_alias",
+        "filename": "libGalaxyCSharpGlue.so",
+        "alias": "libGalaxyCSharpGlue"
+      }
+    }
+  ],
+  "defaults": ["gog_online_services"],
+  "games": {
+    "1453375253": [
+      "native_galaxy_clear_execstack",
+      "native_galaxy_csharp_alias"
+    ]
+  }
+}

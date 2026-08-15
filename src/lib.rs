@@ -1,0 +1,16 @@
+pub mod application;
+pub mod auth;
+pub mod compatibility;
+pub mod config;
+pub mod domain;
+pub mod download;
+pub mod download_selection;
+pub mod gog;
+pub mod identity;
+pub mod installation;
+pub mod managed;
+pub mod online;
+pub mod screenshots;
+pub mod state;
+pub mod text;
+pub mod ui;

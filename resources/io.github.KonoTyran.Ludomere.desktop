@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Ludomere
+Comment=Browse GOG games and manage offline installers
+Exec=ludomere
+Icon=io.github.KonoTyran.Ludomere
+Terminal=false
+Type=Application
+Categories=Game;
+Keywords=GOG;games;library;installers;offline;
+StartupNotify=true
+StartupWMClass=io.github.KonoTyran.Ludomere

@@ -1,0 +1,9 @@
+/target/
+*.pkg.tar.zst
+*.tar.gz
+/pkg/
+/src/gog-library/
+.idea/
+__pycache__/
+/dist/
+/scripts/

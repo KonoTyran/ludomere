@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Ludomere L-shaped portal app icon</title>
+  <desc id="desc">A glowing emerald portal whose dark opening forms a subtle letter L, with a golden game tile inside.</desc>
+  <defs>
+    <linearGradient id="bg" x1="72" y1="48" x2="440" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0D3C31" offset="0"/>
+      <stop offset="1" stop-color="#061E1A"/>
+    </linearGradient>
+    <linearGradient id="emerald" x1="122" y1="92" x2="402" y2="424" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#45E49A" offset=""/>
+      <stop offset="0.52" stop-color="#13B970"/>
+      <stop offset="1" stop-color="#087749"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="286" y1="286" x2="356" y2="368" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE18A" offset=""/>
+      <stop offset="0.56" stop-color="#FFC34E"/>
+      <stop offset="1" stop-color="#D98A20"/>
+    </linearGradient>
+    <filter id="tileGlow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="11"/>
+    </filter>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg)"/>
+  <g transform="translate(-16)">
+    <path fill="url(#emerald)" fill-rule="evenodd" d="M104 420V230C104 129 178 68 274 68c92 0 166 64 166 162v190H104Zm64-28V228c0-58 42-96 98-96 36 0 67 15 87 42l-43 48c-10-16-25-25-44-25-24 0-42 16-42 39v94h148v62H168Z"/>
+    <path d="M126 231c0-84 62-141 148-141 70 0 126 40 141 104" fill="none" stroke="#72F2B3" stroke-width="11" stroke-linecap="round" opacity=".55"/>
+    <path d="M106 420h332" fill="none" stroke="#064C36" stroke-width="14" stroke-linecap="round" opacity=".75"/>
+    <rect x="285" y="286" width="92" height="92" rx="22" fill="#FFC44F" opacity=".28" filter="url(#tileGlow)"/>
+    <rect x="292" y="292" width="78" height="78" rx="18" fill="url(#gold)" stroke="#FFF0B4" stroke-width="5"/>
+    <path d="M309 315h44M309 332h44" fill="none" stroke="#9E6116" stroke-width="7" stroke-linecap="round" opacity=".65"/>
+  </g>
+</svg>

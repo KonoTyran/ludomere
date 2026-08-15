@@ -1,0 +1,9 @@
+Font Awesome Free 7.3.1
+Copyright 2026 Fonticons, Inc.
+
+The Windows, Apple, and Linux icon SVGs in this directory are from Font Awesome Free.
+Icons are licensed under the Creative Commons Attribution 4.0 International license.
+
+Project: https://fontawesome.com/
+License: https://fontawesome.com/license/free
+Full CC BY 4.0 terms: LICENSE.CC-BY-4.0.txt

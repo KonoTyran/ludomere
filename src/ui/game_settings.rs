@@ -259,6 +259,436 @@ pub(super) fn show_game_settings(
     }
     files_page.add(&files_group);
 
+    let cloud_page = adw::PreferencesPage::new();
+    cloud_page.set_title("Cloud Saves");
+    let cloud_group = adw::PreferencesGroup::new();
+    cloud_group.set_title("GOG Cloud Saves");
+    let cloud_status = gtk::Label::new(None);
+    cloud_status.set_xalign(0.0);
+    cloud_status.set_wrap(true);
+    if let Some(installed_game) = &installed {
+        if installed_game.compatibility.is_some()
+            && installed_game
+                .installer_operating_system
+                .as_deref()
+                .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+        {
+            let record = StateStore::open()
+                .and_then(|store| store.cloud_save_record(installed_game.product_id))
+                .unwrap_or(crate::state::CloudSaveRecord {
+                    preference: crate::domain::CloudSavePreference::Undecided,
+                    availability: crate::domain::CloudSaveAvailability::Unknown,
+                    locations: Vec::new(),
+                    metadata_build_id: None,
+                    metadata_checked_at: None,
+                    metadata_error: None,
+                    last_successful_sync: None,
+                    status: crate::domain::CloudSaveStatus::NeverSynced,
+                    error: None,
+                    conflicts: Vec::new(),
+                });
+            let enabled = adw::SwitchRow::new();
+            enabled.set_title("Synchronize saves with GOG");
+            enabled.set_subtitle("Runs before launch and after the monitored game process exits");
+            enabled.set_active(record.preference == crate::domain::CloudSavePreference::Enabled);
+            let supported = record.availability == crate::domain::CloudSaveAvailability::Supported;
+            let locations_state = Rc::new(RefCell::new(record.locations.clone()));
+            enabled.set_sensitive(supported);
+            let product_id = installed_game.product_id;
+            enabled.connect_active_notify(move |row| {
+                let preference = if row.is_active() {
+                    crate::domain::CloudSavePreference::Enabled
+                } else {
+                    crate::domain::CloudSavePreference::Disabled
+                };
+                if let Ok(store) = StateStore::open() {
+                    store.set_cloud_save_preference(product_id, preference).ok();
+                }
+            });
+            cloud_group.add(&enabled);
+            cloud_group.add(&info_row(
+                "Last successful sync",
+                &record
+                    .last_successful_sync
+                    .map(|time| {
+                        chrono::DateTime::from_timestamp(time, 0)
+                            .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_else(|| "Never".into()),
+            ));
+            let inventory_row = adw::ActionRow::new();
+            inventory_row.set_title("GOG Cloud storage");
+            inventory_row.set_subtitle("Remote save files have not been checked");
+            inventory_row.set_visible(supported);
+            let check_inventory = gtk::Button::with_label("Check now");
+            check_inventory.set_valign(gtk::Align::Start);
+            check_inventory.set_margin_top(10);
+            check_inventory.set_sensitive(supported);
+            let inventory_game = installed_game.clone();
+            let inventory_status = inventory_row.clone();
+            check_inventory.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                inventory_status.set_subtitle("Checking remote save files…");
+                load_cloud_inventory(
+                    inventory_game.clone(),
+                    inventory_status.clone(),
+                    button.clone(),
+                );
+            });
+            inventory_row.add_suffix(&check_inventory);
+            cloud_group.add(&inventory_row);
+            let locations_row = adw::ActionRow::new();
+            locations_row.set_title("Save locations");
+            locations_row.set_subtitle(&cloud_location_summary(&record.locations));
+            locations_row.set_visible(supported);
+            let open_save_folder = gtk::Button::with_label("Open save folder");
+            open_save_folder.set_valign(gtk::Align::Start);
+            open_save_folder.set_margin_top(10);
+            open_save_folder.set_sensitive(supported && !record.locations.is_empty());
+            let save_parent = window.clone();
+            let save_locations = locations_state.clone();
+            open_save_folder.connect_clicked(move |_| {
+                if let Some(location) = save_locations.borrow().first() {
+                    super::widgets::file_open::open_directory(
+                        &location.path,
+                        &save_parent,
+                        "cloud-save directory",
+                    );
+                }
+            });
+            locations_row.add_suffix(&open_save_folder);
+            cloud_group.add(&locations_row);
+            match record.availability {
+                crate::domain::CloudSaveAvailability::Supported => {
+                    cloud_status.set_label("GOG cloud saves are supported for this game.")
+                }
+                crate::domain::CloudSaveAvailability::Unsupported => {
+                    cloud_status.set_label("GOG reports cloud saves are disabled for this game.")
+                }
+                crate::domain::CloudSaveAvailability::Unavailable => cloud_status.set_label(
+                    record
+                        .metadata_error
+                        .as_deref()
+                        .unwrap_or("GOG cloud-save metadata is unavailable for this game."),
+                ),
+                crate::domain::CloudSaveAvailability::Unknown => cloud_status.set_label(
+                    record
+                        .metadata_error
+                        .as_deref()
+                        .unwrap_or("Cloud-save support has not been checked yet."),
+                ),
+            }
+            if supported && let Some(error) = &record.error {
+                cloud_status.set_label(error);
+                cloud_status.add_css_class("error");
+            } else if supported && !record.conflicts.is_empty() {
+                cloud_status.set_label(&format!(
+                    "{} pending conflict(s) require a manual choice",
+                    record.conflicts.len()
+                ));
+            }
+
+            let sync_row = adw::ActionRow::new();
+            sync_row.set_title("Synchronize saves");
+            sync_row.set_subtitle("Compare local and cloud saves and prompt before conflicts");
+            let sync_now = gtk::Button::with_label("Sync now");
+            sync_now.set_valign(gtk::Align::Start);
+            sync_now.set_margin_top(10);
+            sync_now.set_sensitive(supported);
+            let game = installed_game.clone();
+            let locations = locations_state.clone();
+            let status = cloud_status.clone();
+            sync_now.connect_clicked(move |button| {
+                run_cloud_action(
+                    button,
+                    &status,
+                    crate::cloud_saves::CloudSyncRequest {
+                        game: game.clone(),
+                        locations: locations.borrow().clone(),
+                        mode: crate::domain::CloudSyncMode::Normal,
+                    },
+                )
+            });
+            sync_row.add_suffix(&sync_now);
+
+            let advanced = gtk::MenuButton::new();
+            advanced.set_label("Advanced…");
+            advanced.set_valign(gtk::Align::Start);
+            advanced.set_margin_top(10);
+            advanced.set_sensitive(supported);
+            let popover = gtk::Popover::new();
+            let advanced_content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+            advanced_content.set_margin_top(14);
+            advanced_content.set_margin_bottom(14);
+            advanced_content.set_margin_start(14);
+            advanced_content.set_margin_end(14);
+            advanced_content.set_width_request(340);
+            let advanced_title = gtk::Label::new(Some("Force synchronization"));
+            advanced_title.set_xalign(0.0);
+            advanced_title.add_css_class("heading");
+            advanced_content.append(&advanced_title);
+            let warning = gtk::Label::new(Some(
+                "Warning: force operations will overwrite save data and will most likely erase either local or cloud progress. Use them only if you know which copy must be kept.",
+            ));
+            warning.set_wrap(true);
+            warning.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            warning.set_max_width_chars(44);
+            warning.set_xalign(0.0);
+            warning.add_css_class("error");
+            advanced_content.append(&warning);
+            let force_actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            for (index, (label, mode)) in [
+                (
+                    "Force download",
+                    crate::domain::CloudSyncMode::ForceDownload,
+                ),
+                ("Force upload", crate::domain::CloudSyncMode::ForceUpload),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index == 1 {
+                    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    spacer.set_hexpand(true);
+                    force_actions.append(&spacer);
+                }
+                let button = gtk::Button::with_label(label);
+                button.add_css_class("destructive-action");
+                let game = installed_game.clone();
+                let locations = locations_state.clone();
+                let status = cloud_status.clone();
+                let parent = window.clone();
+                let popover = popover.clone();
+                button.connect_clicked(move |button| {
+                    popover.popdown();
+                    confirm_force_cloud_action(
+                        &parent,
+                        button,
+                        &status,
+                        crate::cloud_saves::CloudSyncRequest {
+                            game: game.clone(),
+                            locations: locations.borrow().clone(),
+                            mode,
+                        },
+                    );
+                });
+                force_actions.append(&button);
+            }
+            advanced_content.append(&force_actions);
+            popover.set_child(Some(&advanced_content));
+            advanced.set_popover(Some(&popover));
+            sync_row.add_suffix(&advanced);
+            cloud_group.add(&sync_row);
+
+            let backup_row = adw::ActionRow::new();
+            backup_row.set_title("Local backups");
+            backup_row.set_subtitle("Copies made before cloud downloads overwrite local files");
+            let backup = gtk::Button::with_label("Open backup folder");
+            backup.set_valign(gtk::Align::Start);
+            backup.set_margin_top(10);
+            backup.set_sensitive(supported);
+            let backup_path = crate::cloud_saves::sync::backup_directory(product_id);
+            let backup_parent = window.clone();
+            backup.connect_clicked(move |_| {
+                std::fs::create_dir_all(&backup_path).ok();
+                super::widgets::file_open::open_directory(
+                    &backup_path,
+                    &backup_parent,
+                    "cloud-save backup directory",
+                );
+            });
+            backup_row.add_suffix(&backup);
+            cloud_group.add(&backup_row);
+
+            let override_row = adw::ActionRow::new();
+            override_row.set_title("Override save directory");
+            override_row.set_subtitle("Use only when GOG's configured location cannot be resolved");
+            let choose = gtk::Button::with_label("Choose…");
+            choose.set_valign(gtk::Align::Start);
+            choose.set_margin_top(10);
+            choose.set_sensitive(
+                supported || record.availability == crate::domain::CloudSaveAvailability::Unknown,
+            );
+            let choose_parent = window.clone();
+            let override_status = cloud_status.clone();
+            let override_locations = locations_state.clone();
+            let override_locations_row = locations_row.clone();
+            let override_open_folder = open_save_folder.clone();
+            choose.connect_clicked(move |_| {
+                let picker = gtk::FileDialog::builder()
+                    .title("Choose save directory")
+                    .modal(true)
+                    .build();
+                let override_status = override_status.clone();
+                let override_locations = override_locations.clone();
+                let override_locations_row = override_locations_row.clone();
+                let override_open_folder = override_open_folder.clone();
+                picker.select_folder(
+                    Some(&choose_parent),
+                    gio::Cancellable::NONE,
+                    move |result| {
+                        let Ok(file) = result else {
+                            return;
+                        };
+                        let Some(path) = file.path() else {
+                            return;
+                        };
+                        let location = crate::domain::CloudSaveLocation {
+                            name: "override".into(),
+                            path,
+                            remote_namespace: "override".into(),
+                            user_override: true,
+                        };
+                        match StateStore::open().and_then(|store| {
+                            store.set_cloud_save_locations(
+                                product_id,
+                                std::slice::from_ref(&location),
+                            )
+                        }) {
+                            Ok(()) => {
+                                *override_locations.borrow_mut() = vec![location];
+                                override_locations_row.set_subtitle(&cloud_location_summary(
+                                    &override_locations.borrow(),
+                                ));
+                                override_locations_row.set_visible(true);
+                                override_open_folder.set_sensitive(true);
+                                override_status.set_label("Override save directory updated");
+                            }
+                            Err(error) => override_status
+                                .set_label(&format!("Could not save override: {error}")),
+                        }
+                    },
+                );
+            });
+            override_row.add_suffix(&choose);
+            cloud_group.add(&override_row);
+
+            if record.availability == crate::domain::CloudSaveAvailability::Unknown {
+                let retry = gtk::Button::with_label("Retry metadata discovery");
+                retry.set_valign(gtk::Align::Start);
+                retry.set_margin_top(10);
+                let game = installed_game.clone();
+                let locations = locations_state.clone();
+                let status = cloud_status.clone();
+                let locations_row = locations_row.clone();
+                let open_save_folder = open_save_folder.clone();
+                let inventory_row = inventory_row.clone();
+                let check_inventory = check_inventory.clone();
+                let enabled = enabled.clone();
+                let sync_now = sync_now.clone();
+                let advanced = advanced.clone();
+                let backup = backup.clone();
+                let choose = choose.clone();
+                retry.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    status.remove_css_class("error");
+                    status.set_label("Checking GOG cloud-save support…");
+                    let (sender, receiver) = mpsc::channel();
+                    let game = game.clone();
+                    let stored_locations = locations.borrow().clone();
+                    std::thread::spawn(move || {
+                        let result =
+                            crate::cloud_saves::discover_and_store(&game, &stored_locations)
+                                .map_err(|error| format!("{error:#}"));
+                        sender.send(result).ok();
+                    });
+                    let button = button.clone();
+                    let status = status.clone();
+                    let locations = locations.clone();
+                    let locations_row = locations_row.clone();
+                    let open_save_folder = open_save_folder.clone();
+                    let inventory_row = inventory_row.clone();
+                    let check_inventory = check_inventory.clone();
+                    let enabled = enabled.clone();
+                    let sync_now = sync_now.clone();
+                    let advanced = advanced.clone();
+                    let backup = backup.clone();
+                    let choose = choose.clone();
+                    glib::timeout_add_local(Duration::from_millis(100), move || {
+                        match receiver.try_recv() {
+                            Ok(Ok(discovery)) => {
+                                let supported = discovery.availability
+                                    == crate::domain::CloudSaveAvailability::Supported;
+                                *locations.borrow_mut() = discovery.locations.clone();
+                                locations_row
+                                    .set_subtitle(&cloud_location_summary(&discovery.locations));
+                                locations_row.set_visible(supported);
+                                open_save_folder
+                                    .set_sensitive(supported && !discovery.locations.is_empty());
+                                inventory_row.set_visible(supported);
+                                check_inventory.set_sensitive(supported);
+                                if supported {
+                                    inventory_row
+                                        .set_subtitle("Remote save files have not been checked");
+                                }
+                                enabled.set_sensitive(supported);
+                                sync_now.set_sensitive(supported);
+                                advanced.set_sensitive(supported);
+                                backup.set_sensitive(supported);
+                                choose.set_sensitive(
+                                    supported
+                                        || discovery.availability
+                                            == crate::domain::CloudSaveAvailability::Unknown,
+                                );
+                                status.set_label(match discovery.availability {
+                                    crate::domain::CloudSaveAvailability::Supported => {
+                                        "GOG cloud saves are supported for this game."
+                                    }
+                                    crate::domain::CloudSaveAvailability::Unsupported => {
+                                        "GOG reports cloud saves are disabled for this game."
+                                    }
+                                    crate::domain::CloudSaveAvailability::Unavailable => {
+                                        discovery.reason.as_deref().unwrap_or(
+                                            "GOG cloud-save metadata is unavailable for this game.",
+                                        )
+                                    }
+                                    crate::domain::CloudSaveAvailability::Unknown => {
+                                        discovery.reason.as_deref().unwrap_or(
+                                            "Cloud-save discovery failed; retry is available.",
+                                        )
+                                    }
+                                });
+                                button.set_visible(
+                                    discovery.availability
+                                        == crate::domain::CloudSaveAvailability::Unknown,
+                                );
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status.add_css_class("error");
+                                status.set_label(&error);
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                status
+                                    .set_label("Cloud-save discovery worker stopped unexpectedly");
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    });
+                });
+                let retry_row = adw::ActionRow::new();
+                retry_row.set_title("Cloud-save support");
+                retry_row.set_subtitle("Check GOG metadata again");
+                retry_row.add_suffix(&retry);
+                cloud_group.add(&retry_row);
+            }
+        } else {
+            cloud_group.set_description(Some("Cloud saves currently support Windows games installed into a managed UMU prefix only."));
+        }
+    } else {
+        cloud_group.set_description(Some(
+            "Install the Windows version to configure cloud saves.",
+        ));
+    }
+    cloud_group.add(&cloud_status);
+    cloud_page.add(&cloud_group);
+
     let versions_page = adw::PreferencesPage::new();
     versions_page.set_title("Versions");
     let versions_group = adw::PreferencesGroup::new();
@@ -276,6 +706,12 @@ pub(super) fn show_game_settings(
     versions_page.add(&versions_group);
 
     for (name, title, icon, page) in [
+        (
+            "cloud-saves",
+            "Cloud Saves",
+            "folder-remote-symbolic",
+            cloud_page.upcast::<gtk::Widget>(),
+        ),
         (
             "general",
             "General",
@@ -400,6 +836,152 @@ pub(super) fn show_game_settings(
     }
 
     window.present();
+}
+
+fn run_cloud_action(
+    button: &gtk::Button,
+    status: &gtk::Label,
+    request: crate::cloud_saves::CloudSyncRequest,
+) {
+    button.set_sensitive(false);
+    status.set_label("Synchronizing…");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send(crate::cloud_saves::sync(request).map_err(|error| format!("{error:#}")))
+            .ok();
+    });
+    let button = button.clone();
+    let status = status.clone();
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(100),
+        move || match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                button.set_sensitive(true);
+                if result.conflicts.is_empty() {
+                    status.set_label(&format!(
+                        "Synchronized: {} uploaded, {} downloaded",
+                        result.uploaded, result.downloaded
+                    ));
+                } else {
+                    status.set_label(&format!(
+                        "{} conflict(s) need a force upload or force download choice",
+                        result.conflicts.len()
+                    ));
+                }
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                button.set_sensitive(true);
+                status.set_label(&error);
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                button.set_sensitive(true);
+                status.set_label("Cloud-save worker stopped unexpectedly");
+                glib::ControlFlow::Break
+            }
+        },
+    );
+}
+
+fn load_cloud_inventory(
+    game: crate::domain::InstalledGame,
+    row: adw::ActionRow,
+    button: gtk::Button,
+) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send(crate::cloud_saves::inventory(&game).map_err(|error| format!("{error:#}")))
+            .ok();
+    });
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(100),
+        move || match receiver.try_recv() {
+            Ok(Ok(inventory)) => {
+                button.set_sensitive(true);
+                let files = match inventory.file_count {
+                    0 => "No remote save files".into(),
+                    1 => "1 remote save file".into(),
+                    count => format!("{count} remote save files"),
+                };
+                let modified = inventory
+                    .latest_modified_at
+                    .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+                    .map(|time| format!("last modified {}", time.format("%Y-%m-%d %H:%M UTC")));
+                let mut summary = format!(
+                    "{files} · {}",
+                    crate::domain::human_size(inventory.total_size)
+                );
+                if let Some(modified) = modified {
+                    summary.push_str(" · ");
+                    summary.push_str(&modified);
+                }
+                row.set_subtitle(&summary);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                button.set_sensitive(true);
+                row.set_subtitle(&format!("Could not check cloud storage: {error}"));
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                button.set_sensitive(true);
+                row.set_subtitle("Cloud-storage check stopped unexpectedly");
+                glib::ControlFlow::Break
+            }
+        },
+    );
+}
+
+fn confirm_force_cloud_action(
+    parent: &adw::ApplicationWindow,
+    button: &gtk::Button,
+    status: &gtk::Label,
+    request: crate::cloud_saves::CloudSyncRequest,
+) {
+    let (heading, body, response) = match request.mode {
+        crate::domain::CloudSyncMode::ForceDownload => (
+            "Replace local saves?",
+            "This replaces matching local save files with GOG Cloud copies. Local backups are created, but unsynchronized local progress may be lost.",
+            "Force download",
+        ),
+        crate::domain::CloudSyncMode::ForceUpload => (
+            "Replace cloud saves?",
+            "This replaces matching GOG Cloud save files with local copies. Previous cloud versions may be permanently lost.",
+            "Force upload",
+        ),
+        crate::domain::CloudSyncMode::Normal => return,
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("force", response)]);
+    dialog.set_response_appearance("force", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let button = button.clone();
+    let status = status.clone();
+    dialog.choose(Some(parent), gio::Cancellable::NONE, move |response| {
+        if response == "force" {
+            run_cloud_action(&button, &status, request);
+        }
+    });
+}
+
+fn cloud_location_summary(locations: &[crate::domain::CloudSaveLocation]) -> String {
+    if locations.is_empty() {
+        return "No resolved save locations".into();
+    }
+    locations
+        .iter()
+        .map(|location| format!("{} · {}", location.name, location.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn persist_launch_settings(

@@ -176,6 +176,7 @@ pub(super) fn render_detail_page(
     }));
     let primary_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     primary_actions.add_css_class("detail-primary-actions");
+    let cloud_launch_status = Rc::new(RefCell::new(None::<CloudLaunchStatus>));
     {
         let detail = game.clone();
         let model = model.clone();
@@ -187,6 +188,7 @@ pub(super) fn render_detail_page(
         let activity_widgets = widgets.clone_refs();
         let playtime_value = playtime_value.clone();
         let previous_playtime = activity.1;
+        let cloud_launch_status = cloud_launch_status.clone();
         download_button.connect_clicked(move |_| {
             if !detail.owned {
                 if let Some(uri) = detail.links.store.as_deref() {
@@ -280,9 +282,45 @@ pub(super) fn render_detail_page(
                 let playtime_value = playtime_value.clone();
                 let activity_model = activity_model.clone();
                 let activity_widgets = activity_widgets.clone();
+                let cloud_launch_status = cloud_launch_status.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
                     match receiver.try_recv() {
+                        Ok(
+                            event @ (crate::installation::LaunchEvent::EnablementRequired {
+                                ..
+                            }
+                            | crate::installation::LaunchEvent::PreLaunchConflict { .. }
+                            | crate::installation::LaunchEvent::LaunchWithoutSyncRequired {
+                                ..
+                            }
+                            | crate::installation::LaunchEvent::SyncWarning(_)
+                            | crate::installation::LaunchEvent::PostExitSync(_)
+                            | crate::installation::LaunchEvent::PostExitConflict(_)),
+                        ) => {
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                status.hide();
+                            }
+                            present_cloud_launch_event(&window, event);
+                            glib::ControlFlow::Continue
+                        }
+                        Ok(crate::installation::LaunchEvent::CloudSyncStarted(phase)) => {
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                status.show(phase);
+                            }
+                            button.set_sensitive(false);
+                            button.add_css_class("operational-action");
+                            action_group.add_css_class("operational-state");
+                            set_primary_button_content(
+                                &button,
+                                "emblem-synchronizing-symbolic",
+                                "Syncing saves",
+                            );
+                            glib::ControlFlow::Continue
+                        }
                         Ok(crate::installation::LaunchEvent::Started) => {
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                status.hide();
+                            }
                             button.set_sensitive(true);
                             button.add_css_class("operational-action");
                             action_group.add_css_class("operational-state");
@@ -298,6 +336,9 @@ pub(super) fn render_detail_page(
                             seconds,
                             ..
                         }) => {
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                status.hide();
+                            }
                             button.set_sensitive(true);
                             button.remove_css_class("operational-action");
                             action_group.remove_css_class("operational-state");
@@ -329,6 +370,9 @@ pub(super) fn render_detail_page(
                             glib::ControlFlow::Break
                         }
                         Ok(crate::installation::LaunchEvent::Failed(error)) => {
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                status.hide();
+                            }
                             button.set_sensitive(true);
                             button.remove_css_class("operational-action");
                             action_group.remove_css_class("operational-state");
@@ -347,6 +391,9 @@ pub(super) fn render_detail_page(
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                         Err(mpsc::TryRecvError::Disconnected) => {
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                status.hide();
+                            }
                             button.set_sensitive(true);
                             glib::ControlFlow::Break
                         }
@@ -479,7 +526,7 @@ pub(super) fn render_detail_page(
     action_bar.append(&installation_status_panel(
         game.product_id,
         &w.window,
-        (&download_button, &primary_actions),
+        (&download_button, &primary_actions, &cloud_launch_status),
         primary_action,
         installation_was_running,
         model,
@@ -803,7 +850,21 @@ fn launch_installed_game(window: &adw::ApplicationWindow, installed: crate::doma
     let window = window.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         match receiver.try_recv() {
+            Ok(
+                event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
+                | crate::installation::LaunchEvent::PreLaunchConflict { .. }
+                | crate::installation::LaunchEvent::LaunchWithoutSyncRequired { .. }
+                | crate::installation::LaunchEvent::SyncWarning(_)
+                | crate::installation::LaunchEvent::PostExitSync(_)
+                | crate::installation::LaunchEvent::PostExitConflict(_)),
+            ) => {
+                present_cloud_launch_event(&window, event);
+                glib::ControlFlow::Continue
+            }
             Ok(crate::installation::LaunchEvent::Started) => glib::ControlFlow::Continue,
+            Ok(crate::installation::LaunchEvent::CloudSyncStarted(_)) => {
+                glib::ControlFlow::Continue
+            }
             Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
             Ok(crate::installation::LaunchEvent::Failed(error)) => {
                 let dialog = adw::AlertDialog::builder()
@@ -820,16 +881,53 @@ fn launch_installed_game(window: &adw::ApplicationWindow, installed: crate::doma
     });
 }
 
+#[derive(Clone)]
+struct CloudLaunchStatus {
+    panel: gtk::Box,
+    heading: gtk::Label,
+    detail: gtk::Label,
+    progress: gtk::ProgressBar,
+}
+
+impl CloudLaunchStatus {
+    fn show(&self, phase: crate::installation::CloudSyncPhase) {
+        self.heading.set_label(match phase {
+            crate::installation::CloudSyncPhase::BeforeLaunch => "SYNCING CLOUD SAVES",
+            crate::installation::CloudSyncPhase::AfterExit => "UPLOADING CLOUD SAVES",
+        });
+        self.detail.set_label(match phase {
+            crate::installation::CloudSyncPhase::BeforeLaunch => {
+                "Comparing local and GOG Cloud saves before launch…"
+            }
+            crate::installation::CloudSyncPhase::AfterExit => {
+                "Uploading changed saves after the game exited…"
+            }
+        });
+        self.progress.set_fraction(0.0);
+        self.progress.set_visible(true);
+        self.panel.set_visible(true);
+    }
+
+    fn hide(&self) {
+        self.panel.set_visible(false);
+        self.progress.set_visible(false);
+    }
+}
+
 fn installation_status_panel(
     product_id: i64,
     window: &adw::ApplicationWindow,
-    action_widgets: (&gtk::Button, &gtk::Box),
+    action_widgets: (
+        &gtk::Button,
+        &gtk::Box,
+        &Rc<RefCell<Option<CloudLaunchStatus>>>,
+    ),
     normal_action: GamePrimaryAction,
     initially_installing: bool,
     model: &Rc<RefCell<AppModel>>,
     refresh_after_install: Rc<dyn Fn()>,
 ) -> gtk::Box {
-    let (primary_action, action_group) = action_widgets;
+    let (primary_action, action_group, cloud_launch_status) = action_widgets;
     let panel = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     panel.add_css_class("hero-install-status");
     panel.set_visible(false);
@@ -849,6 +947,12 @@ fn installation_status_panel(
     progress.add_css_class("hero-transfer-progress");
     text.append(&progress);
     panel.append(&text);
+    *cloud_launch_status.borrow_mut() = Some(CloudLaunchStatus {
+        panel: panel.clone(),
+        heading: heading.clone(),
+        detail: detail.clone(),
+        progress: progress.clone(),
+    });
     let cancel = gtk::Button::from_icon_name("process-stop-symbolic");
     cancel.add_css_class("flat");
     cancel.add_css_class("destructive-action");
@@ -886,6 +990,45 @@ fn installation_status_panel(
         });
     }
     panel.append(&cancel);
+    let cloud_decline = gtk::Button::with_label("Not now");
+    cloud_decline.set_visible(false);
+    panel.append(&cloud_decline);
+    let cloud_enable = gtk::Button::with_label("Enable cloud saves");
+    cloud_enable.add_css_class("suggested-action");
+    cloud_enable.set_visible(false);
+    panel.append(&cloud_enable);
+    {
+        let panel = panel.clone();
+        let refresh = refresh_after_install.clone();
+        cloud_decline.connect_clicked(move |_| {
+            if let Ok(store) = StateStore::open() {
+                store
+                    .set_cloud_save_preference(
+                        product_id,
+                        crate::domain::CloudSavePreference::Disabled,
+                    )
+                    .ok();
+            }
+            panel.set_visible(false);
+            refresh();
+        });
+    }
+    {
+        let panel = panel.clone();
+        let refresh = refresh_after_install.clone();
+        cloud_enable.connect_clicked(move |_| {
+            if let Ok(store) = StateStore::open() {
+                store
+                    .set_cloud_save_preference(
+                        product_id,
+                        crate::domain::CloudSavePreference::Enabled,
+                    )
+                    .ok();
+            }
+            panel.set_visible(false);
+            refresh();
+        });
+    }
     let receiver = crate::installation::subscribe_installation_events();
     let initial_snapshot = crate::installation::installation_operation_snapshot(product_id);
     let panel_for_poll = panel.clone();
@@ -1088,6 +1231,9 @@ fn installation_status_panel(
                 );
             }
         }
+        if cloud_enable.is_visible() {
+            return glib::ControlFlow::Continue;
+        }
         match installation_snapshot {
             Some(crate::installation::InstallationOperationSnapshot {
                 queued: true,
@@ -1234,7 +1380,65 @@ fn installation_status_panel(
                 state: crate::domain::InstallationState::Installed,
                 ..
             }) if was_installing.replace(false) => {
-                refresh_after_install();
+                let libraries = model.borrow().config.game_libraries.clone();
+                panel_for_poll.set_visible(true);
+                heading.set_label("CHECKING CLOUD SAVES");
+                detail.set_label("Checking GOG cloud-save support…");
+                progress.set_visible(true);
+                cancel.set_visible(false);
+                cloud_decline.set_visible(false);
+                cloud_enable.set_visible(false);
+                primary_action.set_sensitive(false);
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let store = StateStore::open()?;
+                        let record = store.cloud_save_record(product_id)?;
+                        let game =
+                            crate::installation::reconcile_installed_games(&store, &libraries)?
+                                .into_iter()
+                                .find(|game| game.product_id == product_id)
+                                .ok_or_else(|| anyhow::anyhow!("installed game is unavailable"))?;
+                        let discovery =
+                            crate::cloud_saves::discover_and_store(&game, &record.locations)?;
+                        anyhow::Ok((discovery, record.preference))
+                    })()
+                    .map_err(|error| format!("{error:#}"));
+                    sender.send(result).ok();
+                });
+                let panel = panel_for_poll.clone();
+                let heading = heading.clone();
+                let detail = detail.clone();
+                let progress = progress.clone();
+                let decline = cloud_decline.clone();
+                let enable = cloud_enable.clone();
+                let primary = primary_action.clone();
+                let refresh = refresh_after_install.clone();
+                glib::timeout_add_local(Duration::from_millis(100), move || {
+                    match receiver.try_recv() {
+                        Ok(Ok((discovery, preference)))
+                            if discovery.availability
+                                == crate::domain::CloudSaveAvailability::Supported
+                                && preference == crate::domain::CloudSavePreference::Undecided =>
+                        {
+                            heading.set_label("CLOUD SAVES AVAILABLE");
+                            detail.set_label(
+                                "Synchronize this game's saves with GOG before launch and after exit?",
+                            );
+                            progress.set_visible(false);
+                            decline.set_visible(true);
+                            enable.set_visible(true);
+                            primary.set_sensitive(true);
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Ok(_)) | Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                            panel.set_visible(false);
+                            refresh();
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    }
+                });
                 return glib::ControlFlow::Break;
             }
             Some(crate::installation::InstallationOperationSnapshot {

@@ -1,8 +1,10 @@
 use crate::{
     auth::Profile,
     domain::{
-        ArtifactKind, DownloadCategory, DownloadRevision, GalaxyBuild, Game, GamePreferences,
-        InstalledGame, ProductMetadata, RemoteArtifact,
+        ArtifactKind, CloudSaveAvailability, CloudSaveConflict, CloudSaveDiscovery,
+        CloudSaveLocation, CloudSavePreference, CloudSaveStatus, DownloadCategory,
+        DownloadRevision, GalaxyBuild, Game, GamePreferences, InstalledGame, ProductMetadata,
+        RemoteArtifact,
     },
 };
 use anyhow::{Result, bail};
@@ -144,7 +146,24 @@ pub struct StateStore {
     connection: Connection,
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 24;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSaveRecord {
+    pub preference: CloudSavePreference,
+    pub availability: CloudSaveAvailability,
+    pub locations: Vec<CloudSaveLocation>,
+    pub metadata_build_id: Option<String>,
+    pub metadata_checked_at: Option<i64>,
+    pub metadata_error: Option<String>,
+    pub last_successful_sync: Option<i64>,
+    pub status: CloudSaveStatus,
+    pub error: Option<String>,
+    pub conflicts: Vec<CloudSaveConflict>,
+}
+
+const BASELINE_SCHEMA_VERSION: i64 = 24;
+const CURRENT_SCHEMA_VERSION: i64 = 25;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 2;
+const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
     pub fn open() -> Result<Self> {
@@ -168,13 +187,30 @@ impl StateStore {
 
     fn initialize(connection: Connection) -> Result<Self> {
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != 0 && version != CURRENT_SCHEMA_VERSION {
+        if !matches!(
+            version,
+            0 | BASELINE_SCHEMA_VERSION | CURRENT_SCHEMA_VERSION | TRANSIENT_SCHEMA_VERSION
+        ) {
             bail!(
                 "database schema version {version} is unsupported; expected {CURRENT_SCHEMA_VERSION}"
             );
         }
 
-        connection.execute_batch(
+        let target_table_exists = table_exists(&connection, "cloud_save_settings")?;
+        if version == CURRENT_SCHEMA_VERSION && !target_table_exists {
+            bail!("database schema version 25 has an unidentified development revision");
+        }
+        if version == CURRENT_SCHEMA_VERSION
+            && let Some(revision) = development_revision(&connection)?
+            && !(1..=CURRENT_DEVELOPMENT_REVISION).contains(&revision)
+        {
+            bail!("database schema version 25 has unsupported development revision {revision}");
+        }
+
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+
+        let initialized = (|| -> Result<()> {
+            connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS user_game_state (product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS custom_tags (product_id INTEGER NOT NULL, tag TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (product_id, tag));
@@ -279,12 +315,245 @@ impl StateStore {
              CREATE TABLE IF NOT EXISTS game_compatibility_fix_overrides (
                 product_id INTEGER NOT NULL, fix_id TEXT NOT NULL, enabled INTEGER NOT NULL,
                 PRIMARY KEY(product_id, fix_id)
+             );
+             CREATE TABLE IF NOT EXISTS cloud_save_settings (
+                product_id INTEGER PRIMARY KEY, preference TEXT NOT NULL DEFAULT 'undecided',
+                availability TEXT NOT NULL DEFAULT 'unknown', metadata_build_id TEXT,
+                metadata_checked_at INTEGER, metadata_error TEXT,
+                locations_json TEXT NOT NULL DEFAULT '[]', last_successful_sync INTEGER,
+                status TEXT NOT NULL DEFAULT 'never_synced', error TEXT, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cloud_save_baselines (
+                product_id INTEGER PRIMARY KEY, files_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cloud_save_conflicts (
+                product_id INTEGER PRIMARY KEY, conflicts_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS schema_state (
+                state_key INTEGER PRIMARY KEY CHECK(state_key = 1),
+                development_revision INTEGER NOT NULL
              );"
-        )?;
-        if version == 0 {
+            )?;
+            ensure_cloud_save_target_columns(&connection)?;
+            connection.execute(
+                "INSERT INTO schema_state(state_key, development_revision) VALUES (1, ?1)
+                 ON CONFLICT(state_key) DO UPDATE SET development_revision = excluded.development_revision",
+                [CURRENT_DEVELOPMENT_REVISION],
+            )?;
             connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+            Ok(())
+        })();
+        match initialized {
+            Ok(()) => connection.execute_batch("COMMIT")?,
+            Err(error) => {
+                connection.execute_batch("ROLLBACK").ok();
+                return Err(error);
+            }
         }
         Ok(Self { connection })
+    }
+
+    pub fn cloud_save_record(&self, product_id: i64) -> Result<CloudSaveRecord> {
+        let settings = self
+            .connection
+            .query_row(
+                "SELECT preference, availability, locations_json, metadata_build_id,
+                        metadata_checked_at, metadata_error, last_successful_sync, status, error
+             FROM cloud_save_settings WHERE product_id = ?1",
+                [product_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let conflicts = self
+            .connection
+            .query_row(
+                "SELECT conflicts_json FROM cloud_save_conflicts WHERE product_id = ?1",
+                [product_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let Some((
+            preference,
+            availability,
+            locations,
+            metadata_build_id,
+            metadata_checked_at,
+            metadata_error,
+            last_successful_sync,
+            status,
+            error,
+        )) = settings
+        else {
+            return Ok(CloudSaveRecord {
+                preference: CloudSavePreference::Undecided,
+                availability: CloudSaveAvailability::Unknown,
+                locations: Vec::new(),
+                metadata_build_id: None,
+                metadata_checked_at: None,
+                metadata_error: None,
+                last_successful_sync: None,
+                status: CloudSaveStatus::NeverSynced,
+                error: None,
+                conflicts,
+            });
+        };
+        Ok(CloudSaveRecord {
+            preference: serde_json::from_str(&format!("\"{preference}\"")).unwrap_or_default(),
+            availability: serde_json::from_str(&format!("\"{availability}\"")).unwrap_or_default(),
+            locations: serde_json::from_str(&locations).unwrap_or_default(),
+            metadata_build_id,
+            metadata_checked_at,
+            metadata_error,
+            last_successful_sync,
+            status: serde_json::from_str(&format!("\"{status}\"")).unwrap_or_default(),
+            error,
+            conflicts,
+        })
+    }
+
+    pub fn set_cloud_save_discovery(
+        &self,
+        product_id: i64,
+        discovery: &CloudSaveDiscovery,
+    ) -> Result<()> {
+        let availability = serde_json::to_value(discovery.availability)?
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        let reason = discovery
+            .reason
+            .as_deref()
+            .map(|value| value.chars().take(500).collect::<String>());
+        self.connection.execute(
+            "INSERT INTO cloud_save_settings(
+                product_id, availability, locations_json, metadata_build_id,
+                metadata_checked_at, metadata_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET
+                availability = excluded.availability,
+                locations_json = excluded.locations_json,
+                metadata_build_id = excluded.metadata_build_id,
+                metadata_checked_at = excluded.metadata_checked_at,
+                metadata_error = excluded.metadata_error,
+                updated_at = excluded.updated_at",
+            params![
+                product_id,
+                availability,
+                serde_json::to_string(&discovery.locations)?,
+                discovery.metadata_build_id,
+                (discovery.checked_at > 0).then_some(discovery.checked_at),
+                reason,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_cloud_save_preference(
+        &self,
+        product_id: i64,
+        preference: CloudSavePreference,
+    ) -> Result<()> {
+        let value = serde_json::to_value(preference)?
+            .as_str()
+            .unwrap_or("undecided")
+            .to_owned();
+        self.connection.execute(
+            "INSERT INTO cloud_save_settings(product_id, preference, updated_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET preference = excluded.preference, updated_at = excluded.updated_at",
+            params![product_id, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_cloud_save_locations(
+        &self,
+        product_id: i64,
+        locations: &[CloudSaveLocation],
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO cloud_save_settings(product_id, locations_json, updated_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET locations_json = excluded.locations_json, updated_at = excluded.updated_at",
+            params![product_id, serde_json::to_string(locations)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn cloud_save_baseline(&self, product_id: i64) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT files_json FROM cloud_save_baselines WHERE product_id = ?1",
+                [product_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn complete_cloud_save_sync(&self, product_id: i64, baseline: &str) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO cloud_save_baselines(product_id, files_json) VALUES (?1, ?2)
+             ON CONFLICT(product_id) DO UPDATE SET files_json = excluded.files_json",
+            params![product_id, baseline],
+        )?;
+        transaction.execute(
+            "INSERT INTO cloud_save_settings(product_id, last_successful_sync, status, error, updated_at)
+             VALUES (?1, unixepoch(), 'synchronized', NULL, unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET last_successful_sync = unixepoch(), status = 'synchronized', error = NULL, updated_at = unixepoch()",
+            [product_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM cloud_save_conflicts WHERE product_id = ?1",
+            [product_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_cloud_save_conflicts(
+        &self,
+        product_id: i64,
+        conflicts: &[CloudSaveConflict],
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO cloud_save_conflicts(product_id, conflicts_json) VALUES (?1, ?2)
+             ON CONFLICT(product_id) DO UPDATE SET conflicts_json = excluded.conflicts_json",
+            params![product_id, serde_json::to_string(conflicts)?],
+        )?;
+        self.set_cloud_save_status(product_id, CloudSaveStatus::Conflict, None)
+    }
+
+    pub fn set_cloud_save_status(
+        &self,
+        product_id: i64,
+        status: CloudSaveStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let status = serde_json::to_value(status)?
+            .as_str()
+            .unwrap_or("error")
+            .to_owned();
+        let error = error.map(|value| value.chars().take(500).collect::<String>());
+        self.connection.execute(
+            "INSERT INTO cloud_save_settings(product_id, status, error, updated_at) VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET status = excluded.status, error = excluded.error, updated_at = excluded.updated_at",
+            params![product_id, status, error],
+        )?;
+        Ok(())
     }
 
     pub fn compatibility_fix_overrides(&self, product_id: i64) -> Result<HashMap<String, bool>> {
@@ -2017,6 +2286,57 @@ impl StateStore {
     }
 }
 
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn development_revision(connection: &Connection) -> Result<Option<i64>> {
+    if !table_exists(connection, "schema_state")? {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            "SELECT development_revision FROM schema_state WHERE state_key = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_cloud_save_target_columns(connection: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("availability", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("metadata_build_id", "TEXT"),
+        ("metadata_checked_at", "INTEGER"),
+        ("metadata_error", "TEXT"),
+    ] {
+        if !column_exists(connection, "cloud_save_settings", column)? {
+            connection.execute_batch(&format!(
+                "ALTER TABLE cloud_save_settings ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn data_path() -> PathBuf {
     crate::identity::database()
 }
@@ -2281,6 +2601,141 @@ mod tests {
     }
 
     #[test]
+    fn baseline_schema_migrates_once_and_preserves_user_data() {
+        let path = std::env::temp_dir().join(format!(
+            "ludomere-state-baseline-migration-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE user_game_state (
+                    product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO user_game_state VALUES (42, 1);
+                 PRAGMA user_version = 24;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(store.favorites().unwrap(), HashSet::from([42]));
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        assert!(column_exists(&store.connection, "cloud_save_settings", "availability").unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn early_target_schema_advances_through_development_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "ludomere-state-development-migration-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cloud_save_settings (
+                    product_id INTEGER PRIMARY KEY,
+                    preference TEXT NOT NULL DEFAULT 'undecided',
+                    locations_json TEXT NOT NULL DEFAULT '[]',
+                    last_successful_sync INTEGER,
+                    status TEXT NOT NULL DEFAULT 'never_synced',
+                    error TEXT,
+                    updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO cloud_save_settings(product_id, preference, updated_at)
+                 VALUES (42, 'enabled', 1);
+                 PRAGMA user_version = 25;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open_at(&path).unwrap();
+        let record = store.cloud_save_record(42).unwrap();
+        assert_eq!(record.preference, CloudSavePreference::Enabled);
+        assert_eq!(record.availability, CloudSaveAvailability::Unknown);
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn known_transient_public_version_is_squashed_to_target() {
+        let path = std::env::temp_dir().join(format!(
+            "ludomere-state-transient-migration-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute("DROP TABLE schema_state", [])
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "user_version", TRANSIENT_SCHEMA_VERSION)
+            .unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn future_development_revision_is_rejected_without_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "ludomere-state-future-development-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute("UPDATE schema_state SET development_revision = 99", [])
+            .unwrap();
+        drop(store);
+
+        let error = StateStore::open_at(&path).err().unwrap().to_string();
+        assert!(error.contains("unsupported development revision 99"));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(development_revision(&connection).unwrap(), Some(99));
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn obsolete_schema_is_rejected_without_changes() {
         let path = std::env::temp_dir().join(format!(
             "gog-state-obsolete-schema-{}.sqlite3",
@@ -2340,7 +2795,7 @@ mod tests {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 24);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         drop(store);
         let _ = std::fs::remove_file(path);
     }
@@ -2792,6 +3247,39 @@ mod tests {
         assert_eq!(status, "success");
         assert!(completed_at.is_some());
         assert!(error.is_none());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cloud_save_discovery_round_trips_without_secrets() {
+        let path = std::env::temp_dir().join(format!(
+            "ludomere-cloud-discovery-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = StateStore::open_at(&path).unwrap();
+        let discovery = CloudSaveDiscovery {
+            availability: CloudSaveAvailability::Supported,
+            locations: vec![CloudSaveLocation {
+                name: "main".into(),
+                path: PathBuf::from("/prefix/Documents/Game"),
+                remote_namespace: "main".into(),
+                user_override: true,
+            }],
+            metadata_build_id: Some("build-1".into()),
+            checked_at: 123,
+            reason: None,
+        };
+        store.set_cloud_save_discovery(42, &discovery).unwrap();
+        let record = store.cloud_save_record(42).unwrap();
+        assert_eq!(record.availability, CloudSaveAvailability::Supported);
+        assert_eq!(record.locations, discovery.locations);
+        assert_eq!(record.metadata_build_id.as_deref(), Some("build-1"));
+        assert_eq!(record.metadata_checked_at, Some(123));
+        assert!(record.metadata_error.is_none());
         drop(store);
         std::fs::remove_file(path).unwrap();
     }

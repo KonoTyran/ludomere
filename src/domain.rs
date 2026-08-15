@@ -388,6 +388,86 @@ pub struct GamePreferences {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSavePreference {
+    #[default]
+    Undecided,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSaveAvailability {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSaveDiscovery {
+    pub availability: CloudSaveAvailability,
+    pub locations: Vec<CloudSaveLocation>,
+    pub metadata_build_id: Option<String>,
+    pub checked_at: i64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSaveLocation {
+    pub name: String,
+    pub path: PathBuf,
+    pub remote_namespace: String,
+    pub user_override: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSaveStatus {
+    #[default]
+    NeverSynced,
+    Syncing,
+    Synchronized,
+    Conflict,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSaveFileMetadata {
+    pub location: String,
+    pub relative_path: PathBuf,
+    pub size: u64,
+    pub modified_at: i64,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSaveConflict {
+    pub location: String,
+    pub relative_path: PathBuf,
+    pub local: Option<CloudSaveFileMetadata>,
+    pub remote: Option<CloudSaveFileMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSyncMode {
+    Normal,
+    ForceDownload,
+    ForceUpload,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSyncResult {
+    pub uploaded: usize,
+    pub downloaded: usize,
+    pub conflicts: Vec<CloudSaveConflict>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {

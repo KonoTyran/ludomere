@@ -20,8 +20,8 @@ pub use executor::{
     uninstallation_log_path,
 };
 pub use launcher::{
-    LaunchEvent, is_game_running, is_game_stopping, launch_game, runtime_log_path, stop_all_games,
-    stop_game,
+    CloudSyncPhase, LaunchEvent, is_game_running, is_game_stopping, launch_game, runtime_log_path,
+    stop_all_games, stop_game,
 };
 pub use manager::{
     InstallationManagerEvent, InstallationOperationSnapshot, cancel_operation,

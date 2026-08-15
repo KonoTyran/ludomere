@@ -1,5 +1,6 @@
 pub mod application;
 pub mod auth;
+pub mod cloud_saves;
 pub mod compatibility;
 pub mod config;
 pub mod domain;

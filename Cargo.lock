@@ -1498,6 +1498,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "flate2",
  "fs2",
  "gdk-pixbuf",
  "gtk4",

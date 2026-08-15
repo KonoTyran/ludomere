@@ -25,8 +25,29 @@ fn stopping_games() -> &'static Mutex<HashSet<i64>> {
 }
 
 #[derive(Debug)]
+pub enum CloudSyncPhase {
+    BeforeLaunch,
+    AfterExit,
+}
+
+#[derive(Debug)]
 pub enum LaunchEvent {
+    EnablementRequired {
+        respond: mpsc::Sender<bool>,
+    },
+    PreLaunchConflict {
+        conflicts: Vec<crate::domain::CloudSaveConflict>,
+        respond: mpsc::Sender<Option<crate::domain::CloudSyncMode>>,
+    },
+    LaunchWithoutSyncRequired {
+        message: String,
+        respond: mpsc::Sender<bool>,
+    },
+    SyncWarning(String),
+    CloudSyncStarted(CloudSyncPhase),
     Started,
+    PostExitSync(crate::domain::CloudSyncResult),
+    PostExitConflict(Vec<crate::domain::CloudSaveConflict>),
     Exited {
         started_at: i64,
         seconds: u64,
@@ -126,6 +147,7 @@ fn run_game(
             );
         }
     }
+    prepare_cloud_saves(&game, events)?;
     let executable = game
         .primary_executable
         .as_ref()
@@ -208,6 +230,7 @@ fn run_game(
     };
     let seconds = timer.elapsed().as_secs();
     StateStore::open()?.record_game_session(game.product_id, started_at, seconds)?;
+    finish_cloud_saves(&game, events);
     if !status.success()
         && let Ok(mut log) = OpenOptions::new().append(true).open(&log_path)
     {
@@ -217,6 +240,175 @@ fn run_game(
         );
     }
     Ok((started_at, seconds, status.code()))
+}
+
+fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>) -> Result<()> {
+    if game.compatibility.is_none()
+        || !game
+            .installer_operating_system
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+    {
+        return Ok(());
+    }
+    let store = StateStore::open()?;
+    let mut record = store.cloud_save_record(game.product_id)?;
+    let selected_build_id = store
+        .load_galaxy_builds(game.product_id)?
+        .into_iter()
+        .filter(|build| build.operating_system.eq_ignore_ascii_case("windows"))
+        .collect::<Vec<_>>();
+    let selected_build_id = crate::cloud_saves::metadata::select_build(
+        &selected_build_id,
+        game.installed_version.as_deref(),
+    )
+    .map(|build| build.build_id.as_str());
+    let needs_discovery = cloud_discovery_required(&record, selected_build_id);
+    if needs_discovery {
+        match crate::cloud_saves::discover_and_store(game, &record.locations) {
+            Ok(_) => {
+                record = store.cloud_save_record(game.product_id)?;
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+    if record.availability != crate::domain::CloudSaveAvailability::Supported {
+        return Ok(());
+    }
+    if cloud_prompt_required(&record) {
+        let (respond, answer) = mpsc::channel();
+        events
+            .send(LaunchEvent::EnablementRequired { respond })
+            .ok();
+        let enabled = answer.recv().unwrap_or(false);
+        record.preference = if enabled {
+            crate::domain::CloudSavePreference::Enabled
+        } else {
+            crate::domain::CloudSavePreference::Disabled
+        };
+        store.set_cloud_save_preference(game.product_id, record.preference)?;
+    }
+    if !cloud_sync_enabled(&record) {
+        return Ok(());
+    }
+    let request = crate::cloud_saves::CloudSyncRequest {
+        game: game.clone(),
+        locations: record.locations.clone(),
+        mode: crate::domain::CloudSyncMode::Normal,
+    };
+    events
+        .send(LaunchEvent::CloudSyncStarted(CloudSyncPhase::BeforeLaunch))
+        .ok();
+    match crate::cloud_saves::sync(request) {
+        Ok(result) if result.conflicts.is_empty() => Ok(()),
+        Ok(result) => {
+            let (respond, answer) = mpsc::channel();
+            events
+                .send(LaunchEvent::PreLaunchConflict {
+                    conflicts: result.conflicts,
+                    respond,
+                })
+                .ok();
+            let Some(mode) = answer.recv().unwrap_or(None) else {
+                return Ok(());
+            };
+            events
+                .send(LaunchEvent::CloudSyncStarted(CloudSyncPhase::BeforeLaunch))
+                .ok();
+            crate::cloud_saves::sync(crate::cloud_saves::CloudSyncRequest {
+                game: game.clone(),
+                locations: record.locations,
+                mode,
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            if store
+                .cloud_save_record(game.product_id)
+                .is_ok_and(|record| {
+                    record.availability != crate::domain::CloudSaveAvailability::Supported
+                })
+            {
+                return Ok(());
+            }
+            let (respond, answer) = mpsc::channel();
+            events
+                .send(LaunchEvent::LaunchWithoutSyncRequired {
+                    message: format!("{error:#}"),
+                    respond,
+                })
+                .ok();
+            if answer.recv().unwrap_or(false) {
+                Ok(())
+            } else {
+                anyhow::bail!("launch cancelled because cloud saves could not synchronize")
+            }
+        }
+    }
+}
+
+fn cloud_discovery_required(
+    record: &crate::state::CloudSaveRecord,
+    selected_build_id: Option<&str>,
+) -> bool {
+    record.availability == crate::domain::CloudSaveAvailability::Unknown
+        || record.metadata_build_id.as_deref() != selected_build_id
+        || (record.availability == crate::domain::CloudSaveAvailability::Supported
+            && record.locations.is_empty())
+}
+
+fn cloud_prompt_required(record: &crate::state::CloudSaveRecord) -> bool {
+    record.availability == crate::domain::CloudSaveAvailability::Supported
+        && record.preference == crate::domain::CloudSavePreference::Undecided
+}
+
+fn cloud_sync_enabled(record: &crate::state::CloudSaveRecord) -> bool {
+    record.availability == crate::domain::CloudSaveAvailability::Supported
+        && record.preference == crate::domain::CloudSavePreference::Enabled
+}
+
+fn finish_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>) {
+    let Ok(store) = StateStore::open() else {
+        return;
+    };
+    let Ok(record) = store.cloud_save_record(game.product_id) else {
+        return;
+    };
+    if !cloud_sync_enabled(&record) {
+        return;
+    }
+    events
+        .send(LaunchEvent::CloudSyncStarted(CloudSyncPhase::AfterExit))
+        .ok();
+    match crate::cloud_saves::sync(crate::cloud_saves::CloudSyncRequest {
+        game: game.clone(),
+        locations: record.locations,
+        mode: crate::domain::CloudSyncMode::Normal,
+    }) {
+        Ok(result) if result.conflicts.is_empty() => {
+            events.send(LaunchEvent::PostExitSync(result)).ok();
+        }
+        Ok(result) => {
+            events
+                .send(LaunchEvent::PostExitConflict(result.conflicts))
+                .ok();
+        }
+        Err(error) => {
+            if store
+                .cloud_save_record(game.product_id)
+                .is_ok_and(|record| {
+                    record.availability != crate::domain::CloudSaveAvailability::Supported
+                })
+            {
+                return;
+            }
+            events
+                .send(LaunchEvent::SyncWarning(format!(
+                    "Cloud saves were not uploaded: {error:#}"
+                )))
+                .ok();
+        }
+    }
 }
 
 fn bundled_libraries(root: &std::path::Path) -> Vec<PathBuf> {
@@ -549,6 +741,69 @@ mod tests {
         CompatibilityBackendKind, GameCompatibilityPreferences, UmuProfile, UmuProfileSource,
     };
     use std::{process::Command, thread, time::Duration};
+
+    fn cloud_record(
+        availability: crate::domain::CloudSaveAvailability,
+        preference: crate::domain::CloudSavePreference,
+    ) -> crate::state::CloudSaveRecord {
+        crate::state::CloudSaveRecord {
+            preference,
+            availability,
+            locations: vec![crate::domain::CloudSaveLocation {
+                name: "main".into(),
+                path: PathBuf::from("/saves"),
+                remote_namespace: "main".into(),
+                user_override: false,
+            }],
+            metadata_build_id: Some("build".into()),
+            metadata_checked_at: Some(1),
+            metadata_error: None,
+            last_successful_sync: None,
+            status: crate::domain::CloudSaveStatus::NeverSynced,
+            error: None,
+            conflicts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_supported_games_prompt_or_sync() {
+        for availability in [
+            crate::domain::CloudSaveAvailability::Unknown,
+            crate::domain::CloudSaveAvailability::Unsupported,
+            crate::domain::CloudSaveAvailability::Unavailable,
+        ] {
+            assert!(!cloud_prompt_required(&cloud_record(
+                availability,
+                crate::domain::CloudSavePreference::Undecided,
+            )));
+            assert!(!cloud_sync_enabled(&cloud_record(
+                availability,
+                crate::domain::CloudSavePreference::Enabled,
+            )));
+        }
+        assert!(cloud_prompt_required(&cloud_record(
+            crate::domain::CloudSaveAvailability::Supported,
+            crate::domain::CloudSavePreference::Undecided,
+        )));
+        assert!(cloud_sync_enabled(&cloud_record(
+            crate::domain::CloudSaveAvailability::Supported,
+            crate::domain::CloudSavePreference::Enabled,
+        )));
+    }
+
+    #[test]
+    fn cloud_discovery_rechecks_unknown_build_changes_and_missing_locations() {
+        let mut record = cloud_record(
+            crate::domain::CloudSaveAvailability::Supported,
+            crate::domain::CloudSavePreference::Disabled,
+        );
+        assert!(!cloud_discovery_required(&record, Some("build")));
+        assert!(cloud_discovery_required(&record, Some("new-build")));
+        record.locations.clear();
+        assert!(cloud_discovery_required(&record, Some("build")));
+        record.availability = crate::domain::CloudSaveAvailability::Unknown;
+        assert!(cloud_discovery_required(&record, Some("build")));
+    }
 
     fn test_game(root: PathBuf, executable: PathBuf, windows: bool) -> InstalledGame {
         InstalledGame {

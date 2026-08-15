@@ -35,6 +35,65 @@ use downloads::*;
 use executable_chooser::*;
 use files::*;
 use game_settings::*;
+
+fn present_cloud_launch_event(
+    window: &adw::ApplicationWindow,
+    event: crate::installation::LaunchEvent,
+) {
+    match event {
+        crate::installation::LaunchEvent::EnablementRequired { respond } => {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Enable GOG Cloud Saves?")
+                .body("Ludomere can synchronize this Windows game's saves before launch and after exit. You can change this later in game settings.")
+                .build();
+            dialog.add_responses(&[("disable", "Not Now"), ("enable", "Enable")]);
+            dialog.set_default_response(Some("enable"));
+            dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
+                respond.send(response == "enable").ok();
+            });
+        }
+        crate::installation::LaunchEvent::PreLaunchConflict { conflicts, respond } => {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Cloud Save Conflict")
+                .body(format!("{} save file(s) changed both locally and in GOG Cloud. Choose which copy to keep.", conflicts.len()))
+                .build();
+            dialog.add_responses(&[
+                ("skip", "Skip and Launch"),
+                ("cloud", "Use Cloud"),
+                ("local", "Use Local"),
+            ]);
+            dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
+                let mode = match response.as_str() {
+                    "cloud" => Some(crate::domain::CloudSyncMode::ForceDownload),
+                    "local" => Some(crate::domain::CloudSyncMode::ForceUpload),
+                    _ => None,
+                };
+                respond.send(mode).ok();
+            });
+        }
+        crate::installation::LaunchEvent::LaunchWithoutSyncRequired { message, respond } => {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Cloud Saves Unavailable")
+                .body(message)
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("launch", "Launch Anyway")]);
+            dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
+                respond.send(response == "launch").ok();
+            });
+        }
+        crate::installation::LaunchEvent::SyncWarning(message) => {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Cloud Save Warning")
+                .body(message)
+                .build();
+            dialog.add_response("close", "Close");
+            dialog.present(Some(window));
+        }
+        crate::installation::LaunchEvent::PostExitConflict(_) => {}
+        crate::installation::LaunchEvent::PostExitSync(_) => {}
+        _ => unreachable!("non-cloud launch event"),
+    }
+}
 use gdk_pixbuf::InterpType;
 use gdk_pixbuf::prelude::PixbufLoaderExt;
 use gtk::{gdk, gio, glib};

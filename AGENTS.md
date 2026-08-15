@@ -6,10 +6,46 @@ Ludomere is a Rust GTK4/libadwaita desktop application for browsing a GOG librar
 downloads, and installing and launching Linux and Windows games. Windows games use standalone
 `/usr/bin/umu-run`; Bottles is not part of the architecture.
 
-This repository is being prepared for its first release. Pre-release data from earlier private
-iterations is disposable. Do not add migrations or compatibility paths for unreleased schemas,
-names, directories, markers, or backends. When the persistent schema changes before the first
-release, update the current schema and its tests directly.
+This repository is being prepared for its first release. Schema 24 is the first-release database
+baseline.
+
+## Database schema policy
+
+SQLite `user_version` represents released schema compatibility boundaries. Do not increment it for
+each schema change made during development. When an upcoming release requires schema changes,
+allocate one target schema version and keep that target unchanged throughout the release cycle.
+The next release requiring database changes should target schema 25, regardless of how many
+development iterations are needed before that release.
+
+Track intermediate changes to an unreleased target schema using a small internal development
+revision. Development revisions exist only to advance local databases created by earlier builds of
+the same unreleased target. They must not consume additional public schema-version numbers.
+
+Maintain one canonical migration from the most recently released or designated baseline schema to
+the current target schema. Update that canonical migration in place as development continues.
+Before release, squash all development changes into this single clean migration so normal users
+execute only one transition between releases.
+
+A database matching the target `user_version` must also have its development revision checked until
+the target schema is finalized. Apply any retained development-revision steps needed to bring it to
+the current target shape.
+
+Development revision records should be short, ordered, and documented with their schema effect.
+They are temporary implementation history, not permanent public migration history. Remove or
+consolidate them once the release migration is finalized, except where a retained step is still
+needed to open known development databases safely.
+
+Do not add compatibility paths for arbitrary private schema variants. If a development database
+cannot be identified by a supported development revision, reject it with an actionable error or
+offer an explicit recoverable reset.
+
+Schema verification must cover:
+
+- Creation of a fresh current database.
+- The canonical migration from the previous released or designated baseline schema.
+- Advancement from every retained development revision of the current target.
+- Preservation of durable user data during those transitions.
+- Rejection of future or unidentified schema versions.
 
 ## Invariants
 

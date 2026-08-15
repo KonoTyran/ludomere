@@ -438,7 +438,23 @@ pub(super) fn activate_context_primary_action(
             let window = widgets.window.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
+                    Ok(
+                        event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
+                        | crate::installation::LaunchEvent::PreLaunchConflict { .. }
+                        | crate::installation::LaunchEvent::LaunchWithoutSyncRequired {
+                            ..
+                        }
+                        | crate::installation::LaunchEvent::SyncWarning(_)
+                        | crate::installation::LaunchEvent::PostExitSync(_)
+                        | crate::installation::LaunchEvent::PostExitConflict(_)),
+                    ) => {
+                        present_cloud_launch_event(&window, event);
+                        glib::ControlFlow::Continue
+                    }
                     Ok(crate::installation::LaunchEvent::Started) => glib::ControlFlow::Continue,
+                    Ok(crate::installation::LaunchEvent::CloudSyncStarted(_)) => {
+                        glib::ControlFlow::Continue
+                    }
                     Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
                     Ok(crate::installation::LaunchEvent::Failed(error)) => {
                         let dialog = adw::AlertDialog::builder()

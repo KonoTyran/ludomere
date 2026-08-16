@@ -156,6 +156,9 @@ pub(super) fn show_settings_page(
     downloads.add(&retired_artifacts);
     downloads_page.add(&downloads);
 
+    let source_order = installation_source_order_group(model);
+    downloads_page.add(&source_order);
+
     let maintenance = adw::PreferencesGroup::new();
     maintenance.set_title("Storage and synchronization");
     let open_downloads = adw::ActionRow::new();
@@ -577,6 +580,102 @@ fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
         child = current.next_sibling();
     }
     None
+}
+
+fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Preferred installation order");
+    group.set_description(Some(
+        "Fresh installs use the first available source. Drag rows or use the arrow buttons.",
+    ));
+    let labels = Rc::new(RefCell::new(Vec::<adw::ActionRow>::new()));
+    for index in 0..3 {
+        let row = adw::ActionRow::new();
+        row.set_activatable(false);
+        let drag = gtk::Image::from_icon_name("list-drag-handle-symbolic");
+        drag.set_tooltip_text(Some("Drag to reorder"));
+        row.add_prefix(&drag);
+        let up = gtk::Button::from_icon_name("go-up-symbolic");
+        up.set_tooltip_text(Some("Move up"));
+        up.set_valign(gtk::Align::Center);
+        up.set_sensitive(index > 0);
+        let down = gtk::Button::from_icon_name("go-down-symbolic");
+        down.set_tooltip_text(Some("Move down"));
+        down.set_valign(gtk::Align::Center);
+        down.set_sensitive(index < 2);
+        row.add_suffix(&up);
+        row.add_suffix(&down);
+
+        let drag_source = gtk::DragSource::builder()
+            .actions(gdk::DragAction::MOVE)
+            .build();
+        drag_source.connect_prepare(move |_, _, _| {
+            Some(gdk::ContentProvider::for_value(&(index as u32).to_value()))
+        });
+        row.add_controller(drag_source);
+        let drop_target = gtk::DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+        {
+            let model = model.clone();
+            let labels = labels.clone();
+            drop_target.connect_drop(move |_, value, _, _| {
+                let Ok(from) = value.get::<u32>() else {
+                    return false;
+                };
+                reorder_installation_sources(&model, from as usize, index);
+                refresh_installation_source_labels(&model, &labels.borrow());
+                true
+            });
+        }
+        row.add_controller(drop_target);
+        {
+            let model = model.clone();
+            let labels = labels.clone();
+            up.connect_clicked(move |_| {
+                reorder_installation_sources(&model, index, index - 1);
+                refresh_installation_source_labels(&model, &labels.borrow());
+            });
+        }
+        {
+            let model = model.clone();
+            let labels = labels.clone();
+            down.connect_clicked(move |_| {
+                reorder_installation_sources(&model, index, index + 1);
+                refresh_installation_source_labels(&model, &labels.borrow());
+            });
+        }
+        labels.borrow_mut().push(row.clone());
+        group.add(&row);
+    }
+    refresh_installation_source_labels(model, &labels.borrow());
+    group
+}
+
+fn reorder_installation_sources(model: &Rc<RefCell<AppModel>>, from: usize, to: usize) {
+    if from >= 3 || to >= 3 || from == to {
+        return;
+    }
+    let mut state = model.borrow_mut();
+    let source = state.config.installation_source_order.remove(from);
+    state.config.installation_source_order.insert(to, source);
+    if let Err(error) = state.config.save() {
+        tracing::warn!(%error, "could not save preferred installation order");
+    }
+}
+
+fn refresh_installation_source_labels(model: &Rc<RefCell<AppModel>>, rows: &[adw::ActionRow]) {
+    use crate::config::PreferredInstallationSource::*;
+    for (row, source) in rows
+        .iter()
+        .zip(&model.borrow().config.installation_source_order)
+    {
+        let (title, subtitle) = match source {
+            LinuxOffline => ("Linux", "Native offline installer"),
+            WindowsGalaxy => ("Windows", "Galaxy build"),
+            WindowsOffline => ("Windows", "Offline installer"),
+        };
+        row.set_title(title);
+        row.set_subtitle(subtitle);
+    }
 }
 
 pub(super) fn settings_navigation_row(name: &str, title: &str, icon: &str) -> gtk::ListBoxRow {

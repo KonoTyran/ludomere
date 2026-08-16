@@ -1,4 +1,5 @@
 use ludomere::{
+    config::{Config, GameLibrary},
     domain::{InstallationState, InstalledGame},
     installation,
     state::{InstallationOperationRecord, StateStore},
@@ -63,6 +64,16 @@ fn installation_recovery_helper_process() {
     let phase = std::env::var("LUDOMERE_INSTALL_TEST_PHASE").unwrap();
     let root = PathBuf::from(std::env::var_os("LUDOMERE_INSTALL_TEST_ROOT").unwrap());
     let product_id = 1449651388;
+    let library = root.join("games");
+    let mut config = Config::load_or_create().unwrap();
+    config.game_libraries = vec![GameLibrary {
+        id: "test".into(),
+        name: "Test".into(),
+        path: library.clone(),
+        default: true,
+    }];
+    config.save().unwrap();
+    let journal = library.join(".ludomere/staging/grim_dawn.operation.json");
 
     match phase.as_str() {
         "persist" => {
@@ -110,16 +121,18 @@ fn installation_recovery_helper_process() {
                 other => panic!("unexpected recovery event: {other:?}"),
             }
 
-            let record = StateStore::open()
-                .unwrap()
-                .installation_operations()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.product_id == product_id)
-                .unwrap();
-            assert_eq!(record.state, "queued");
-            assert_eq!(record.queue_position, Some(4));
-            assert_eq!(record.percentage, None);
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(record["record"]["state"], "queued");
+            assert_eq!(record["record"]["queue_position"], 4);
+            assert!(record["record"]["percentage"].is_null());
+            assert!(
+                StateStore::open()
+                    .unwrap()
+                    .installation_operations()
+                    .unwrap()
+                    .is_empty()
+            );
         }
         "shutdown" => {
             let installer = root.join("setup.sh");
@@ -139,19 +152,14 @@ fn installation_recovery_helper_process() {
             wait_for_operation(product_id, InstallationState::Installing);
             installation::shutdown();
 
-            let record = StateStore::open()
-                .unwrap()
-                .installation_operations()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.product_id == product_id)
-                .unwrap();
-            assert_eq!(record.state, "queued");
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(record["record"]["state"], "queued");
             assert_eq!(
-                record.message.as_deref(),
-                Some("Queued after application shutdown")
+                record["record"]["message"],
+                "Queued after application shutdown"
             );
-            assert_eq!(record.percentage, None);
+            assert!(record["record"]["percentage"].is_null());
         }
         "shutdown-uninstall" => {
             let installation_directory = root.join("games/grim_dawn");
@@ -175,18 +183,13 @@ fn installation_recovery_helper_process() {
             wait_for_operation(product_id, InstallationState::Uninstalling);
             installation::shutdown();
 
-            let store = StateStore::open().unwrap();
-            let record = store
-                .installation_operations()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.product_id == product_id)
-                .unwrap();
-            assert_eq!(record.operation, "uninstall");
-            assert_eq!(record.state, "queued");
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(record["record"]["operation"], "uninstall");
+            assert_eq!(record["record"]["state"], "queued");
             assert_eq!(
-                record.message.as_deref(),
-                Some("Queued after application shutdown")
+                record["record"]["message"],
+                "Queued after application shutdown"
             );
             assert!(
                 installation::load_installation_marker(&marker_directory)
@@ -197,16 +200,7 @@ fn installation_recovery_helper_process() {
         "cancel-queued" => {
             assert_eq!(installation::recover_interrupted_operations().unwrap(), 1);
             assert!(installation::cancel_operation(product_id));
-            let record = StateStore::open()
-                .unwrap()
-                .installation_operations()
-                .unwrap()
-                .into_iter()
-                .find(|record| record.product_id == product_id)
-                .unwrap();
-            assert_eq!(record.state, "cancelled");
-            assert_eq!(record.queue_position, None);
-            assert_eq!(record.message.as_deref(), Some("Operation cancelled"));
+            assert!(!journal.exists());
         }
         "confirm-cancelled" => {
             assert_eq!(installation::recover_interrupted_operations().unwrap(), 0);
@@ -238,6 +232,7 @@ fn run_helper(phase: &str, root: &std::path::Path) {
             "--nocapture",
         ])
         .env("XDG_DATA_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("LUDOMERE_INSTALL_TEST_PHASE", phase)
         .env("LUDOMERE_INSTALL_TEST_ROOT", root)
         .status()

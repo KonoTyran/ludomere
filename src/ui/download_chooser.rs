@@ -203,18 +203,260 @@ pub(super) fn managed_artifact_paths() -> HashSet<ManagedArtifactIdentity> {
         .collect()
 }
 
-pub(super) fn show_install_dialog(window: &adw::ApplicationWindow, detail: &DetailPageModel) {
-    show_install_dialog_with_mode(window, detail, false);
+pub(super) fn show_install_dialog(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+) {
+    show_install_dialog_with_mode(
+        window,
+        model,
+        detail,
+        false,
+        Some(cached_galaxy_available(detail, &model.borrow().config)),
+    );
 }
 
-pub(super) fn show_repair_dialog(window: &adw::ApplicationWindow, detail: &DetailPageModel) {
-    show_install_dialog_with_mode(window, detail, true);
+pub(super) fn cached_galaxy_available(
+    detail: &DetailPageModel,
+    config: &Config,
+) -> Result<(), String> {
+    let build = newest_master_windows_build(detail)
+        .ok_or_else(|| "no current Master build is advertised".to_owned())?;
+    let store =
+        StateStore::open().map_err(|error| format!("could not open metadata cache: {error}"))?;
+    crate::installation::depot_planner::cached_acquisition_available(
+        &store,
+        &build,
+        &default_galaxy_selection(detail, config),
+    )
+    .map_err(|error| format!("cached metadata is invalid: {error}"))?
+    .then_some(())
+    .ok_or_else(|| "refresh the library to validate this build".to_owned())
+}
+
+pub(super) fn newest_master_windows_build(
+    detail: &DetailPageModel,
+) -> Option<crate::domain::GalaxyBuild> {
+    detail
+        .galaxy_builds
+        .iter()
+        .filter(|build| {
+            build.generation == 2
+                && build.currently_returned
+                && build.operating_system.eq_ignore_ascii_case("windows")
+                && build.branch.is_none()
+        })
+        .max_by_key(|build| (build.published_at.unwrap_or_default(), build.last_seen_at))
+        .cloned()
+}
+
+pub(super) fn default_galaxy_selection(
+    detail: &DetailPageModel,
+    config: &Config,
+) -> crate::gog::depot_acquisition::Selection {
+    let language = detail
+        .metadata
+        .localizations
+        .iter()
+        .find(|localization| {
+            config
+                .installer_language
+                .as_deref()
+                .is_some_and(|configured| {
+                    localization.name.eq_ignore_ascii_case(configured)
+                        || localization.language_code.eq_ignore_ascii_case(configured)
+                })
+        })
+        .or_else(|| {
+            detail
+                .metadata
+                .localizations
+                .iter()
+                .find(|localization| localization.language_code.starts_with("en"))
+        })
+        .map(|localization| localization.language_code.clone())
+        .unwrap_or_else(|| "en".into());
+    let owned_dlc = detail
+        .dlcs
+        .iter()
+        .filter(|dlc| dlc.owned)
+        .map(|dlc| dlc.product_id)
+        .collect::<BTreeSet<_>>();
+    crate::gog::depot_acquisition::Selection {
+        language,
+        bitness: Some("64".into()),
+        owned_dlc: owned_dlc.clone(),
+        selected_dlc: owned_dlc,
+    }
+}
+
+pub(super) fn show_repair_dialog(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+) {
+    if start_existing_depot_operation_dialog(
+        window,
+        model,
+        detail,
+        crate::domain::DepotOperationKind::Repair,
+    ) {
+        return;
+    }
+    show_install_dialog_with_mode(window, model, detail, true, None);
+}
+
+pub(super) fn show_update_dialog(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+) {
+    if !start_existing_depot_operation_dialog(
+        window,
+        model,
+        detail,
+        crate::domain::DepotOperationKind::Update,
+    ) {
+        show_install_dialog_with_mode(window, model, detail, true, None);
+    }
+}
+
+fn start_existing_depot_operation_dialog(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+    kind: crate::domain::DepotOperationKind,
+) -> bool {
+    let config = model.borrow().config.clone();
+    let Some((installed, marker)) = StateStore::open().ok().and_then(|store| {
+        let installed =
+            crate::installation::reconcile_installed_games(&store, &config.game_libraries)
+                .ok()?
+                .into_iter()
+                .find(|game| game.product_id == detail.product_id)?;
+        let marker =
+            crate::installation::load_installation_marker(&installed.installation_directory)
+                .ok()??;
+        (marker.source == crate::domain::InstallationSource::GalaxyDepot)
+            .then_some((installed, marker))
+    }) else {
+        return false;
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(match kind {
+            crate::domain::DepotOperationKind::Update => "Update Galaxy installation?",
+            _ => "Repair Galaxy installation?",
+        })
+        .body(match kind {
+            crate::domain::DepotOperationKind::Update => {
+                "Install the newest build from the currently selected branch."
+            }
+            _ => {
+                "Restore every managed file to the installed build while preserving unknown files."
+            }
+        })
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("start", "Start")]);
+    dialog.set_default_response(Some("start"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("start", adw::ResponseAppearance::Suggested);
+    let user_id = model
+        .borrow()
+        .account_profile
+        .as_ref()
+        .map(|profile| profile.user_id.clone())
+        .unwrap_or_default();
+    let branches = marker
+        .galaxy_depot
+        .as_ref()
+        .and_then(|depot| depot.branch.clone());
+    let library_root = installed
+        .installation_directory
+        .parent()
+        .map(std::path::Path::to_path_buf);
+    let selected_dlc = marker
+        .dlc
+        .iter()
+        .map(|dlc| dlc.product_id)
+        .collect::<BTreeSet<_>>();
+    let language = marker
+        .galaxy_depot
+        .as_ref()
+        .and_then(|depot| depot.language.clone())
+        .unwrap_or_else(|| "en".into());
+    let bitness = marker
+        .galaxy_depot
+        .as_ref()
+        .and_then(|depot| depot.architecture.clone());
+    let product_id = detail.product_id;
+    let slug = detail.slug.clone();
+    let library_id = installed.library_id;
+    dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
+        if response != "start" {
+            return;
+        }
+        let Some(library_root) = library_root else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let store = StateStore::open()?;
+                let client = reqwest::blocking::Client::new();
+                let builds = crate::gog::depot_service::list_builds(
+                    &store,
+                    &client,
+                    &crate::gog::depot_service::BuildRequest {
+                        user_id,
+                        product_id,
+                        platform: "windows".into(),
+                        generation: 2,
+                        branch: branches.clone(),
+                        supplied_password: None,
+                    },
+                )?;
+                let build = crate::gog::depot_service::resolve_operation_build(
+                    &builds, &marker, kind, None,
+                )?
+                .clone();
+                crate::gog::depot_service::start_operation(
+                    &store,
+                    &client,
+                    crate::gog::depot_service::PrepareOperationRequest {
+                        build,
+                        selection: crate::gog::depot_acquisition::Selection {
+                            language,
+                            bitness,
+                            owned_dlc: selected_dlc.clone(),
+                            selected_dlc,
+                        },
+                        operation_id: format!(
+                            "{}-{}",
+                            product_id,
+                            chrono::Utc::now().timestamp_millis()
+                        ),
+                        kind,
+                        library_id,
+                        library_root,
+                        slug,
+                    },
+                )?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                tracing::warn!(product_id, %error, "could not start Galaxy depot operation");
+            }
+        });
+    });
+    true
 }
 
 fn show_install_dialog_with_mode(
     window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
     detail: &DetailPageModel,
     repair: bool,
+    galaxy_preflight: Option<Result<(), String>>,
 ) {
     let config = Config::load_or_create().unwrap_or_default();
     let store = StateStore::open().ok();
@@ -274,6 +516,65 @@ fn show_install_dialog_with_mode(
     let body = adw::PreferencesPage::new();
     let installer_group = adw::PreferencesGroup::new();
     installer_group.set_title("Installer");
+    let galaxy_builds = detail
+        .galaxy_builds
+        .iter()
+        .filter(|build| {
+            build.generation == 2
+                && build.currently_returned
+                && build.operating_system.eq_ignore_ascii_case("windows")
+        })
+        .filter(|_| galaxy_preflight.as_ref().is_none_or(Result::is_ok))
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(Err(error)) = &galaxy_preflight {
+        installer_group.set_description(Some(&format!("Galaxy build unavailable: {error}")));
+    }
+    let ranked_sources = if repair || existing_installation.is_some() {
+        Vec::new()
+    } else {
+        crate::installation::rank_fresh_install_sources(
+            &config,
+            &candidates.usable,
+            !galaxy_builds.is_empty(),
+        )
+    };
+    let mut source_values = Vec::new();
+    for source in &ranked_sources {
+        let label = match source {
+            crate::installation::FreshInstallSource::GalaxyWindows => {
+                "Windows · Galaxy build".to_owned()
+            }
+            crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+                let candidate = &candidates.usable[*index];
+                format!(
+                    "{} · Offline installer · {}",
+                    if candidate.method == crate::installation::InstallationMethod::NativeLinux {
+                        "Linux"
+                    } else {
+                        "Windows"
+                    },
+                    candidate.version.as_deref().unwrap_or("Unknown version")
+                )
+            }
+        };
+        source_values.push((label, *source));
+    }
+    let source_list = gtk::StringList::new(
+        &source_values
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let source = gtk::DropDown::new(Some(source_list), gtk::Expression::NONE);
+    let galaxy_selected = Rc::new(std::cell::Cell::new(source_values.first().is_some_and(
+        |(_, value)| {
+            matches!(
+                value,
+                crate::installation::FreshInstallSource::GalaxyWindows
+            )
+        },
+    )));
     let candidate_labels = candidates
         .usable
         .iter()
@@ -293,40 +594,103 @@ fn show_install_dialog_with_mode(
             .collect::<Vec<_>>(),
     );
     let candidate = gtk::DropDown::new(Some(candidate_list), gtk::Expression::NONE);
-    candidate.set_selected(candidates.preferred.unwrap_or(0) as u32);
+    let preferred_candidate = source_values
+        .first()
+        .and_then(|(_, source)| match source {
+            crate::installation::FreshInstallSource::OfflineInstaller(index) => Some(*index),
+            crate::installation::FreshInstallSource::GalaxyWindows => None,
+        })
+        .or(candidates.preferred)
+        .unwrap_or(0);
+    candidate.set_selected(preferred_candidate as u32);
     let candidate_menu = gtk::MenuButton::new();
     candidate_menu.set_hexpand(true);
-    candidate_menu.set_sensitive(!candidates.usable.is_empty());
+    candidate_menu.set_sensitive(if existing_installation.is_none() && !repair {
+        !source_values.is_empty()
+    } else {
+        !candidates.usable.is_empty()
+    });
     candidate_menu.add_css_class("install-choice-menu");
     let candidate_popover = gtk::Popover::new();
     let candidate_choices = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let mut candidate_choice_buttons = Vec::new();
-    for (index, installer) in candidates.usable.iter().enumerate() {
-        let choice = gtk::Button::new();
-        choice.add_css_class("flat");
-        choice.add_css_class("install-choice-row");
-        choice.set_child(Some(&install_choice_content(
-            detail.icon.as_deref(),
-            &detail.title,
-            &candidate_labels[index],
-            installer.total_size,
-            index == candidate.selected() as usize,
-            false,
-        )));
-        choice.connect_clicked({
-            let candidate = candidate.clone();
-            let popover = candidate_popover.clone();
-            move |_| {
-                candidate.set_selected(index as u32);
-                popover.popdown();
-            }
-        });
-        candidate_choices.append(&choice);
-        candidate_choice_buttons.push(choice);
+    let mut source_choice_buttons = Vec::new();
+    if existing_installation.is_none() && !repair {
+        for (index, (label, source_value)) in source_values.iter().enumerate() {
+            let size = match source_value {
+                crate::installation::FreshInstallSource::OfflineInstaller(candidate_index) => {
+                    candidates.usable[*candidate_index].total_size
+                }
+                crate::installation::FreshInstallSource::GalaxyWindows => 0,
+            };
+            let choice = gtk::Button::new();
+            choice.add_css_class("flat");
+            choice.add_css_class("install-choice-row");
+            choice.set_child(Some(&install_choice_content(
+                detail.icon.as_deref(),
+                &detail.title,
+                label,
+                size,
+                index == source.selected() as usize,
+                false,
+            )));
+            choice.connect_clicked({
+                let source = source.clone();
+                let popover = candidate_popover.clone();
+                move |_| {
+                    source.set_selected(index as u32);
+                    popover.popdown();
+                }
+            });
+            candidate_choices.append(&choice);
+            source_choice_buttons.push(choice);
+        }
+    } else {
+        for (index, installer) in candidates.usable.iter().enumerate() {
+            let choice = gtk::Button::new();
+            choice.add_css_class("flat");
+            choice.add_css_class("install-choice-row");
+            choice.set_child(Some(&install_choice_content(
+                detail.icon.as_deref(),
+                &detail.title,
+                &candidate_labels[index],
+                installer.total_size,
+                index == candidate.selected() as usize,
+                false,
+            )));
+            choice.connect_clicked({
+                let candidate = candidate.clone();
+                let popover = candidate_popover.clone();
+                move |_| {
+                    candidate.set_selected(index as u32);
+                    popover.popdown();
+                }
+            });
+            candidate_choices.append(&choice);
+            candidate_choice_buttons.push(choice);
+        }
     }
     candidate_popover.set_child(Some(&candidate_choices));
     candidate_menu.set_popover(Some(&candidate_popover));
-    if let Some(installer) = candidates.usable.get(candidate.selected() as usize) {
+    if let Some((label, source_value)) = source_values.first()
+        && existing_installation.is_none()
+        && !repair
+    {
+        let size = match source_value {
+            crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+                candidates.usable[*index].total_size
+            }
+            crate::installation::FreshInstallSource::GalaxyWindows => 0,
+        };
+        candidate_menu.set_child(Some(&install_choice_content(
+            detail.icon.as_deref(),
+            &detail.title,
+            label,
+            size,
+            false,
+            true,
+        )));
+    } else if let Some(installer) = candidates.usable.get(candidate.selected() as usize) {
         candidate_menu.set_child(Some(&install_choice_content(
             detail.icon.as_deref(),
             &detail.title,
@@ -337,6 +701,34 @@ fn show_install_dialog_with_mode(
         )));
     }
     installer_group.add(&candidate_menu);
+    let mut branches = galaxy_builds
+        .iter()
+        .map(|build| build.branch.clone())
+        .collect::<Vec<_>>();
+    branches.sort_by(|left, right| match (left, right) {
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        _ => left.cmp(right),
+    });
+    branches.dedup();
+    let branch_labels = branches
+        .iter()
+        .map(|branch| branch.as_deref().unwrap_or("Master"))
+        .collect::<Vec<_>>();
+    let branch_list = gtk::StringList::new(&branch_labels);
+    let branch = gtk::DropDown::new(Some(branch_list), gtk::Expression::NONE);
+    branch.set_selected(0);
+    let branch_row = adw::ActionRow::new();
+    branch_row.set_title("Galaxy branch");
+    branch_row.add_suffix(&branch);
+    branch_row.set_visible(false);
+    installer_group.add(&branch_row);
+    let branch_password = adw::PasswordEntryRow::new();
+    branch_password.set_title("Protected branch password");
+    branch_password.set_show_apply_button(false);
+    branch_password
+        .set_visible(galaxy_selected.get() && branches.first().is_some_and(Option::is_some));
+    installer_group.add(&branch_password);
     if let Some(installed_game) = &existing_installation
         && !repair
     {
@@ -464,6 +856,100 @@ fn show_install_dialog_with_mode(
         dlc_menu.set_popover(Some(&dlc_popover));
         installer_group.add(&dlc_menu);
     }
+    if existing_installation.is_none() && !repair {
+        candidate_menu.set_sensitive(!source_values.is_empty());
+        branch_row.set_visible(galaxy_selected.get() && branches.len() > 1);
+        for choice in &dlc_choices {
+            if galaxy_selected.get() {
+                choice.check.set_active(true);
+                choice.check.set_sensitive(true);
+            }
+        }
+        let galaxy_selected_state = galaxy_selected.clone();
+        let candidate_menu_state = candidate_menu.clone();
+        let candidate_state = candidate.clone();
+        let branch_row_state = branch_row.clone();
+        let choices = dlc_choices.clone();
+        let source_values_state = source_values.clone();
+        let branch_count = branches.len();
+        let branch_password_state = branch_password.clone();
+        let branches_state = branches.clone();
+        let branch_state = branch.clone();
+        let source_buttons_state = source_choice_buttons.clone();
+        let icon = detail.icon.clone();
+        let title = detail.title.clone();
+        let source_candidates = candidates.usable.clone();
+        source.connect_selected_notify(move |selector| {
+            let selected_index = selector.selected() as usize;
+            let Some((label, selected)) = source_values_state.get(selected_index) else {
+                return;
+            };
+            let is_galaxy = matches!(
+                selected,
+                crate::installation::FreshInstallSource::GalaxyWindows
+            );
+            galaxy_selected_state.set(is_galaxy);
+            branch_row_state.set_visible(is_galaxy && branch_count > 1);
+            branch_password_state.set_visible(
+                is_galaxy
+                    && branches_state
+                        .get(branch_state.selected() as usize)
+                        .is_some_and(Option::is_some),
+            );
+            if let crate::installation::FreshInstallSource::OfflineInstaller(index) = selected {
+                candidate_state.set_selected(*index as u32);
+            }
+            for choice in &choices {
+                if is_galaxy {
+                    choice.check.set_active(true);
+                    choice.check.set_sensitive(true);
+                }
+            }
+            let size = match selected {
+                crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+                    source_candidates[*index].total_size
+                }
+                crate::installation::FreshInstallSource::GalaxyWindows => 0,
+            };
+            candidate_menu_state.set_child(Some(&install_choice_content(
+                icon.as_deref(),
+                &title,
+                label,
+                size,
+                false,
+                true,
+            )));
+            for (index, button) in source_buttons_state.iter().enumerate() {
+                if let Some((label, source)) = source_values_state.get(index) {
+                    let size = match source {
+                        crate::installation::FreshInstallSource::OfflineInstaller(
+                            candidate_index,
+                        ) => source_candidates[*candidate_index].total_size,
+                        crate::installation::FreshInstallSource::GalaxyWindows => 0,
+                    };
+                    button.set_child(Some(&install_choice_content(
+                        icon.as_deref(),
+                        &title,
+                        label,
+                        size,
+                        index == selected_index,
+                        false,
+                    )));
+                }
+            }
+        });
+        let galaxy_selected_state = galaxy_selected.clone();
+        let branch_password_state = branch_password.clone();
+        let branches_state = branches.clone();
+        branch.connect_selected_notify(move |selector| {
+            branch_password_state.set_visible(
+                galaxy_selected_state.get()
+                    && branches_state
+                        .get(selector.selected() as usize)
+                        .is_some_and(Option::is_some),
+            );
+        });
+    }
     let interactive_prompts = adw::SwitchRow::new();
     interactive_prompts.set_title("Interactive install");
     interactive_prompts.set_subtitle(
@@ -473,6 +959,21 @@ fn show_install_dialog_with_mode(
         "When disabled, Windows installers run fully unattended. Enable this to choose options such as the installer language yourself.",
     ));
     interactive_prompts.set_active(config.interactive_installer_prompts);
+    interactive_prompts.set_visible(!galaxy_selected.get());
+    {
+        let interactive_prompts = interactive_prompts.clone();
+        let values = source_values.clone();
+        source.connect_selected_notify(move |selector| {
+            interactive_prompts.set_visible(!values.get(selector.selected() as usize).is_some_and(
+                |(_, source)| {
+                    matches!(
+                        source,
+                        crate::installation::FreshInstallSource::GalaxyWindows
+                    )
+                },
+            ));
+        });
+    }
     {
         let window = window.clone();
         let reverting = Rc::new(std::cell::Cell::new(false));
@@ -638,7 +1139,8 @@ fn show_install_dialog_with_mode(
     install.add_css_class("suggested-action");
     install.set_sensitive(
         !config.game_libraries.is_empty()
-            && ((!candidates.usable.is_empty() && (repair || existing_installation.is_none()))
+            && ((galaxy_selected.get() && existing_installation.is_none() && !repair)
+                || (!candidates.usable.is_empty() && (repair || existing_installation.is_none()))
                 || (existing_installation.is_some()
                     && dlc_choices.iter().any(|choice| choice.check.is_sensitive()))),
     );
@@ -790,7 +1292,7 @@ fn show_install_dialog_with_mode(
         let candidates = candidates.usable;
         let dlc_choices = dlc_choices.clone();
         let existing_installation = existing_installation.clone();
-        let libraries = config.game_libraries;
+        let libraries = config.game_libraries.clone();
         let product_id = detail.product_id;
         let slug = detail.slug.clone();
         let candidate = candidate.clone();
@@ -798,7 +1300,144 @@ fn show_install_dialog_with_mode(
         let status = status.clone();
         let dialog = dialog.clone();
         let interactive_prompts = interactive_prompts.clone();
+        let galaxy_selected = galaxy_selected.clone();
+        let galaxy_builds = galaxy_builds.clone();
+        let branches = branches.clone();
+        let branch = branch.clone();
+        let language = detail
+            .metadata
+            .localizations
+            .iter()
+            .find(|localization| {
+                config
+                    .installer_language
+                    .as_deref()
+                    .is_some_and(|configured| {
+                        localization.name.eq_ignore_ascii_case(configured)
+                            || localization.language_code.eq_ignore_ascii_case(configured)
+                    })
+            })
+            .or_else(|| {
+                detail
+                    .metadata
+                    .localizations
+                    .iter()
+                    .find(|localization| localization.language_code.starts_with("en"))
+            })
+            .map(|localization| localization.language_code.clone())
+            .unwrap_or_else(|| "en".into());
+        let owned_dlc = detail
+            .dlcs
+            .iter()
+            .filter(|dlc| dlc.owned)
+            .map(|dlc| dlc.product_id)
+            .collect::<BTreeSet<_>>();
+        let user_id = model
+            .borrow()
+            .account_profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .unwrap_or_default();
+        let branch_password = branch_password.clone();
         install.connect_clicked(move |_| {
+            if galaxy_selected.get() {
+                let selected_branch = branches.get(branch.selected() as usize).cloned().flatten();
+                let Some(mut build) = galaxy_builds
+                    .iter()
+                    .filter(|build| build.branch == selected_branch)
+                    .max_by_key(|build| build.published_at)
+                    .cloned()
+                else {
+                    status.set_label("The selected Galaxy branch has no available build");
+                    status.add_css_class("error");
+                    return;
+                };
+                let Some(library) = libraries.get(library.selected() as usize).cloned() else {
+                    return;
+                };
+                let selected_dlc = dlc_choices
+                    .iter()
+                    .filter(|choice| choice.check.is_active())
+                    .map(|choice| choice.product_id)
+                    .collect();
+                let request = crate::gog::depot_service::PrepareOperationRequest {
+                    build: build.clone(),
+                    selection: crate::gog::depot_acquisition::Selection {
+                        language: language.clone(),
+                        bitness: Some("64".into()),
+                        owned_dlc: owned_dlc.clone(),
+                        selected_dlc,
+                    },
+                    operation_id: format!(
+                        "{}-{}",
+                        product_id,
+                        chrono::Utc::now().timestamp_millis()
+                    ),
+                    kind: crate::domain::DepotOperationKind::Install,
+                    library_id: library.id,
+                    library_root: library.path,
+                    slug: slug.clone(),
+                };
+                status.remove_css_class("error");
+                status.set_label("Preparing Galaxy installation…");
+                let (sender, receiver) = mpsc::channel();
+                let password = (!branch_password.text().is_empty()).then(|| {
+                    crate::gog::depot_service::BranchPassword::new(
+                        branch_password.text().to_string(),
+                    )
+                });
+                let build_request = crate::gog::depot_service::BuildRequest {
+                    user_id: user_id.clone(),
+                    product_id,
+                    platform: "windows".into(),
+                    generation: 2,
+                    branch: selected_branch.clone(),
+                    supplied_password: password,
+                };
+                std::thread::spawn(move || {
+                    let result = StateStore::open().and_then(|store| {
+                        let client = reqwest::blocking::Client::new();
+                        if selected_branch.is_some() {
+                            let builds = crate::gog::depot_service::list_builds(
+                                &store,
+                                &client,
+                                &build_request,
+                            )?;
+                            build = builds
+                                .into_iter()
+                                .filter(|candidate| candidate.branch == selected_branch)
+                                .max_by_key(|candidate| candidate.published_at)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("selected Galaxy branch is unavailable")
+                                })?;
+                        }
+                        let mut request = request;
+                        request.build = build;
+                        crate::gog::depot_service::start_operation(&store, &client, request)
+                    });
+                    let _ = sender.send(result);
+                });
+                let status_result = status.clone();
+                let dialog_result = dialog.clone();
+                glib::timeout_add_local(Duration::from_millis(100), move || {
+                    match receiver.try_recv() {
+                        Ok(Ok(_)) => {
+                            dialog_result.close();
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(error)) => {
+                            status_result.set_label(&format!(
+                                "Could not start Galaxy installation: {error}"
+                            ));
+                            status_result.add_css_class("error");
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    }
+                });
+                return;
+            }
             let candidate = candidates.get(candidate.selected() as usize);
             if existing_installation.is_none() && candidate.is_none() {
                 return;
@@ -1138,9 +1777,10 @@ fn install_choice_content(
     choice.add_css_class("dim-label");
     labels.append(&choice);
     content.append(&labels);
-    let size = gtk::Label::new(Some(&human_size(size)));
-    size.add_css_class("install-choice-size");
-    content.append(&size);
+    let size_label = gtk::Label::new(Some(&human_size(size)));
+    size_label.add_css_class("install-choice-size");
+    size_label.set_visible(size > 0);
+    content.append(&size_label);
     if selected || dropdown {
         let indicator = gtk::Image::from_icon_name(if selected {
             "object-select-symbolic"

@@ -130,6 +130,12 @@ pub fn start_installation(
     let (sender, events) = mpsc::channel();
     let (responses, response_receiver) = mpsc::channel();
     thread::spawn(move || {
+        let Some(_permit) =
+            crate::operation_gate::acquire(|| worker_cancellation.load(Ordering::Acquire))
+        else {
+            let _ = sender.send(InstallationEvent::Cancelled);
+            return;
+        };
         if let Err(error) = run_installation(
             &plan,
             &additional_installers,
@@ -178,6 +184,12 @@ pub fn start_uninstallation(game: InstalledGame) -> UninstallationHandle {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let _ = sender.send(UninstallationEvent::Started);
+        let Some(_permit) =
+            crate::operation_gate::acquire(|| worker_cancellation.load(Ordering::Acquire))
+        else {
+            let _ = sender.send(UninstallationEvent::Cancelled);
+            return;
+        };
         match run_uninstallation(&game, &worker_cancellation) {
             Ok(()) => {
                 let _ = sender.send(UninstallationEvent::Complete);
@@ -199,6 +211,15 @@ pub fn start_uninstallation(game: InstalledGame) -> UninstallationHandle {
 }
 
 fn run_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -> Result<()> {
+    if super::marker::load(&game.installation_directory)?
+        .is_some_and(|marker| marker.source == crate::domain::InstallationSource::GalaxyDepot)
+    {
+        return run_depot_uninstallation(
+            game.product_id,
+            &game.installation_directory,
+            cancellation,
+        );
+    }
     if game.compatibility.is_some() {
         return run_windows_uninstallation(game, cancellation);
     }
@@ -284,6 +305,59 @@ fn run_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -> Result
     Ok(())
 }
 
+fn run_depot_uninstallation(
+    product_id: i64,
+    directory: &Path,
+    cancellation: &AtomicBool,
+) -> Result<()> {
+    let library = directory
+        .parent()
+        .context("depot installation has no library root")?;
+    let marker = super::marker::load(directory)?.context("depot installation marker is missing")?;
+    if marker.source != crate::domain::InstallationSource::GalaxyDepot
+        || marker.product_id != product_id
+        || directory.file_name().and_then(|name| name.to_str()) != Some(marker.slug.as_str())
+    {
+        bail!("depot installation identity is inconsistent");
+    }
+    reject_symlink_path(directory)?;
+    let journal = super::depot::operation_staging_path(library, directory, &marker.slug, "")?;
+    let prefix = marker
+        .compatibility
+        .filter(|compatibility| compatibility.managed_by_ludomere)
+        .map(|compatibility| {
+            crate::compatibility::prefix_path(library, &compatibility.prefix_slug)
+        });
+    if let Some(prefix) = prefix.as_deref() {
+        reject_symlink_path(prefix)?;
+    }
+    if cancellation.load(Ordering::Acquire) {
+        bail!("uninstallation cancelled");
+    }
+    if directory.exists() {
+        fs::remove_dir_all(directory)?;
+    }
+    if let Some(prefix) = prefix.filter(|path| path.exists()) {
+        fs::remove_dir_all(prefix)?;
+    }
+    super::depot_actions::remove_support_staging(&journal)?;
+    if journal.exists() {
+        fs::remove_file(journal)?;
+    }
+    Ok(())
+}
+
+fn reject_symlink_path(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            bail!("uninstallation path crosses a symlink");
+        }
+    }
+    Ok(())
+}
+
 fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -> Result<()> {
     use crate::compatibility::{CompatibilityBackend, CompatibilityRunRequest};
     let compatibility = game
@@ -309,6 +383,7 @@ fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -
         arguments: Vec::new(),
         working_directory: uninstaller.parent().map(PathBuf::from),
         log_path,
+        background: false,
     })?;
     loop {
         if cancellation.load(Ordering::Acquire) {
@@ -603,6 +678,7 @@ fn run_windows_installation(
             ),
             working_directory: installer.parent().map(PathBuf::from),
             log_path: log_path.clone(),
+            background: !interactive_install,
         })?;
         loop {
             if cancellation.load(Ordering::Acquire) {
@@ -803,6 +879,26 @@ fn run_native_installer(
     responses: &mpsc::Receiver<String>,
 ) -> Result<()> {
     let mut log = File::options().append(true).open(log_path)?;
+    let arguments = [
+        installer.to_string_lossy().into_owned(),
+        "--".into(),
+        "--i-agree-to-all-licenses".into(),
+        "--noreadme".into(),
+        "--nooptions".into(),
+        "--noprompt".into(),
+        format!("--destination={}", destination.display()),
+    ];
+    crate::compatibility::append_step_log(
+        log_path,
+        &format!(
+            "command: sh {}",
+            arguments
+                .iter()
+                .map(|argument| shell_words::quote(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    )?;
     let pty = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
             rows: 30,
@@ -812,13 +908,9 @@ fn run_native_installer(
         })
         .context("could not create installer pseudo-terminal")?;
     let mut command = portable_pty::CommandBuilder::new("sh");
-    command.arg(installer);
-    command.arg("--");
-    command.arg("--i-agree-to-all-licenses");
-    command.arg("--noreadme");
-    command.arg("--nooptions");
-    command.arg("--noprompt");
-    command.arg(format!("--destination={}", destination.display()));
+    for argument in &arguments {
+        command.arg(argument);
+    }
     command.cwd(installer.parent().unwrap_or_else(|| Path::new(".")));
     let mut child = pty
         .slave
@@ -1170,7 +1262,72 @@ fn executable_rank(root: &Path, path: &Path) -> (u8, usize, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        domain::{GalaxyDepotProvenance, InstallationSource},
+        installation::marker::{InstallationMarker, InstalledCompatibility, InstalledComponent},
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn depot_uninstall_removes_payload_prefix_and_staging() {
+        let library = std::env::temp_dir().join(format!(
+            "gog-depot-uninstall-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let directory = library.join("game");
+        let prefix = crate::compatibility::prefix_path(&library, "game");
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir_all(&prefix).unwrap();
+        fs::write(directory.join("payload.bin"), b"game").unwrap();
+        let marker = InstallationMarker {
+            schema_version: 2,
+            product_id: 7,
+            slug: "game".into(),
+            base: InstalledComponent {
+                operating_system: Some("windows".into()),
+                language: Some("en".into()),
+                version: Some("1".into()),
+                revision_id: None,
+                installed_at: 1,
+            },
+            dlc: Vec::new(),
+            compatibility: Some(InstalledCompatibility {
+                backend: crate::compatibility::CompatibilityBackendKind::Umu,
+                managed_by_ludomere: true,
+                prefix_slug: "game".into(),
+                profile: crate::compatibility::UmuProfile::fallback(),
+            }),
+            source: InstallationSource::GalaxyDepot,
+            galaxy_depot: Some(GalaxyDepotProvenance {
+                build_id: "build".into(),
+                repository_id: "repository".into(),
+                manifest_fingerprint: "sha256:test".into(),
+                branch: None,
+                language: Some("en".into()),
+                architecture: Some("64".into()),
+                depots: Vec::new(),
+                dlc: Vec::new(),
+            }),
+            launch: None,
+            dependencies: Vec::new(),
+        };
+        super::super::marker::write(&marker, &directory).unwrap();
+        let journal =
+            super::super::depot::operation_staging_path(&library, &directory, "game", "").unwrap();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(&journal, b"journal").unwrap();
+
+        run_depot_uninstallation(7, &directory, &AtomicBool::new(false)).unwrap();
+
+        assert!(!directory.exists());
+        assert!(!prefix.exists());
+        assert!(!journal.exists());
+        fs::remove_dir_all(library).unwrap();
+    }
 
     #[test]
     fn executable_discovery_prefers_start_script() {

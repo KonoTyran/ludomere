@@ -84,6 +84,10 @@ pub fn build_window(app: &adw::Application) {
         downloaded_products,
         downloaded_installer_products,
         download_jobs,
+        depot_operations: crate::installation::depot_operation_snapshots(),
+        transfer_history: Rc::new(RefCell::new(VecDeque::new())),
+        transfer_totals: None,
+        active_transfer_id: None,
         windows_only: false,
         linux_only: false,
         macos_only: false,
@@ -131,7 +135,9 @@ pub fn build_window(app: &adw::Application) {
 
 fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     let events = crate::installation::subscribe_installation_events();
+    let depot_events = crate::installation::subscribe_depot_events();
     let (state_sender, state_receiver) = mpsc::channel::<(HashSet<i64>, HashSet<i64>)>();
+    let mut depot_states = HashMap::<String, String>::new();
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -222,6 +228,23 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                 }
             }
         }
+        while let Ok(crate::installation::DepotManagerEvent::Snapshot(snapshot)) =
+            depot_events.try_recv()
+        {
+            let state_changed = depot_states
+                .insert(snapshot.operation_id, snapshot.state.clone())
+                .is_none_or(|previous| previous != snapshot.state);
+            let terminal = matches!(
+                snapshot.state.as_str(),
+                "complete" | "failed" | "cancelled" | "abandoned"
+            );
+            if state_changed || terminal {
+                changed_products.insert(snapshot.product_id);
+            }
+            if terminal {
+                terminal_products.insert(snapshot.product_id);
+            }
+        }
         while let Ok((installed_products, playable_products)) = state_receiver.try_recv() {
             let mut state = model.borrow_mut();
             state.installed_products = installed_products;
@@ -296,14 +319,30 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
         }
         glib::ControlFlow::Continue
     });
-    std::thread::spawn(
-        || match crate::installation::recover_interrupted_operations() {
-            Ok(_) => crate::installation::start_recovered_operations(),
-            Err(error) => {
-                tracing::warn!(%error, "could not recover interrupted installation operations");
+    std::thread::spawn(|| match crate::installation::recover_backend_operations() {
+        Ok(_) => {
+            crate::installation::start_recovered_operations();
+            if let Ok(config) = Config::load_or_create()
+                && let Ok(migrations) =
+                    crate::installation::source_migration::discover(&config.game_libraries)
+            {
+                for (library, journal) in migrations {
+                    if journal.target.is_some() && journal.old_game.is_some() {
+                        let destinations = journal.locations.clone();
+                        let events = crate::installation::source_migration::start(
+                            library,
+                            journal,
+                            destinations,
+                        );
+                        std::thread::spawn(move || while events.recv().is_ok() {});
+                    }
+                }
             }
-        },
-    );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not recover interrupted installation operations");
+        }
+    });
 }
 
 pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {

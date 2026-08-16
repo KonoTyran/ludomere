@@ -260,6 +260,9 @@ fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>)
         .collect::<Vec<_>>();
     let selected_build_id = crate::cloud_saves::metadata::select_build(
         &selected_build_id,
+        crate::installation::marker::load(&game.installation_directory)?
+            .and_then(|marker| marker.galaxy_depot.map(|depot| depot.build_id))
+            .as_deref(),
         game.installed_version.as_deref(),
     )
     .map(|build| build.build_id.as_str());
@@ -673,18 +676,23 @@ fn refresh_fallback_profile(
     true
 }
 
-fn launch_working_directory<'a>(
-    game: &'a InstalledGame,
-    executable: &'a std::path::Path,
-) -> &'a std::path::Path {
+fn launch_working_directory(game: &InstalledGame, executable: &std::path::Path) -> PathBuf {
+    if let Ok(Some(marker)) = super::marker::load(&game.installation_directory)
+        && let Some(directory) = marker.launch.and_then(|launch| launch.working_directory)
+    {
+        return game.installation_directory.join(directory);
+    }
     // GOG Windows play tasks locate an executable relative to the payload
     // root. Subdirectory executables still expect resources and data relative
     // to that root (for example Grim Dawn's x64 executable). This also matches
     // the working directory in GOG-generated shortcuts.
     if game.compatibility.is_some() {
-        &game.installation_directory
+        game.installation_directory.clone()
     } else {
-        executable.parent().unwrap_or(&game.installation_directory)
+        executable
+            .parent()
+            .unwrap_or(&game.installation_directory)
+            .to_owned()
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::{
-    domain::{InstallationState, InstalledGame},
+    domain::{GalaxyDepotProvenance, InstallationSource, InstallationState, InstalledGame},
     state::StateStore,
 };
 use anyhow::{Context, Result, bail};
@@ -23,6 +23,72 @@ pub struct InstallationMarker {
     pub dlc: Vec<InstalledDlc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<InstalledCompatibility>,
+    #[serde(
+        default,
+        skip_serializing_if = "InstallationSource::is_offline_installer"
+    )]
+    pub source: InstallationSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub galaxy_depot: Option<GalaxyDepotProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<InstalledLaunch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
+}
+
+impl InstallationMarker {
+    pub fn with_galaxy_depot(mut self, provenance: GalaxyDepotProvenance) -> Result<Self> {
+        self.source = InstallationSource::GalaxyDepot;
+        self.galaxy_depot = Some(provenance);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let expected_schema = if self.compatibility.is_some() { 2 } else { 1 };
+        if self.schema_version != expected_schema {
+            bail!("installation marker schema does not match its platform runtime");
+        }
+        if let Some(launch) = &self.launch {
+            validate_marker_relative_path(&launch.executable)?;
+            if let Some(directory) = launch.working_directory.as_deref() {
+                validate_marker_relative_path(directory)?;
+            }
+        }
+        match (self.source, self.galaxy_depot.as_ref()) {
+            (InstallationSource::OfflineInstaller, None)
+            | (InstallationSource::GalaxyDepot, Some(_)) => Ok(()),
+            (InstallationSource::OfflineInstaller, Some(_)) => {
+                bail!("offline installation marker contains Galaxy depot provenance")
+            }
+            (InstallationSource::GalaxyDepot, None) => {
+                bail!("Galaxy depot installation marker is missing provenance")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledLaunch {
+    pub executable: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+}
+
+fn validate_marker_relative_path(path: &str) -> Result<()> {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+        || normalized
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("installation marker contains an unsafe launch path");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +124,12 @@ pub fn marker_path(installation_directory: &Path) -> PathBuf {
 
 pub fn load(installation_directory: &Path) -> Result<Option<InstallationMarker>> {
     let path = marker_path(installation_directory);
+    let directory = path.parent().unwrap();
+    if fs::symlink_metadata(directory).is_ok_and(|value| value.file_type().is_symlink())
+        || fs::symlink_metadata(&path).is_ok_and(|value| value.file_type().is_symlink())
+    {
+        bail!("installation marker path cannot be a symlink");
+    }
     if !path.is_file() {
         return Ok(None);
     }
@@ -71,16 +143,35 @@ pub fn load(installation_directory: &Path) -> Result<Option<InstallationMarker>>
             marker.schema_version
         );
     }
+    marker.validate()?;
     Ok(Some(marker))
 }
 
 pub fn write(marker: &InstallationMarker, installation_directory: &Path) -> Result<()> {
+    marker.validate()?;
     let directory = installation_directory.join(crate::identity::MARKER_DIRECTORY);
+    if fs::symlink_metadata(&directory).is_ok_and(|value| value.file_type().is_symlink()) {
+        bail!("installation marker directory cannot be a symlink");
+    }
     fs::create_dir_all(&directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
     let final_path = directory.join(MARKER_FILENAME);
-    let temporary_path = directory.join(format!("{MARKER_FILENAME}.tmp"));
-    let mut file = fs::File::create(&temporary_path)
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let temporary_path = directory.join(format!(
+        ".{MARKER_FILENAME}.{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary_path)
         .with_context(|| format!("could not create {}", temporary_path.display()))?;
     serde_json::to_writer_pretty(&mut file, marker)?;
     file.write_all(b"\n")?;
@@ -125,6 +216,10 @@ pub fn from_game(game: &InstalledGame, dlc: Vec<InstalledDlc>) -> InstallationMa
                 prefix_slug: value.prefix_slug.clone(),
                 profile: value.profile.clone(),
             }),
+        source: InstallationSource::OfflineInstaller,
+        galaxy_depot: None,
+        launch: None,
+        dependencies: Vec::new(),
     }
 }
 
@@ -214,6 +309,10 @@ pub fn game_from_marker(
     executable: Option<PathBuf>,
 ) -> InstalledGame {
     let now = chrono::Utc::now().timestamp();
+    let marker_executable = marker
+        .launch
+        .as_ref()
+        .map(|launch| directory.join(&launch.executable));
     InstalledGame {
         product_id: marker.product_id,
         installed_version: marker.base.version.clone(),
@@ -233,8 +332,12 @@ pub fn game_from_marker(
                 pending_profile: None,
             }
         }),
-        primary_executable: executable,
-        launch_arguments: Vec::new(),
+        primary_executable: marker_executable.or(executable),
+        launch_arguments: marker
+            .launch
+            .as_ref()
+            .map(|launch| launch.arguments.clone())
+            .unwrap_or_default(),
         state: InstallationState::Installed,
         error: None,
         installed_at: Some(marker.base.installed_at),
@@ -249,6 +352,8 @@ pub fn game_from_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{GalaxyDepotDlcProvenance, GalaxyDepotIdentity};
+
     fn example_marker() -> InstallationMarker {
         InstallationMarker {
             schema_version: 1,
@@ -268,6 +373,10 @@ mod tests {
                 installed_at: 11,
             }],
             compatibility: None,
+            source: InstallationSource::OfflineInstaller,
+            galaxy_depot: None,
+            launch: None,
+            dependencies: Vec::new(),
         }
     }
 
@@ -277,6 +386,62 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
         ))
+    }
+
+    fn depot_provenance() -> GalaxyDepotProvenance {
+        GalaxyDepotProvenance {
+            build_id: "build-123".into(),
+            repository_id: "repository-456".into(),
+            manifest_fingerprint: "sha256:abcdef".into(),
+            branch: None,
+            language: Some("en-US".into()),
+            architecture: Some("x86_64".into()),
+            depots: vec![GalaxyDepotIdentity {
+                depot_id: "base-depot".into(),
+                manifest_id: "base-manifest".into(),
+            }],
+            dlc: vec![GalaxyDepotDlcProvenance {
+                product_id: 43,
+                depots: vec![GalaxyDepotIdentity {
+                    depot_id: "dlc-depot".into(),
+                    manifest_id: "dlc-manifest".into(),
+                }],
+                has_payload: true,
+                entitlement_only_marker: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn legacy_schema_one_defaults_to_offline_source() {
+        let root = test_root("legacy-schema-one");
+        let directory = marker_path(&root).parent().unwrap().to_owned();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            marker_path(&root),
+            r#"{
+                "schema_version": 1,
+                "product_id": 42,
+                "slug": "example",
+                "base": {
+                    "operating_system": "linux",
+                    "language": "en",
+                    "version": "1.0",
+                    "revision_id": 7,
+                    "installed_at": 10
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let marker = load(&root).unwrap().unwrap();
+        assert_eq!(marker.source, InstallationSource::OfflineInstaller);
+        assert_eq!(marker.galaxy_depot, None);
+        write(&marker, &root).unwrap();
+        let serialized = fs::read_to_string(marker_path(&root)).unwrap();
+        assert!(!serialized.contains("\"source\""));
+        assert!(!serialized.contains("galaxy_depot"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -320,5 +485,67 @@ mod tests {
                 .contains(root.to_string_lossy().as_ref())
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn galaxy_linux_marker_keeps_schema_one_and_provenance() {
+        let marker = example_marker()
+            .with_galaxy_depot(depot_provenance())
+            .unwrap();
+        assert_eq!(marker.schema_version, 1);
+        assert_eq!(marker.source, InstallationSource::GalaxyDepot);
+        assert_eq!(marker.galaxy_depot, Some(depot_provenance()));
+    }
+
+    #[test]
+    fn galaxy_windows_marker_keeps_schema_two() {
+        let mut marker = example_marker();
+        marker.schema_version = 2;
+        marker.base.operating_system = Some("windows".into());
+        marker.compatibility = Some(InstalledCompatibility {
+            backend: crate::compatibility::CompatibilityBackendKind::Umu,
+            managed_by_ludomere: true,
+            prefix_slug: "example".into(),
+            profile: crate::compatibility::UmuProfile {
+                game_id: "umu-42".into(),
+                store: "gog".into(),
+                source: crate::compatibility::UmuProfileSource::GogProductId,
+            },
+        });
+        let marker = marker.with_galaxy_depot(depot_provenance()).unwrap();
+        assert_eq!(marker.schema_version, 2);
+        assert!(marker.compatibility.is_some());
+    }
+
+    #[test]
+    fn inconsistent_source_and_provenance_are_rejected() {
+        let root = test_root("inconsistent");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut missing = example_marker();
+        missing.source = InstallationSource::GalaxyDepot;
+        assert!(write(&missing, &root).is_err());
+
+        let mut unexpected = example_marker();
+        unexpected.galaxy_depot = Some(depot_provenance());
+        assert!(write(&unexpected, &root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn depot_provenance_serialization_has_no_secret_fields() {
+        let marker = example_marker()
+            .with_galaxy_depot(depot_provenance())
+            .unwrap();
+        let serialized = serde_json::to_string(&marker).unwrap();
+        for forbidden in [
+            "password",
+            "credential",
+            "token",
+            "signed_url",
+            "https://secret.invalid",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
     }
 }

@@ -86,6 +86,7 @@ fn run_patch_worker(
         arguments: crate::compatibility::inno_patch_arguments(game.installer_language.as_deref()),
         working_directory: Some(game.installation_directory.clone()),
         log_path,
+        background: true,
     })?;
     let status = process.wait()?;
     if !status.success() {

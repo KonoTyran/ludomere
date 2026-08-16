@@ -69,12 +69,19 @@ pub struct RemoteLocation {
 
 pub fn select_build<'a>(
     builds: &'a [GalaxyBuild],
+    build_id: Option<&str>,
     installed: Option<&str>,
 ) -> Option<&'a GalaxyBuild> {
     builds
         .iter()
         .filter(|build| build.generation == 2)
-        .find(|build| installed.is_some() && build.version.as_deref() == installed)
+        .find(|build| build_id == Some(build.build_id.as_str()))
+        .or_else(|| {
+            builds
+                .iter()
+                .filter(|build| build.generation == 2)
+                .find(|build| installed.is_some() && build.version.as_deref() == installed)
+        })
         .or_else(|| {
             builds
                 .iter()

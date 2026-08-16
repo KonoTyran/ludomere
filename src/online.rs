@@ -189,6 +189,7 @@ pub fn stream_owned_games(
     access_token: &str,
     sender: &mpsc::Sender<Result<SyncEvent>>,
     force_gamesdb_refresh: bool,
+    preferred_installer_language: Option<&str>,
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(45))
@@ -626,6 +627,45 @@ pub fn stream_owned_games(
                 None => {}
             }
             apply_builds(&mut games, product_id, builds.clone());
+            if let Some(game) = games.iter().find(|game| game.product_id == product_id)
+                && let Some(build) = builds
+                    .iter()
+                    .filter(|build| {
+                        build.generation == 2
+                            && build.currently_returned
+                            && build.branch.is_none()
+                            && build.operating_system.eq_ignore_ascii_case("windows")
+                    })
+                    .max_by_key(|build| {
+                        (build.published_at.unwrap_or_default(), build.last_seen_at)
+                    })
+            {
+                let selection = galaxy_selection(game, preferred_installer_language);
+                let cached = crate::installation::depot_planner::cached_acquisition_available(
+                    &enrichment_store,
+                    build,
+                    &selection,
+                )
+                .unwrap_or(false);
+                if !cached {
+                    let result = crate::gog::depot_acquisition::acquire(
+                        &client,
+                        access_token,
+                        build,
+                        &selection,
+                    )
+                    .and_then(|acquisition| {
+                        crate::installation::depot_planner::cache_acquisition(
+                            &enrichment_store,
+                            &acquisition,
+                            build,
+                        )
+                    });
+                    if let Err(error) = result {
+                        tracing::warn!(product_id, %error, "Galaxy build metadata is unusable");
+                    }
+                }
+            }
             let _ = sender.send(Ok(SyncEvent::Builds {
                 product_id,
                 builds,
@@ -752,6 +792,42 @@ pub fn stream_owned_games(
     }
     sender.send(Ok(SyncEvent::Complete { games }))?;
     Ok(())
+}
+
+fn galaxy_selection(
+    game: &Game,
+    preferred_installer_language: Option<&str>,
+) -> crate::gog::depot_acquisition::Selection {
+    let language = game
+        .metadata
+        .localizations
+        .iter()
+        .find(|localization| {
+            preferred_installer_language.is_some_and(|preferred| {
+                localization.name.eq_ignore_ascii_case(preferred)
+                    || localization.language_code.eq_ignore_ascii_case(preferred)
+            })
+        })
+        .or_else(|| {
+            game.metadata
+                .localizations
+                .iter()
+                .find(|localization| localization.language_code.starts_with("en"))
+        })
+        .map(|localization| localization.language_code.clone())
+        .unwrap_or_else(|| "en".into());
+    let owned_dlc = game
+        .dlcs
+        .iter()
+        .filter(|dlc| dlc.owned)
+        .map(|dlc| dlc.product_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    crate::gog::depot_acquisition::Selection {
+        language,
+        bitness: Some("64".into()),
+        owned_dlc: owned_dlc.clone(),
+        selected_dlc: owned_dlc,
+    }
 }
 
 fn merge_metadata(target: &mut ProductMetadata, enrichment: ProductMetadata) {

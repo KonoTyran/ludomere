@@ -29,6 +29,7 @@ impl UmuBackend {
         prefix: &std::path::Path,
         profile: &UmuProfile,
         verbs: &[String],
+        working_directory: &std::path::Path,
         log_path: &std::path::Path,
     ) -> Result<CompatibilityProcess> {
         let mut command = Command::new(Self::executable());
@@ -38,7 +39,8 @@ impl UmuBackend {
             .env("STORE", "gog")
             .arg("winetricks")
             .arg("-q")
-            .args(verbs);
+            .args(verbs)
+            .current_dir(working_directory);
         quiet_setup(&mut command);
         CompatibilityProcess::spawn(command, log_path)
     }
@@ -94,7 +96,9 @@ impl CompatibilityBackend for UmuBackend {
         }
         if initialize {
             fs::create_dir_all(prefix.parent().unwrap())?;
-            let mut c = prefix_initialization_command(&prefix, &r.profile);
+            let game_directory = library.join(&r.slug);
+            fs::create_dir_all(&game_directory)?;
+            let mut c = prefix_initialization_command(&prefix, &r.profile, &game_directory);
             quiet_setup(&mut c);
             let mut p = CompatibilityProcess::spawn(c, &r.log_path)?;
             if !p.wait()?.success() {
@@ -128,13 +132,18 @@ fn is_incomplete_umu_prefix(prefix: &std::path::Path) -> bool {
         && prefix.join("tracked_files").is_file()
 }
 
-fn prefix_initialization_command(prefix: &std::path::Path, profile: &UmuProfile) -> Command {
+fn prefix_initialization_command(
+    prefix: &std::path::Path,
+    profile: &UmuProfile,
+    game_directory: &std::path::Path,
+) -> Command {
     let mut command = Command::new(UmuBackend::executable());
     command
         .env("WINEPREFIX", prefix)
         .env("GAMEID", &profile.game_id)
         .env("STORE", "gog")
         .env("PROTON_VERB", "waitforexitandrun")
+        .current_dir(game_directory)
         .arg(prefix.join("drive_c/windows/regedit.exe"))
         .arg("/S");
     command
@@ -181,8 +190,11 @@ mod tests {
 
     #[test]
     fn prefix_initialization_does_not_launch_an_empty_executable() {
-        let command =
-            prefix_initialization_command(std::path::Path::new("/prefix"), &UmuProfile::fallback());
+        let command = prefix_initialization_command(
+            std::path::Path::new("/prefix"),
+            &UmuProfile::fallback(),
+            std::path::Path::new("/library/game"),
+        );
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
@@ -193,6 +205,10 @@ mod tests {
         assert!(command.get_envs().any(|(name, value)| {
             name == "PROTON_VERB" && value == Some(std::ffi::OsStr::new("waitforexitandrun"))
         }));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/library/game"))
+        );
     }
 
     #[cfg(unix)]

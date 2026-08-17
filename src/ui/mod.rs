@@ -904,7 +904,7 @@ const CSS: &str = r#"
 .active-transfer-background { background: #08121d; }
 .active-transfer-fade { background: linear-gradient(to right, transparent 0%, rgba(8, 18, 29, .18) 32%, rgba(8, 18, 29, .82) 62%, #08121d 75%); }
 .active-transfer-logo { background: transparent; }
-.active-transfer-title { font-size: .55em; }
+.active-transfer-title { font-size: 1.2em; }
 .active-transfer-stage { font-size: .72em; font-weight: 800; color: alpha(@window_fg_color, .72); letter-spacing: .08em; }
 .active-transfer-details { padding: 16px 18px; background: alpha(#101923, .95); }
 .completed-transfer-history { min-height: 174px; background: #08121d; border-bottom: 1px solid alpha(@borders, .55); }

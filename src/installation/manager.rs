@@ -685,6 +685,12 @@ fn run_depot_operation(
             "failed"
         };
         let message = redact_error(&format!("{error:#}"), &request.access_token);
+        if let Ok(log_path) = super::executor::installation_log_path(request.product_id) {
+            let _ = crate::compatibility::append_step_log(
+                &log_path,
+                &format!("installation failed: {message}"),
+            );
+        }
         let progress = super::operation_journal::find_depot(&request.operation_id)
             .ok()
             .map(|(_, record)| record)
@@ -1473,6 +1479,16 @@ fn finalize_depot_metadata(
         let backend = crate::compatibility::default_backend();
         let log_path = super::executor::installation_log_path(request.product_id)?;
         std::fs::File::create(&log_path)?;
+        for (name, path) in [
+            ("library", request.library_root.as_path()),
+            ("game", request.destination.as_path()),
+            ("operation journal", request.staging_path.as_path()),
+        ] {
+            crate::compatibility::append_step_log(
+                &log_path,
+                &format!("{name} path: {}", path.display()),
+            )?;
+        }
         let prefix = backend.initialize_prefix(crate::compatibility::InitializePrefixRequest {
             library_id: request.library_id.clone(),
             library: request.library_root.clone(),
@@ -1481,14 +1497,23 @@ fn finalize_depot_metadata(
             log_path: log_path.clone(),
         })?;
         let prefix = request.library_root.join(prefix.relative_path);
+        crate::compatibility::append_step_log(
+            &log_path,
+            &format!("prefix path: {}", prefix.display()),
+        )?;
         let installed_dependencies = super::marker::load(&request.destination)?
             .map(|installed| installed.dependencies)
             .unwrap_or_default();
         if installed_dependencies != request.dependencies {
             let verbs = dependency_verbs(&request.dependencies)?;
             if !verbs.is_empty() {
-                let mut process =
-                    backend.run_winetricks(&prefix, &compatibility.profile, &verbs, &log_path)?;
+                let mut process = backend.run_winetricks(
+                    &prefix,
+                    &compatibility.profile,
+                    &verbs,
+                    &request.destination,
+                    &log_path,
+                )?;
                 if !process.wait()?.success() {
                     anyhow::bail!("installing required Windows dependencies failed");
                 }

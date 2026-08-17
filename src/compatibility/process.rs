@@ -101,16 +101,17 @@ fn append_command_log(log_path: &Path, command: &Command) -> Result<()> {
         .iter()
         .any(|name| lower == *name);
     }
+    let working_directory = command
+        .get_current_dir()
+        .map_or_else(|| "<inherited>".into(), |path| path.display().to_string());
+    let command = parts
+        .iter()
+        .map(|part| shell_words::quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
     append_step_log(
         log_path,
-        &format!(
-            "command: {}",
-            parts
-                .iter()
-                .map(|part| shell_words::quote(part))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
+        &format!("command: {command} (working directory: {working_directory})"),
     )
 }
 

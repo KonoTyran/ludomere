@@ -2,12 +2,10 @@
 
 A native GOG library, download, and game manager for Linux.
 
-Sign in to GOG to synchronize owned games, artwork, structured offline-installer manifests,
-official store metadata, GamesDB enrichment, and locally observed Galaxy build history. Catalog
-metadata is cached for offline browsing, while installers, patches, and extras are stored in a
-plain, browsable managed download directory. Downloads use a persistent, concurrency-limited
-queue, can be resumed after interruption, and can be explicitly verified. Future releases will
-expand the installation and compatibility features already included.
+Sign in to GOG to synchronize owned games, artwork, offline installers, and current Galaxy depot
+build metadata. Ludomere can install native Linux offline builds, Windows offline installers, or
+ready-to-run Windows Galaxy builds. Downloads and installations can be paused, resumed after an
+interruption, cancelled, and repaired from the unified Downloads page.
 
 > [!IMPORTANT]
 > Ludomere was built entirely with AI assistance for the author's personal use. Its behavior and
@@ -63,8 +61,8 @@ Run directly from the repository:
 cargo run
 ```
 
-The first run creates `~/.config/ludomere/config.toml`. Managed downloads default to
-`$XDG_DATA_HOME/ludomere/downloads`. The executable is `ludomere`.
+The first run creates `~/.config/ludomere/config.toml`. The default game library and managed
+download location are `$XDG_DATA_HOME/ludomere/games`. The executable is `ludomere`.
 
 Use isolated state during testing:
 
@@ -97,31 +95,86 @@ cargo build --release
 - Cached artwork grid and persistent game sidebar
 - Search by title, slug, feature, or personal tag
 - Search and filters for official tags, genres/themes, play modes, and store properties
-- Metadata, installer, patch, extra, DLC, changelog, and Galaxy-build details
+- Metadata, offline installers, patches, extras, DLC, and changelogs
 - Official GOG group/file identity with locally accumulated immutable download revisions
-- Resumable offline-installer downloads, verification, and managed storage
-- Windows installation and launch through UMU/Proton, with Comet-backed GOG Galaxy authentication
-- Persistent ordered queue with configurable concurrency from one through four groups
-- Collision-free partial staging under the selected download directory
+- Native Linux and Windows offline-installer installation
+- Generation-two Windows Galaxy depot installation, updates, repair, DLC, and branch switching
+- Chunk-level resumable depot downloads, including GOG small-files containers
+- Parallel verification of existing depot files and destructive repair of managed files
+- Windows installation and launch through UMU/Proton, with quiet registry and setup actions
+- Comet-backed GOG Galaxy authentication for supported Windows games
+- Unified download and installation queue with pause, resume, cancellation, speed history, and
+  separate network and disk progress
+- Configurable installation-source priority; the default is Linux offline, Windows Galaxy, then
+  Windows offline
+- Multiple game libraries with library-owned installation markers and operation recovery journals
 - Persistent favorites and personal tags in SQLite
 - Offline browsing after the first successful synchronization
+
+Galaxy installs use the newest available generation-two build on the selected branch. Master is
+the default branch. If alternate branches are advertised, they can be selected from the game's
+settings; successful protected-branch passwords are saved automatically. Generation-one Galaxy
+builds are not currently supported.
+
+Changing between Galaxy and offline installation sources is a full reinstall, not an in-place
+conversion. Ludomere attempts to preserve known save locations during that transition and warns
+before continuing when no save locations are known. Normal cloud-save conflict handling remains
+responsible for reconciling cloud and local saves.
 
 ## Data locations
 
 - Configuration: `$XDG_CONFIG_HOME/ludomere/config.toml`
-- Persistent library and queue state: `$XDG_DATA_HOME/ludomere/library.sqlite3`
+- Catalog metadata, preferences, activity, and the offline download queue:
+  `$XDG_DATA_HOME/ludomere/library.sqlite3`
+- Installation and runtime logs: `$XDG_DATA_HOME/ludomere/installation-logs/` and
+  `$XDG_DATA_HOME/ludomere/runtime-logs/`
 - Replaceable artwork and screenshots: `$XDG_CACHE_HOME/ludomere/`
-- Installers, patches, extras, and partial staging: the directory selected in Settings
+- Offline installers, patches, and extras: the managed directory selected in Settings
+- Installed games and their operation state: the selected game library
 
 GOG credentials are stored through the desktop Secret Service. Access and refresh tokens are not
-written to `config.toml` or the application database. Comet receives them through a private,
-per-session compatibility file that is removed when the game exits.
+written to `config.toml` or the application database. Protected-branch passwords are encrypted in
+SQLite with an account-bound key kept in the Secret Service. Comet receives tokens through a
+private, per-session compatibility file that is removed when the game exits.
 
-## License
+Each game library is self-describing. A completed installation stores its permanent marker beneath
+the game directory; an active or interrupted operation stores its journal in the library control
+directory:
 
-Ludomere is licensed under the [GNU General Public License version 3 or later](LICENSE).
-Third-party components and artwork retain their own licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+```text
+<library>/<game slug>/.ludomere/installation.json
+<library>/.ludomere/staging/<game slug>.operation.json
+<library>/.ludomere/staging/<game slug>.json
+<library>/.ludomere/compatibility/<game slug>/
+```
+
+The operation files contain the information needed to resume or permanently cancel an interrupted
+install without relying on SQLite. Depot payload is written directly into the final game directory;
+temporary file parts remain beside the files they are building. A library scan can reconstruct
+installed-game state from markers and plausible payloads if the application database is lost.
+
+## Installation sources and storage
+
+Settings controls the preferred order of Linux offline installers, Windows Galaxy builds, and
+Windows offline installers. Rows can be reordered by dragging them or with the arrow buttons. A
+choice made in the installation dialog applies only to that installation and does not change the
+saved order. When more than one matching offline installer exists, the newest version is preferred.
+
+Offline downloads use a plain, browsable layout. Base-game files live directly beneath their game
+slug, while DLC is nested beneath its parent game:
+
+```text
+<managed download directory>/<game slug>/installer/...
+<managed download directory>/<game slug>/patch/...
+<managed download directory>/<game slug>/extra/...
+<managed download directory>/<game slug>/dlc/<dlc slug>/installer/...
+```
+
+Galaxy depot installations are ready-made game trees rather than installer archives. Ludomere
+downloads compressed chunks, verifies their GOG hashes, decompresses them into managed files, and
+runs the repository's supported setup tasks afterward. Updates, repairs, DLC changes, and branch
+switches reconcile the installed tree with the selected target manifests. Repair restores every
+modified or corrupt managed file and leaves unknown files untouched.
 
 Settings can change the managed directory and simultaneous-download limit, open the download
 directory, clear replaceable image data, or request a complete online metadata refresh.
@@ -136,11 +189,8 @@ cargo run -- --audit-gog-sources
 The audit reads the existing keyring login and prints normalized counts only. It does not print
 tokens or signed download links and does not write SQLite, cache, or download files.
 
-Base-game files live directly beneath their game slug. DLC is nested under its parent game:
+## License
 
-```text
-<download directory>/<game slug>/installer/...
-<download directory>/<game slug>/patch/...
-<download directory>/<game slug>/extra/...
-<download directory>/<game slug>/dlc/<dlc slug>/installer/...
-```
+Ludomere is licensed under the [GNU General Public License version 3 or later](LICENSE).
+Third-party components and artwork retain their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

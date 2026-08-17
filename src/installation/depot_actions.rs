@@ -174,13 +174,20 @@ pub fn execute_actions(
                 action.kind
             ),
         )?;
-        match action.kind {
-            DepotScriptActionKind::SetRegistry => execute_registry(backend, context, action)?,
-            DepotScriptActionKind::SetIni => execute_ini(context, action)?,
-            DepotScriptActionKind::SupportData => execute_support(context, action)?,
-            DepotScriptActionKind::SavePath => validate_save_path(context, action)?,
-            DepotScriptActionKind::InstallSdb => execute_sdb(backend, context, action)?,
-            DepotScriptActionKind::Execute => execute_program(backend, context, action)?,
+        let result = match action.kind {
+            DepotScriptActionKind::SetRegistry => execute_registry(backend, context, action),
+            DepotScriptActionKind::SetIni => execute_ini(context, action),
+            DepotScriptActionKind::SupportData => execute_support(context, action),
+            DepotScriptActionKind::SavePath => validate_save_path(context, action),
+            DepotScriptActionKind::InstallSdb => execute_sdb(backend, context, action),
+            DepotScriptActionKind::Execute => execute_program(backend, context, action),
+        };
+        if let Err(error) = result {
+            crate::compatibility::append_step_log(
+                &context.log_path,
+                &format!("GOG script action failed: {}: {error:#}", action.name),
+            )?;
+            return Err(error);
         }
         crate::compatibility::append_step_log(
             &context.log_path,
@@ -248,6 +255,7 @@ fn execute_registry(
 ) -> Result<()> {
     let command = registry_command(context, action)?;
     let script = context.prefix.join("drive_c/ludomere-registry.reg");
+    log_path(context, "registry script", &script)?;
     fs::write(&script, &command.script)?;
     let result = run(
         backend,
@@ -328,6 +336,7 @@ fn execute_ini(context: &ActionContext, action: &DepotScriptAction) -> Result<()
     let value: IniArguments =
         serde_json::from_value(action.arguments.clone()).context("parsing GOG INI action")?;
     let path = resolve_path(context, &value.filename)?;
+    log_path(context, "INI target", &path)?;
     reject_symlink_path(&path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -374,6 +383,7 @@ fn execute_support(context: &ActionContext, action: &DepotScriptAction) -> Resul
         bail!("unsupported GOG support-data condition");
     }
     let target = resolve_path(context, &value.target)?;
+    log_path(context, "support-data target", &target)?;
     reject_symlink_path(&target)?;
     if condition_only_once(&value.conditions) && target.exists() {
         return Ok(());
@@ -381,10 +391,14 @@ fn execute_support(context: &ActionContext, action: &DepotScriptAction) -> Resul
     match (value.kind.as_str(), value.source) {
         ("folder", None) => fs::create_dir_all(target)?,
         ("folder", Some(source)) => {
-            copy_tree(&resolve_path(context, &source)?, &target, value.overwrite)?
+            let source = resolve_path(context, &source)?;
+            log_path(context, "support-data source", &source)?;
+            copy_tree(&source, &target, value.overwrite)?
         }
         ("file", Some(source)) => {
-            copy_file(&resolve_path(context, &source)?, &target, value.overwrite)?
+            let source = resolve_path(context, &source)?;
+            log_path(context, "support-data source", &source)?;
+            copy_file(&source, &target, value.overwrite)?
         }
         _ => bail!("unsupported GOG support-data shape"),
     }
@@ -397,7 +411,8 @@ fn validate_save_path(context: &ActionContext, action: &DepotScriptAction) -> Re
         .get("savePath")
         .and_then(serde_json::Value::as_str)
         .context("GOG save-path action has no path")?;
-    resolve_path(context, path).map(|_| ())
+    let path = resolve_path(context, path)?;
+    log_path(context, "save path", &path)
 }
 
 fn execute_sdb(
@@ -408,6 +423,7 @@ fn execute_sdb(
     let value: SdbArguments =
         serde_json::from_value(action.arguments.clone()).context("parsing GOG SDB action")?;
     let file = resolve_path(context, &value.sdb_file)?;
+    log_path(context, "SDB file", &file)?;
     let executable = context.prefix.join("drive_c/windows/system32/sdbinst.exe");
     run(
         backend,
@@ -432,6 +448,10 @@ fn execute_program(
         .filter(|path| !path.is_empty())
         .map(|path| resolve_path(context, path))
         .transpose()?;
+    log_path(context, "executable", &executable)?;
+    if let Some(path) = &working {
+        log_path(context, "working directory", path)?;
+    }
     let arguments =
         shell_words::split(&value.arguments).context("parsing GOG execute arguments")?;
     run(backend, context, executable, arguments, working)
@@ -449,7 +469,7 @@ fn resolve_executable_path(context: &ActionContext, value: &str) -> Result<PathB
             .split('/')
             .any(|part| part.is_empty() || matches!(part, "." | ".."))
     {
-        bail!("unsafe GOG executable path");
+        bail!("unsafe GOG executable path: {value:?}");
     }
     Ok(context.app.join(normalized))
 }
@@ -506,28 +526,43 @@ fn resolve_path(context: &ActionContext, value: &str) -> Result<PathBuf> {
                 || value.starts_with(&format!("{token}/"))
                 || value.starts_with(&format!(r"{token}\"))
         })
-        .context("unsupported GOG setup path variable")?;
+        .with_context(|| format!("unsupported GOG setup path variable: {value:?}"))?;
     let suffix = value[token.len()..]
         .trim_start_matches(['/', '\\'])
         .replace('\\', "/");
-    if suffix
-        .split('/')
-        .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        && !suffix.is_empty()
-    {
-        bail!("unsafe GOG setup path");
-    }
-    Ok(if suffix.is_empty() {
-        root
+    let boundary = if root.starts_with(&context.prefix) {
+        context.prefix.clone()
     } else {
-        root.join(suffix)
-    })
+        root.clone()
+    };
+    let mut resolved = root;
+    for part in suffix.split('/').filter(|part| !part.is_empty()) {
+        match part {
+            "." => {}
+            ".." if resolved != boundary => {
+                resolved.pop();
+            }
+            ".." => bail!("GOG setup path escapes its managed root: {value:?}"),
+            _ => resolved.push(part),
+        }
+    }
+    if !resolved.starts_with(&boundary) {
+        bail!("GOG setup path escapes its managed root: {value:?}");
+    }
+    Ok(resolved)
 }
 
 fn expand_text(context: &ActionContext, value: &str) -> String {
     value
         .replace("{productID}", &context.product_id.to_string())
         .replace("{app}", &context.windows_app)
+}
+
+fn log_path(context: &ActionContext, kind: &str, path: &Path) -> Result<()> {
+    Ok(crate::compatibility::append_step_log(
+        &context.log_path,
+        &format!("GOG setup {kind}: {}", path.display()),
+    )?)
 }
 
 fn reject_symlink_path(path: &Path) -> Result<()> {
@@ -722,6 +757,22 @@ mod tests {
             resolve_path(&context, "{usersavedgames}/id Software/DOOM",).unwrap(),
             root.join("prefix/drive_c/users/steamuser/Saved Games/id Software/DOOM")
         );
+        assert_eq!(
+            resolve_path(
+                &context,
+                "{userdocs}/../Saved Games/Nightdive Studios/DOOM 64",
+            )
+            .unwrap(),
+            root.join("prefix/drive_c/users/steamuser/Saved Games/Nightdive Studios/DOOM 64")
+        );
+        assert!(
+            resolve_path(
+                &context,
+                "{userdocs}/../../../../../../../../outside-prefix",
+            )
+            .is_err()
+        );
+        assert!(resolve_path(&context, "{app}/../outside-game").is_err());
     }
 
     #[test]
@@ -764,5 +815,42 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(execute.arguments, "--quiet");
+    }
+
+    #[test]
+    fn logs_resolved_paths_and_action_failures() {
+        let root =
+            std::env::temp_dir().join(format!("ludomere-depot-action-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let profile = UmuProfile::fallback();
+        let context = context(&root, &profile);
+        let actions = [
+            DepotScriptAction {
+                name: "valid save".into(),
+                kind: DepotScriptActionKind::SavePath,
+                arguments: json!({"savePath":"{app}/saves"}),
+                uninstall: false,
+            },
+            DepotScriptAction {
+                name: "unsafe save".into(),
+                kind: DepotScriptActionKind::SavePath,
+                arguments: json!({"savePath":"{app}/../escape"}),
+                uninstall: false,
+            },
+        ];
+        assert!(
+            execute_actions(&crate::compatibility::UmuBackend, &context, &actions, false).is_err()
+        );
+        let log = fs::read_to_string(&context.log_path).unwrap();
+        assert!(log.contains(&format!(
+            "GOG setup save path: {}",
+            root.join("game/saves").display()
+        )));
+        assert!(log.contains(
+            "GOG script action failed: unsafe save: GOG setup path escapes its managed root"
+        ));
+        assert!(log.contains(r#""{app}/../escape""#));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -69,6 +69,7 @@ pub struct CompatibilityRunRequest {
     pub arguments: Vec<String>,
     pub working_directory: Option<PathBuf>,
     pub log_path: PathBuf,
+    pub background: bool,
 }
 
 pub trait CompatibilityBackend: Send + Sync {

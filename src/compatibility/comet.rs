@@ -190,6 +190,7 @@ fn install_dummy_service(
         ],
         working_directory: destination.parent().map(PathBuf::from),
         log_path: log_path.to_owned(),
+        background: true,
     })?;
     let status = process.wait()?;
     if !status.success() {

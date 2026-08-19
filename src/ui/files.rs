@@ -143,7 +143,8 @@ pub(super) fn detail_file_management(
         {
             let window = window.clone();
             let game = game.clone();
-            repair.connect_clicked(move |_| show_repair_dialog(&window, &game));
+            let model = model.clone();
+            repair.connect_clicked(move |_| show_repair_dialog(&window, &model, &game));
         }
         manage_actions.append(&repair);
         manage_submenu_actions.push(repair);
@@ -252,10 +253,12 @@ pub(super) fn detail_file_management(
         let window = window.clone();
         let game = game.clone();
         let installed = installed.clone();
+        let model = model.clone();
         let refresh_after_change = refresh_after_change.clone();
         game_settings.connect_clicked(move |_| {
             show_game_settings(
                 &window,
+                &model,
                 &game,
                 installed.clone(),
                 refresh_after_change.clone(),
@@ -402,7 +405,7 @@ pub(super) fn activate_context_primary_action(
             .find(|installed| installed.product_id == game.product_id)
     });
     match context_primary_action(&game, installed.as_ref(), &model.borrow().config) {
-        GamePrimaryAction::Install => show_install_dialog(&widgets.window, &game),
+        GamePrimaryAction::Install => show_install_dialog(&widgets.window, model, &game),
         GamePrimaryAction::InstallUpdate => {
             if model.borrow().config.prefer_patch_updates
                 && installed.as_ref().is_some_and(|installed| {
@@ -411,7 +414,7 @@ pub(super) fn activate_context_primary_action(
             {
                 return;
             }
-            show_install_dialog(&widgets.window, &game)
+            show_update_dialog(&widgets.window, model, &game)
         }
         GamePrimaryAction::Play => {
             let Some(installed) = installed else { return };

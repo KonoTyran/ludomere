@@ -283,6 +283,61 @@ pub struct GalaxyBuild {
     pub last_seen_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallationSource {
+    #[default]
+    OfflineInstaller,
+    GalaxyDepot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepotOperationKind {
+    Install,
+    Update,
+    BranchSwitch,
+    Repair,
+}
+
+impl InstallationSource {
+    pub const fn is_offline_installer(value: &Self) -> bool {
+        matches!(value, Self::OfflineInstaller)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GalaxyDepotIdentity {
+    pub depot_id: String,
+    pub manifest_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GalaxyDepotDlcProvenance {
+    pub product_id: i64,
+    #[serde(default)]
+    pub depots: Vec<GalaxyDepotIdentity>,
+    pub has_payload: bool,
+    pub entitlement_only_marker: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GalaxyDepotProvenance {
+    pub build_id: String,
+    pub repository_id: String,
+    pub manifest_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub depots: Vec<GalaxyDepotIdentity>,
+    #[serde(default)]
+    pub dlc: Vec<GalaxyDepotDlcProvenance>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct DownloadPart {

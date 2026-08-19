@@ -447,6 +447,7 @@ pub(super) fn start_owned_library_sync(
     w.sync_progress.set_visible(true);
     w.account_library_status.set_label("Synchronizing…");
     let persistence = start_sync_persistence_worker();
+    let installer_language = model.borrow().config.installer_language.clone();
     let (sender, receiver) = mpsc::channel::<anyhow::Result<online::SyncEvent>>();
     std::thread::spawn(move || {
         let result = (|| {
@@ -466,7 +467,13 @@ pub(super) fn start_owned_library_sync(
             store.replace_owned_products(&ids)?;
             store.mark_sync_stage_finished("ownership", true, None)?;
             sender.send(Ok(online::SyncEvent::Ownership(ids.len())))?;
-            online::stream_owned_games(&ids, &token.access_token, &sender, force_gamesdb_refresh)
+            online::stream_owned_games(
+                &ids,
+                &token.access_token,
+                &sender,
+                force_gamesdb_refresh,
+                installer_language.as_deref(),
+            )
         })();
         if let Err(error) = result {
             let _ = sender.send(Err(error));

@@ -16,6 +16,8 @@ pub struct Config {
     pub installer_linux: bool,
     #[serde(default = "default_true")]
     pub installer_macos: bool,
+    #[serde(default = "default_installation_source_order")]
+    pub installation_source_order: Vec<PreferredInstallationSource>,
     #[serde(default = "default_true")]
     pub download_extras_by_default: bool,
     #[serde(default)]
@@ -60,6 +62,22 @@ pub enum SidebarSortMode {
     LastPlayed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferredInstallationSource {
+    LinuxOffline,
+    WindowsGalaxy,
+    WindowsOffline,
+}
+
+pub fn default_installation_source_order() -> Vec<PreferredInstallationSource> {
+    vec![
+        PreferredInstallationSource::LinuxOffline,
+        PreferredInstallationSource::WindowsGalaxy,
+        PreferredInstallationSource::WindowsOffline,
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameLibrary {
     pub id: String,
@@ -93,6 +111,7 @@ impl Default for Config {
             installer_windows: true,
             installer_linux: true,
             installer_macos: true,
+            installation_source_order: default_installation_source_order(),
             download_extras_by_default: true,
             download_patches_by_default: false,
             prefer_patch_updates: false,
@@ -140,6 +159,7 @@ impl Config {
             config.max_concurrent_downloads = config.max_concurrent_downloads.clamp(1, 4);
             config.library_card_size = config.library_card_size.min(3);
             config.normalize_game_libraries();
+            config.normalize_installation_source_order();
             write_config(&path, &config)?;
             return Ok(config);
         }
@@ -209,6 +229,21 @@ impl Config {
         if let Some(library) = self.installer_library() {
             self.download_directory = library.path.clone();
         }
+    }
+
+    pub fn normalize_installation_source_order(&mut self) {
+        let mut normalized = Vec::new();
+        for source in self
+            .installation_source_order
+            .iter()
+            .copied()
+            .chain(default_installation_source_order())
+        {
+            if !normalized.contains(&source) {
+                normalized.push(source);
+            }
+        }
+        self.installation_source_order = normalized;
     }
 }
 
@@ -342,6 +377,30 @@ enabled = true
         );
         assert!(!config.game_libraries[0].id.is_empty());
         assert_eq!(config.game_libraries[0].name, "fast");
+    }
+
+    #[test]
+    fn installation_source_order_defaults_and_normalizes() {
+        assert_eq!(
+            Config::default().installation_source_order,
+            default_installation_source_order()
+        );
+        let mut config = Config {
+            installation_source_order: vec![
+                PreferredInstallationSource::WindowsOffline,
+                PreferredInstallationSource::WindowsOffline,
+            ],
+            ..Config::default()
+        };
+        config.normalize_installation_source_order();
+        assert_eq!(
+            config.installation_source_order,
+            [
+                PreferredInstallationSource::WindowsOffline,
+                PreferredInstallationSource::LinuxOffline,
+                PreferredInstallationSource::WindowsGalaxy,
+            ]
+        );
     }
 
     #[cfg(unix)]

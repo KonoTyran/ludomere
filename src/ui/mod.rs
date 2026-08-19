@@ -101,7 +101,7 @@ use library::*;
 use settings::*;
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{Mutex, OnceLock, mpsc},
     time::Duration,
@@ -140,6 +140,10 @@ struct AppModel {
     downloaded_products: HashSet<i64>,
     downloaded_installer_products: HashSet<i64>,
     download_jobs: Vec<DownloadJobRecord>,
+    depot_operations: Vec<crate::installation::DepotOperationSnapshot>,
+    transfer_history: Rc<RefCell<VecDeque<TransferHistorySample>>>,
+    transfer_totals: Option<(std::time::Instant, u64, u64)>,
+    active_transfer_id: Option<String>,
     windows_only: bool,
     linux_only: bool,
     macos_only: bool,
@@ -163,6 +167,12 @@ struct AppModel {
     sidebar_playable_only: bool,
     collapsed_activity_sections: HashSet<ActivitySectionKey>,
     activity_sections: Vec<SidebarSection>,
+}
+
+#[derive(Clone, Copy)]
+struct TransferHistorySample {
+    download_bytes_per_second: f64,
+    disk_bytes_per_second: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -890,6 +900,19 @@ const CSS: &str = r#"
 .download-section-heading separator { margin-top: 10px; }
 .downloads-empty { padding: 6px 14px 24px; color: alpha(@window_fg_color, .60); }
 .download-active-card { padding: 18px; background: alpha(@card_bg_color, .75); border: 1px solid alpha(@borders, .55); border-radius: 10px; }
+.active-transfer-header { min-height: 174px; background: #08121d; border: 1px solid alpha(@borders, .55); border-radius: 10px; overflow: hidden; }
+.active-transfer-background { background: #08121d; }
+.active-transfer-fade { background: linear-gradient(to right, transparent 0%, rgba(8, 18, 29, .18) 32%, rgba(8, 18, 29, .82) 62%, #08121d 75%); }
+.active-transfer-logo { background: transparent; }
+.active-transfer-title { font-size: 1.2em; }
+.active-transfer-stage { font-size: .72em; font-weight: 800; color: alpha(@window_fg_color, .72); letter-spacing: .08em; }
+.active-transfer-details { padding: 16px 18px; background: alpha(#101923, .95); }
+.completed-transfer-history { min-height: 174px; background: #08121d; border-bottom: 1px solid alpha(@borders, .55); }
+.transfer-metric-title { font-size: .72em; font-weight: 700; color: alpha(@window_fg_color, .72); letter-spacing: .05em; }
+.transfer-metric-value { font-weight: 800; }
+.download-network-progress trough, .download-disk-progress trough { min-height: 4px; border-radius: 0; background: alpha(@window_fg_color, .20); }
+.download-network-progress progress { background: #1687d9; }
+.download-disk-progress progress { background: #73c76b; }
 .download-queue-row { padding: 12px; border-bottom: 1px solid alpha(@borders, .35); }
 "#;
 

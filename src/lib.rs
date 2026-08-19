@@ -1,5 +1,6 @@
 pub mod application;
 pub mod auth;
+pub mod branch_credentials;
 pub mod cloud_saves;
 pub mod compatibility;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod identity;
 pub mod installation;
 pub mod managed;
 pub mod online;
+pub(crate) mod operation_gate;
 pub mod screenshots;
 pub mod state;
 pub mod text;

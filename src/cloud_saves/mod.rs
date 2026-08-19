@@ -55,7 +55,11 @@ pub fn discover(
     }
     let store = crate::state::StateStore::open()?;
     let builds = windows_builds(&store, game.product_id)?;
-    let Some(build) = metadata::select_build(&builds, game.installed_version.as_deref()) else {
+    let exact = crate::installation::load_installation_marker(&game.installation_directory)?
+        .and_then(|marker| marker.galaxy_depot.map(|depot| depot.build_id));
+    let Some(build) =
+        metadata::select_build(&builds, exact.as_deref(), game.installed_version.as_deref())
+    else {
         return Ok(unavailable("no generation-2 Windows build is available"));
     };
     let build_id = Some(build.build_id.clone());
@@ -167,8 +171,11 @@ pub fn inventory(game: &InstalledGame) -> Result<CloudSaveInventory> {
     }
     let token = crate::auth::load_saved_token()?.context("sign in to GOG to check cloud saves")?;
     let builds = windows_builds(&store, game.product_id)?;
-    let build = metadata::select_build(&builds, game.installed_version.as_deref())
-        .context("no generation-2 Windows build is available")?;
+    let exact = crate::installation::load_installation_marker(&game.installation_directory)?
+        .and_then(|marker| marker.galaxy_depot.map(|depot| depot.build_id));
+    let build =
+        metadata::select_build(&builds, exact.as_deref(), game.installed_version.as_deref())
+            .context("no generation-2 Windows build is available")?;
     let client = api::client()?;
     let credentials = metadata::fetch_credentials(&client, &build.repository_url)?;
     let scoped = api::exchange_scoped_token(&client, &token.refresh_token, &credentials)?;
@@ -210,8 +217,15 @@ pub fn sync(mut request: CloudSyncRequest) -> Result<CloudSyncResult> {
     request.locations = discovery.locations;
     let token = crate::auth::load_saved_token()?.context("sign in to GOG to synchronize saves")?;
     let builds = windows_builds(&store, request.game.product_id)?;
-    let build = metadata::select_build(&builds, request.game.installed_version.as_deref())
-        .context("no generation-2 Windows build is available")?;
+    let exact =
+        crate::installation::load_installation_marker(&request.game.installation_directory)?
+            .and_then(|marker| marker.galaxy_depot.map(|depot| depot.build_id));
+    let build = metadata::select_build(
+        &builds,
+        exact.as_deref(),
+        request.game.installed_version.as_deref(),
+    )
+    .context("no generation-2 Windows build is available")?;
     let client = api::client()?;
     let credentials = metadata::fetch_credentials(&client, &build.repository_url)?;
     let scoped = api::exchange_scoped_token(&client, &token.refresh_token, &credentials)?;

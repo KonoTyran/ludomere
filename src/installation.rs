@@ -8,12 +8,19 @@ use std::{
     path::PathBuf,
 };
 
+pub mod depot;
+pub mod depot_actions;
+pub mod depot_metadata;
+pub mod depot_planner;
 mod executor;
 mod launcher;
 mod manager;
 mod marker;
+mod operation_journal;
 mod patch;
+pub mod source_migration;
 mod windows_executable;
+pub use depot::{delete_abandoned_depot_staging, inspect_abandoned_depot_staging};
 pub use executor::{
     AdditionalInstaller, InstallationEvent, InstallationHandle, UninstallationEvent,
     UninstallationHandle, installation_log_path, start_installation, start_uninstallation,
@@ -24,9 +31,13 @@ pub use launcher::{
     stop_all_games, stop_game,
 };
 pub use manager::{
-    InstallationManagerEvent, InstallationOperationSnapshot, cancel_operation,
+    DepotManagerEvent, DepotOperationRequest, DepotOperationSnapshot, DepotSource,
+    InstallationManagerEvent, InstallationOperationSnapshot, abandon_depot_operation,
+    cancel_depot_operation, cancel_operation, depot_operation_snapshot,
+    depot_operation_snapshot_for_product, depot_operation_snapshots, enqueue_depot_operation,
     enqueue_installation, enqueue_uninstallation, installation_operation_snapshot,
-    recover_interrupted_operations, respond_to_installation, shutdown, start_recovered_operations,
+    recover_depot_operations, recover_interrupted_operations, respond_to_installation,
+    resume_depot_operation, shutdown, start_recovered_operations, subscribe_depot_events,
     subscribe_installation_events,
 };
 pub use marker::{
@@ -37,6 +48,12 @@ pub use patch::{PatchEvent, patch_target_version, run_patch};
 pub use windows_executable::{
     WindowsExecutableCandidate, WindowsExecutableDiscovery, discover_windows_executable,
 };
+
+pub fn recover_backend_operations() -> anyhow::Result<(usize, usize)> {
+    let installers = recover_interrupted_operations()?;
+    let depots = recover_depot_operations()?;
+    Ok((installers, depots))
+}
 
 pub fn patch_log_path(product_id: i64) -> anyhow::Result<PathBuf> {
     let root = crate::identity::installation_logs();
@@ -57,6 +74,46 @@ pub struct InstallerCandidate {
     pub total_size: u64,
     pub currently_offered: bool,
     pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshInstallSource {
+    OfflineInstaller(usize),
+    GalaxyWindows,
+}
+
+pub fn rank_fresh_install_sources(
+    config: &Config,
+    candidates: &[InstallerCandidate],
+    galaxy_windows_available: bool,
+) -> Vec<FreshInstallSource> {
+    use crate::config::PreferredInstallationSource::*;
+    let mut ranked = Vec::new();
+    for preferred in &config.installation_source_order {
+        match preferred {
+            LinuxOffline => ranked.extend(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| candidate.method == InstallationMethod::NativeLinux)
+                    .map(|(index, _)| FreshInstallSource::OfflineInstaller(index)),
+            ),
+            WindowsGalaxy if galaxy_windows_available => {
+                ranked.push(FreshInstallSource::GalaxyWindows)
+            }
+            WindowsOffline => ranked.extend(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| {
+                        candidate.method == InstallationMethod::WindowsCompatibility
+                    })
+                    .map(|(index, _)| FreshInstallSource::OfflineInstaller(index)),
+            ),
+            _ => {}
+        }
+    }
+    ranked
 }
 
 pub fn resolve_installation_directory(
@@ -97,6 +154,16 @@ pub fn reconcile_installed_games(
             let directory = entry.path();
             match marker::load(&directory) {
                 Ok(Some(marker)) => {
+                    if depot::operation_staging_path(
+                        &library.path,
+                        &directory,
+                        &marker.slug,
+                        "reconcile",
+                    )
+                    .is_ok_and(|journal| journal.is_file())
+                    {
+                        continue;
+                    }
                     discovered.insert(marker.product_id, (library.id.clone(), directory, marker));
                 }
                 Ok(None) => {}
@@ -969,5 +1036,36 @@ mod tests {
         assert_eq!(detected.usable[0].method, InstallationMethod::Unsupported);
         assert_eq!(detected.preferred, None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_sources_follow_preference_and_keep_offline_candidate_order() {
+        let candidate = |method| InstallerCandidate {
+            product_id: 1,
+            revision_id: None,
+            version: None,
+            operating_system: None,
+            language: None,
+            paths: Vec::new(),
+            launcher: None,
+            method,
+            total_size: 0,
+            currently_offered: true,
+            complete: true,
+        };
+        let candidates = [
+            candidate(InstallationMethod::WindowsCompatibility),
+            candidate(InstallationMethod::WindowsCompatibility),
+            candidate(InstallationMethod::NativeLinux),
+        ];
+        assert_eq!(
+            rank_fresh_install_sources(&Config::default(), &candidates, true),
+            [
+                FreshInstallSource::OfflineInstaller(2),
+                FreshInstallSource::GalaxyWindows,
+                FreshInstallSource::OfflineInstaller(0),
+                FreshInstallSource::OfflineInstaller(1),
+            ]
+        );
     }
 }

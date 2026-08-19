@@ -13,6 +13,7 @@ pub use fixes::{
 };
 pub use paths::*;
 pub use process::CompatibilityProcess;
+pub(crate) use process::append_step_log;
 pub use umu::UmuBackend;
 
 pub fn default_backend() -> UmuBackend {

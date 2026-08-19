@@ -201,6 +201,24 @@ pub(super) fn render_detail_page(
                 }
                 return;
             }
+            if let Some(snapshot) =
+                crate::installation::depot_operation_snapshot_for_product(detail.product_id)
+                && matches!(snapshot.state.as_str(), "interrupted" | "failed")
+            {
+                let Some(token) = model
+                    .borrow()
+                    .account_token
+                    .as_ref()
+                    .map(|token| token.access_token.clone())
+                else {
+                    widgets.reconnect.emit_clicked();
+                    return;
+                };
+                if crate::installation::resume_depot_operation(snapshot.operation_id, token) {
+                    primary_button.set_sensitive(false);
+                }
+                return;
+            }
             if crate::installation::installation_operation_snapshot(detail.product_id).is_some_and(
                 |snapshot| {
                     snapshot.queued
@@ -246,11 +264,12 @@ pub(super) fn render_detail_page(
                 }
                 return;
             }
-            if matches!(
-                primary_action,
-                GamePrimaryAction::Install | GamePrimaryAction::InstallUpdate
-            ) {
-                show_install_dialog(&widgets.window, &detail);
+            if primary_action == GamePrimaryAction::Install {
+                show_install_dialog(&widgets.window, &model, &detail);
+                return;
+            }
+            if primary_action == GamePrimaryAction::InstallUpdate {
+                show_update_dialog(&widgets.window, &model, &detail);
                 return;
             }
             if primary_action == GamePrimaryAction::Play {
@@ -467,10 +486,11 @@ pub(super) fn render_detail_page(
             install_downloaded.set_halign(gtk::Align::Fill);
             let detail = game.clone();
             let window = w.window.clone();
+            let model = model.clone();
             let action_popover = popover.clone();
             install_downloaded.connect_clicked(move |_| {
                 action_popover.popdown();
-                show_install_dialog(&window, &detail);
+                show_install_dialog(&window, &model, &detail);
             });
             actions.append(&install_downloaded);
         }
@@ -756,14 +776,6 @@ pub(super) fn render_detail_page(
         );
     }
 
-    if !game.galaxy_builds.is_empty() {
-        tabs.add_titled(
-            &build_galaxy_builds_page(&game.galaxy_builds),
-            Some("builds"),
-            "Builds",
-        );
-    }
-
     let logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
     logs.set_margin_top(12);
     refresh_product_logs(&logs, game.product_id, &w.window);
@@ -956,35 +968,76 @@ fn installation_status_panel(
     let cancel = gtk::Button::from_icon_name("process-stop-symbolic");
     cancel.add_css_class("flat");
     cancel.add_css_class("destructive-action");
-    cancel.set_tooltip_text(Some("Cancel operation"));
+    cancel.set_tooltip_text(Some("Pause installation"));
     cancel.set_valign(gtk::Align::Center);
     cancel.set_visible(false);
     {
         let window = window.clone();
         let cancel_for_dialog = cancel.clone();
         cancel.connect_clicked(move |_| {
+            let depot = crate::installation::depot_operation_snapshot_for_product(product_id);
+            let abandoned = depot.as_ref().is_some_and(|snapshot| {
+                matches!(snapshot.state.as_str(), "interrupted" | "failed")
+            });
+            let pausing = depot.is_some() && !abandoned;
             let snapshot = crate::installation::installation_operation_snapshot(product_id);
             let queued = snapshot.as_ref().is_some_and(|snapshot| snapshot.queued);
             let dialog = adw::AlertDialog::builder()
-                .heading(if queued {
+                .heading(if abandoned {
+                    "Cancel this installation?"
+                } else if queued {
                     "Remove queued operation?"
                 } else {
-                    "Cancel current operation?"
+                    "Pause download?"
                 })
-                .body(if queued {
+                .body(if abandoned {
+                    "This abandons the current attempt and deletes its resumable temporary files. Files already published into the game directory are not rolled back."
+                } else if queued {
                     "This removes the operation from the installation queue."
                 } else {
-                    "The running installer or uninstaller will be stopped. Any files it already changed will remain in place."
+                    "You can resume this download later."
                 })
                 .build();
-            dialog.add_responses(&[("keep", "Keep Running"), ("cancel", "Cancel Operation")]);
+            dialog.add_responses(&[
+                (
+                    "keep",
+                    if pausing {
+                        "Continue Downloading"
+                    } else if queued {
+                        "Keep Queued"
+                    } else {
+                        "Keep Installation"
+                    },
+                ),
+                (
+                    "cancel",
+                    if abandoned {
+                        "Cancel Installation"
+                    } else if pausing {
+                        "Pause Download"
+                    } else {
+                        "Cancel Operation"
+                    },
+                ),
+            ]);
             dialog.set_default_response(Some("keep"));
             dialog.set_close_response("keep");
-            dialog.set_response_appearance("cancel", adw::ResponseAppearance::Destructive);
+            if !pausing {
+                dialog.set_response_appearance("cancel", adw::ResponseAppearance::Destructive);
+            }
             let cancel = cancel_for_dialog.clone();
             dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response == "cancel" && crate::installation::cancel_operation(product_id) {
-                    cancel.set_sensitive(false);
+                if response == "cancel" {
+                    let cancelled = depot.as_ref().is_some_and(|snapshot| {
+                        if abandoned {
+                            crate::installation::abandon_depot_operation(&snapshot.operation_id)
+                        } else {
+                            crate::installation::cancel_depot_operation(&snapshot.operation_id)
+                        }
+                    }) || crate::installation::cancel_operation(product_id);
+                    if cancelled {
+                        cancel.set_sensitive(false);
+                    }
                 }
             });
         });
@@ -1030,6 +1083,7 @@ fn installation_status_panel(
         });
     }
     let receiver = crate::installation::subscribe_installation_events();
+    let depot_receiver = crate::installation::subscribe_depot_events();
     let initial_snapshot = crate::installation::installation_operation_snapshot(product_id);
     let panel_for_poll = panel.clone();
     let primary_action = primary_action.clone();
@@ -1042,6 +1096,7 @@ fn installation_status_panel(
     let was_downloading = Rc::new(std::cell::Cell::new(false));
     let was_game_running = Rc::new(std::cell::Cell::new(false));
     let action_visual = Rc::new(std::cell::Cell::new(0_u8));
+    let depot_rate = Rc::new(RefCell::new(SmoothedTransferRate::default()));
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if panel_for_poll.root().is_none() {
             return glib::ControlFlow::Break;
@@ -1070,6 +1125,99 @@ fn installation_status_panel(
                 *pending_snapshot.borrow_mut() =
                     crate::installation::installation_operation_snapshot(product_id);
             }
+        }
+        while let Ok(crate::installation::DepotManagerEvent::Snapshot(snapshot)) =
+            depot_receiver.try_recv()
+        {
+            if snapshot.product_id == product_id
+                && matches!(
+                    snapshot.state.as_str(),
+                    "complete" | "cancelled" | "abandoned"
+                )
+            {
+                refresh_after_install();
+                return glib::ControlFlow::Break;
+            }
+        }
+        if let Some(snapshot) =
+            crate::installation::depot_operation_snapshot_for_product(product_id)
+            && matches!(snapshot.state.as_str(), "interrupted" | "failed")
+        {
+            panel_for_poll.set_visible(true);
+            heading.set_label(if snapshot.state == "failed" {
+                "INSTALLATION FAILED"
+            } else {
+                "INSTALLATION PAUSED"
+            });
+            detail.set_label(
+                snapshot
+                    .error
+                    .as_deref()
+                    .unwrap_or("Resume this installation or cancel it to start over"),
+            );
+            progress.set_visible(snapshot.total_bytes > 0);
+            if snapshot.total_bytes > 0 {
+                progress.set_fraction(
+                    (snapshot.bytes_completed as f64 / snapshot.total_bytes as f64).min(1.0),
+                );
+            }
+            set_primary_button_content(&primary_action, "media-playback-start-symbolic", "Resume");
+            primary_action.set_sensitive(true);
+            set_alternate_game_actions_sensitive(&action_group, false);
+            cancel.set_tooltip_text(Some("Cancel installation"));
+            cancel.set_sensitive(true);
+            cancel.set_visible(true);
+            return glib::ControlFlow::Continue;
+        }
+        if let Some(snapshot) =
+            crate::installation::depot_operation_snapshot_for_product(product_id)
+            && !matches!(snapshot.state.as_str(), "complete" | "failed" | "cancelled")
+        {
+            panel_for_poll.set_visible(true);
+            primary_action.set_sensitive(false);
+            set_alternate_game_actions_sensitive(&action_group, false);
+            let display_state = match snapshot.state.as_str() {
+                "queued" => "INSTALL QUEUED".to_owned(),
+                "preparing" => "PREPARING DOWNLOAD".to_owned(),
+                "verifying" => "VERIFYING FILES".to_owned(),
+                "verifying_existing" => "CHECKING EXISTING FILES".to_owned(),
+                "downloading" => "STARTING DOWNLOAD".to_owned(),
+                "materializing" => "DOWNLOADING".to_owned(),
+                "committing" => "INSTALLING".to_owned(),
+                "finalizing" => "FINALIZING".to_owned(),
+                _ => snapshot.state.replace('_', " ").to_uppercase(),
+            };
+            heading.set_label(&display_state);
+            if snapshot.total_bytes > 0 {
+                let fraction =
+                    (snapshot.bytes_completed as f64 / snapshot.total_bytes as f64).min(1.0);
+                progress.set_fraction(fraction);
+                determinate.set(true);
+                let mut text = format!("{:.0}% Complete", fraction * 100.0);
+                if snapshot.state == "materializing" {
+                    if let Some(speed) = depot_rate
+                        .borrow_mut()
+                        .sample(std::time::Instant::now(), snapshot.bytes_downloaded)
+                        .filter(|speed| *speed > 0.0)
+                    {
+                        text.push_str(&format!(" · {}", format_transfer_rate(speed)));
+                    }
+                } else {
+                    depot_rate.borrow_mut().reset();
+                }
+                detail.set_label(&text);
+            } else {
+                determinate.set(false);
+                detail.set_label(match snapshot.state.as_str() {
+                    "queued" => "Waiting to start",
+                    "preparing" => "Reading game download information",
+                    "downloading" => "Preparing secure download",
+                    _ => "Preparing Galaxy installation",
+                });
+            }
+            progress.set_visible(true);
+            cancel.set_visible(true);
+            return glib::ControlFlow::Continue;
         }
         let installation_snapshot = pending_snapshot
             .borrow_mut()
@@ -1479,6 +1627,66 @@ fn parse_installation_progress(output: &str) -> Option<u8> {
     (percentage <= 100).then_some(percentage)
 }
 
+fn format_transfer_rate(bytes_per_second: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if bytes_per_second >= MIB {
+        format!("{:.1} MiB/s", bytes_per_second / MIB)
+    } else {
+        format!("{:.0} KiB/s", bytes_per_second / KIB)
+    }
+}
+
+#[derive(Default)]
+struct SmoothedTransferRate {
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    displayed: Option<(std::time::Instant, f64)>,
+}
+
+impl SmoothedTransferRate {
+    const WINDOW: Duration = Duration::from_secs(8);
+    const MINIMUM: Duration = Duration::from_secs(1);
+
+    fn sample(&mut self, now: std::time::Instant, bytes: u64) -> Option<f64> {
+        if self
+            .samples
+            .back()
+            .is_some_and(|(_, previous)| bytes < *previous)
+        {
+            self.reset();
+        }
+        self.samples.push_back((now, bytes));
+        while self.samples.len() > 2
+            && self
+                .samples
+                .front()
+                .is_some_and(|(time, _)| now.duration_since(*time) > Self::WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let (first_at, first_bytes) = *self.samples.front()?;
+        let elapsed = now.duration_since(first_at);
+        if elapsed < Self::MINIMUM {
+            return None;
+        }
+        if self
+            .displayed
+            .is_none_or(|(updated, _)| now.duration_since(updated) >= Self::MINIMUM)
+        {
+            self.displayed = Some((
+                now,
+                bytes.saturating_sub(first_bytes) as f64 / elapsed.as_secs_f64(),
+            ));
+        }
+        self.displayed.map(|(_, rate)| rate)
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+        self.displayed = None;
+    }
+}
+
 pub(super) fn append_official_metadata(
     container: &gtk::Box,
     metadata: &crate::domain::ProductMetadata,
@@ -1803,119 +2011,6 @@ pub(super) fn append_term_chips<'a>(
     container.append(&box_);
 }
 
-pub(super) fn build_galaxy_builds_page(builds: &[crate::domain::GalaxyBuild]) -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    page.set_margin_top(12);
-    let heading = gtk::Label::new(Some("GOG Galaxy builds"));
-    heading.set_xalign(0.0);
-    heading.add_css_class("section-title");
-    page.append(&heading);
-    let subtitle = gtk::Label::new(Some(
-        "Locally observed Galaxy depot builds. These are separate from offline installers.",
-    ));
-    subtitle.set_xalign(0.0);
-    subtitle.set_wrap(true);
-    subtitle.add_css_class("dim-label");
-    page.append(&subtitle);
-    let mut systems = builds
-        .iter()
-        .map(|build| build.operating_system.clone())
-        .collect::<BTreeSet<_>>();
-    if systems.len() > 1 {
-        let stack = gtk::Stack::new();
-        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-        let switcher = gtk::StackSwitcher::builder()
-            .stack(&stack)
-            .halign(gtk::Align::Start)
-            .build();
-        page.append(&switcher);
-        for system in systems {
-            let values = builds
-                .iter()
-                .filter(|build| build.operating_system == system)
-                .cloned()
-                .collect::<Vec<_>>();
-            stack.add_titled(
-                &galaxy_build_rows(values),
-                Some(&system),
-                &system_label(&system),
-            );
-        }
-        page.append(&stack);
-    } else {
-        let system = systems.pop_first().unwrap_or_default();
-        let values = builds
-            .iter()
-            .filter(|build| build.operating_system == system)
-            .cloned()
-            .collect::<Vec<_>>();
-        page.append(&galaxy_build_rows(values));
-    }
-    page
-}
-
-pub(super) fn galaxy_build_rows(mut values: Vec<crate::domain::GalaxyBuild>) -> gtk::Box {
-    let rows = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    values.sort_by_key(|build| std::cmp::Reverse(build.published_at));
-    for build in values {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-        row.add_css_class("file-row");
-        let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        text.set_hexpand(true);
-        let version = gtk::Label::new(Some(build.version.as_deref().unwrap_or("Unknown version")));
-        version.set_xalign(0.0);
-        version.add_css_class("heading");
-        text.append(&version);
-        let date = build
-            .published_at
-            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
-            .map(|date| date.format("%Y-%m-%d %H:%M UTC").to_string())
-            .unwrap_or_else(|| "Unknown publication date".into());
-        let details = gtk::Label::new(Some(&format!(
-            "{} · {} · Generation {} · {}\nBuild ID: {}{}{}",
-            build.operating_system,
-            build.branch.as_deref().unwrap_or("Master"),
-            build.generation,
-            date,
-            build.build_id,
-            build
-                .repository_id
-                .as_ref()
-                .map(|id| format!(" · Repository {id}"))
-                .unwrap_or_default(),
-            if build.currently_returned {
-                " · Returned by current GOG listing"
-            } else {
-                " · Previously observed"
-            }
-        )));
-        details.set_xalign(0.0);
-        details.set_wrap(true);
-        details.add_css_class("dim-label");
-        text.append(&details);
-        row.append(&text);
-        let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
-        copy.set_tooltip_text(Some("Copy build ID"));
-        let id = build.build_id.clone();
-        copy.connect_clicked(move |_| {
-            if let Some(display) = gdk::Display::default() {
-                display.clipboard().set_text(&id);
-            }
-        });
-        row.append(&copy);
-        rows.append(&row);
-    }
-    rows
-}
-
-pub(super) fn system_label(system: &str) -> String {
-    match system {
-        "windows" => "Windows".into(),
-        "osx" | "macos" | "mac" => "macOS".into(),
-        value => value.into(),
-    }
-}
-
 pub(super) fn folder_button(
     label: &str,
     path: &std::path::Path,
@@ -2177,13 +2272,42 @@ pub(super) fn show_dlc_page(w: &Widgets, model: &Rc<RefCell<AppModel>>, parent_i
 
 #[cfg(test)]
 mod installation_progress_tests {
-    use super::parse_installation_progress;
+    use super::{SmoothedTransferRate, format_transfer_rate, parse_installation_progress};
 
     #[test]
     fn uses_latest_total_progress_and_ignores_file_progress() {
         let output = "file.bin: 90% (total progress: 41%)\r\nnext.bin: 5% (total progress: 42%)";
         assert_eq!(parse_installation_progress(output), Some(42));
         assert_eq!(parse_installation_progress("Uncompressing 77%"), None);
+    }
+
+    #[test]
+    fn formats_download_rates_for_the_install_status() {
+        assert_eq!(format_transfer_rate(512.0 * 1024.0), "512 KiB/s");
+        assert_eq!(format_transfer_rate(12.5 * 1024.0 * 1024.0), "12.5 MiB/s");
+    }
+
+    #[test]
+    fn transfer_rate_uses_an_eight_second_rolling_window() {
+        let start = std::time::Instant::now();
+        let mut rate = SmoothedTransferRate::default();
+        for second in 0..=8 {
+            rate.sample(
+                start + std::time::Duration::from_secs(second),
+                second * 10 * 1024 * 1024,
+            );
+        }
+        let displayed = rate
+            .sample(start + std::time::Duration::from_secs(9), 80 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(displayed as u64, 9_175_040);
+        assert_eq!(
+            rate.sample(
+                start + std::time::Duration::from_millis(9_100),
+                90 * 1024 * 1024,
+            ),
+            Some(displayed)
+        );
     }
 }
 

@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool, mpsc},
 };
 
+pub mod depot;
 mod files;
 mod layout;
 mod manager;

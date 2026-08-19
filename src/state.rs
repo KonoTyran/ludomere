@@ -96,7 +96,7 @@ pub struct DownloadJobUpdate<'a> {
     pub error: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallationOperationRecord {
     pub product_id: i64,
     pub operation: String,
@@ -142,6 +142,50 @@ pub struct CatalogArtifact {
     pub last_seen_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepotRepositoryRecord {
+    pub product_id: i64,
+    pub operating_system: String,
+    pub build_id: String,
+    pub branch: Option<String>,
+    pub manifest_identity: String,
+    pub repository_json: String,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepotManifestRecord {
+    pub manifest_identity: String,
+    pub product_id: i64,
+    pub build_id: String,
+    pub depot_id: String,
+    pub manifest_json: String,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DepotOperationRecord {
+    pub operation_id: String,
+    pub product_id: i64,
+    pub build_id: String,
+    pub branch: Option<String>,
+    pub kind: String,
+    pub state: String,
+    pub destination: PathBuf,
+    pub staging_path: PathBuf,
+    pub plan_json: String,
+    pub bytes_completed: u64,
+    pub total_bytes: Option<u64>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+pub type GalaxyBranchCredential = (u8, Vec<u8>, Vec<u8>);
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -162,7 +206,7 @@ pub struct CloudSaveRecord {
 
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 2;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 5;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -200,19 +244,28 @@ impl StateStore {
         if version == CURRENT_SCHEMA_VERSION && !target_table_exists {
             bail!("database schema version 25 has an unidentified development revision");
         }
-        if version == CURRENT_SCHEMA_VERSION
-            && let Some(revision) = development_revision(&connection)?
+        let initial_development_revision = if version == CURRENT_SCHEMA_VERSION {
+            development_revision(&connection)?
+        } else {
+            None
+        };
+        if version == CURRENT_SCHEMA_VERSION && initial_development_revision.is_none() {
+            bail!(
+                "database schema version 25 has no supported development revision; restore a backup or reset the application database"
+            );
+        }
+        if let Some(revision) = initial_development_revision
             && !(1..=CURRENT_DEVELOPMENT_REVISION).contains(&revision)
         {
             bail!("database schema version 25 has unsupported development revision {revision}");
         }
 
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch("BEGIN IMMEDIATE")?;
 
         let initialized = (|| -> Result<()> {
             connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS user_game_state (product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0);
+            "CREATE TABLE IF NOT EXISTS user_game_state (product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS custom_tags (product_id INTEGER NOT NULL, tag TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (product_id, tag));
              CREATE TABLE IF NOT EXISTS account_cache (cache_key INTEGER PRIMARY KEY CHECK(cache_key = 1), profile_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS owned_products (product_id INTEGER PRIMARY KEY, synchronized_at INTEGER NOT NULL);
@@ -329,12 +382,43 @@ impl StateStore {
              CREATE TABLE IF NOT EXISTS cloud_save_conflicts (
                 product_id INTEGER PRIMARY KEY, conflicts_json TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS galaxy_branch_credentials (
+                user_id TEXT NOT NULL, product_id INTEGER NOT NULL, branch TEXT NOT NULL,
+                format_version INTEGER NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY(user_id, product_id, branch)
+             );
+             CREATE TABLE IF NOT EXISTS galaxy_depot_repositories (
+                product_id INTEGER NOT NULL, operating_system TEXT NOT NULL, build_id TEXT NOT NULL,
+                branch TEXT, manifest_identity TEXT NOT NULL, repository_json TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                PRIMARY KEY(product_id, operating_system, build_id)
+             );
+             CREATE TABLE IF NOT EXISTS galaxy_depot_manifests (
+                manifest_identity TEXT NOT NULL, product_id INTEGER NOT NULL, build_id TEXT NOT NULL,
+                depot_id TEXT NOT NULL, manifest_json TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                PRIMARY KEY(manifest_identity, product_id, build_id, depot_id)
+             );
+             CREATE TABLE IF NOT EXISTS galaxy_depot_operations (
+                operation_id TEXT PRIMARY KEY, product_id INTEGER NOT NULL, build_id TEXT NOT NULL,
+                branch TEXT, kind TEXT NOT NULL, state TEXT NOT NULL, destination TEXT NOT NULL,
+                staging_path TEXT NOT NULL, plan_json TEXT NOT NULL,
+                bytes_completed INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER, error TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, completed_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS galaxy_depot_operations_state
+                ON galaxy_depot_operations(state, updated_at);
              CREATE TABLE IF NOT EXISTS schema_state (
                 state_key INTEGER PRIMARY KEY CHECK(state_key = 1),
                 development_revision INTEGER NOT NULL
              );"
             )?;
             ensure_cloud_save_target_columns(&connection)?;
+            if initial_development_revision == Some(4) {
+                connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
+            }
             connection.execute(
                 "INSERT INTO schema_state(state_key, development_revision) VALUES (1, ?1)
                  ON CONFLICT(state_key) DO UPDATE SET development_revision = excluded.development_revision",
@@ -351,6 +435,286 @@ impl StateStore {
             }
         }
         Ok(Self { connection })
+    }
+
+    pub fn save_depot_repository(&self, record: &DepotRepositoryRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO galaxy_depot_repositories(
+                product_id, operating_system, build_id, branch, manifest_identity,
+                repository_json, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(product_id, operating_system, build_id) DO UPDATE SET
+                branch=excluded.branch, manifest_identity=excluded.manifest_identity,
+                repository_json=excluded.repository_json, last_seen_at=excluded.last_seen_at",
+            params![
+                record.product_id,
+                record.operating_system,
+                record.build_id,
+                record.branch,
+                record.manifest_identity,
+                record.repository_json,
+                record.first_seen_at,
+                record.last_seen_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn depot_repository(
+        &self,
+        product_id: i64,
+        operating_system: &str,
+        build_id: &str,
+    ) -> Result<Option<DepotRepositoryRecord>> {
+        self.connection
+            .query_row(
+                "SELECT product_id, operating_system, build_id, branch, manifest_identity,
+                    repository_json, first_seen_at, last_seen_at
+             FROM galaxy_depot_repositories
+             WHERE product_id=?1 AND operating_system=?2 AND build_id=?3",
+                params![product_id, operating_system, build_id],
+                |row| {
+                    Ok(DepotRepositoryRecord {
+                        product_id: row.get(0)?,
+                        operating_system: row.get(1)?,
+                        build_id: row.get(2)?,
+                        branch: row.get(3)?,
+                        manifest_identity: row.get(4)?,
+                        repository_json: row.get(5)?,
+                        first_seen_at: row.get(6)?,
+                        last_seen_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_depot_manifest(&self, record: &DepotManifestRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO galaxy_depot_manifests(
+                manifest_identity, product_id, build_id, depot_id, manifest_json,
+                first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(manifest_identity, product_id, build_id, depot_id) DO UPDATE SET
+                manifest_json=excluded.manifest_json, last_seen_at=excluded.last_seen_at",
+            params![
+                record.manifest_identity,
+                record.product_id,
+                record.build_id,
+                record.depot_id,
+                record.manifest_json,
+                record.first_seen_at,
+                record.last_seen_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn depot_manifest(
+        &self,
+        manifest_identity: &str,
+        product_id: i64,
+        build_id: &str,
+        depot_id: &str,
+    ) -> Result<Option<DepotManifestRecord>> {
+        self.connection
+            .query_row(
+                "SELECT manifest_identity, product_id, build_id, depot_id, manifest_json,
+                    first_seen_at, last_seen_at FROM galaxy_depot_manifests
+             WHERE manifest_identity=?1 AND product_id=?2 AND build_id=?3 AND depot_id=?4",
+                params![manifest_identity, product_id, build_id, depot_id],
+                |row| {
+                    Ok(DepotManifestRecord {
+                        manifest_identity: row.get(0)?,
+                        product_id: row.get(1)?,
+                        build_id: row.get(2)?,
+                        depot_id: row.get(3)?,
+                        manifest_json: row.get(4)?,
+                        first_seen_at: row.get(5)?,
+                        last_seen_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn depot_manifest_for_depot(
+        &self,
+        product_id: i64,
+        build_id: &str,
+        depot_id: &str,
+    ) -> Result<Option<DepotManifestRecord>> {
+        self.connection
+            .query_row(
+                "SELECT manifest_identity, product_id, build_id, depot_id, manifest_json,
+                    first_seen_at, last_seen_at FROM galaxy_depot_manifests
+                 WHERE product_id=?1 AND build_id=?2 AND depot_id=?3
+                 ORDER BY last_seen_at DESC LIMIT 1",
+                params![product_id, build_id, depot_id],
+                |row| {
+                    Ok(DepotManifestRecord {
+                        manifest_identity: row.get(0)?,
+                        product_id: row.get(1)?,
+                        build_id: row.get(2)?,
+                        depot_id: row.get(3)?,
+                        manifest_json: row.get(4)?,
+                        first_seen_at: row.get(5)?,
+                        last_seen_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_depot_operation(&self, record: &DepotOperationRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO galaxy_depot_operations(
+                operation_id, product_id, build_id, branch, kind, state, destination,
+                staging_path, plan_json, bytes_completed, total_bytes, error,
+                created_at, updated_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(operation_id) DO UPDATE SET
+                product_id=excluded.product_id, build_id=excluded.build_id, branch=excluded.branch,
+                kind=excluded.kind, state=excluded.state, destination=excluded.destination,
+                staging_path=excluded.staging_path, plan_json=excluded.plan_json,
+                bytes_completed=excluded.bytes_completed, total_bytes=excluded.total_bytes,
+                error=excluded.error, updated_at=excluded.updated_at,
+                completed_at=excluded.completed_at",
+            params![
+                record.operation_id,
+                record.product_id,
+                record.build_id,
+                record.branch,
+                record.kind,
+                record.state,
+                record.destination.to_string_lossy(),
+                record.staging_path.to_string_lossy(),
+                record.plan_json,
+                i64::try_from(record.bytes_completed)?,
+                record.total_bytes.map(i64::try_from).transpose()?,
+                record.error,
+                record.created_at,
+                record.updated_at,
+                record.completed_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn depot_operation(&self, operation_id: &str) -> Result<Option<DepotOperationRecord>> {
+        self.connection
+            .query_row(
+                "SELECT operation_id, product_id, build_id, branch, kind, state, destination,
+                    staging_path, plan_json, bytes_completed, total_bytes, error,
+                    created_at, updated_at, completed_at
+             FROM galaxy_depot_operations WHERE operation_id=?1",
+                [operation_id],
+                depot_operation_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn depot_operations(&self) -> Result<Vec<DepotOperationRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id, product_id, build_id, branch, kind, state, destination,
+                    staging_path, plan_json, bytes_completed, total_bytes, error,
+                    created_at, updated_at, completed_at
+             FROM galaxy_depot_operations
+             WHERE state IN ('queued', 'downloading', 'materializing', 'committing', 'paused', 'interrupted', 'failed')
+             ORDER BY created_at, operation_id",
+        )?;
+        statement
+            .query_map([], depot_operation_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_depot_operation(&self, operation_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM galaxy_depot_operations WHERE operation_id=?1",
+            [operation_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_depot_operations(&self) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM galaxy_depot_operations", [])?;
+        Ok(())
+    }
+
+    pub fn galaxy_branch_credential(
+        &self,
+        user_id: &str,
+        product_id: i64,
+        branch: &str,
+    ) -> Result<Option<GalaxyBranchCredential>> {
+        self.connection
+            .query_row(
+                "SELECT format_version, nonce, ciphertext FROM galaxy_branch_credentials
+                 WHERE user_id = ?1 AND product_id = ?2 AND branch = ?3",
+                params![user_id, product_id, branch],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_galaxy_branch_credential(
+        &self,
+        user_id: &str,
+        product_id: i64,
+        branch: &str,
+        format_version: u8,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO galaxy_branch_credentials(
+                user_id, product_id, branch, format_version, nonce, ciphertext
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id, product_id, branch) DO UPDATE SET
+                format_version = excluded.format_version,
+                nonce = excluded.nonce,
+                ciphertext = excluded.ciphertext,
+                updated_at = unixepoch()",
+            params![
+                user_id,
+                product_id,
+                branch,
+                format_version,
+                nonce,
+                ciphertext
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_galaxy_branch_credential(
+        &self,
+        user_id: &str,
+        product_id: i64,
+        branch: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM galaxy_branch_credentials
+             WHERE user_id = ?1 AND product_id = ?2 AND branch = ?3",
+            params![user_id, product_id, branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_all_galaxy_branch_credentials(&self, user_id: &str) -> Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM galaxy_branch_credentials WHERE user_id = ?1",
+                [user_id],
+            )
+            .map_err(Into::into)
     }
 
     pub fn cloud_save_record(&self, product_id: i64) -> Result<CloudSaveRecord> {
@@ -699,7 +1063,38 @@ impl StateStore {
             .map_err(Into::into)
     }
 
+    pub fn delete_installation_operation(&self, product_id: i64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM installation_operations WHERE product_id=?1",
+            [product_id],
+        )?;
+        Ok(())
+    }
+
     pub fn installation_update_available(&self, game: &InstalledGame) -> Result<bool> {
+        if let Some(marker) =
+            crate::installation::load_installation_marker(&game.installation_directory)?
+                .filter(|marker| marker.source == crate::domain::InstallationSource::GalaxyDepot)
+        {
+            let installed = marker
+                .galaxy_depot
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Galaxy depot marker has no provenance"))?;
+            let newest = self
+                .load_galaxy_builds(game.product_id)?
+                .into_iter()
+                .filter(|build| build.generation == 2 && build.currently_returned)
+                .filter(|build| {
+                    marker
+                        .base
+                        .operating_system
+                        .as_deref()
+                        .is_none_or(|os| build.operating_system.eq_ignore_ascii_case(os))
+                        && build.branch == installed.branch
+                })
+                .max_by_key(|build| build.published_at);
+            return Ok(newest.is_some_and(|build| build.build_id != installed.build_id));
+        }
         if let Some(revision_id) = game.installer_revision_id {
             return self
                 .connection
@@ -2286,6 +2681,37 @@ impl StateStore {
     }
 }
 
+fn depot_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DepotOperationRecord> {
+    let bytes: i64 = row.get(9)?;
+    let total: Option<i64> = row.get(10)?;
+    let convert = |index, value| {
+        u64::try_from(value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })
+    };
+    Ok(DepotOperationRecord {
+        operation_id: row.get(0)?,
+        product_id: row.get(1)?,
+        build_id: row.get(2)?,
+        branch: row.get(3)?,
+        kind: row.get(4)?,
+        state: row.get(5)?,
+        destination: PathBuf::from(row.get::<_, String>(6)?),
+        staging_path: PathBuf::from(row.get::<_, String>(7)?),
+        plan_json: row.get(8)?,
+        bytes_completed: convert(9, bytes)?,
+        total_bytes: total.map(|value| convert(10, value)).transpose()?,
+        error: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        completed_at: row.get(14)?,
+    })
+}
+
 fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
     connection
         .query_row(
@@ -2580,6 +3006,16 @@ mod tests {
     use crate::domain::InstallationState;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn temp_database_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ludomere-state-{label}-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn current_schema_reopens() {
         let path = std::env::temp_dir().join(format!(
@@ -2596,6 +3032,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         drop(store);
         fs::remove_file(path).unwrap();
     }
@@ -2633,12 +3071,416 @@ mod tests {
             Some(CURRENT_DEVELOPMENT_REVISION)
         );
         assert!(column_exists(&store.connection, "cloud_save_settings", "availability").unwrap());
+        assert!(table_exists(&store.connection, "galaxy_branch_credentials").unwrap());
+        for table in [
+            "galaxy_depot_repositories",
+            "galaxy_depot_manifests",
+            "galaxy_depot_operations",
+        ] {
+            assert!(table_exists(&store.connection, table).unwrap());
+        }
+        assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         drop(store);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn early_target_schema_advances_through_development_revision() {
+    fn encrypted_branch_credential_storage_round_trips() {
+        let path = std::env::temp_dir().join(format!(
+            "ludomere-state-branch-credential-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .save_galaxy_branch_credential("user", 42, "beta", 1, &[1; 12], b"ciphertext")
+            .unwrap();
+        assert_eq!(
+            store.galaxy_branch_credential("user", 42, "beta").unwrap(),
+            Some((1, vec![1; 12], b"ciphertext".to_vec()))
+        );
+        store
+            .delete_galaxy_branch_credential("user", 42, "beta")
+            .unwrap();
+        assert_eq!(
+            store.galaxy_branch_credential("user", 42, "beta").unwrap(),
+            None
+        );
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn branch_credential_forget_all_is_user_scoped_and_stores_no_plaintext() {
+        let path = temp_database_path("branch-forget-all");
+        let store = StateStore::open_at(&path).unwrap();
+        for (user, product, branch) in [
+            ("first", 1, "beta"),
+            ("first", 2, "preview"),
+            ("second", 1, "beta"),
+        ] {
+            store
+                .save_galaxy_branch_credential(user, product, branch, 1, &[2; 12], b"opaque")
+                .unwrap();
+        }
+        assert_eq!(
+            store.delete_all_galaxy_branch_credentials("first").unwrap(),
+            2
+        );
+        assert!(
+            store
+                .galaxy_branch_credential("first", 1, "beta")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .galaxy_branch_credential("first", 2, "preview")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .galaxy_branch_credential("second", 1, "beta")
+                .unwrap()
+                .is_some()
+        );
+        let stored: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT ciphertext FROM galaxy_branch_credentials WHERE user_id='second'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, b"opaque");
+        assert!(!String::from_utf8_lossy(&stored).contains("password-sentinel"));
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn depot_repository_and_manifest_storage_round_trip_and_upsert() {
+        let path = temp_database_path("depot-metadata");
+        let store = StateStore::open_at(&path).unwrap();
+        let mut repository = DepotRepositoryRecord {
+            product_id: 42,
+            operating_system: "windows".into(),
+            build_id: "build-1".into(),
+            branch: Some("beta".into()),
+            manifest_identity: "repo-hash".into(),
+            repository_json: r#"{"version":1}"#.into(),
+            first_seen_at: 10,
+            last_seen_at: 10,
+        };
+        store.save_depot_repository(&repository).unwrap();
+        repository.repository_json = r#"{"version":2}"#.into();
+        repository.last_seen_at = 20;
+        store.save_depot_repository(&repository).unwrap();
+        assert_eq!(
+            store.depot_repository(42, "windows", "build-1").unwrap(),
+            Some(repository)
+        );
+
+        let mut manifest = DepotManifestRecord {
+            manifest_identity: "manifest-hash".into(),
+            product_id: 42,
+            build_id: "build-1".into(),
+            depot_id: "depot-1".into(),
+            manifest_json: r#"{"items":[]}"#.into(),
+            first_seen_at: 11,
+            last_seen_at: 11,
+        };
+        store.save_depot_manifest(&manifest).unwrap();
+        manifest.last_seen_at = 21;
+        store.save_depot_manifest(&manifest).unwrap();
+        assert_eq!(
+            store
+                .depot_manifest("manifest-hash", 42, "build-1", "depot-1")
+                .unwrap(),
+            Some(manifest)
+        );
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn depot_operation_storage_round_trips_and_deletes() {
+        let path = temp_database_path("depot-operation");
+        let store = StateStore::open_at(&path).unwrap();
+        let mut operation = DepotOperationRecord {
+            operation_id: "operation-1".into(),
+            product_id: 42,
+            build_id: "build-1".into(),
+            branch: Some("beta".into()),
+            kind: "install".into(),
+            state: "downloading".into(),
+            destination: PathBuf::from("/games/example"),
+            staging_path: PathBuf::from("/games/.staging/example"),
+            plan_json: r#"{"depots":["depot-1"]}"#.into(),
+            bytes_completed: 5,
+            total_bytes: Some(10),
+            error: None,
+            created_at: 1,
+            updated_at: 2,
+            completed_at: None,
+        };
+        store.save_depot_operation(&operation).unwrap();
+        operation.state = "paused".into();
+        operation.bytes_completed = 7;
+        operation.updated_at = 3;
+        store.save_depot_operation(&operation).unwrap();
+        assert_eq!(
+            store.depot_operation("operation-1").unwrap(),
+            Some(operation)
+        );
+        store.delete_depot_operation("operation-1").unwrap();
+        assert_eq!(store.depot_operation("operation-1").unwrap(), None);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn depot_operation_recovery_listing_filters_orders_and_reopens() {
+        let path = temp_database_path("depot-recovery-list");
+        let store = StateStore::open_at(&path).unwrap();
+        let template = DepotOperationRecord {
+            operation_id: String::new(),
+            product_id: 42,
+            build_id: "build-1".into(),
+            branch: Some("beta".into()),
+            kind: "install".into(),
+            state: String::new(),
+            destination: PathBuf::from("/games/example"),
+            staging_path: PathBuf::from("/games/.staging/example"),
+            plan_json: r#"{"depots":["depot-1"]}"#.into(),
+            bytes_completed: 5,
+            total_bytes: Some(10),
+            error: None,
+            created_at: 2,
+            updated_at: 3,
+            completed_at: None,
+        };
+        for (operation_id, state, created_at) in [
+            ("second", "paused", 2),
+            ("terminal-complete", "complete", 0),
+            ("first-b", "materializing", 1),
+            ("terminal-failed", "failed", 0),
+            ("first-a", "queued", 1),
+            ("terminal-cancelled", "cancelled", 0),
+        ] {
+            store
+                .save_depot_operation(&DepotOperationRecord {
+                    operation_id: operation_id.into(),
+                    state: state.into(),
+                    created_at,
+                    ..template.clone()
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        let operations = store.depot_operations().unwrap();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|record| record.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["terminal-failed", "first-a", "first-b", "second"]
+        );
+        assert_eq!(operations[0].plan_json, template.plan_json);
+        assert_eq!(operations[0].staging_path, template.staging_path);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn depot_operation_recovery_rejects_negative_progress() {
+        let path = temp_database_path("depot-recovery-negative-progress");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO galaxy_depot_operations(
+                    operation_id, product_id, build_id, kind, state, destination, staging_path,
+                    plan_json, bytes_completed, created_at, updated_at)
+                 VALUES ('invalid', 42, 'build-1', 'install', 'queued', '/game', '/stage', '{}', -1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(store.depot_operations().is_err());
+        assert!(store.depot_operation("invalid").is_err());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn development_revision_three_advances_and_preserves_credentials() {
+        let path = temp_database_path("depot-development-migration");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .save_galaxy_branch_credential("user", 42, "beta", 1, &[1; 12], b"ciphertext")
+            .unwrap();
+        store
+            .connection
+            .execute("INSERT INTO user_game_state VALUES (42, 1)", [])
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE galaxy_depot_operations;
+                 DROP TABLE galaxy_depot_manifests;
+                 DROP TABLE galaxy_depot_repositories;
+                 UPDATE schema_state SET development_revision = 3;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(store.favorites().unwrap(), HashSet::from([42]));
+        assert_eq!(
+            store.galaxy_branch_credential("user", 42, "beta").unwrap(),
+            Some((1, vec![1; 12], b"ciphertext".to_vec()))
+        );
+        for table in [
+            "galaxy_depot_repositories",
+            "galaxy_depot_manifests",
+            "galaxy_depot_operations",
+        ] {
+            assert!(table_exists(&store.connection, table).unwrap());
+        }
+        assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retained_development_revisions_one_through_three_advance() {
+        for revision in 1..=3 {
+            let path = temp_database_path(&format!("depot-revision-{revision}"));
+            let store = StateStore::open_at(&path).unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE schema_state SET development_revision=?1",
+                    [revision],
+                )
+                .unwrap();
+            drop(store);
+            let store = StateStore::open_at(&path).unwrap();
+            assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+            assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
+            drop(store);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn development_revision_four_drops_chunks_and_preserves_durable_state() {
+        let path = temp_database_path("depot-revision-four");
+        let store = StateStore::open_at(&path).unwrap();
+        let operation = DepotOperationRecord {
+            operation_id: "operation-1".into(),
+            product_id: 42,
+            build_id: "build-1".into(),
+            branch: Some("beta".into()),
+            kind: "install".into(),
+            state: "paused".into(),
+            destination: PathBuf::from("/games/example"),
+            staging_path: PathBuf::from("/games/.staging/example"),
+            plan_json: r#"{"depots":["depot-1"]}"#.into(),
+            bytes_completed: 5,
+            total_bytes: Some(10),
+            error: None,
+            created_at: 1,
+            updated_at: 2,
+            completed_at: None,
+        };
+        store.save_depot_operation(&operation).unwrap();
+        store
+            .save_galaxy_branch_credential("user", 42, "beta", 1, &[1; 12], b"ciphertext")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO user_game_state VALUES (42, 1);
+                 INSERT INTO product_activity(product_id, playtime_seconds, updated_at)
+                    VALUES (42, 60, 1);
+                 INSERT INTO download_jobs(
+                    job_id, product_id, title, artifacts_json, destination, state)
+                    VALUES ('job-1', 42, 'Example', '[]', '/downloads', 'paused');
+                 CREATE TABLE galaxy_depot_chunks (
+                    operation_id TEXT NOT NULL REFERENCES galaxy_depot_operations(operation_id) ON DELETE CASCADE,
+                    compressed_md5 TEXT NOT NULL, manifest_identity TEXT NOT NULL,
+                    compressed_size INTEGER NOT NULL, uncompressed_size INTEGER NOT NULL,
+                    uncompressed_md5 TEXT NOT NULL, state TEXT NOT NULL, staging_path TEXT,
+                    verified_bytes INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(operation_id, compressed_md5)
+                 );
+                 INSERT INTO galaxy_depot_chunks VALUES (
+                    'operation-1', 'compressed', 'manifest', 10, 20, 'uncompressed',
+                    'verified', '/stage/chunk', 10, 2);
+                 UPDATE schema_state SET development_revision = 4;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
+        assert_eq!(
+            store.depot_operation("operation-1").unwrap(),
+            Some(operation)
+        );
+        assert_eq!(store.favorites().unwrap(), HashSet::from([42]));
+        assert_eq!(store.product_activity(42).unwrap().1, 60);
+        assert_eq!(store.download_jobs().unwrap().len(), 1);
+        assert_eq!(
+            store.galaxy_branch_credential("user", 42, "beta").unwrap(),
+            Some((1, vec![1; 12], b"ciphertext".to_vec()))
+        );
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn depot_persistence_schema_contains_no_remote_secrets() {
+        let path = temp_database_path("depot-secret-columns");
+        let store = StateStore::open_at(&path).unwrap();
+        for table in [
+            "galaxy_depot_repositories",
+            "galaxy_depot_manifests",
+            "galaxy_depot_operations",
+        ] {
+            let sql: String = store
+                .connection
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let sql = sql.to_ascii_lowercase();
+            for forbidden in [
+                "signed_url",
+                "oauth",
+                "access_token",
+                "password",
+                "secure_link",
+            ] {
+                assert!(!sql.contains(forbidden), "{table} contains {forbidden}");
+            }
+        }
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unidentified_target_schema_is_rejected_without_changes() {
         let path = std::env::temp_dir().join(format!(
             "ludomere-state-development-migration-{}.sqlite3",
             SystemTime::now()
@@ -2665,15 +3507,21 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let store = StateStore::open_at(&path).unwrap();
-        let record = store.cloud_save_record(42).unwrap();
-        assert_eq!(record.preference, CloudSavePreference::Enabled);
-        assert_eq!(record.availability, CloudSaveAvailability::Unknown);
+        let error = StateStore::open_at(&path).err().unwrap().to_string();
+        assert!(error.contains("no supported development revision"));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(development_revision(&connection).unwrap(), None);
         assert_eq!(
-            development_revision(&store.connection).unwrap(),
-            Some(CURRENT_DEVELOPMENT_REVISION)
+            connection
+                .query_row(
+                    "SELECT preference FROM cloud_save_settings WHERE product_id=42",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "enabled"
         );
-        drop(store);
+        drop(connection);
         fs::remove_file(path).unwrap();
     }
 

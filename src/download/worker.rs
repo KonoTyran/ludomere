@@ -39,15 +39,23 @@ pub(super) fn start_worker(
     }
     let worker_cancelled = cancelled.clone();
     std::thread::spawn(move || {
-        if let Err(error) = run(
-            &artifacts,
-            &title,
-            &access_token,
-            &destination,
-            &worker_cancelled,
-            &sender,
-            part_concurrency,
-        ) {
+        let permit = crate::operation_gate::acquire(|| worker_cancelled.load(Ordering::Relaxed));
+        let result = match permit {
+            Some(_permit) => Some(run(
+                &artifacts,
+                &title,
+                &access_token,
+                &destination,
+                &worker_cancelled,
+                &sender,
+                part_concurrency,
+            )),
+            None => {
+                let _ = sender.send(DownloadEvent::Cancelled);
+                None
+            }
+        };
+        if let Some(Err(error)) = result {
             let failure = classify_download_error(&error);
             let message = failure.message.clone();
             let downloaded = downloaded_on_disk(&destination);

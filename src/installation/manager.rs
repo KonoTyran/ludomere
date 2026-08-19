@@ -966,6 +966,8 @@ fn run_depot_operation_inner(
         .map(local_chunk_candidates)
         .unwrap_or_default();
     let operation_id = request.operation_id.clone();
+    let installed_marker = super::marker::load(&request.destination)?;
+    let commit_marker = dependency_commit_marker(&request.target_marker, installed_marker.as_ref());
     let plan = super::depot::DepotInstallPlan {
         operation: match request.kind {
             DepotOperationKind::Install => super::depot::DepotOperationKind::Install,
@@ -976,7 +978,7 @@ fn run_depot_operation_inner(
         target: request.destination.clone(),
         target_manifest: &target,
         current_manifest: current.as_ref(),
-        target_marker: request.target_marker.clone(),
+        target_marker: commit_marker,
     };
     let forced_remove_paths = forced_dlc_removals(request)?;
     let mut retry_states = HashMap::<usize, SourceRetryState>::new();
@@ -1504,19 +1506,17 @@ fn finalize_depot_metadata(
         let installed_dependencies = super::marker::load(&request.destination)?
             .map(|installed| installed.dependencies)
             .unwrap_or_default();
-        if installed_dependencies != request.dependencies {
-            let verbs = dependency_verbs(&request.dependencies)?;
-            if !verbs.is_empty() {
-                let mut process = backend.run_winetricks(
-                    &prefix,
-                    &compatibility.profile,
-                    &verbs,
-                    &request.destination,
-                    &log_path,
-                )?;
-                if !process.wait()?.success() {
-                    anyhow::bail!("installing required Windows dependencies failed");
-                }
+        let verbs = changed_dependency_verbs(&installed_dependencies, &request.dependencies)?;
+        if !verbs.is_empty() {
+            let mut process = backend.run_winetricks(
+                &prefix,
+                &compatibility.profile,
+                &verbs,
+                &request.destination,
+                &log_path,
+            )?;
+            if !process.wait()?.success() {
+                anyhow::bail!("installing required Windows dependencies failed");
             }
         }
         marker.dependencies = request.dependencies.clone();
@@ -1652,6 +1652,28 @@ fn dependency_verbs(dependencies: &[String]) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(verbs.into_iter().collect())
+}
+
+fn changed_dependency_verbs(
+    installed: &[String],
+    requested: &[String],
+) -> anyhow::Result<Vec<String>> {
+    if installed == requested {
+        Ok(Vec::new())
+    } else {
+        dependency_verbs(requested)
+    }
+}
+
+fn dependency_commit_marker(
+    target: &super::marker::InstallationMarker,
+    installed: Option<&super::marker::InstallationMarker>,
+) -> super::marker::InstallationMarker {
+    let mut marker = target.clone();
+    marker.dependencies = installed
+        .map(|marker| marker.dependencies.clone())
+        .unwrap_or_default();
+    marker
 }
 
 fn removed_dlc_actions(
@@ -2990,6 +3012,22 @@ mod tests {
             ]
         );
         assert!(dependency_verbs(&["FutureRuntime".into()]).is_err());
+    }
+
+    #[test]
+    fn changed_gog_dependencies_schedule_winetricks() {
+        let mut target = marker(false);
+        target.dependencies = vec!["MSVC2015".into()];
+        let committed = dependency_commit_marker(&target, None);
+        assert_eq!(
+            changed_dependency_verbs(&committed.dependencies, &target.dependencies).unwrap(),
+            ["vcrun2015"]
+        );
+        assert!(
+            changed_dependency_verbs(&["MSVC2015".into()], &["MSVC2015".into()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

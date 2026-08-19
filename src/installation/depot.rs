@@ -107,7 +107,9 @@ impl DepotInstallPlan<'_> {
                 {
                     bail!("installed depot provenance is incomplete");
                 }
-                if provenance.manifest_fingerprint != current.identity() {
+                if provenance.manifest_fingerprint != current.identity()
+                    && provenance.manifest_fingerprint != self.target_manifest.identity()
+                {
                     bail!("current depot manifest does not match installed provenance");
                 }
             }
@@ -855,6 +857,46 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(root.join("game.dat")).unwrap(), b"old");
         assert_eq!(fs::read(root.join("mods/user.cfg")).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_commit_update_can_resume_finalization() {
+        let root = temp("post-commit-resume");
+        let old_files = [("game.dat", b"old".as_slice())];
+        let new_files = [("game.dat", b"new".as_slice())];
+        let old = manifest(&old_files);
+        let new = manifest(&new_files);
+        run(
+            DepotOperationKind::Install,
+            &root,
+            None,
+            &old,
+            &old_files,
+            "1",
+        )
+        .unwrap();
+        run(
+            DepotOperationKind::Update,
+            &root,
+            Some(&old),
+            &new,
+            &new_files,
+            "2",
+        )
+        .unwrap();
+
+        run(
+            DepotOperationKind::Update,
+            &root,
+            Some(&old),
+            &new,
+            &new_files,
+            "2",
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("game.dat")).unwrap(), b"new");
+        assert_eq!(marker::load(&root).unwrap(), Some(marker("2", &new)));
         let _ = fs::remove_dir_all(root);
     }
 

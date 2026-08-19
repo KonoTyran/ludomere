@@ -77,7 +77,7 @@ fn fetch_from(
     if let Some(password) = password {
         request = request.query(&[("password", password)]);
     }
-    let response = request.send()?;
+    let response = request.send().map_err(reqwest::Error::without_url)?;
     if matches!(response.status().as_u16(), 401 | 403) {
         return Err(
             crate::gog::depot_acquisition::AcquisitionError(if password.is_some() {
@@ -89,8 +89,10 @@ fn fetch_from(
         );
     }
     let response: BuildListResponse = response
-        .error_for_status()?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?
         .json()
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("parsing {operating_system} builds for {product_id}"))?;
     let now = chrono::Utc::now().timestamp();
     Ok(response
@@ -130,16 +132,16 @@ mod tests {
         thread,
     };
 
-    fn server(status: &str) -> (String, thread::JoinHandle<String>) {
+    fn server(status: &str, body: &str) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let status = status.to_owned();
+        let body = body.to_owned();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut bytes = [0; 4096];
             let size = stream.read(&mut bytes).unwrap();
             let request = String::from_utf8_lossy(&bytes[..size]).into_owned();
-            let body = r#"{"items":[]}"#;
             write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             request
         });
@@ -148,7 +150,7 @@ mod tests {
 
     #[test]
     fn authenticated_fetch_encodes_password_and_sends_bearer() {
-        let (base, handle) = server("200 OK");
+        let (base, handle) = server("200 OK", r#"{"items":[]}"#);
         fetch_from(
             &reqwest::blocking::Client::new(),
             Some("token"),
@@ -183,7 +185,7 @@ mod tests {
                 crate::gog::depot_acquisition::AcquisitionErrorKind::InvalidBranchPassword,
             ),
         ] {
-            let (base, handle) = server("403 Forbidden");
+            let (base, handle) = server("403 Forbidden", r#"{"items":[]}"#);
             let error = fetch_from(
                 &reqwest::blocking::Client::new(),
                 Some("token"),
@@ -207,8 +209,46 @@ mod tests {
     }
 
     #[test]
+    fn protected_branch_failures_strip_password_urls() {
+        let sentinel = "password-sentinel";
+        for (status, body) in [
+            ("500 Internal Server Error", r#"{"items":[]}"#),
+            ("200 OK", "not-json"),
+        ] {
+            let (base, handle) = server(status, body);
+            let error = fetch_from(
+                &reqwest::blocking::Client::new(),
+                Some("token"),
+                Some(sentinel),
+                2,
+                &base,
+                7,
+                "windows",
+            )
+            .unwrap_err();
+            handle.join().unwrap();
+            assert!(!format!("{error:?} {error}").contains(sentinel));
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = fetch_from(
+            &reqwest::blocking::Client::new(),
+            Some("token"),
+            Some(sentinel),
+            2,
+            &base,
+            7,
+            "windows",
+        )
+        .unwrap_err();
+        assert!(!format!("{error:?} {error}").contains(sentinel));
+    }
+
+    #[test]
     fn authenticated_generation_one_listing_is_visible() {
-        let (base, handle) = server("200 OK");
+        let (base, handle) = server("200 OK", r#"{"items":[]}"#);
         fetch_from(
             &reqwest::blocking::Client::new(),
             Some("token"),

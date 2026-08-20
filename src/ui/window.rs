@@ -72,6 +72,7 @@ pub fn build_window(app: &adw::Application) {
     let model = Rc::new(RefCell::new(AppModel {
         config,
         games: cached_games,
+        patch_notes: HashMap::new(),
         favorites,
         tags,
         favorites_only: false,

@@ -793,12 +793,6 @@ pub(super) fn build_files_page(
             ));
         }
     }
-    if !game.changelog.is_empty() {
-        let changelog_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        changelog_card.add_css_class("file-collection");
-        changelog_card.append(&lazy_html_section("Changelog", game.changelog.clone()));
-        page.append(&changelog_card);
-    }
     page
 }
 

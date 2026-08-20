@@ -423,6 +423,19 @@ pub(super) fn merge_cached_media(source: &[Game], target: &mut [Game]) {
     }
 }
 
+fn retain_patch_note_cache(
+    mut cache: HashMap<i64, Rc<Vec<PatchNote>>>,
+    previous: &[Game],
+    current: &[Game],
+) -> HashMap<i64, Rc<Vec<PatchNote>>> {
+    cache.retain(|product_id, _| {
+        let previous = previous.iter().find(|game| game.product_id == *product_id);
+        let current = current.iter().find(|game| game.product_id == *product_id);
+        matches!((previous, current), (Some(previous), Some(current)) if previous.changelog == current.changelog)
+    });
+    cache
+}
+
 pub(super) fn retain_cached_path(
     target: &mut Option<std::path::PathBuf>,
     cached: &Option<std::path::PathBuf>,
@@ -528,6 +541,9 @@ pub(super) fn start_owned_library_sync(
                 merge_remote_artifacts(&model.borrow().games, &mut games);
                 merge_cached_media(&model.borrow().games, &mut games);
                 let mut state = model.borrow_mut();
+                let cache = std::mem::take(&mut state.patch_notes);
+                let cache = retain_patch_note_cache(cache, &state.games, &games);
+                state.patch_notes = cache;
                 let needs_initial_render = state.games.is_empty();
                 let existing = state
                     .games
@@ -631,6 +647,9 @@ pub(super) fn start_owned_library_sync(
                 let games_to_persist = games.clone();
                 let _ = persistence.send(SyncPersistence::Catalog(games_to_persist));
                 let mut state = model.borrow_mut();
+                let cache = std::mem::take(&mut state.patch_notes);
+                let cache = retain_patch_note_cache(cache, &state.games, &games);
+                state.patch_notes = cache;
                 state.online_synced_at = Some(chrono::Utc::now().timestamp());
                 let existing = state
                     .games
@@ -1060,6 +1079,47 @@ pub(super) fn local_files_exist(files: &[LibraryFile]) -> bool {
 #[cfg(test)]
 mod media_cache_tests {
     use super::*;
+
+    #[test]
+    fn library_scan_keeps_only_unchanged_patch_note_caches() {
+        let unchanged = Rc::new(vec![PatchNote {
+            title: "Patch 1".into(),
+            version: Some("1".into()),
+            date: None,
+            body_markup: "Cached".into(),
+        }]);
+        let changed = Rc::new(Vec::new());
+        let cache = HashMap::from([(1, unchanged.clone()), (2, changed)]);
+        let previous = vec![
+            Game {
+                product_id: 1,
+                changelog: "same".into(),
+                ..Game::default()
+            },
+            Game {
+                product_id: 2,
+                changelog: "old".into(),
+                ..Game::default()
+            },
+        ];
+        let current = vec![
+            Game {
+                product_id: 1,
+                changelog: "same".into(),
+                ..Game::default()
+            },
+            Game {
+                product_id: 2,
+                changelog: "new".into(),
+                ..Game::default()
+            },
+        ];
+
+        let cache = retain_patch_note_cache(cache, &previous, &current);
+
+        assert!(Rc::ptr_eq(cache.get(&1).unwrap(), &unchanged));
+        assert!(!cache.contains_key(&2));
+    }
 
     #[test]
     fn catalog_refresh_preserves_local_managed_content() {

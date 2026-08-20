@@ -344,6 +344,7 @@ impl<R: Read, P: FnMut(u64)> Read for BoundedHashReader<R, P> {
         }
         let limit = usize::try_from(self.remaining.min(buffer.len() as u64)).unwrap();
         let read = self.inner.read(&mut buffer[..limit])?;
+        super::bandwidth::acquire(read as u64, || false);
         self.remaining -= read as u64;
         self.read += read as u64;
         self.md5.consume(&buffer[..read]);

@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool, mpsc},
 };
 
+mod bandwidth;
 pub mod depot;
 mod files;
 mod layout;
@@ -147,6 +148,14 @@ pub fn is_active(job_id: &str) -> bool {
 
 pub fn set_concurrency(limit: usize) {
     manager::set_concurrency(limit);
+}
+
+pub fn set_bandwidth_limit(bytes_per_second: Option<u64>) {
+    bandwidth::set_limit(bytes_per_second);
+}
+
+pub(crate) fn acquire_bandwidth(bytes: u64) {
+    bandwidth::acquire(bytes, || false);
 }
 
 pub fn recover(access_token: String) {

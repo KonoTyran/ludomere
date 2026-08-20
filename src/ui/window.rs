@@ -114,6 +114,7 @@ pub fn build_window(app: &adw::Application) {
         activity_sections: Vec::new(),
     }));
     download::set_concurrency(model.borrow().config.max_concurrent_downloads);
+    download::set_bandwidth_limit(model.borrow().config.download_bandwidth_limit_bps);
     let widgets = Rc::new(create_widgets(app, &model.borrow().config));
 
     connect_actions(&widgets, &model, &store);

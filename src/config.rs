@@ -34,6 +34,8 @@ pub struct Config {
     pub show_retired_artifacts: bool,
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
+    #[serde(default)]
+    pub download_bandwidth_limit_bps: Option<u64>,
     #[serde(default = "default_game_libraries")]
     pub game_libraries: Vec<GameLibrary>,
     #[serde(default)]
@@ -119,6 +121,7 @@ impl Default for Config {
             interactive_installer_explanation_dismissed: false,
             show_retired_artifacts: false,
             max_concurrent_downloads: default_max_concurrent_downloads(),
+            download_bandwidth_limit_bps: None,
             game_libraries,
             installer_library_id,
             library_card_size: default_library_card_size(),
@@ -157,6 +160,9 @@ impl Config {
             let mut config: Self =
                 toml::from_str(&text).context("parsing Ludomere configuration")?;
             config.max_concurrent_downloads = config.max_concurrent_downloads.clamp(1, 4);
+            config.download_bandwidth_limit_bps = config
+                .download_bandwidth_limit_bps
+                .filter(|limit| *limit > 0);
             config.library_card_size = config.library_card_size.min(3);
             config.normalize_game_libraries();
             config.normalize_installation_source_order();

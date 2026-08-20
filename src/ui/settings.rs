@@ -69,6 +69,31 @@ pub(super) fn show_settings_page(
     concurrency_row.add_suffix(&concurrency);
     downloads.add(&concurrency_row);
 
+    let bandwidth_row = adw::ActionRow::new();
+    bandwidth_row.set_title("Download speed limit");
+    bandwidth_row.set_subtitle("Shared by installer, Galaxy depot, and cloud-save downloads");
+    let bandwidth_controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bandwidth_controls.set_valign(gtk::Align::Center);
+    let bandwidth = gtk::DropDown::from_strings(&[
+        "Unlimited",
+        "512 KiB/s",
+        "1 MiB/s",
+        "2 MiB/s",
+        "5 MiB/s",
+        "10 MiB/s",
+        "Custom",
+    ]);
+    let configured_bandwidth = model.borrow().config.download_bandwidth_limit_bps;
+    bandwidth.set_selected(bandwidth_preset_index(configured_bandwidth));
+    let custom_bandwidth = gtk::SpinButton::with_range(64.0, 1_048_576.0, 64.0);
+    custom_bandwidth.set_tooltip_text(Some("Custom limit in KiB/s"));
+    custom_bandwidth.set_value(configured_bandwidth.unwrap_or(1024 * 1024).div_ceil(1024) as f64);
+    custom_bandwidth.set_visible(bandwidth.selected() == 6);
+    bandwidth_controls.append(&bandwidth);
+    bandwidth_controls.append(&custom_bandwidth);
+    bandwidth_row.add_suffix(&bandwidth_controls);
+    downloads.add(&bandwidth_row);
+
     let rebuild_row = adw::ActionRow::new();
     rebuild_row.set_title("Rebuild downloaded-file index");
     rebuild_row.set_subtitle("Inspect the managed download directory without changing any files");
@@ -501,6 +526,41 @@ pub(super) fn show_settings_page(
     }
     {
         let model = model.clone();
+        let custom_bandwidth = custom_bandwidth.clone();
+        bandwidth.connect_selected_notify(move |selector| {
+            let selected = selector.selected();
+            custom_bandwidth.set_visible(selected == 6);
+            let limit = if selected == 6 {
+                Some(custom_bandwidth.value_as_int().max(64) as u64 * 1024)
+            } else {
+                bandwidth_preset(selected)
+            };
+            let mut state = model.borrow_mut();
+            state.config.download_bandwidth_limit_bps = limit;
+            if let Err(error) = state.config.save() {
+                tracing::warn!(%error, "could not save download speed limit");
+            }
+            download::set_bandwidth_limit(limit);
+        });
+    }
+    {
+        let model = model.clone();
+        let bandwidth = bandwidth.clone();
+        custom_bandwidth.connect_value_changed(move |selector| {
+            if bandwidth.selected() != 6 {
+                return;
+            }
+            let limit = Some(selector.value_as_int().max(64) as u64 * 1024);
+            let mut state = model.borrow_mut();
+            state.config.download_bandwidth_limit_bps = limit;
+            if let Err(error) = state.config.save() {
+                tracing::warn!(%error, "could not save custom download speed limit");
+            }
+            download::set_bandwidth_limit(limit);
+        });
+    }
+    {
+        let model = model.clone();
         extras_default.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.download_extras_by_default = row.is_active();
@@ -580,6 +640,23 @@ fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
         child = current.next_sibling();
     }
     None
+}
+
+fn bandwidth_preset(index: u32) -> Option<u64> {
+    match index {
+        1 => Some(512 * 1024),
+        2 => Some(1024 * 1024),
+        3 => Some(2 * 1024 * 1024),
+        4 => Some(5 * 1024 * 1024),
+        5 => Some(10 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+fn bandwidth_preset_index(limit: Option<u64>) -> u32 {
+    (0..=5)
+        .find(|index| bandwidth_preset(*index) == limit)
+        .unwrap_or(6)
 }
 
 fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::PreferencesGroup {

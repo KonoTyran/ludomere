@@ -175,12 +175,12 @@ impl Storage for CloudClient {
         {
             bail!("cloud-save object exceeds the safety limit");
         }
-        let bytes = response.bytes()?;
+        let bytes = read_download(response, MAX_RESPONSE)?;
         if bytes.len() > MAX_RESPONSE {
             bail!("cloud-save object exceeds the safety limit");
         }
         let mut decoded = Vec::new();
-        GzDecoder::new(bytes.as_ref())
+        GzDecoder::new(bytes.as_slice())
             .take(MAX_RESPONSE as u64 + 1)
             .read_to_end(&mut decoded)?;
         if decoded.len() > MAX_RESPONSE {
@@ -219,6 +219,23 @@ impl Storage for CloudClient {
             etag,
         })
     }
+}
+
+fn read_download(mut response: reqwest::blocking::Response, maximum: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        crate::download::acquire_bandwidth(read as u64);
+        if bytes.len().saturating_add(read) > maximum {
+            bail!("cloud-save object exceeds the safety limit");
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
 }
 
 fn remote_object_from_listing(object: ListedObject) -> Result<RemoteObject> {

@@ -194,6 +194,9 @@ pub(super) fn run_transfer(
             if count == 0 {
                 break;
             }
+            if !super::bandwidth::acquire(count as u64, || cancelled.load(Ordering::Relaxed)) {
+                continue;
+            }
             output.write_all(&buffer[..count])?;
             current += count as u64;
             if last_update.elapsed() >= Duration::from_millis(100) {

@@ -7,6 +7,7 @@ use crate::{
     download,
     download_selection::{self, ArtifactGroup},
     managed, online,
+    patch_notes::PatchNote,
     state::{DownloadJobRecord, DownloadState, ProductActivity, StateStore},
     text,
 };
@@ -108,7 +109,7 @@ use std::{
 };
 use sync::*;
 pub(crate) use tray::shutdown_tray;
-use widgets::content::{empty_dash, expandable_section, lazy_html_section, section, text_excerpt};
+use widgets::content::{empty_dash, expandable_section, section, text_excerpt};
 use widgets::gallery::screenshot_strip;
 use widgets::media::{
     card_picture, install_smooth_wheel_scroll, parallax_detail_hero, picture, scaled_card_texture,
@@ -128,6 +129,7 @@ struct VerificationDisplayState {
 struct AppModel {
     config: Config,
     games: Vec<Game>,
+    patch_notes: HashMap<i64, Rc<Vec<PatchNote>>>,
     favorites: HashSet<i64>,
     tags: HashMap<i64, Vec<String>>,
     favorites_only: bool,
@@ -779,8 +781,19 @@ const CSS: &str = r#"
 .compact-account-button { min-height: 28px; padding: 0 7px; border-radius: 4px; }
 .compact-account-button box { margin: 0; }
 .body-copy { line-height: 1.35; }
-.long-text-expander { font-weight: 700; }
-.long-text-scroll { background: alpha(@card_bg_color, .65); border-radius: 8px; }
+.patch-notes-page { padding-bottom: 8px; }
+.patch-note-reader { border-radius: 8px; background: alpha(@card_bg_color, .58); border: 1px solid alpha(@borders, .55); }
+.patch-note-sidebar { background: alpha(@window_bg_color, .36); border-right: 1px solid alpha(@borders, .55); }
+.patch-note-list { background: transparent; }
+.patch-note-list row { border-bottom: 1px solid alpha(@borders, .35); }
+.patch-note-list row:hover { background: alpha(@accent_bg_color, .10); }
+.patch-note-list row:selected { background: alpha(@accent_bg_color, .24); color: @window_fg_color; }
+.patch-note-title { font-size: 1.05em; font-weight: 800; }
+.patch-note-metadata { color: alpha(@window_fg_color, .62); font-size: .84em; }
+.patch-note-detail { background: alpha(@card_bg_color, .45); }
+.patch-note-detail-header { border-bottom: 1px solid alpha(@borders, .42); }
+.patch-note-detail-title { font-size: 1.28em; font-weight: 800; }
+.patch-note-body { line-height: 1.35; }
 .detail-tabs { margin: 0; }
 .game-navigation-shell { min-height: 32px; background: #1b2530; border-bottom: 1px solid alpha(black, .65); }
 .game-navigation { min-height: 32px; background: transparent; border: 0; padding: 0 4px; }

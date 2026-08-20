@@ -13,6 +13,7 @@ pub mod installation;
 pub mod managed;
 pub mod online;
 pub(crate) mod operation_gate;
+pub(crate) mod patch_notes;
 pub mod screenshots;
 pub mod state;
 pub mod text;

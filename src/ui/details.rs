@@ -615,6 +615,7 @@ pub(super) fn render_detail_page(
     let tabs = gtk::Stack::new();
     tabs.set_widget_name("game-tabs");
     tabs.set_transition_type(gtk::StackTransitionType::Crossfade);
+    tabs.set_vhomogeneous(false);
     tabs.set_vexpand(true);
     let switcher = gtk::StackSwitcher::builder()
         .stack(&tabs)
@@ -776,6 +777,15 @@ pub(super) fn render_detail_page(
         );
     }
 
+    if game.parent_id.is_none() {
+        let notes = cached_patch_notes(model, game.product_id, &game.changelog);
+        tabs.add_titled(
+            &build_patch_notes_page(notes),
+            Some("patch-notes"),
+            "Patch Notes",
+        );
+    }
+
     let logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
     logs.set_margin_top(12);
     refresh_product_logs(&logs, game.product_id, &w.window);
@@ -847,6 +857,143 @@ pub(super) fn render_detail_page(
     w.content.set_visible_child_name("details");
     let adjustment = w.details_scroll.vadjustment();
     glib::idle_add_local_once(move || adjustment.set_value(adjustment.lower()));
+}
+
+fn cached_patch_notes(
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    changelog: &str,
+) -> Rc<Vec<PatchNote>> {
+    if let Some(notes) = model.borrow().patch_notes.get(&product_id) {
+        return notes.clone();
+    }
+    let notes = Rc::new(crate::patch_notes::parse(changelog));
+    model
+        .borrow_mut()
+        .patch_notes
+        .insert(product_id, notes.clone());
+    notes
+}
+
+fn build_patch_notes_page(notes: Rc<Vec<PatchNote>>) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.set_margin_top(12);
+    page.set_margin_bottom(24);
+    page.add_css_class("patch-notes-page");
+    if notes.is_empty() {
+        page.append(
+            &adw::StatusPage::builder()
+                .title("No Patch Notes")
+                .description("GOG has not provided patch notes for this game.")
+                .build(),
+        );
+        return page;
+    }
+
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.set_valign(gtk::Align::Start);
+    list.set_width_request(285);
+    list.add_css_class("patch-note-list");
+    list.add_css_class("patch-note-sidebar");
+    for note in notes.iter() {
+        let row = gtk::ListBoxRow::new();
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        header.set_margin_top(10);
+        header.set_margin_bottom(10);
+        header.set_margin_start(12);
+        header.set_margin_end(12);
+        let title = gtk::Label::new(Some(&note.title));
+        title.set_xalign(0.0);
+        title.set_wrap(true);
+        title.set_lines(2);
+        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title.add_css_class("patch-note-title");
+        header.append(&title);
+        let metadata = patch_note_metadata(note);
+        if !metadata.is_empty() {
+            let metadata = gtk::Label::new(Some(&metadata));
+            metadata.set_xalign(0.0);
+            metadata.add_css_class("patch-note-metadata");
+            header.append(&metadata);
+        }
+        row.set_child(Some(&header));
+        list.append(&row);
+    }
+
+    let detail_title = gtk::Label::new(None);
+    detail_title.set_xalign(0.0);
+    detail_title.set_wrap(true);
+    detail_title.add_css_class("patch-note-detail-title");
+    let detail_metadata = gtk::Label::new(None);
+    detail_metadata.set_xalign(0.0);
+    detail_metadata.add_css_class("patch-note-metadata");
+    let detail_header = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    detail_header.set_margin_top(16);
+    detail_header.set_margin_bottom(14);
+    detail_header.set_margin_start(20);
+    detail_header.set_margin_end(20);
+    detail_header.add_css_class("patch-note-detail-header");
+    detail_header.append(&detail_title);
+    detail_header.append(&detail_metadata);
+
+    let body = gtk::Label::new(None);
+    body.set_xalign(0.0);
+    body.set_yalign(0.0);
+    body.set_wrap(true);
+    body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    body.set_selectable(true);
+    body.set_margin_top(16);
+    body.set_margin_bottom(20);
+    body.set_margin_start(20);
+    body.set_margin_end(20);
+    body.add_css_class("patch-note-body");
+    let detail = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    detail.set_valign(gtk::Align::Start);
+    detail.add_css_class("patch-note-detail");
+    detail.append(&detail_header);
+    detail.append(&body);
+
+    list.connect_row_selected({
+        let notes = notes.clone();
+        let detail_title = detail_title.clone();
+        let detail_metadata = detail_metadata.clone();
+        let body = body.clone();
+        move |_, row| {
+            let Some(note) = row.and_then(|row| notes.get(row.index() as usize)) else {
+                return;
+            };
+            detail_title.set_label(&note.title);
+            let metadata = patch_note_metadata(note);
+            detail_metadata.set_label(&metadata);
+            detail_metadata.set_visible(!metadata.is_empty());
+            body.set_markup(&note.body_markup);
+        }
+    });
+
+    let reader = gtk::Paned::new(gtk::Orientation::Horizontal);
+    reader.set_position(300);
+    reader.set_resize_start_child(false);
+    reader.set_shrink_start_child(false);
+    reader.set_start_child(Some(&list));
+    reader.set_end_child(Some(&detail));
+    reader.add_css_class("patch-note-reader");
+    page.append(&reader);
+    list.select_row(list.row_at_index(0).as_ref());
+    page
+}
+
+fn patch_note_metadata(note: &PatchNote) -> String {
+    [
+        note.version
+            .as_ref()
+            .map(|version| format!("Version {version}")),
+        note.date.as_ref().map(|date| format!("Date {date}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("  •  ")
 }
 
 fn set_primary_button_content(button: &gtk::Button, icon: &str, label: &str) {

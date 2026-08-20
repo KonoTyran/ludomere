@@ -130,9 +130,11 @@ pub fn start_installation(
     let (sender, events) = mpsc::channel();
     let (responses, response_receiver) = mpsc::channel();
     thread::spawn(move || {
-        let Some(_permit) =
-            crate::operation_gate::acquire(|| worker_cancellation.load(Ordering::Acquire))
-        else {
+        let Some(_permit) = crate::operation_gate::acquire_work(
+            crate::state::WorkKind::Installation,
+            &plan.product_id.to_string(),
+            || worker_cancellation.load(Ordering::Acquire),
+        ) else {
             let _ = sender.send(InstallationEvent::Cancelled);
             return;
         };
@@ -183,13 +185,15 @@ pub fn start_uninstallation(game: InstalledGame) -> UninstallationHandle {
     let worker_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = sender.send(UninstallationEvent::Started);
-        let Some(_permit) =
-            crate::operation_gate::acquire(|| worker_cancellation.load(Ordering::Acquire))
-        else {
+        let Some(_permit) = crate::operation_gate::acquire_work(
+            crate::state::WorkKind::Installation,
+            &game.product_id.to_string(),
+            || worker_cancellation.load(Ordering::Acquire),
+        ) else {
             let _ = sender.send(UninstallationEvent::Cancelled);
             return;
         };
+        let _ = sender.send(UninstallationEvent::Started);
         match run_uninstallation(&game, &worker_cancellation) {
             Ok(()) => {
                 let _ = sender.send(UninstallationEvent::Complete);

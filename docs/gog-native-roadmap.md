@@ -15,6 +15,12 @@ Implement the selected Galaxy-equivalent features as phased, independently relea
 
 Explicitly exclude overlays, store browsing/purchasing/redeeming, rollback support, Galaxy 2.0 cross-platform aggregation, activity feeds, crossplay, and multiplayer invites.
 
+## Implementation status
+
+- Phase 0 complete: typed friends, presence, and gameplay reads; capability manifest; sanitized audit and guarded live-write command.
+- Phase 1 complete: durable mixed-work queue, drag and accessible reorder controls, and a live shared bandwidth limiter.
+- Phases 2 through 7 remain in progress.
+
 ## Phase 0: GOG Protocol Validation
 
 Create typed GOG service modules rather than exposing raw JSON outside the protocol layer:

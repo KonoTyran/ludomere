@@ -461,11 +461,6 @@ fn schedule(
     subscribers: &Arc<Mutex<Vec<mpsc::Sender<DownloadManagerEvent>>>>,
 ) {
     loop {
-        // Only one logical game/artifact group is active. The configured limit is used by that
-        // worker for multipart file concurrency.
-        if active.lock().map_or(true, |active| !active.is_empty()) {
-            return;
-        }
         let Some(position) = queued
             .iter()
             .position(|request| request.ready_at <= Instant::now())
@@ -485,7 +480,6 @@ fn schedule(
             return;
         }
         set_waiting_status(&request.id, None);
-        persist_state(&request, DownloadState::Downloading);
         let (worker_sender, worker_receiver) = mpsc::channel();
         let worker = start_worker(
             request.artifacts.clone(),

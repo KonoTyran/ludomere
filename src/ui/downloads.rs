@@ -426,8 +426,7 @@ pub(super) fn rebuild_downloads_page(w: &Widgets, model: &AppModel) {
         .is_none()
         .then(|| {
             jobs.iter().rev().find(|job| {
-                download::is_active(&job.job_id)
-                    || matches!(job.state.as_str(), "paused" | "failed")
+                job.state == "downloading" || matches!(job.state.as_str(), "paused" | "failed")
             })
         })
         .flatten();
@@ -439,35 +438,37 @@ pub(super) fn rebuild_downloads_page(w: &Widgets, model: &AppModel) {
         page.append(&completed_transfer_history_header(model));
     }
 
-    let depot_is_active = featured_depot.is_some_and(|operation| depot_active(&operation.state));
-
-    let queued = jobs
-        .iter()
-        .filter(|job| {
-            job.state == "queued" || (depot_is_active && download::is_active(&job.job_id))
-        })
-        .filter(|job| depot_is_active || !download::is_active(&job.job_id))
-        .collect::<Vec<_>>();
-    let queued_depots = model
-        .depot_operations
-        .iter()
-        .filter(|operation| operation.state == "queued")
-        .collect::<Vec<_>>();
-    page.append(&download_section_heading(
-        "Up Next",
-        queued.len() + queued_depots.len(),
-    ));
-    if queued.is_empty() && queued_depots.is_empty() {
+    let work_queue = StateStore::open()
+        .and_then(|store| store.work_queue())
+        .unwrap_or_default();
+    page.append(&download_section_heading("Up Next", work_queue.len()));
+    if work_queue.is_empty() {
         let empty = gtk::Label::new(Some("There are no downloads waiting in the queue"));
         empty.set_xalign(0.0);
         empty.add_css_class("downloads-empty");
         page.append(&empty);
     } else {
-        for job in queued {
-            page.append(&download_job_card(job, model, w, false));
-        }
-        for operation in queued_depots {
-            page.append(&depot_operation_card(operation, model, w, false));
+        for item in &work_queue {
+            match item.kind {
+                crate::state::WorkKind::Download => {
+                    if let Some(job) = jobs
+                        .iter()
+                        .find(|job| job.job_id == item.source_id && job.state == "queued")
+                    {
+                        page.append(&download_job_card(job, model, w, false));
+                    }
+                }
+                crate::state::WorkKind::Depot => {
+                    if let Some(operation) = model.depot_operations.iter().find(|operation| {
+                        operation.operation_id == item.source_id && operation.state == "queued"
+                    }) {
+                        page.append(&depot_operation_card(operation, model, w, false));
+                    }
+                }
+                crate::state::WorkKind::Installation => {
+                    page.append(&installation_queue_card(item, model));
+                }
+            }
         }
     }
 
@@ -1124,6 +1125,12 @@ fn depot_operation_card(
         copy.append(&progress);
     }
     row.append(&copy);
+    if operation.state == "queued" {
+        row.append(&queue_controls(
+            &row,
+            format!("depot:{}", operation.operation_id),
+        ));
+    }
     let operation_id = operation.operation_id.clone();
     if depot_active(&operation.state) {
         let pause = gtk::Button::from_icon_name("media-playback-pause-symbolic");
@@ -1464,6 +1471,9 @@ pub(super) fn download_job_card(
         copy.append(&progress);
     }
     row.append(&copy);
+    if job.state == "queued" {
+        row.append(&queue_controls(&row, format!("download:{}", job.job_id)));
+    }
     if featured {
         let pause = gtk::Button::from_icon_name("media-playback-pause-symbolic");
         pause.set_tooltip_text(Some("Pause download"));
@@ -1545,6 +1555,149 @@ pub(super) fn download_job_card(
         &w.window,
     ));
     row
+}
+
+fn installation_queue_card(item: &crate::state::WorkQueueItem, model: &AppModel) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    row.add_css_class("download-queue-row");
+    let game = item.product_id.and_then(|product_id| {
+        model
+            .games
+            .iter()
+            .find(|game| game.product_id == product_id)
+    });
+    row.append(&card_picture(
+        game.and_then(|game| game.artwork.as_ref()),
+        150,
+        84,
+    ));
+    let copy = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    copy.set_hexpand(true);
+    copy.set_valign(gtk::Align::Center);
+    let title = gtk::Label::new(Some(
+        game.map_or("Game operation", |game| game.title.as_str()),
+    ));
+    title.set_xalign(0.0);
+    title.add_css_class("section-title");
+    copy.append(&title);
+    let detail = gtk::Label::new(Some("Waiting to install or remove game files"));
+    detail.set_xalign(0.0);
+    detail.add_css_class("dim-label");
+    copy.append(&detail);
+    row.append(&copy);
+    row.append(&queue_controls(&row, item.work_id.clone()));
+    if let Some(product_id) = item.product_id {
+        let cancel = gtk::Button::from_icon_name("user-trash-symbolic");
+        cancel.set_tooltip_text(Some("Cancel queued operation"));
+        cancel.connect_clicked(move |button| {
+            if crate::installation::cancel_operation(product_id) {
+                button.set_sensitive(false);
+            }
+        });
+        row.append(&cancel);
+    }
+    row
+}
+
+fn queue_controls(row: &gtk::Box, work_id: String) -> gtk::Box {
+    enable_queue_drag(row, &work_id);
+    let controls = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let earlier = gtk::Button::from_icon_name("go-up-symbolic");
+    earlier.set_tooltip_text(Some("Move earlier"));
+    earlier.update_property(&[gtk::accessible::Property::Label("Move earlier")]);
+    let earlier_row = row.clone();
+    let earlier_id = work_id.clone();
+    earlier.connect_clicked(move |_| {
+        if crate::work_queue::QueueCoordinator::move_earlier(&earlier_id).unwrap_or(false) {
+            move_queue_row(&earlier_row, false);
+        }
+    });
+    controls.append(&earlier);
+    let later = gtk::Button::from_icon_name("go-down-symbolic");
+    later.set_tooltip_text(Some("Move later"));
+    later.update_property(&[gtk::accessible::Property::Label("Move later")]);
+    let later_row = row.clone();
+    later.connect_clicked(move |_| {
+        if crate::work_queue::QueueCoordinator::move_later(&work_id).unwrap_or(false) {
+            move_queue_row(&later_row, true);
+        }
+    });
+    controls.append(&later);
+    controls
+}
+
+fn enable_queue_drag(row: &gtk::Box, work_id: &str) {
+    row.set_widget_name(&queue_widget_name(work_id));
+    let drag = gtk::DragSource::builder()
+        .actions(gtk::gdk::DragAction::MOVE)
+        .build();
+    let dragged_id = work_id.to_owned();
+    drag.connect_prepare(move |_, _, _| {
+        Some(gtk::gdk::ContentProvider::for_value(&dragged_id.to_value()))
+    });
+    row.add_controller(drag);
+
+    let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+    let target_id = work_id.to_owned();
+    let target_row = row.clone();
+    drop.connect_drop(move |_, value, _, y| {
+        let Ok(dragged_id) = value.get::<String>() else {
+            return false;
+        };
+        let after = y >= f64::from(target_row.height()) / 2.0;
+        if !crate::work_queue::QueueCoordinator::move_relative(&dragged_id, &target_id, after)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let Some(parent) = target_row.parent().and_downcast::<gtk::Box>() else {
+            return true;
+        };
+        let Some(dragged_row) = find_direct_queue_row(&parent, &dragged_id) else {
+            return true;
+        };
+        if after {
+            parent.reorder_child_after(&dragged_row, Some(&target_row));
+        } else {
+            let mut anchor = target_row.prev_sibling();
+            let dragged_widget: gtk::Widget = dragged_row.clone().upcast();
+            if anchor.as_ref() == Some(&dragged_widget) {
+                anchor = dragged_row.prev_sibling();
+            }
+            parent.reorder_child_after(&dragged_row, anchor.as_ref());
+        }
+        true
+    });
+    row.add_controller(drop);
+}
+
+fn queue_widget_name(work_id: &str) -> String {
+    format!("queued-work-{:x}", md5::compute(work_id))
+}
+
+fn find_direct_queue_row(parent: &gtk::Box, work_id: &str) -> Option<gtk::Box> {
+    let name = queue_widget_name(work_id);
+    let mut child = parent.first_child();
+    while let Some(current) = child {
+        if current.widget_name() == name {
+            return current.downcast().ok();
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
+fn move_queue_row(row: &gtk::Box, later: bool) {
+    let Some(parent) = row.parent().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    if later {
+        if let Some(next) = row.next_sibling() {
+            parent.reorder_child_after(row, Some(&next));
+        }
+    } else if let Some(previous) = row.prev_sibling() {
+        parent.reorder_child_after(row, previous.prev_sibling().as_ref());
+    }
 }
 
 #[cfg(test)]

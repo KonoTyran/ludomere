@@ -450,6 +450,7 @@ fn migrate_legacy_operation_records() -> anyhow::Result<()> {
             super::operation_journal::write_depot(&path, &record)?;
         }
         store.delete_depot_operation(&record.operation_id)?;
+        store.complete_work(crate::state::WorkKind::Depot, &record.operation_id)?;
     }
     store.clear_depot_operations()?;
     Ok(())
@@ -672,10 +673,19 @@ fn run_depot_operation(
     request: DepotOperationRequest,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let permit =
-        crate::operation_gate::acquire(|| cancelled.load(std::sync::atomic::Ordering::Relaxed));
+    let permit = crate::operation_gate::acquire_work(
+        crate::state::WorkKind::Depot,
+        &request.operation_id,
+        || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let result = match permit {
-        Some(_permit) => run_depot_operation_inner(&request, &cancelled),
+        Some(_permit) => {
+            let _ = crate::work_queue::QueueCoordinator::complete(
+                crate::state::WorkKind::Depot,
+                &request.operation_id,
+            );
+            run_depot_operation_inner(&request, &cancelled)
+        }
         None => Err(crate::download::depot::DepotCancelled.into()),
     };
     let mut failure_snapshot = None;
@@ -753,6 +763,12 @@ fn run_depot_operation(
         let _ = abandon_saved_depot_operation(&request.operation_id);
     } else if let Some(snapshot) = failure_snapshot {
         publish_depot(snapshot);
+    }
+    if !DEPOT_MANAGER.lock().unwrap().shutting_down {
+        let _ = crate::work_queue::QueueCoordinator::complete(
+            crate::state::WorkKind::Depot,
+            &request.operation_id,
+        );
     }
 }
 
@@ -1979,6 +1995,11 @@ fn persist_depot_request(request: &DepotOperationRequest) -> anyhow::Result<()> 
         completed_at: None,
     };
     super::operation_journal::write_depot(&journal_path, &record)?;
+    crate::work_queue::QueueCoordinator::register(
+        crate::state::WorkKind::Depot,
+        &request.operation_id,
+        Some(request.product_id),
+    )?;
     Ok(())
 }
 
@@ -2421,32 +2442,24 @@ pub fn enqueue_uninstallation(game: InstalledGame) -> bool {
 }
 
 fn schedule_next() {
-    let operation = {
-        let mut manager = MANAGER.lock().unwrap();
-        if manager.shutting_down || !manager.active.is_empty() {
-            return;
+    loop {
+        let operation = {
+            let mut manager = MANAGER.lock().unwrap();
+            if manager.shutting_down {
+                return;
+            }
+            manager.queue.pop_front()
+        };
+        match operation {
+            Some(QueuedOperation::Installation(plan)) => start_queued_installation(plan),
+            Some(QueuedOperation::Uninstallation(game)) => start_queued_uninstallation(game),
+            None => return,
         }
-        manager.queue.pop_front()
-    };
-    match operation {
-        Some(QueuedOperation::Installation(plan)) => start_queued_installation(plan),
-        Some(QueuedOperation::Uninstallation(game)) => start_queued_uninstallation(game),
-        None => {}
     }
 }
 
 fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
     let product_id = persisted_plan.game.product_id;
-    let running_message = if persisted_plan
-        .game
-        .installer_operating_system
-        .as_deref()
-        .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
-    {
-        "Preparing Windows installer"
-    } else {
-        "Running native installer"
-    };
     let handle = super::executor::start_installation(
         persisted_plan.game.clone(),
         persisted_plan.additional_installers.clone(),
@@ -2458,20 +2471,6 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
         manager
             .active
             .insert(product_id, OperationControl::Installation(handle.control()));
-    }
-    persist_existing_operation(product_id, "running", Some(running_message), None, None);
-    {
-        let mut manager = MANAGER.lock().unwrap();
-        manager.snapshots.insert(
-            product_id,
-            InstallationOperationSnapshot {
-                product_id,
-                state: crate::domain::InstallationState::Installing,
-                message: Some(running_message.into()),
-                percentage: None,
-                queued: false,
-            },
-        );
     }
     thread::spawn(move || {
         while let Ok(event) = handle.events.recv() {
@@ -2513,26 +2512,6 @@ fn start_queued_uninstallation(game: InstalledGame) {
         manager.active.insert(
             product_id,
             OperationControl::Uninstallation(handle.control()),
-        );
-    }
-    persist_existing_operation(
-        product_id,
-        "running",
-        Some("Running native uninstaller"),
-        None,
-        None,
-    );
-    {
-        let mut manager = MANAGER.lock().unwrap();
-        manager.snapshots.insert(
-            product_id,
-            InstallationOperationSnapshot {
-                product_id,
-                state: crate::domain::InstallationState::Uninstalling,
-                message: Some("Running native uninstaller".into()),
-                percentage: None,
-                queued: false,
-            },
         );
     }
     thread::spawn(move || {
@@ -2682,6 +2661,11 @@ pub fn recover_interrupted_operations() -> anyhow::Result<usize> {
             operation.percentage = None;
             operation.updated_at = chrono::Utc::now().timestamp();
             super::operation_journal::write_offline(&path, &operation)?;
+            crate::work_queue::QueueCoordinator::register(
+                crate::state::WorkKind::Installation,
+                &product_id.to_string(),
+                Some(product_id),
+            )?;
             recovered += 1;
         }
     }
@@ -2907,6 +2891,11 @@ fn persist_operation<T: serde::Serialize>(
     if let Ok(path) = super::operation_journal::offline_path(&record) {
         let _ = super::operation_journal::write_offline(&path, &record);
     }
+    let _ = crate::work_queue::QueueCoordinator::register(
+        crate::state::WorkKind::Installation,
+        &product_id.to_string(),
+        Some(product_id),
+    );
 }
 
 fn persist_existing_operation(
@@ -2942,6 +2931,18 @@ fn persist_existing_operation(
         let _ = super::operation_journal::remove(&path);
     } else {
         let _ = super::operation_journal::write_offline(&path, &record);
+    }
+    if state == "queued" {
+        let _ = crate::work_queue::QueueCoordinator::register(
+            crate::state::WorkKind::Installation,
+            &product_id.to_string(),
+            Some(product_id),
+        );
+    } else {
+        let _ = crate::work_queue::QueueCoordinator::complete(
+            crate::state::WorkKind::Installation,
+            &product_id.to_string(),
+        );
     }
 }
 

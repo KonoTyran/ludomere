@@ -39,7 +39,11 @@ pub(super) fn start_worker(
     }
     let worker_cancelled = cancelled.clone();
     std::thread::spawn(move || {
-        let permit = crate::operation_gate::acquire(|| worker_cancelled.load(Ordering::Relaxed));
+        let permit = crate::operation_gate::acquire_work(
+            crate::state::WorkKind::Download,
+            &active_job_id,
+            || worker_cancelled.load(Ordering::Relaxed),
+        );
         let result = match permit {
             Some(_permit) => Some(run(
                 &artifacts,

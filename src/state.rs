@@ -96,6 +96,42 @@ pub struct DownloadJobUpdate<'a> {
     pub error: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkKind {
+    Download,
+    Installation,
+    Depot,
+}
+
+impl WorkKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Installation => "installation",
+            Self::Depot => "depot",
+        }
+    }
+
+    fn from_database(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "download" => Ok(Self::Download),
+            "installation" => Ok(Self::Installation),
+            "depot" => Ok(Self::Depot),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkQueueItem {
+    pub work_id: String,
+    pub kind: WorkKind,
+    pub source_id: String,
+    pub product_id: Option<i64>,
+    pub queue_position: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallationOperationRecord {
     pub product_id: i64,
@@ -227,7 +263,7 @@ pub struct CloudSaveRecord {
 
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 5;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 6;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -384,6 +420,8 @@ impl StateStore {
              CREATE TABLE IF NOT EXISTS game_preferences (
                 product_id INTEGER PRIMARY KEY, executable_path TEXT,
                 launch_arguments_json TEXT NOT NULL DEFAULT '[]', compatibility_json TEXT,
+                auto_update_galaxy INTEGER, auto_download_offline_installer INTEGER,
+                prune_superseded_installers INTEGER, galaxy_language TEXT,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS game_compatibility_fix_overrides (
@@ -431,12 +469,27 @@ impl StateStore {
              );
              CREATE INDEX IF NOT EXISTS galaxy_depot_operations_state
                 ON galaxy_depot_operations(state, updated_at);
+             CREATE TABLE IF NOT EXISTS work_queue (
+                work_id TEXT PRIMARY KEY, kind TEXT NOT NULL, source_id TEXT NOT NULL,
+                product_id INTEGER, queue_position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(kind, source_id)
+             );
+             CREATE INDEX IF NOT EXISTS work_queue_position ON work_queue(queue_position, created_at);
+             CREATE TABLE IF NOT EXISTS game_sessions (
+                session_id TEXT PRIMARY KEY, product_id INTEGER NOT NULL,
+                started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL,
+                duration_seconds INTEGER NOT NULL, source TEXT NOT NULL,
+                remote_state TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS game_sessions_product ON game_sessions(product_id, started_at DESC);
              CREATE TABLE IF NOT EXISTS schema_state (
                 state_key INTEGER PRIMARY KEY CHECK(state_key = 1),
                 development_revision INTEGER NOT NULL
              );"
             )?;
             ensure_cloud_save_target_columns(&connection)?;
+            ensure_revision_six_schema(&connection)?;
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
@@ -477,6 +530,126 @@ impl StateStore {
                 record.first_seen_at,
                 record.last_seen_at
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn register_work(
+        &self,
+        kind: WorkKind,
+        source_id: &str,
+        product_id: Option<i64>,
+    ) -> Result<WorkQueueItem> {
+        let work_id = format!("{}:{source_id}", kind.as_str());
+        self.connection.execute(
+            "INSERT INTO work_queue(
+                work_id, kind, source_id, product_id, queue_position, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4,
+                COALESCE((SELECT MAX(queue_position) + 1 FROM work_queue), 1),
+                unixepoch(), unixepoch())
+             ON CONFLICT(work_id) DO UPDATE SET
+                product_id=excluded.product_id, updated_at=unixepoch()",
+            params![work_id, kind.as_str(), source_id, product_id],
+        )?;
+        self.work_item(&work_id)?
+            .ok_or_else(|| anyhow::anyhow!("registered work item was not found"))
+    }
+
+    pub fn work_item(&self, work_id: &str) -> Result<Option<WorkQueueItem>> {
+        self.connection
+            .query_row(
+                "SELECT work_id, kind, source_id, product_id, queue_position, created_at
+                 FROM work_queue WHERE work_id=?1",
+                [work_id],
+                work_queue_item_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn work_queue(&self) -> Result<Vec<WorkQueueItem>> {
+        let mut statement = self.connection.prepare(
+            "SELECT work_id, kind, source_id, product_id, queue_position, created_at
+             FROM work_queue ORDER BY queue_position, created_at, work_id",
+        )?;
+        statement
+            .query_map([], work_queue_item_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn move_work(&self, work_id: &str, offset: i64) -> Result<bool> {
+        if offset == 0 {
+            return Ok(false);
+        }
+        let Some(current) = self.work_item(work_id)? else {
+            return Ok(false);
+        };
+        let neighbor = if offset < 0 {
+            self.connection
+                .query_row(
+                    "SELECT work_id, kind, source_id, product_id, queue_position, created_at
+                     FROM work_queue WHERE queue_position < ?1
+                     ORDER BY queue_position DESC, created_at DESC, work_id DESC LIMIT 1",
+                    [current.queue_position],
+                    work_queue_item_from_row,
+                )
+                .optional()?
+        } else {
+            self.connection
+                .query_row(
+                    "SELECT work_id, kind, source_id, product_id, queue_position, created_at
+                     FROM work_queue WHERE queue_position > ?1
+                     ORDER BY queue_position, created_at, work_id LIMIT 1",
+                    [current.queue_position],
+                    work_queue_item_from_row,
+                )
+                .optional()?
+        };
+        let Some(neighbor) = neighbor else {
+            return Ok(false);
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE work_queue SET queue_position=?2, updated_at=unixepoch() WHERE work_id=?1",
+            params![current.work_id, neighbor.queue_position],
+        )?;
+        transaction.execute(
+            "UPDATE work_queue SET queue_position=?2, updated_at=unixepoch() WHERE work_id=?1",
+            params![neighbor.work_id, current.queue_position],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn move_work_relative(&self, work_id: &str, target_id: &str, after: bool) -> Result<bool> {
+        if work_id == target_id {
+            return Ok(false);
+        }
+        let mut queue = self.work_queue()?;
+        let Some(source) = queue.iter().position(|item| item.work_id == work_id) else {
+            return Ok(false);
+        };
+        let item = queue.remove(source);
+        let Some(target) = queue.iter().position(|item| item.work_id == target_id) else {
+            return Ok(false);
+        };
+        queue.insert(target + usize::from(after), item);
+        let transaction = self.connection.unchecked_transaction()?;
+        for (position, item) in queue.iter().enumerate() {
+            transaction.execute(
+                "UPDATE work_queue SET queue_position=?2, updated_at=unixepoch() WHERE work_id=?1",
+                params![item.work_id, position as i64 + 1],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn complete_work(&self, kind: WorkKind, source_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM work_queue WHERE kind=?1 AND source_id=?2",
+            params![kind.as_str(), source_id],
         )?;
         Ok(())
     }
@@ -2320,6 +2493,11 @@ impl StateStore {
                 job.error,
             ],
         )?;
+        if job.state == DownloadState::Queued {
+            self.register_work(WorkKind::Download, job.job_id, Some(job.product_id))?;
+        } else {
+            self.complete_work(WorkKind::Download, job.job_id)?;
+        }
         Ok(())
     }
 
@@ -2403,6 +2581,7 @@ impl StateStore {
             "DELETE FROM download_jobs WHERE job_id = ?1",
             params![job_id],
         )?;
+        self.complete_work(WorkKind::Download, job_id)?;
         Ok(())
     }
 
@@ -2724,6 +2903,17 @@ fn depot_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DepotOp
     })
 }
 
+fn work_queue_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkQueueItem> {
+    Ok(WorkQueueItem {
+        work_id: row.get(0)?,
+        kind: WorkKind::from_database(&row.get::<_, String>(1)?)?,
+        source_id: row.get(2)?,
+        product_id: row.get(3)?,
+        queue_position: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
 fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
     connection
         .query_row(
@@ -2772,6 +2962,46 @@ fn ensure_cloud_save_target_columns(connection: &Connection) -> Result<()> {
             ))?;
         }
     }
+    Ok(())
+}
+
+fn ensure_revision_six_schema(connection: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("auto_update_galaxy", "INTEGER"),
+        ("auto_download_offline_installer", "INTEGER"),
+        ("prune_superseded_installers", "INTEGER"),
+        ("galaxy_language", "TEXT"),
+    ] {
+        if !column_exists(connection, "game_preferences", column)? {
+            connection.execute_batch(&format!(
+                "ALTER TABLE game_preferences ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    connection.execute_batch(
+        "INSERT OR IGNORE INTO work_queue(
+            work_id, kind, source_id, product_id, queue_position, created_at, updated_at)
+         SELECT 'download:' || job_id, 'download', job_id, product_id,
+                COALESCE((SELECT MAX(queue_position) FROM work_queue), 0)
+                    + ROW_NUMBER() OVER (ORDER BY created_at, job_id),
+                created_at, updated_at
+         FROM download_jobs WHERE state IN ('queued', 'downloading');
+         INSERT OR IGNORE INTO work_queue(
+            work_id, kind, source_id, product_id, queue_position, created_at, updated_at)
+         SELECT 'installation:' || product_id, 'installation', CAST(product_id AS TEXT), product_id,
+                COALESCE((SELECT MAX(queue_position) FROM work_queue), 0)
+                    + ROW_NUMBER() OVER (ORDER BY created_at, product_id),
+                created_at, updated_at
+         FROM installation_operations WHERE state IN ('queued', 'running');
+         INSERT OR IGNORE INTO work_queue(
+            work_id, kind, source_id, product_id, queue_position, created_at, updated_at)
+         SELECT 'depot:' || operation_id, 'depot', operation_id, product_id,
+                COALESCE((SELECT MAX(queue_position) FROM work_queue), 0)
+                    + ROW_NUMBER() OVER (ORDER BY created_at, operation_id),
+                created_at, updated_at
+         FROM galaxy_depot_operations
+         WHERE state NOT IN ('complete', 'failed', 'cancelled', 'abandoned');",
+    )?;
     Ok(())
 }
 
@@ -3089,7 +3319,10 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         drop(store);
         fs::remove_file(path).unwrap();
@@ -3397,7 +3630,10 @@ mod tests {
         drop(store);
 
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert_eq!(store.favorites().unwrap(), HashSet::from([42]));
         assert_eq!(
             store.galaxy_branch_credential("user", 42, "beta").unwrap(),
@@ -3429,7 +3665,10 @@ mod tests {
                 .unwrap();
             drop(store);
             let store = StateStore::open_at(&path).unwrap();
-            assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+            assert_eq!(
+                development_revision(&store.connection).unwrap(),
+                Some(CURRENT_DEVELOPMENT_REVISION)
+            );
             assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
             drop(store);
             fs::remove_file(path).unwrap();
@@ -3487,7 +3726,10 @@ mod tests {
         drop(store);
 
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         assert_eq!(
             store.depot_operation("operation-1").unwrap(),
@@ -4187,5 +4429,76 @@ mod tests {
         assert!(record.metadata_error.is_none());
         drop(store);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn global_work_queue_orders_and_moves_mixed_work() {
+        let path = temp_database_path("global-work-queue");
+        let store = StateStore::open_at(&path).unwrap();
+        let download = store
+            .register_work(WorkKind::Download, "job", Some(1))
+            .unwrap();
+        let install = store
+            .register_work(WorkKind::Installation, "2", Some(2))
+            .unwrap();
+        let depot = store
+            .register_work(WorkKind::Depot, "operation", Some(3))
+            .unwrap();
+        assert_eq!(
+            store
+                .work_queue()
+                .unwrap()
+                .iter()
+                .map(|item| item.work_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                download.work_id.as_str(),
+                install.work_id.as_str(),
+                depot.work_id.as_str()
+            ]
+        );
+        assert!(store.move_work(&depot.work_id, -1).unwrap());
+        assert!(store.move_work(&depot.work_id, -1).unwrap());
+        assert_eq!(store.work_queue().unwrap()[0].work_id, depot.work_id);
+        assert!(
+            store
+                .move_work_relative(&download.work_id, &install.work_id, true)
+                .unwrap()
+        );
+        assert_eq!(store.work_queue().unwrap()[2].work_id, download.work_id);
+        store.complete_work(WorkKind::Depot, "operation").unwrap();
+        assert_eq!(store.work_queue().unwrap().len(), 2);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn development_revision_five_gains_revision_six_schema() {
+        let path = temp_database_path("development-revision-five");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE work_queue;
+                 DROP TABLE game_sessions;
+                 ALTER TABLE game_preferences DROP COLUMN auto_update_galaxy;
+                 ALTER TABLE game_preferences DROP COLUMN auto_download_offline_installer;
+                 ALTER TABLE game_preferences DROP COLUMN prune_superseded_installers;
+                 ALTER TABLE game_preferences DROP COLUMN galaxy_language;
+                 UPDATE schema_state SET development_revision=5;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        assert!(table_exists(&store.connection, "work_queue").unwrap());
+        assert!(table_exists(&store.connection, "game_sessions").unwrap());
+        assert!(column_exists(&store.connection, "game_preferences", "galaxy_language").unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 }

@@ -14,7 +14,12 @@ pub fn build_window(app: &adw::Application) {
     let store = Rc::new(StateStore::open().expect("opening application database"));
     let _ = store.prune_completed_download_history(chrono::Utc::now().timestamp() - 30 * 86_400);
     let favorites = store.favorites().unwrap_or_default();
+    let hidden_games = store.hidden_games().unwrap_or_default();
     let tags = store.tags().unwrap_or_default();
+    let saved_views = store.saved_views().unwrap_or_else(|error| {
+        tracing::error!(%error, "loading saved views");
+        Vec::new()
+    });
     let cached_games = store
         .normalized_games()
         .ok()
@@ -74,8 +79,11 @@ pub fn build_window(app: &adw::Application) {
         games: cached_games,
         patch_notes: HashMap::new(),
         favorites,
+        hidden_games,
         tags,
+        saved_views,
         favorites_only: false,
+        show_hidden: false,
         downloaded_only: false,
         installed_only: false,
         played_only: false,
@@ -642,6 +650,8 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     library_column.append(&filter_heading("Library"));
     let favorite_filter = gtk::CheckButton::with_label("Favorites only");
     library_column.append(&favorite_filter);
+    let show_hidden_filter = gtk::CheckButton::with_label("Show hidden");
+    library_column.append(&show_hidden_filter);
     let downloaded_filter = gtk::CheckButton::with_label("Downloaded content");
     downloaded_filter.set_tooltip_text(Some("Show games with downloaded base-game or DLC content"));
     library_column.append(&downloaded_filter);
@@ -977,6 +987,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         filter_button,
         clear_filters,
         favorite_filter,
+        show_hidden_filter,
         downloaded_filter,
         installed_filter,
         played_filter,
@@ -1171,6 +1182,9 @@ pub(super) fn connect_actions(
     connect_check_filter(w, model, &w.favorite_filter, |m, active| {
         m.favorites_only = active
     });
+    connect_check_filter(w, model, &w.show_hidden_filter, |m, active| {
+        m.show_hidden = active
+    });
     connect_check_filter(w, model, &w.downloaded_filter, |m, active| {
         m.downloaded_only = active
     });
@@ -1226,6 +1240,7 @@ pub(super) fn connect_actions(
             {
                 let mut model = model.borrow_mut();
                 model.favorites_only = false;
+                model.show_hidden = false;
                 model.downloaded_only = false;
                 model.installed_only = false;
                 model.played_only = false;
@@ -1241,6 +1256,7 @@ pub(super) fn connect_actions(
                 model.property_filters.clear();
             }
             w.favorite_filter.set_active(false);
+            w.show_hidden_filter.set_active(false);
             w.downloaded_filter.set_active(false);
             w.installed_filter.set_active(false);
             w.played_filter.set_active(false);
@@ -1272,6 +1288,7 @@ pub(super) fn connect_actions(
                 let mut state = model.borrow_mut();
                 match key.as_str() {
                     "favorite" => state.favorites_only = false,
+                    "hidden" => state.show_hidden = false,
                     "downloaded" => state.downloaded_only = false,
                     "installed" => state.installed_only = false,
                     "played" => state.played_only = false,
@@ -1298,6 +1315,7 @@ pub(super) fn connect_actions(
                 let state = model.borrow();
                 (
                     state.favorites_only,
+                    state.show_hidden,
                     state.downloaded_only,
                     state.installed_only,
                     state.played_only,
@@ -1311,16 +1329,17 @@ pub(super) fn connect_actions(
                 )
             };
             w.favorite_filter.set_active(flags.0);
-            w.downloaded_filter.set_active(flags.1);
-            w.installed_filter.set_active(flags.2);
-            w.played_filter.set_active(flags.3);
-            w.unplayed_filter.set_active(flags.4);
-            w.windows_filter.set_active(flags.5);
-            w.linux_filter.set_active(flags.6);
-            w.macos_filter.set_active(flags.7);
-            w.cloud_saves_filter.set_active(flags.8);
-            w.achievements_filter.set_active(flags.9);
-            if flags.10 {
+            w.show_hidden_filter.set_active(flags.1);
+            w.downloaded_filter.set_active(flags.2);
+            w.installed_filter.set_active(flags.3);
+            w.played_filter.set_active(flags.4);
+            w.unplayed_filter.set_active(flags.5);
+            w.windows_filter.set_active(flags.6);
+            w.linux_filter.set_active(flags.7);
+            w.macos_filter.set_active(flags.8);
+            w.cloud_saves_filter.set_active(flags.9);
+            w.achievements_filter.set_active(flags.10);
+            if flags.11 {
                 w.language_filter.set_selected(0);
             }
             update_metadata_filter_options(&w, &model);
@@ -1482,6 +1501,37 @@ pub(super) fn connect_actions(
         });
     }
     w.window.add_action(&favorite_action);
+
+    let hidden_action = gio::SimpleAction::new("hidden", Some(&i64::static_variant_type()));
+    {
+        let w = w.clone();
+        let model = model.clone();
+        let store = store.clone();
+        hidden_action.connect_activate(move |_, value| {
+            let Some(id) = value.and_then(|value| value.get::<i64>()) else {
+                return;
+            };
+            let hidden = {
+                let mut state = model.borrow_mut();
+                if state.hidden_games.contains(&id) {
+                    state.hidden_games.remove(&id);
+                    false
+                } else {
+                    state.hidden_games.insert(id);
+                    true
+                }
+            };
+            if let Err(error) = store.set_hidden(id, hidden) {
+                tracing::error!(%error, "saving hidden game state");
+            }
+            refresh_filters(&w, &model.borrow());
+            rebuild_collections_index(&w, &model);
+            if model.borrow().selected == Some(id) {
+                show_game(&w, &model, id, Some(false));
+            }
+        });
+    }
+    w.window.add_action(&hidden_action);
 }
 
 fn update_sort_toggle(w: &Widgets, mode: SidebarSortMode) {

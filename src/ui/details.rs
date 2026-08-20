@@ -20,8 +20,9 @@ pub(super) fn show_game(
         return;
     };
     let favorite = m.favorites.contains(&id);
+    let hidden = m.hidden_games.contains(&id);
     drop(m);
-    render_detail_page(w, model, DetailPageModel::game(game, favorite));
+    render_detail_page(w, model, DetailPageModel::game(game, favorite, hidden));
 }
 
 pub(super) fn render_detail_page(

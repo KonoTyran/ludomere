@@ -95,6 +95,13 @@ pub(super) fn detail_file_management(
         actions.append(&favorite_action);
         main_actions.push(favorite_action);
     }
+    if let Some(hidden) = game.hidden {
+        let hidden_action = management_menu_button(if hidden { "Unhide" } else { "Hide" });
+        hidden_action.set_action_name(Some("win.hidden"));
+        hidden_action.set_action_target_value(Some(&game.product_id.to_variant()));
+        actions.append(&hidden_action);
+        main_actions.push(hidden_action);
+    }
 
     let verify = management_menu_button("Verify Downloads");
     let check_updates = management_menu_button("Check for Updates");

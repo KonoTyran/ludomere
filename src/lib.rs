@@ -14,6 +14,7 @@ pub mod managed;
 pub mod online;
 pub(crate) mod operation_gate;
 pub(crate) mod patch_notes;
+pub mod saved_view;
 pub mod screenshots;
 pub mod state;
 pub mod text;

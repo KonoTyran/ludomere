@@ -6,6 +6,7 @@ use crate::{
         DownloadRevision, GalaxyBuild, Game, GamePreferences, InstalledGame, ProductMetadata,
         RemoteArtifact,
     },
+    saved_view::{SavedView, SavedViewQuery},
 };
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -273,7 +274,7 @@ pub struct CloudSaveTombstone {
 
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 7;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 8;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -332,8 +333,13 @@ impl StateStore {
 
         let initialized = (|| -> Result<()> {
             connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS user_game_state (product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0);
+            "CREATE TABLE IF NOT EXISTS user_game_state (product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0, hidden INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS custom_tags (product_id INTEGER NOT NULL, tag TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (product_id, tag));
+             CREATE TABLE IF NOT EXISTS saved_views (
+                view_id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                query_json TEXT NOT NULL, position INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS account_cache (cache_key INTEGER PRIMARY KEY CHECK(cache_key = 1), profile_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS owned_products (product_id INTEGER PRIMARY KEY, synchronized_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS online_sync_state (sync_key TEXT PRIMARY KEY, completed_at INTEGER NOT NULL);
@@ -506,6 +512,7 @@ impl StateStore {
             ensure_cloud_save_target_columns(&connection)?;
             ensure_revision_six_schema(&connection)?;
             ensure_revision_seven_schema(&connection)?;
+            ensure_revision_eight_schema(&connection)?;
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
@@ -1657,6 +1664,25 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn hidden_games(&self) -> Result<HashSet<i64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT product_id FROM user_game_state WHERE hidden = 1")?;
+        Ok(statement
+            .query_map([], |row| row.get(0))?
+            .filter_map(Result::ok)
+            .collect())
+    }
+
+    pub fn set_hidden(&self, product_id: i64, hidden: bool) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO user_game_state(product_id, hidden) VALUES (?1, ?2)
+             ON CONFLICT(product_id) DO UPDATE SET hidden = excluded.hidden",
+            params![product_id, hidden],
+        )?;
+        Ok(())
+    }
+
     pub fn tags(&self) -> Result<HashMap<i64, Vec<String>>> {
         let mut statement = self
             .connection
@@ -1672,10 +1698,126 @@ impl StateStore {
     }
 
     pub fn add_tag(&self, product_id: i64, tag: &str) -> Result<()> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            bail!("tag name cannot be empty");
+        }
         self.connection.execute(
             "INSERT OR IGNORE INTO custom_tags(product_id, tag) VALUES (?1, ?2)",
             params![product_id, tag],
         )?;
+        Ok(())
+    }
+
+    pub fn remove_tag(&self, product_id: i64, tag: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM custom_tags WHERE product_id = ?1 AND tag = ?2 COLLATE NOCASE",
+            params![product_id, tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_tag(&self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        if new.is_empty() {
+            bail!("tag name cannot be empty");
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO custom_tags(product_id, tag)
+             SELECT product_id, ?2 FROM custom_tags WHERE tag = ?1 COLLATE NOCASE",
+            params![old, new],
+        )?;
+        transaction.execute(
+            "DELETE FROM custom_tags WHERE tag = ?1 COLLATE NOCASE",
+            params![old],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_tag(&self, tag: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM custom_tags WHERE tag = ?1 COLLATE NOCASE",
+            params![tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn saved_views(&self) -> Result<Vec<SavedView>> {
+        let mut statement = self.connection.prepare(
+            "SELECT view_id, name, query_json, position FROM saved_views
+             ORDER BY position, view_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, name, json, position) = row?;
+                Ok(SavedView {
+                    id,
+                    name,
+                    query: SavedViewQuery::from_json(&json)?,
+                    position,
+                })
+            })
+            .collect()
+    }
+
+    pub fn create_saved_view(&self, name: &str, query: &SavedViewQuery) -> Result<i64> {
+        let name = saved_view_name(name)?;
+        query.validate()?;
+        self.connection.execute(
+            "INSERT INTO saved_views(name, query_json, position, created_at, updated_at)
+             VALUES (?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM saved_views), 0), unixepoch(), unixepoch())",
+            params![name, serde_json::to_string(query)?],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn update_saved_view(&self, id: i64, name: &str, query: &SavedViewQuery) -> Result<()> {
+        let name = saved_view_name(name)?;
+        query.validate()?;
+        let changed = self.connection.execute(
+            "UPDATE saved_views SET name = ?2, query_json = ?3, updated_at = unixepoch()
+             WHERE view_id = ?1",
+            params![id, name, serde_json::to_string(query)?],
+        )?;
+        if changed == 0 {
+            bail!("saved view no longer exists");
+        }
+        Ok(())
+    }
+
+    pub fn reorder_saved_views(&self, ids: &[i64]) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM saved_views", [], |row| row.get(0))?;
+        if usize::try_from(count).ok() != Some(ids.len()) {
+            bail!("saved view order does not contain every view");
+        }
+        for (position, id) in ids.iter().enumerate() {
+            if transaction.execute(
+                "UPDATE saved_views SET position = ?2, updated_at = unixepoch() WHERE view_id = ?1",
+                params![id, i64::try_from(position)?],
+            )? != 1
+            {
+                bail!("saved view order contains an unknown view");
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_saved_view(&self, id: i64) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM saved_views WHERE view_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -3183,6 +3325,33 @@ fn ensure_revision_seven_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_revision_eight_schema(connection: &Connection) -> Result<()> {
+    if !column_exists(connection, "user_game_state", "hidden")? {
+        connection.execute_batch(
+            "ALTER TABLE user_game_state ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS saved_views (
+            view_id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            query_json TEXT NOT NULL, position INTEGER NOT NULL, created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+fn saved_view_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("saved view name cannot be empty");
+    }
+    if name.chars().count() > 80 {
+        bail!("saved view name cannot exceed 80 characters");
+    }
+    Ok(name)
+}
+
 fn data_path() -> PathBuf {
     crate::identity::database()
 }
@@ -3794,7 +3963,10 @@ mod tests {
             .unwrap();
         store
             .connection
-            .execute("INSERT INTO user_game_state VALUES (42, 1)", [])
+            .execute(
+                "INSERT INTO user_game_state(product_id, favorite) VALUES (42, 1)",
+                [],
+            )
             .unwrap();
         store
             .connection
@@ -3881,7 +4053,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO user_game_state VALUES (42, 1);
+                "INSERT INTO user_game_state(product_id, favorite) VALUES (42, 1);
                  INSERT INTO product_activity(product_id, playtime_seconds, updated_at)
                     VALUES (42, 60, 1);
                  INSERT INTO download_jobs(
@@ -4808,6 +4980,74 @@ mod tests {
             store.cloud_save_tombstone(42, "main", "save.dat").unwrap(),
             None
         );
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn development_revision_seven_gains_library_organization_schema() {
+        let path = temp_database_path("development-revision-seven");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE saved_views;
+                 ALTER TABLE user_game_state DROP COLUMN hidden;
+                 UPDATE schema_state SET development_revision=7;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        assert!(table_exists(&store.connection, "saved_views").unwrap());
+        assert!(column_exists(&store.connection, "user_game_state", "hidden").unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn hidden_tags_and_saved_views_are_durable() {
+        let path = temp_database_path("library-organization");
+        let store = StateStore::open_at(&path).unwrap();
+        store.set_hidden(42, true).unwrap();
+        store.add_tag(42, "RPG").unwrap();
+        store.add_tag(42, "rpg").unwrap();
+        store.rename_tag("RPG", "Role-playing").unwrap();
+        let first = store
+            .create_saved_view(
+                "Favorites",
+                &SavedViewQuery {
+                    favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let second = store
+            .create_saved_view("Linux", &SavedViewQuery::default())
+            .unwrap();
+        store.reorder_saved_views(&[second, first]).unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert!(store.hidden_games().unwrap().contains(&42));
+        assert_eq!(store.tags().unwrap()[&42], ["Role-playing"]);
+        assert_eq!(
+            store
+                .saved_views()
+                .unwrap()
+                .iter()
+                .map(|view| view.id)
+                .collect::<Vec<_>>(),
+            [second, first]
+        );
+        store.remove_tag(42, "role-PLAYING").unwrap();
+        store.delete_saved_view(first).unwrap();
+        assert!(store.tags().unwrap().is_empty());
+        assert_eq!(store.saved_views().unwrap().len(), 1);
         drop(store);
         fs::remove_file(path).unwrap();
     }

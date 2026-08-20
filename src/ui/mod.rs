@@ -131,8 +131,11 @@ struct AppModel {
     games: Vec<Game>,
     patch_notes: HashMap<i64, Rc<Vec<PatchNote>>>,
     favorites: HashSet<i64>,
+    hidden_games: HashSet<i64>,
     tags: HashMap<i64, Vec<String>>,
+    saved_views: Vec<crate::saved_view::SavedView>,
     favorites_only: bool,
+    show_hidden: bool,
     downloaded_only: bool,
     installed_only: bool,
     played_only: bool,
@@ -232,6 +235,7 @@ struct DetailPageModel {
     dlcs: Vec<Dlc>,
     disk_usage: u64,
     favorite: Option<bool>,
+    hidden: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -360,7 +364,7 @@ struct DownloadDialogWidgets {
 }
 
 impl DetailPageModel {
-    fn game(game: Game, favorite: bool) -> Self {
+    fn game(game: Game, favorite: bool, hidden: bool) -> Self {
         let release_year = game.release_year();
         let platform_label = game.platform_label();
         Self {
@@ -394,6 +398,7 @@ impl DetailPageModel {
             dlcs: game.dlcs,
             disk_usage: game.disk_usage,
             favorite: Some(favorite),
+            hidden: Some(hidden),
         }
     }
 
@@ -433,6 +438,7 @@ impl DetailPageModel {
             dlcs: parent.dlcs.clone(),
             disk_usage: dlc.disk_usage,
             favorite: None,
+            hidden: None,
         }
     }
 }
@@ -464,6 +470,7 @@ struct Widgets {
     filter_button: gtk::MenuButton,
     clear_filters: gtk::Button,
     favorite_filter: gtk::CheckButton,
+    show_hidden_filter: gtk::CheckButton,
     downloaded_filter: gtk::CheckButton,
     installed_filter: gtk::CheckButton,
     played_filter: gtk::CheckButton,
@@ -630,6 +637,7 @@ impl Widgets {
             filter_button: self.filter_button.clone(),
             clear_filters: self.clear_filters.clone(),
             favorite_filter: self.favorite_filter.clone(),
+            show_hidden_filter: self.show_hidden_filter.clone(),
             downloaded_filter: self.downloaded_filter.clone(),
             installed_filter: self.installed_filter.clone(),
             played_filter: self.played_filter.clone(),

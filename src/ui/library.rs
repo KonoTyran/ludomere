@@ -321,7 +321,8 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
                 context_click.connect_pressed(move |gesture, _, x, y| {
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                     let favorite = model.borrow().favorites.contains(&game.product_id);
-                    let detail = DetailPageModel::game(game.clone(), favorite);
+                    let hidden = model.borrow().hidden_games.contains(&game.product_id);
+                    let detail = DetailPageModel::game(game.clone(), favorite, hidden);
                     let libraries = model.borrow().config.game_libraries.clone();
                     let installed = StateStore::open().ok().and_then(|store| {
                         crate::installation::reconcile_installed_games(&store, &libraries)
@@ -349,6 +350,10 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
                                     DetailPageModel::game(
                                         action_game.clone(),
                                         model.borrow().favorites.contains(&action_game.product_id),
+                                        model
+                                            .borrow()
+                                            .hidden_games
+                                            .contains(&action_game.product_id),
                                     ),
                                 );
                             })
@@ -415,8 +420,11 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
         .games
         .iter()
         .map(|game| {
-            let detail =
-                DetailPageModel::game(game.clone(), model.favorites.contains(&game.product_id));
+            let detail = DetailPageModel::game(
+                game.clone(),
+                model.favorites.contains(&game.product_id),
+                model.hidden_games.contains(&game.product_id),
+            );
             (
                 game.product_id,
                 installer_backup_coverage(&detail, &model.config),
@@ -427,8 +435,11 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
         .games
         .iter()
         .map(|game| {
-            let detail =
-                DetailPageModel::game(game.clone(), model.favorites.contains(&game.product_id));
+            let detail = DetailPageModel::game(
+                game.clone(),
+                model.favorites.contains(&game.product_id),
+                model.hidden_games.contains(&game.product_id),
+            );
             (
                 game.product_id,
                 required_owned_dlc_ids(&detail, &model.config),
@@ -641,6 +652,9 @@ pub(super) fn game_matches_library_filters(model: &AppModel, id: i64) -> bool {
     let Some(game) = model.games.iter().find(|game| game.product_id == id) else {
         return false;
     };
+    if !model.show_hidden && model.hidden_games.contains(&id) {
+        return false;
+    }
     if model.favorites_only && !model.favorites.contains(&id) {
         return false;
     }
@@ -821,6 +835,7 @@ pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
     w.count.set_label(&format!("{count} games"));
     let active_count = [
         model.favorites_only,
+        model.show_hidden,
         model.downloaded_only,
         model.installed_only,
         model.played_only,
@@ -886,6 +901,7 @@ fn rebuild_filter_chips(w: &Widgets, model: &AppModel) {
     let mut chips = Vec::<(String, String)>::new();
     for (active, key, label) in [
         (model.favorites_only, "favorite", "Favorites"),
+        (model.show_hidden, "hidden", "Show hidden"),
         (model.downloaded_only, "downloaded", "Downloaded"),
         (model.installed_only, "installed", "Installed"),
         (model.played_only, "played", "Played"),

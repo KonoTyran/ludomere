@@ -2836,6 +2836,51 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn verified_installer_revision_for_job(&self, job_id: &str) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT revision.revision_id
+                 FROM managed_files file
+                 JOIN download_revisions revision USING(revision_id)
+                 WHERE file.job_id = ?1 AND file.present = 1
+                   AND file.artifact_kind = 'installer'
+                   AND revision.currently_offered = 1
+                 GROUP BY revision.revision_id
+                 HAVING COUNT(DISTINCT file.part_id) = (
+                            SELECT COUNT(*) FROM download_parts
+                            WHERE revision_id = revision.revision_id)
+                    AND SUM(file.verified_at IS NULL) = 0",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn superseded_installer_files(
+        &self,
+        product_id: i64,
+        replacement_revision_id: i64,
+    ) -> Result<Vec<PathBuf>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT old_file.path
+             FROM managed_files old_file
+             JOIN download_revisions old_revision USING(revision_id)
+             JOIN download_slots slot USING(slot_id)
+             JOIN download_revisions replacement
+               ON replacement.slot_id = slot.slot_id AND replacement.revision_id = ?2
+             WHERE old_file.product_id = ?1 AND old_file.present = 1
+               AND old_file.artifact_kind = 'installer'
+               AND old_revision.revision_id != replacement.revision_id
+             ORDER BY old_file.path",
+        )?;
+        let rows = statement.query_map(params![product_id, replacement_revision_id], |row| {
+            row.get::<_, String>(0).map(PathBuf::from)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn record_completed_artifacts(
         &self,
         _job_id: &str,
@@ -4325,6 +4370,80 @@ mod tests {
             .unwrap();
         assert_eq!(revision_count, 2);
         assert_eq!(current_count, 1);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retention_requires_a_complete_verified_replacement_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "gog-state-retention-{}.sqlite3",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = StateStore::open_at(&path).unwrap();
+        let artifact = |file_id: &str, version: &str| RemoteArtifact {
+            product_id: 42,
+            kind: ArtifactKind::Installer,
+            name: "Example".into(),
+            language: Some("English".into()),
+            operating_system: Some("windows".into()),
+            version: Some(version.into()),
+            release_date: None,
+            size_label: None,
+            size_bytes: Some(4),
+            part_number: Some(1),
+            part_count: Some(1),
+            download_path: format!("/downlink/installer/{file_id}"),
+            provider_group_id: Some("installer_windows_en".into()),
+            provider_file_id: Some(file_id.into()),
+            provider_category: Some(DownloadCategory::Installer),
+        };
+        let old = artifact("old", "1.0");
+        let old_path = PathBuf::from("/downloads/example-1.exe");
+        store
+            .observe_download_manifest(42, std::slice::from_ref(&old))
+            .unwrap();
+        store
+            .record_completed_artifacts(
+                "old-job",
+                "example",
+                std::slice::from_ref(&old),
+                std::slice::from_ref(&old_path),
+            )
+            .unwrap();
+        let replacement = artifact("new", "2.0");
+        let replacement_path = PathBuf::from("/downloads/example-2.exe");
+        store
+            .observe_download_manifest(42, std::slice::from_ref(&replacement))
+            .unwrap();
+        store
+            .record_completed_artifacts(
+                "new-job",
+                "example",
+                std::slice::from_ref(&replacement),
+                std::slice::from_ref(&replacement_path),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .verified_installer_revision_for_job("new-job")
+                .unwrap(),
+            None
+        );
+        store
+            .mark_managed_file_verified(&replacement_path, &replacement, "checksum")
+            .unwrap();
+        let revision = store
+            .verified_installer_revision_for_job("new-job")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.superseded_installer_files(42, revision).unwrap(),
+            vec![old_path]
+        );
         drop(store);
         std::fs::remove_file(path).unwrap();
     }

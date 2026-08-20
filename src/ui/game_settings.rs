@@ -271,7 +271,15 @@ pub(super) fn show_game_settings(
     update_status.add_css_class("dim-label");
     updates_group.add(&update_status);
     updates_page.add(&updates_group);
+    let galaxy_installed = installed.as_ref().is_some_and(|installed| {
+        crate::installation::load_installation_marker(&installed.installation_directory)
+            .ok()
+            .flatten()
+            .is_some_and(|marker| marker.source == crate::domain::InstallationSource::GalaxyDepot)
+    });
     wire_update_preferences(
+        &window,
+        model,
         game.product_id,
         galaxy_updates.1,
         offline_updates.1,
@@ -279,6 +287,7 @@ pub(super) fn show_game_settings(
         language,
         languages,
         update_status,
+        galaxy_installed,
     );
 
     let files_page = adw::PreferencesPage::new();
@@ -1786,7 +1795,10 @@ fn policy_row(title: &str, value: Option<bool>) -> (adw::ActionRow, gtk::DropDow
     (row, selector)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_update_preferences(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
     product_id: i64,
     galaxy: gtk::DropDown,
     offline: gtk::DropDown,
@@ -1794,12 +1806,14 @@ fn wire_update_preferences(
     language: gtk::DropDown,
     languages: Vec<String>,
     status: gtk::Label,
+    reconcile_language: bool,
 ) {
     let save = Rc::new({
         let galaxy = galaxy.clone();
         let offline = offline.clone();
         let prune = prune.clone();
         let language = language.clone();
+        let status = status.clone();
         move || {
             let selected_language = (language.selected() > 0)
                 .then(|| languages.get(language.selected() as usize))
@@ -1826,10 +1840,101 @@ fn wire_update_preferences(
             }
         }
     });
-    for selector in [galaxy, offline, prune, language] {
+    for selector in [galaxy, offline, prune] {
         let save = save.clone();
         selector.connect_selected_notify(move |_| save());
     }
+    let previous = Rc::new(std::cell::Cell::new(language.selected()));
+    let suppress = Rc::new(std::cell::Cell::new(false));
+    language.connect_selected_notify({
+        let window = window.clone();
+        let model = model.clone();
+        let language = language.clone();
+        let status = status.clone();
+        move |_| {
+            if suppress.get() {
+                return;
+            }
+            let selected = language.selected();
+            if !reconcile_language {
+                previous.set(selected);
+                save();
+                return;
+            }
+            let dialog = adw::AlertDialog::builder()
+                .heading("Change Installed Language?")
+                .body("Ludomere will queue a Galaxy reconciliation. The current installation remains unchanged if preparation or installation fails.")
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("apply", "Queue Change")]);
+            dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+            let previous = previous.clone();
+            let suppress = suppress.clone();
+            let save = save.clone();
+            let language = language.clone();
+            let model = model.clone();
+            let status = status.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+                if response != "apply" {
+                    suppress.set(true);
+                    language.set_selected(previous.get());
+                    suppress.set(false);
+                    return;
+                }
+                previous.set(selected);
+                save();
+                start_language_reconciliation(&model, product_id, &status);
+            });
+        }
+    });
+}
+
+fn start_language_reconciliation(
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    status: &gtk::Label,
+) {
+    let (config, game, token) = {
+        let state = model.borrow();
+        let game = state
+            .games
+            .iter()
+            .find(|game| game.product_id == product_id)
+            .cloned();
+        (state.config.clone(), game, state.account_token.clone())
+    };
+    let (Some(game), Some(token)) = (game, token) else {
+        status.add_css_class("error");
+        status.set_label("Connect to GOG before changing the installed language");
+        return;
+    };
+    status.remove_css_class("error");
+    status.set_label("Preparing language reconciliation…");
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(crate::updates::queue_language_reconciliation(
+            &config, &game, &token,
+        ));
+    });
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(true)) => {
+                status.set_label("Language reconciliation queued");
+                glib::ControlFlow::Break
+            }
+            Ok(Ok(false)) => {
+                status.set_label("Installed language is already current");
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                status.add_css_class("error");
+                status.set_label(&format!("Could not queue language change: {error}"));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
 }
 
 fn policy_selection(selected: u32) -> Option<bool> {

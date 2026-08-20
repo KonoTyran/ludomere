@@ -317,6 +317,34 @@ fn run(
                         queued.push_back(request);
                     } else {
                         if matches!(event, DownloadEvent::Complete { .. }) {
+                            if let DownloadEvent::Complete { files } = &event {
+                                let product_id = request.artifacts[0].product_id;
+                                let job_id = request.id.clone();
+                                let artifacts = request.artifacts.clone();
+                                let files = files.clone();
+                                let access_token = request.access_token.clone();
+                                let subscribers = subscribers.clone();
+                                std::thread::spawn(move || {
+                                    match crate::updates::verify_and_prune_offline_installer(
+                                        product_id,
+                                        &job_id,
+                                        &artifacts,
+                                        &files,
+                                        &access_token,
+                                    ) {
+                                        Ok(trashed) if trashed > 0 => publish(
+                                            &subscribers,
+                                            DownloadManagerEvent::ManagedFilesChanged(product_id),
+                                        ),
+                                        Ok(_) => {}
+                                        Err(error) => tracing::warn!(
+                                            product_id,
+                                            %error,
+                                            "installer retention left existing files unchanged"
+                                        ),
+                                    }
+                                });
+                            }
                             publish(
                                 &subscribers,
                                 DownloadManagerEvent::ManagedFilesChanged(

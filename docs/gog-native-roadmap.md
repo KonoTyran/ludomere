@@ -19,7 +19,8 @@ Explicitly exclude overlays, store browsing/purchasing/redeeming, rollback suppo
 
 - Phase 0 complete: typed friends, presence, and gameplay reads; capability manifest; sanitized audit and guarded live-write command.
 - Phase 1 complete: durable mixed-work queue, drag and accessible reorder controls, and a live shared bandwidth limiter.
-- Phases 2 through 7 remain in progress.
+- Phase 2 complete: inherited update policies, post-sync and six-hour checks, manual checks, language reconciliation, and verified installer retention.
+- Phases 3 through 7 remain in progress.
 
 ## Phase 0: GOG Protocol Validation
 

@@ -537,6 +537,7 @@ fn depot_active(state: &str) -> bool {
         "preparing"
             | "verifying"
             | "verifying_existing"
+            | "calculating"
             | "downloading"
             | "materializing"
             | "committing"
@@ -940,15 +941,21 @@ fn active_depot_header(
         model,
     );
     details.append(&transfer_stats(model, depot_active(&operation.state)));
-    let download_fraction =
-        depot_download_fraction(operation.bytes_completed, operation.total_bytes);
+    let download_fraction = operation.download_total_bytes.map_or(0.0, |total| {
+        depot_download_fraction(operation.bytes_downloaded, total)
+    });
     let download_label = if operation.state == "preparing" {
         "Preparing download"
     } else if operation.state == "verifying_existing" {
         "Checking existing files"
     } else if operation.state == "verifying" {
         "Checking downloaded files"
-    } else if operation.total_bytes > 0 && operation.bytes_completed >= operation.total_bytes {
+    } else if operation.state == "calculating" {
+        "Calculating download size"
+    } else if operation
+        .download_total_bytes
+        .is_some_and(|total| operation.bytes_downloaded >= total)
+    {
         "Download complete"
     } else {
         "Downloading data"
@@ -956,10 +963,15 @@ fn active_depot_header(
     details.append(&labeled_progress(
         download_label,
         download_fraction,
-        &format!(
-            "{} / {}",
-            human_size(operation.bytes_completed),
-            human_size(operation.total_bytes)
+        &operation.download_total_bytes.map_or_else(
+            || "Calculating…".into(),
+            |total| {
+                format!(
+                    "{} / {}",
+                    human_size(operation.bytes_downloaded),
+                    human_size(total)
+                )
+            },
         ),
         false,
     ));
@@ -975,12 +987,9 @@ fn active_depot_header(
         true,
     ));
     let footer_text = operation.error.clone().or_else(|| {
-        estimated_remaining(
-            model,
-            operation
-                .total_bytes
-                .saturating_sub(operation.bytes_completed),
-        )
+        operation.download_total_bytes.and_then(|total| {
+            estimated_remaining(model, total.saturating_sub(operation.bytes_downloaded))
+        })
     });
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let eta = gtk::Label::new(footer_text.as_deref());
@@ -1035,6 +1044,7 @@ fn depot_stage_label(state: &str) -> &'static str {
         "preparing" => "PREPARING DOWNLOAD",
         "verifying" => "CHECKING FILES",
         "verifying_existing" => "CHECKING EXISTING FILES",
+        "calculating" => "CALCULATING DOWNLOAD SIZE",
         "downloading" => "STARTING DOWNLOAD",
         "materializing" => "DOWNLOADING",
         "committing" => "INSTALLING FILES",
@@ -1104,12 +1114,12 @@ fn depot_operation_card(
     detail.set_xalign(0.0);
     detail.add_css_class("dim-label");
     copy.append(&detail);
-    if operation.total_bytes > 0 && operation.state != "complete" {
+    if operation.download_total_bytes.is_some() && operation.state != "complete" {
         let progress = gtk::ProgressBar::new();
         progress.set_widget_name(&format!("depot-progress-{}", operation.operation_id));
         progress.set_fraction(depot_download_fraction(
-            operation.bytes_completed,
-            operation.total_bytes,
+            operation.bytes_downloaded,
+            operation.download_total_bytes.unwrap_or_default(),
         ));
         copy.append(&progress);
     }
@@ -1200,10 +1210,10 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
         .depot_operations
         .iter()
         .find(|operation| depot_active(&operation.state))
-        .map(|operation| {
+        .and_then(|operation| {
             operation
-                .total_bytes
-                .saturating_sub(operation.bytes_completed)
+                .download_total_bytes
+                .map(|total| total.saturating_sub(operation.bytes_downloaded))
         })
         .or_else(|| {
             model
@@ -1230,8 +1240,10 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
             find_named_descendant(&root, &format!("depot-detail-{}", operation.operation_id))
                 .and_downcast::<gtk::Label>()
         {
-            let percent = (operation.total_bytes > 0)
-                .then(|| operation.bytes_completed.saturating_mul(100) / operation.total_bytes);
+            let percent = operation
+                .download_total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| operation.bytes_downloaded.saturating_mul(100) / total);
             detail.set_label(&percent.map_or_else(
                 || operation.state.clone(),
                 |percent| format!("{} · {percent}%", operation.state),
@@ -1240,30 +1252,35 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
         if let Some(progress) =
             find_named_descendant(&root, &format!("depot-progress-{}", operation.operation_id))
                 .and_downcast::<gtk::ProgressBar>()
-            && operation.total_bytes > 0
+            && operation.download_total_bytes.is_some()
         {
             progress.set_fraction(depot_download_fraction(
-                operation.bytes_completed,
-                operation.total_bytes,
+                operation.bytes_downloaded,
+                operation.download_total_bytes.unwrap_or_default(),
             ));
         }
         if depot_active(&operation.state) {
             if let Some(progress) = find_named_descendant(&root, "active-download-progress")
                 .and_downcast::<gtk::ProgressBar>()
-                && operation.total_bytes > 0
+                && operation.download_total_bytes.is_some()
             {
                 progress.set_fraction(depot_download_fraction(
-                    operation.bytes_completed,
-                    operation.total_bytes,
+                    operation.bytes_downloaded,
+                    operation.download_total_bytes.unwrap_or_default(),
                 ));
             }
             if let Some(detail) =
                 find_named_descendant(&root, "active-download-detail").and_downcast::<gtk::Label>()
             {
-                detail.set_label(&format!(
-                    "{} / {}",
-                    human_size(operation.bytes_completed),
-                    human_size(operation.total_bytes)
+                detail.set_label(&operation.download_total_bytes.map_or_else(
+                    || "Calculating…".into(),
+                    |total| {
+                        format!(
+                            "{} / {}",
+                            human_size(operation.bytes_downloaded),
+                            human_size(total)
+                        )
+                    },
                 ));
             }
             let install_fraction = depot_install_fraction(

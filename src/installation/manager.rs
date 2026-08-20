@@ -78,6 +78,7 @@ pub struct DepotOperationSnapshot {
     pub bytes_written: u64,
     pub total_write_bytes: u64,
     pub total_bytes: u64,
+    pub download_total_bytes: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -422,6 +423,7 @@ fn depot_state_is_active(state: &str) -> bool {
             | "preparing"
             | "verifying"
             | "verifying_existing"
+            | "calculating"
             | "downloading"
             | "materializing"
             | "committing"
@@ -481,6 +483,7 @@ pub fn recover_depot_operations() -> anyhow::Result<usize> {
             bytes_written: 0,
             total_write_bytes: 0,
             total_bytes: operation.total_bytes.unwrap_or_default(),
+            download_total_bytes: None,
             error: operation.error,
         });
         recovered += 1;
@@ -541,6 +544,7 @@ pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
         bytes_written: 0,
         total_write_bytes: 0,
         total_bytes: 0,
+        download_total_bytes: None,
         error: None,
     };
     manager
@@ -619,6 +623,7 @@ pub fn resume_depot_operation(operation_id: String, access_token: String) -> boo
                 bytes_written: 0,
                 total_write_bytes: 0,
                 total_bytes: 0,
+                download_total_bytes: None,
                 error: Some(redact_error(&error.to_string(), "")),
             });
             false
@@ -723,6 +728,9 @@ fn run_depot_operation(
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.total_write_bytes),
             total_bytes: previous.as_ref().map_or(0, |snapshot| snapshot.total_bytes),
+            download_total_bytes: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.download_total_bytes),
             error: (!was_cancelled).then_some(message),
         });
     }
@@ -789,6 +797,7 @@ fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
         bytes_written: 0,
         total_write_bytes: 0,
         total_bytes: 0,
+        download_total_bytes: None,
         error: None,
     });
     Ok(())
@@ -807,6 +816,7 @@ fn run_depot_operation_inner(
         bytes_written: 0,
         total_write_bytes: 0,
         total_bytes: 0,
+        download_total_bytes: None,
         error: None,
     });
     let (target, chunk_sources) = merge_depot_sources(request)?;
@@ -835,6 +845,7 @@ fn run_depot_operation_inner(
             bytes_written: 0,
             total_write_bytes: 0,
             total_bytes: total,
+            download_total_bytes: None,
             error: None,
         });
         return Ok(());
@@ -858,6 +869,7 @@ fn run_depot_operation_inner(
             bytes_written: 0,
             total_write_bytes: 0,
             total_bytes: verification_total,
+            download_total_bytes: None,
             error: None,
         });
         crate::download::depot::verify_installed_files(
@@ -896,6 +908,7 @@ fn run_depot_operation_inner(
             bytes_written: 0,
             total_write_bytes: 0,
             total_bytes: verification_total,
+            download_total_bytes: None,
             error: None,
         });
     }
@@ -928,6 +941,7 @@ fn run_depot_operation_inner(
                         bytes_written: 0,
                         total_write_bytes: 0,
                         total_bytes: total,
+                        download_total_bytes: None,
                         error: None,
                     });
                 }
@@ -946,6 +960,34 @@ fn run_depot_operation_inner(
             || cancelled.load(std::sync::atomic::Ordering::Relaxed),
         )?);
     }
+    publish_depot(DepotOperationSnapshot {
+        operation_id: request.operation_id.clone(),
+        product_id: request.product_id,
+        state: "calculating".into(),
+        bytes_completed: completed,
+        bytes_downloaded: 0,
+        bytes_written: 0,
+        total_write_bytes: write_total,
+        total_bytes: total,
+        download_total_bytes: None,
+        error: None,
+    });
+    let local_chunks = current
+        .as_ref()
+        .map(local_chunk_candidates)
+        .unwrap_or_default();
+    let pending_chunks = crate::download::depot::pending_chunks(
+        &target,
+        &request.destination,
+        &request.staging_path,
+        &trusted_files,
+    )?;
+    let reusable = reusable_local_chunks(&request.destination, &local_chunks, &pending_chunks)?;
+    let pending_support =
+        super::depot_actions::pending_support_chunks(&support, &request.staging_path)?;
+    let support_download =
+        required_network_bytes(&pending_support, &std::collections::HashSet::new(), 0)?;
+    let download_total = required_network_bytes(&pending_chunks, &reusable, support_download)?;
     update_depot_record(&request.operation_id, "downloading", completed, None, false)?;
     publish_depot(DepotOperationSnapshot {
         operation_id: request.operation_id.clone(),
@@ -956,15 +998,12 @@ fn run_depot_operation_inner(
         bytes_written: 0,
         total_write_bytes: write_total,
         total_bytes: total,
+        download_total_bytes: Some(download_total),
         error: None,
     });
     let downloaded = std::sync::atomic::AtomicU64::new(0);
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut served = std::collections::HashSet::new();
-    let local_chunks = current
-        .as_ref()
-        .map(local_chunk_candidates)
-        .unwrap_or_default();
     let operation_id = request.operation_id.clone();
     let installed_marker = super::marker::load(&request.destination)?;
     let commit_marker = dependency_commit_marker(&request.target_marker, installed_marker.as_ref());
@@ -1112,6 +1151,7 @@ fn run_depot_operation_inner(
                     bytes_written: written.load(std::sync::atomic::Ordering::Relaxed),
                     total_write_bytes: write_total,
                     total_bytes: total,
+                    download_total_bytes: Some(download_total),
                     error: None,
                 });
                 Ok(())
@@ -1170,6 +1210,7 @@ fn run_depot_operation_inner(
         bytes_written: written.load(std::sync::atomic::Ordering::Relaxed),
         total_write_bytes: write_total,
         total_bytes: total,
+        download_total_bytes: Some(download_total),
         error: None,
     });
     Ok(())
@@ -1184,6 +1225,12 @@ fn publish_depot_progress(
     write_total: u64,
     total: u64,
 ) {
+    let download_total_bytes = DEPOT_MANAGER
+        .lock()
+        .unwrap()
+        .snapshots
+        .get(&request.operation_id)
+        .and_then(|snapshot| snapshot.download_total_bytes);
     publish_depot(DepotOperationSnapshot {
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
@@ -1193,6 +1240,7 @@ fn publish_depot_progress(
         bytes_written: written,
         total_write_bytes: write_total,
         total_bytes: total,
+        download_total_bytes,
         error: None,
     });
 }
@@ -1217,7 +1265,7 @@ fn local_chunk_candidates(
         let mut offset = 0_u64;
         for chunk in &file.chunks {
             candidates
-                .entry(chunk.compressed_md5.clone())
+                .entry(chunk.md5.clone())
                 .or_default()
                 .push(LocalChunk {
                     path: file.path.clone(),
@@ -1238,7 +1286,7 @@ fn reuse_local_chunk(
     output: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
     use std::io::{Read, Seek};
-    let Some(candidates) = candidates.get(&chunk.compressed_md5) else {
+    let Some(candidates) = candidates.get(&chunk.md5) else {
         return Ok(false);
     };
     for candidate in candidates {
@@ -1277,6 +1325,42 @@ fn reuse_local_chunk(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn reusable_local_chunks(
+    root: &std::path::Path,
+    candidates: &HashMap<String, Vec<LocalChunk>>,
+    chunks: &[crate::gog::depot_manifest::DepotChunk],
+) -> anyhow::Result<std::collections::HashSet<(String, u64)>> {
+    let mut reusable = std::collections::HashSet::new();
+    for chunk in chunks {
+        let key = (chunk.md5.clone(), chunk.size);
+        if reusable.contains(&key) {
+            continue;
+        }
+        let mut sink = std::io::sink();
+        if reuse_local_chunk(root, candidates, chunk, &mut sink)? {
+            reusable.insert(key);
+        }
+    }
+    Ok(reusable)
+}
+
+fn required_network_bytes(
+    chunks: &[crate::gog::depot_manifest::DepotChunk],
+    reusable: &std::collections::HashSet<(String, u64)>,
+    support_bytes: u64,
+) -> anyhow::Result<u64> {
+    let mut served = std::collections::HashSet::new();
+    chunks
+        .iter()
+        .filter(|chunk| served.insert(chunk.compressed_md5.clone()))
+        .filter(|chunk| !reusable.contains(&(chunk.md5.clone(), chunk.size)))
+        .try_fold(support_bytes, |total, chunk| {
+            total
+                .checked_add(chunk.compressed_size)
+                .ok_or_else(|| anyhow::anyhow!("depot network size overflows"))
+        })
 }
 
 fn current_manifest(
@@ -3071,6 +3155,9 @@ mod tests {
             size: bytes.len() as u64,
         };
         let good = chunk(b"good");
+        let mut recompressed = good.clone();
+        recompressed.compressed_md5 = "f".repeat(32);
+        recompressed.compressed_size = 3;
         let expected = chunk(b"best");
         let manifest = DepotManifest {
             generation: 2,
@@ -3088,11 +3175,21 @@ mod tests {
         };
         let candidates = local_chunk_candidates(&manifest);
         let mut output = Vec::new();
-        assert!(reuse_local_chunk(&root, &candidates, &good, &mut output).unwrap());
+        assert!(reuse_local_chunk(&root, &candidates, &recompressed, &mut output).unwrap());
         assert_eq!(output, b"good");
         output.clear();
         assert!(!reuse_local_chunk(&root, &candidates, &expected, &mut output).unwrap());
         assert!(output.is_empty());
+        let reusable = reusable_local_chunks(
+            &root,
+            &candidates,
+            &[recompressed.clone(), expected.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            required_network_bytes(&[recompressed, expected.clone()], &reusable, 7).unwrap(),
+            7 + expected.compressed_size
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

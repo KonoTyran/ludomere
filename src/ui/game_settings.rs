@@ -694,12 +694,26 @@ pub(super) fn show_game_settings(
     installation_page.set_title("Installation");
     let installation_group = adw::PreferencesGroup::new();
     installation_group.set_title("Installed source");
+    let installation_marker = installed.as_ref().and_then(|game| {
+        crate::installation::load_installation_marker(&game.installation_directory)
+            .ok()
+            .flatten()
+    });
     installation_group.add(&info_row(
         "Current installation",
         installed
             .as_ref()
             .and_then(|value| value.installed_version.as_deref())
             .unwrap_or("Not installed"),
+    ));
+    installation_group.add(&info_row(
+        "Source",
+        match installation_marker.as_ref().map(|marker| marker.source) {
+            Some(crate::domain::InstallationSource::OfflineInstaller) => "Offline installer",
+            Some(crate::domain::InstallationSource::GalaxyDepot) => "Galaxy depot",
+            None if installed.is_some() => "Unknown",
+            None => "Not installed",
+        },
     ));
     let reinstall_row = adw::ActionRow::new();
     reinstall_row.set_title("Reinstall using another source");
@@ -722,8 +736,7 @@ pub(super) fn show_game_settings(
     installation_page.add(&installation_group);
 
     if let Some(installed_game) = &installed
-        && let Ok(Some(marker)) =
-            crate::installation::load_installation_marker(&installed_game.installation_directory)
+        && let Some(marker) = installation_marker
         && marker.source == crate::domain::InstallationSource::GalaxyDepot
     {
         let branch_group = adw::PreferencesGroup::new();
@@ -1103,7 +1116,12 @@ fn present_source_migration(
     ));
     if crate::installation::installation_operation_snapshot(game.product_id).is_some()
         || crate::installation::depot_operation_snapshot_for_product(game.product_id).is_some_and(
-            |snapshot| !matches!(snapshot.state.as_str(), "complete" | "failed" | "cancelled"),
+            |snapshot| {
+                !matches!(
+                    snapshot.state.as_str(),
+                    "complete" | "failed" | "cancelled" | "abandoned"
+                )
+            },
         )
     {
         let alert = adw::AlertDialog::builder()

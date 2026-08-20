@@ -190,6 +190,27 @@ pub struct StateStore {
     connection: Connection,
 }
 
+fn galaxy_update_available(
+    builds: &[GalaxyBuild],
+    installed: &crate::domain::GalaxyDepotProvenance,
+    operating_system: Option<&str>,
+) -> bool {
+    let matches_install = |build: &&GalaxyBuild| {
+        operating_system.is_none_or(|os| build.operating_system.eq_ignore_ascii_case(os))
+            && build.branch == installed.branch
+    };
+    let installed_build = builds
+        .iter()
+        .filter(matches_install)
+        .find(|build| build.build_id == installed.build_id);
+    let newest = builds
+        .iter()
+        .filter(|build| build.generation == 2 && build.currently_returned)
+        .filter(matches_install)
+        .max_by_key(|build| build.published_at);
+    matches!((installed_build, newest), (Some(installed), Some(newest)) if newest.published_at > installed.published_at)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudSaveRecord {
     pub preference: CloudSavePreference,
@@ -1080,20 +1101,11 @@ impl StateStore {
                 .galaxy_depot
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Galaxy depot marker has no provenance"))?;
-            let newest = self
-                .load_galaxy_builds(game.product_id)?
-                .into_iter()
-                .filter(|build| build.generation == 2 && build.currently_returned)
-                .filter(|build| {
-                    marker
-                        .base
-                        .operating_system
-                        .as_deref()
-                        .is_none_or(|os| build.operating_system.eq_ignore_ascii_case(os))
-                        && build.branch == installed.branch
-                })
-                .max_by_key(|build| build.published_at);
-            return Ok(newest.is_some_and(|build| build.build_id != installed.build_id));
+            return Ok(galaxy_update_available(
+                &self.load_galaxy_builds(game.product_id)?,
+                installed,
+                marker.base.operating_system.as_deref(),
+            ));
         }
         if let Some(revision_id) = game.installer_revision_id {
             return self
@@ -3014,6 +3026,51 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn galaxy_update_requires_a_known_newer_build() {
+        let installed = crate::domain::GalaxyDepotProvenance {
+            build_id: "installed".into(),
+            repository_id: "repository".into(),
+            manifest_fingerprint: "manifest".into(),
+            branch: None,
+            language: None,
+            architecture: None,
+            depots: Vec::new(),
+            dlc: Vec::new(),
+        };
+        let build = |id: &str, published_at: i64| GalaxyBuild {
+            build_id: id.into(),
+            product_id: 42,
+            operating_system: "windows".into(),
+            version: None,
+            branch: None,
+            tags: Vec::new(),
+            public: true,
+            generation: 2,
+            repository_url: String::new(),
+            repository_id: None,
+            published_at: Some(published_at),
+            currently_returned: true,
+            first_seen_at: 0,
+            last_seen_at: 0,
+        };
+        assert!(!galaxy_update_available(
+            &[build("older-cache-entry", 1)],
+            &installed,
+            Some("windows")
+        ));
+        assert!(!galaxy_update_available(
+            &[build("installed", 2)],
+            &installed,
+            Some("windows")
+        ));
+        assert!(galaxy_update_available(
+            &[build("installed", 2), build("newer", 3)],
+            &installed,
+            Some("windows")
+        ));
     }
 
     #[test]

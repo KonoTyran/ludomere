@@ -575,6 +575,41 @@ pub(super) fn show_game_settings(
             backup_row.add_suffix(&backup);
             cloud_group.add(&backup_row);
 
+            let export_row = adw::ActionRow::new();
+            export_row.set_title("Export cloud saves");
+            export_row.set_subtitle("Download original paths plus a credential-free manifest");
+            let export = gtk::Button::with_label("Export…");
+            export.set_valign(gtk::Align::Start);
+            export.set_margin_top(10);
+            export.set_sensitive(supported);
+            let export_game = installed_game.clone();
+            let export_parent = window.clone();
+            let export_status = cloud_status.clone();
+            export.connect_clicked(move |button| {
+                let picker = gtk::FileDialog::builder()
+                    .title("Choose cloud-save export directory")
+                    .modal(true)
+                    .build();
+                let button = button.clone();
+                let game = export_game.clone();
+                let status = export_status.clone();
+                picker.select_folder(
+                    Some(&export_parent),
+                    gio::Cancellable::NONE,
+                    move |result| {
+                        let Ok(file) = result else {
+                            return;
+                        };
+                        let Some(destination) = file.path() else {
+                            return;
+                        };
+                        run_cloud_export(&game, &destination, &button, &status);
+                    },
+                );
+            });
+            export_row.add_suffix(&export);
+            cloud_group.add(&export_row);
+
             let override_row = adw::ActionRow::new();
             override_row.set_title("Override save directory");
             override_row.set_subtitle("Use only when GOG's configured location cannot be resolved");
@@ -653,6 +688,7 @@ pub(super) fn show_game_settings(
                 let sync_now = sync_now.clone();
                 let advanced = advanced.clone();
                 let backup = backup.clone();
+                let export = export.clone();
                 let choose = choose.clone();
                 retry.connect_clicked(move |button| {
                     button.set_sensitive(false);
@@ -678,6 +714,7 @@ pub(super) fn show_game_settings(
                     let sync_now = sync_now.clone();
                     let advanced = advanced.clone();
                     let backup = backup.clone();
+                    let export = export.clone();
                     let choose = choose.clone();
                     glib::timeout_add_local(Duration::from_millis(100), move || {
                         match receiver.try_recv() {
@@ -700,6 +737,7 @@ pub(super) fn show_game_settings(
                                 sync_now.set_sensitive(supported);
                                 advanced.set_sensitive(supported);
                                 backup.set_sensitive(supported);
+                                export.set_sensitive(supported);
                                 choose.set_sensitive(
                                     supported
                                         || discovery.availability
@@ -1682,6 +1720,49 @@ fn load_cloud_inventory(
             }
         },
     );
+}
+
+fn run_cloud_export(
+    game: &crate::domain::InstalledGame,
+    destination: &std::path::Path,
+    button: &gtk::Button,
+    status: &gtk::Label,
+) {
+    button.set_sensitive(false);
+    status.remove_css_class("error");
+    status.set_label("Exporting and verifying cloud saves…");
+    let game = game.clone();
+    let destination = destination.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send(crate::cloud_saves::export_cloud_saves(&game, &destination))
+            .ok();
+    });
+    let button = button.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(path)) => {
+                button.set_sensitive(true);
+                status.set_label(&format!("Cloud saves exported to {}", path.display()));
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                button.set_sensitive(true);
+                status.add_css_class("error");
+                status.set_label(&format!("Could not export cloud saves: {error}"));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                button.set_sensitive(true);
+                status.add_css_class("error");
+                status.set_label("Cloud-save export worker stopped unexpectedly");
+                glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn confirm_force_cloud_action(

@@ -78,6 +78,7 @@ pub trait Storage {
         data: &[u8],
         modified_at: i64,
     ) -> Result<RemoteObject>;
+    fn delete(&self, namespace: &str, path: &str, etag: Option<&str>) -> Result<()>;
 }
 
 pub struct CloudClient {
@@ -219,6 +220,29 @@ impl Storage for CloudClient {
             etag,
         })
     }
+
+    fn delete(&self, namespace: &str, path: &str, etag: Option<&str>) -> Result<()> {
+        validate_remote_path(path)?;
+        let mut request = self
+            .client
+            .delete(self.object_url(namespace, path)?)
+            .bearer_auth(&self.access_token);
+        if let Some(etag) = etag.filter(|etag| !etag.is_empty()) {
+            request = request.header(header::IF_MATCH, etag);
+        }
+        request
+            .send()
+            .map_err(|_| anyhow::anyhow!("cloud-save deletion request failed"))?
+            .error_for_status()
+            .map_err(|error| {
+                if error.status() == Some(reqwest::StatusCode::PRECONDITION_FAILED) {
+                    anyhow::anyhow!("cloud-save object changed before deletion")
+                } else {
+                    anyhow::anyhow!("cloud-save deletion was rejected")
+                }
+            })?;
+        Ok(())
+    }
 }
 
 fn read_download(mut response: reqwest::blocking::Response, maximum: usize) -> Result<Vec<u8>> {
@@ -297,6 +321,7 @@ fn validate_remote_path(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::Write, net::TcpListener, thread};
     #[test]
     fn gzip_is_deterministic() {
         assert_eq!(
@@ -339,5 +364,37 @@ mod tests {
                 etag: "etag".into(),
             }
         );
+    }
+
+    #[test]
+    fn delete_uses_encoded_object_path_and_revision_precondition() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+            sender
+                .send(String::from_utf8_lossy(&request[..read]).into_owned())
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let cloud = CloudClient::new(
+            client().unwrap(),
+            "user".into(),
+            "client".into(),
+            "secret".into(),
+        )
+        .with_base_url(format!("http://{address}/v1"));
+        cloud
+            .delete("save slot", "profile one/save.dat", Some("revision"))
+            .unwrap();
+        let request = receiver.recv().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("delete /v1/user/client/save%20slot/profile%20one/save.dat"));
+        assert!(request.contains("if-match: revision"));
+        server.join().unwrap();
     }
 }

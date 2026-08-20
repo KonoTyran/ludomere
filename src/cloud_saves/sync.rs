@@ -393,6 +393,14 @@ mod tests {
             );
             Ok(object)
         }
+
+        fn delete(&self, namespace: &str, path: &str, _etag: Option<&str>) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .remove(&format!("{namespace}/{path}"));
+            Ok(())
+        }
     }
 
     fn fixture(name: &str) -> (PathBuf, StateStore, CloudSaveLocation) {

@@ -1,6 +1,7 @@
 //! GOG cloud saves for managed Windows/UMU installations.
 
 pub mod api;
+mod backup;
 pub mod metadata;
 pub mod paths;
 pub mod sync;
@@ -11,6 +12,7 @@ use crate::domain::{
 };
 use anyhow::{Context, Result, bail};
 use api::Storage;
+pub use backup::{CloudExportManifest, export_cloud_saves};
 
 #[derive(Debug, Clone)]
 pub struct CloudSyncRequest {
@@ -164,6 +166,11 @@ fn windows_builds(
 }
 
 pub fn inventory(game: &InstalledGame) -> Result<CloudSaveInventory> {
+    let cloud = authenticated_storage(game)?;
+    Ok(summarize_inventory(&cloud.list()?))
+}
+
+fn authenticated_storage(game: &InstalledGame) -> Result<api::CloudClient> {
     let store = crate::state::StateStore::open()?;
     let record = store.cloud_save_record(game.product_id)?;
     if record.availability != CloudSaveAvailability::Supported {
@@ -179,8 +186,12 @@ pub fn inventory(game: &InstalledGame) -> Result<CloudSaveInventory> {
     let client = api::client()?;
     let credentials = metadata::fetch_credentials(&client, &build.repository_url)?;
     let scoped = api::exchange_scoped_token(&client, &token.refresh_token, &credentials)?;
-    let cloud = api::CloudClient::new(client, token.user_id, credentials.client_id, scoped);
-    Ok(summarize_inventory(&cloud.list()?))
+    Ok(api::CloudClient::new(
+        client,
+        token.user_id,
+        credentials.client_id,
+        scoped,
+    ))
 }
 
 fn summarize_inventory(objects: &[api::RemoteObject]) -> CloudSaveInventory {
@@ -215,21 +226,7 @@ pub fn sync(mut request: CloudSyncRequest) -> Result<CloudSyncResult> {
         );
     }
     request.locations = discovery.locations;
-    let token = crate::auth::load_saved_token()?.context("sign in to GOG to synchronize saves")?;
-    let builds = windows_builds(&store, request.game.product_id)?;
-    let exact =
-        crate::installation::load_installation_marker(&request.game.installation_directory)?
-            .and_then(|marker| marker.galaxy_depot.map(|depot| depot.build_id));
-    let build = metadata::select_build(
-        &builds,
-        exact.as_deref(),
-        request.game.installed_version.as_deref(),
-    )
-    .context("no generation-2 Windows build is available")?;
-    let client = api::client()?;
-    let credentials = metadata::fetch_credentials(&client, &build.repository_url)?;
-    let scoped = api::exchange_scoped_token(&client, &token.refresh_token, &credentials)?;
-    let cloud = api::CloudClient::new(client, token.user_id, credentials.client_id, scoped);
+    let cloud = authenticated_storage(&request.game)?;
     sync::synchronize(
         &store,
         request.game.product_id,

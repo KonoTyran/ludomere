@@ -123,9 +123,13 @@ pub(super) fn render_detail_page(
     let current_installer_downloaded =
         default_installers_are_downloaded(&game, &model.borrow().config);
     let installed_update = installed.as_ref().is_some_and(|(_, update)| *update);
+    let galaxy_depot_installation = installed
+        .as_ref()
+        .is_some_and(|(installed, _)| is_galaxy_depot_installation(installed));
     let primary_action = primary_action_for_state(
         installed.is_some(),
         installed_update,
+        galaxy_depot_installation,
         backup_update,
         current_installer_downloaded,
         dlc_action,

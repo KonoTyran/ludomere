@@ -591,6 +591,7 @@ fn context_primary_action(
     primary_action_for_state(
         installed.is_some(),
         installed_update,
+        installed.is_some_and(is_galaxy_depot_installation),
         backup_update,
         current_installer_downloaded,
         dlc_action,

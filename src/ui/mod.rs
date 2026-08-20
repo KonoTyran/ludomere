@@ -287,10 +287,18 @@ impl GamePrimaryAction {
 fn primary_action_for_state(
     installed: bool,
     installed_update: bool,
+    galaxy_depot_installation: bool,
     backup_update: bool,
     current_installer_downloaded: bool,
     dlc_action: DlcActionState,
 ) -> GamePrimaryAction {
+    if installed && galaxy_depot_installation {
+        return if installed_update {
+            GamePrimaryAction::InstallUpdate
+        } else {
+            GamePrimaryAction::Play
+        };
+    }
     let needs_download = backup_update
         || dlc_action.missing_download
         || (installed_update && !current_installer_downloaded);
@@ -308,6 +316,13 @@ fn primary_action_for_state(
     } else {
         GamePrimaryAction::Download
     }
+}
+
+fn is_galaxy_depot_installation(game: &crate::domain::InstalledGame) -> bool {
+    crate::installation::load_installation_marker(&game.installation_directory)
+        .ok()
+        .flatten()
+        .is_some_and(|marker| marker.source == crate::domain::InstallationSource::GalaxyDepot)
 }
 
 #[derive(Clone)]
@@ -985,7 +1000,7 @@ mod primary_action_tests {
     #[test]
     fn installed_game_without_pending_work_plays() {
         assert_eq!(
-            primary_action_for_state(true, false, false, true, DlcActionState::default()),
+            primary_action_for_state(true, false, false, false, true, DlcActionState::default()),
             GamePrimaryAction::Play
         );
     }
@@ -993,11 +1008,11 @@ mod primary_action_tests {
     #[test]
     fn downloaded_update_is_installed_while_missing_update_is_downloaded() {
         assert_eq!(
-            primary_action_for_state(true, true, false, true, DlcActionState::default()),
+            primary_action_for_state(true, true, false, false, true, DlcActionState::default()),
             GamePrimaryAction::InstallUpdate
         );
         assert_eq!(
-            primary_action_for_state(true, true, false, false, DlcActionState::default()),
+            primary_action_for_state(true, true, false, false, false, DlcActionState::default()),
             GamePrimaryAction::DownloadUpdate
         );
     }
@@ -1005,11 +1020,12 @@ mod primary_action_tests {
     #[test]
     fn uninstalled_game_never_resolves_to_play_or_install_update() {
         assert_eq!(
-            primary_action_for_state(false, false, false, true, DlcActionState::default()),
+            primary_action_for_state(false, false, false, false, true, DlcActionState::default()),
             GamePrimaryAction::Install
         );
         assert_eq!(
             primary_action_for_state(
+                false,
                 false,
                 false,
                 false,
@@ -1030,6 +1046,7 @@ mod primary_action_tests {
                 true,
                 false,
                 false,
+                false,
                 true,
                 DlcActionState {
                     missing_download: true,
@@ -1037,6 +1054,28 @@ mod primary_action_tests {
                 },
             ),
             GamePrimaryAction::DownloadUpdate
+        );
+    }
+
+    #[test]
+    fn galaxy_depot_installation_ignores_offline_backup_state() {
+        assert_eq!(
+            primary_action_for_state(true, true, true, false, false, DlcActionState::default()),
+            GamePrimaryAction::InstallUpdate
+        );
+        assert_eq!(
+            primary_action_for_state(
+                true,
+                false,
+                true,
+                true,
+                false,
+                DlcActionState {
+                    missing_download: true,
+                    missing_install: true,
+                },
+            ),
+            GamePrimaryAction::Play
         );
     }
 }

@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "capabilities": [
+    { "name": "friends_read", "read": true, "write": false },
+    { "name": "friend_requests", "read": true, "write": false },
+    { "name": "presence_read", "read": true, "write": false },
+    { "name": "presence_write", "read": false, "write": false },
+    { "name": "achievements_read", "read": true, "write": false },
+    { "name": "sessions_read", "read": true, "write": false },
+    { "name": "sessions_write", "read": false, "write": false },
+    { "name": "account_tags", "read": false, "write": false },
+    { "name": "hidden_games", "read": false, "write": false },
+    { "name": "friend_mutations", "read": false, "write": false },
+    { "name": "statistics_read", "read": false, "write": false },
+    { "name": "statistics_write", "read": false, "write": false },
+    { "name": "chat", "read": false, "write": false }
+  ]
+}

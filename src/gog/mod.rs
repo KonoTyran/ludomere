@@ -1,9 +1,14 @@
 pub mod audit;
 pub mod builds;
+pub mod capabilities;
+pub mod capability_audit;
 pub mod depot_acquisition;
 pub mod depot_manifest;
 pub mod depot_service;
+pub mod friends;
+pub mod gameplay;
 pub mod gamesdb;
+pub mod presence;
 pub mod product;
 pub mod repository;
 pub mod store;

@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 const BASE_URL: &str = "https://cloudstorage.gog.com/v1";
 const MAX_RESPONSE: usize = 256 * 1024 * 1024;
 const MAX_FILES: usize = 10_000;
+pub const DELETION_ETAG: &str = "aadd86936a80ee8a369579c3926f1b3c";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteObject {
@@ -16,6 +17,12 @@ pub struct RemoteObject {
     pub size: u64,
     pub modified_at: i64,
     pub etag: String,
+}
+
+impl RemoteObject {
+    pub fn is_deleted(&self) -> bool {
+        self.etag.eq_ignore_ascii_case(DELETION_ETAG)
+    }
 }
 
 #[derive(Deserialize)]

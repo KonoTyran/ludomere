@@ -470,7 +470,7 @@ pub(super) fn show_game_settings(
             sync_now.set_valign(gtk::Align::Start);
             sync_now.set_margin_top(10);
             sync_now.set_sensitive(supported);
-            let game = installed_game.clone();
+            let sync_game = installed_game.clone();
             let locations = locations_state.clone();
             let status = cloud_status.clone();
             sync_now.connect_clicked(move |button| {
@@ -478,7 +478,7 @@ pub(super) fn show_game_settings(
                     button,
                     &status,
                     crate::cloud_saves::CloudSyncRequest {
-                        game: game.clone(),
+                        game: sync_game.clone(),
                         locations: locations.borrow().clone(),
                         mode: crate::domain::CloudSyncMode::Normal,
                     },
@@ -610,6 +610,32 @@ pub(super) fn show_game_settings(
             export_row.add_suffix(&export);
             cloud_group.add(&export_row);
 
+            let delete_row = adw::ActionRow::new();
+            delete_row.set_title("Delete remote cloud saves");
+            delete_row.set_subtitle("Creates a verified recovery snapshot before deletion");
+            let delete_remote = gtk::Button::with_label("Select Files…");
+            delete_remote.add_css_class("destructive-action");
+            delete_remote.set_valign(gtk::Align::Start);
+            delete_remote.set_margin_top(10);
+            delete_remote.set_sensitive(supported);
+            let delete_game = installed_game.clone();
+            let delete_title = game.title.clone();
+            let delete_parent = window.clone();
+            let delete_status = cloud_status.clone();
+            let delete_inventory = inventory_row.clone();
+            delete_remote.connect_clicked(move |button| {
+                load_cloud_deletion_inventory(
+                    &delete_parent,
+                    &delete_title,
+                    &delete_game,
+                    button,
+                    &delete_status,
+                    &delete_inventory,
+                );
+            });
+            delete_row.add_suffix(&delete_remote);
+            cloud_group.add(&delete_row);
+
             let override_row = adw::ActionRow::new();
             override_row.set_title("Override save directory");
             override_row.set_subtitle("Use only when GOG's configured location cannot be resolved");
@@ -689,6 +715,7 @@ pub(super) fn show_game_settings(
                 let advanced = advanced.clone();
                 let backup = backup.clone();
                 let export = export.clone();
+                let delete_remote = delete_remote.clone();
                 let choose = choose.clone();
                 retry.connect_clicked(move |button| {
                     button.set_sensitive(false);
@@ -715,6 +742,7 @@ pub(super) fn show_game_settings(
                     let advanced = advanced.clone();
                     let backup = backup.clone();
                     let export = export.clone();
+                    let delete_remote = delete_remote.clone();
                     let choose = choose.clone();
                     glib::timeout_add_local(Duration::from_millis(100), move || {
                         match receiver.try_recv() {
@@ -738,6 +766,7 @@ pub(super) fn show_game_settings(
                                 advanced.set_sensitive(supported);
                                 backup.set_sensitive(supported);
                                 export.set_sensitive(supported);
+                                delete_remote.set_sensitive(supported);
                                 choose.set_sensitive(
                                     supported
                                         || discovery.availability
@@ -1731,12 +1760,15 @@ fn run_cloud_export(
     button.set_sensitive(false);
     status.remove_css_class("error");
     status.set_label("Exporting and verifying cloud saves…");
-    let game = game.clone();
+    let worker_game = game.clone();
     let destination = destination.to_path_buf();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         sender
-            .send(crate::cloud_saves::export_cloud_saves(&game, &destination))
+            .send(crate::cloud_saves::export_cloud_saves(
+                &worker_game,
+                &destination,
+            ))
             .ok();
     });
     let button = button.clone();
@@ -1759,6 +1791,246 @@ fn run_cloud_export(
                 button.set_sensitive(true);
                 status.add_css_class("error");
                 status.set_label("Cloud-save export worker stopped unexpectedly");
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn load_cloud_deletion_inventory(
+    parent: &adw::ApplicationWindow,
+    title: &str,
+    game: &crate::domain::InstalledGame,
+    button: &gtk::Button,
+    status: &gtk::Label,
+    inventory_row: &adw::ActionRow,
+) {
+    button.set_sensitive(false);
+    status.remove_css_class("error");
+    status.set_label("Refreshing remote save inventory…");
+    let worker_game = game.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send(crate::cloud_saves::cloud_inventory_objects(&worker_game))
+            .ok();
+    });
+    let parent = parent.clone();
+    let title = title.to_owned();
+    let game = game.clone();
+    let button = button.clone();
+    let status = status.clone();
+    let inventory_row = inventory_row.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(objects)) => {
+                if objects.is_empty() {
+                    button.set_sensitive(true);
+                    status.set_label("No remote cloud saves to delete");
+                } else {
+                    present_cloud_deletion_selection(
+                        &parent,
+                        &title,
+                        &game,
+                        objects,
+                        &button,
+                        &status,
+                        &inventory_row,
+                    );
+                }
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                button.set_sensitive(true);
+                status.add_css_class("error");
+                status.set_label(&format!("Could not refresh cloud saves: {error}"));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                button.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn present_cloud_deletion_selection(
+    parent: &adw::ApplicationWindow,
+    title: &str,
+    game: &crate::domain::InstalledGame,
+    objects: Vec<crate::cloud_saves::api::RemoteObject>,
+    trigger: &gtk::Button,
+    status: &gtk::Label,
+    inventory_row: &adw::ActionRow,
+) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let select_all = gtk::CheckButton::with_label("Select all remote saves");
+    content.append(&select_all);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let rows = objects
+        .into_iter()
+        .map(|object| {
+            let row = gtk::CheckButton::with_label(&format!(
+                "{}/{} · {}",
+                object.namespace,
+                object.path,
+                crate::domain::human_size(object.size)
+            ));
+            row.set_tooltip_text(Some(&format!("Remote revision: {}", object.etag)));
+            list.append(&row);
+            (row, object)
+        })
+        .collect::<Vec<_>>();
+    let scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(220)
+        .max_content_height(360)
+        .child(&list)
+        .build();
+    content.append(&scroll);
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Select {title} Cloud Saves"))
+        .body("Only selected remote files will be deleted. Local save files are not removed.")
+        .extra_child(&content)
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("continue", "Continue")]);
+    dialog.set_response_enabled("continue", false);
+    let rows = Rc::new(rows);
+    let update_response = Rc::new({
+        let dialog = dialog.clone();
+        let rows = rows.clone();
+        move || dialog.set_response_enabled("continue", rows.iter().any(|row| row.0.is_active()))
+    });
+    select_all.connect_toggled({
+        let rows = rows.clone();
+        let update_response = update_response.clone();
+        move |all| {
+            for (row, _) in rows.iter() {
+                row.set_active(all.is_active());
+            }
+            update_response();
+        }
+    });
+    for (row, _) in rows.iter() {
+        let update_response = update_response.clone();
+        row.connect_toggled(move |_| update_response());
+    }
+    let present_parent = parent.clone();
+    let callback_parent = parent.clone();
+    let title = title.to_owned();
+    let game = game.clone();
+    let trigger = trigger.clone();
+    let status = status.clone();
+    let inventory_row = inventory_row.clone();
+    dialog.choose(
+        Some(&present_parent),
+        gio::Cancellable::NONE,
+        move |response| {
+            if response != "continue" {
+                trigger.set_sensitive(true);
+                return;
+            }
+            let selected = rows
+                .iter()
+                .filter(|row| row.0.is_active())
+                .map(|row| row.1.clone())
+                .collect::<Vec<_>>();
+            confirm_cloud_deletion(
+                &callback_parent,
+                &title,
+                &game,
+                selected,
+                &trigger,
+                &status,
+                &inventory_row,
+            );
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_cloud_deletion(
+    parent: &adw::ApplicationWindow,
+    title: &str,
+    game: &crate::domain::InstalledGame,
+    selected: Vec<crate::cloud_saves::api::RemoteObject>,
+    trigger: &gtk::Button,
+    status: &gtk::Label,
+    inventory_row: &adw::ActionRow,
+) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let instruction = gtk::Label::new(Some("Type DELETE to confirm"));
+    instruction.set_xalign(0.0);
+    let entry = gtk::Entry::new();
+    content.append(&instruction);
+    content.append(&entry);
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Delete {} Cloud Save File(s) for {title}?", selected.len()))
+        .body("Ludomere will refresh the inventory and create and verify a complete recovery snapshot before sending any deletion request.")
+        .extra_child(&content)
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete Remote Files")]);
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_response_enabled("delete", false);
+    entry.connect_changed({
+        let dialog = dialog.clone();
+        move |entry| dialog.set_response_enabled("delete", entry.text().as_str() == "DELETE")
+    });
+    let game = game.clone();
+    let trigger = trigger.clone();
+    let status = status.clone();
+    let inventory_row = inventory_row.clone();
+    dialog.choose(Some(parent), gio::Cancellable::NONE, move |response| {
+        if response != "delete" {
+            trigger.set_sensitive(true);
+            return;
+        }
+        run_cloud_deletion(&game, selected, &trigger, &status, &inventory_row);
+    });
+}
+
+fn run_cloud_deletion(
+    game: &crate::domain::InstalledGame,
+    selected: Vec<crate::cloud_saves::api::RemoteObject>,
+    trigger: &gtk::Button,
+    status: &gtk::Label,
+    inventory_row: &adw::ActionRow,
+) {
+    status.set_label("Creating and verifying recovery snapshot…");
+    let game = game.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send(crate::cloud_saves::delete_cloud_saves(&game, &selected))
+            .ok();
+    });
+    let trigger = trigger.clone();
+    let status = status.clone();
+    let inventory_row = inventory_row.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(report)) => {
+                trigger.set_sensitive(true);
+                status.remove_css_class("error");
+                status.set_label(&format!(
+                    "Deleted {} remote file(s); recovery snapshot: {}",
+                    report.deleted,
+                    report.recovery_snapshot.display()
+                ));
+                inventory_row.set_subtitle("Remote inventory changed; check again to refresh");
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                trigger.set_sensitive(true);
+                status.add_css_class("error");
+                status.set_label(&format!("Remote deletion stopped: {error}"));
+                inventory_row.set_subtitle("Check again before retrying remote deletion");
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                trigger.set_sensitive(true);
                 glib::ControlFlow::Break
             }
         }

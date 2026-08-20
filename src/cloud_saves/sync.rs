@@ -93,10 +93,28 @@ fn run(
             | (Some(local), Some(_), CloudSyncMode::Normal)
                 if local_changed =>
             {
+                let remote_path = remote_path(&local.metadata);
+                if let Some(tombstone) = store.cloud_save_tombstone(
+                    product_id,
+                    &local.metadata.location,
+                    &remote_path,
+                )? {
+                    if mode == CloudSyncMode::Normal
+                        && tombstone.local_etag.as_deref() == Some(&local.metadata.etag)
+                    {
+                        next.remove(&key);
+                        continue;
+                    }
+                    store.clear_cloud_save_tombstone(
+                        product_id,
+                        &local.metadata.location,
+                        &remote_path,
+                    )?;
+                }
                 let bytes = read_file(&local.path)?;
                 let uploaded = cloud.upload(
                     &local.metadata.location,
-                    &remote_path(&local.metadata),
+                    &remote_path,
                     &bytes,
                     local.metadata.modified_at,
                 )?;
@@ -251,6 +269,9 @@ fn local_metadata(location: &str, relative: &Path, path: &Path) -> Result<CloudS
 fn remote_map(objects: Vec<RemoteObject>) -> Result<HashMap<String, RemoteObject>> {
     let mut map = HashMap::new();
     for object in objects {
+        if object.is_deleted() {
+            continue;
+        }
         let relative = safe_relative(&object.path)?;
         map.insert(key(&object.namespace, &relative), object);
     }
@@ -433,6 +454,52 @@ mod tests {
         .unwrap();
         assert_eq!(result.uploaded, 1);
         assert!(cloud.0.lock().unwrap().contains_key("main/save.dat"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletion_tombstone_suppresses_unchanged_local_file_until_modified() {
+        let (root, store, location) = fixture("tombstone");
+        let save = location.path.join("save.dat");
+        fs::write(&save, b"local").unwrap();
+        store
+            .record_cloud_save_tombstone(&crate::state::CloudSaveTombstone {
+                product_id: 7,
+                namespace: "main".into(),
+                path: "save.dat".into(),
+                remote_etag: "deleted".into(),
+                local_etag: Some(format!("{:x}", md5::compute(b"local"))),
+                deleted_at: 1,
+            })
+            .unwrap();
+        let cloud = MemoryCloud::default();
+        let first = synchronize(
+            &store,
+            7,
+            std::slice::from_ref(&location),
+            crate::domain::CloudSyncMode::Normal,
+            &cloud,
+        )
+        .unwrap();
+        assert_eq!(first.uploaded, 0);
+        assert!(cloud.0.lock().unwrap().is_empty());
+
+        fs::write(&save, b"changed").unwrap();
+        let second = synchronize(
+            &store,
+            7,
+            &[location],
+            crate::domain::CloudSyncMode::Normal,
+            &cloud,
+        )
+        .unwrap();
+        assert_eq!(second.uploaded, 1);
+        assert!(
+            store
+                .cloud_save_tombstone(7, "main", "save.dat")
+                .unwrap()
+                .is_none()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

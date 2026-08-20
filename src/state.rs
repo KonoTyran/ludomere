@@ -261,9 +261,19 @@ pub struct CloudSaveRecord {
     pub conflicts: Vec<CloudSaveConflict>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSaveTombstone {
+    pub product_id: i64,
+    pub namespace: String,
+    pub path: String,
+    pub remote_etag: String,
+    pub local_etag: Option<String>,
+    pub deleted_at: i64,
+}
+
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 6;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 7;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -441,6 +451,11 @@ impl StateStore {
              CREATE TABLE IF NOT EXISTS cloud_save_conflicts (
                 product_id INTEGER PRIMARY KEY, conflicts_json TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS cloud_save_tombstones (
+                product_id INTEGER NOT NULL, namespace TEXT NOT NULL, path TEXT NOT NULL,
+                remote_etag TEXT NOT NULL, local_etag TEXT, deleted_at INTEGER NOT NULL,
+                PRIMARY KEY(product_id, namespace, path)
+             );
              CREATE TABLE IF NOT EXISTS galaxy_branch_credentials (
                 user_id TEXT NOT NULL, product_id INTEGER NOT NULL, branch TEXT NOT NULL,
                 format_version INTEGER NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
@@ -490,6 +505,7 @@ impl StateStore {
             )?;
             ensure_cloud_save_target_columns(&connection)?;
             ensure_revision_six_schema(&connection)?;
+            ensure_revision_seven_schema(&connection)?;
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
@@ -1110,6 +1126,67 @@ impl StateStore {
             "INSERT INTO cloud_save_settings(product_id, status, error, updated_at) VALUES (?1, ?2, ?3, unixepoch())
              ON CONFLICT(product_id) DO UPDATE SET status = excluded.status, error = excluded.error, updated_at = excluded.updated_at",
             params![product_id, status, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn cloud_save_tombstone(
+        &self,
+        product_id: i64,
+        namespace: &str,
+        path: &str,
+    ) -> Result<Option<CloudSaveTombstone>> {
+        self.connection
+            .query_row(
+                "SELECT remote_etag, local_etag, deleted_at
+                 FROM cloud_save_tombstones
+                 WHERE product_id = ?1 AND namespace = ?2 AND path = ?3",
+                params![product_id, namespace, path],
+                |row| {
+                    Ok(CloudSaveTombstone {
+                        product_id,
+                        namespace: namespace.into(),
+                        path: path.into(),
+                        remote_etag: row.get(0)?,
+                        local_etag: row.get(1)?,
+                        deleted_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn record_cloud_save_tombstone(&self, tombstone: &CloudSaveTombstone) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO cloud_save_tombstones(
+                product_id, namespace, path, remote_etag, local_etag, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(product_id, namespace, path) DO UPDATE SET
+                remote_etag = excluded.remote_etag, local_etag = excluded.local_etag,
+                deleted_at = excluded.deleted_at",
+            params![
+                tombstone.product_id,
+                tombstone.namespace,
+                tombstone.path,
+                tombstone.remote_etag,
+                tombstone.local_etag,
+                tombstone.deleted_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_cloud_save_tombstone(
+        &self,
+        product_id: i64,
+        namespace: &str,
+        path: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM cloud_save_tombstones
+             WHERE product_id = ?1 AND namespace = ?2 AND path = ?3",
+            params![product_id, namespace, path],
         )?;
         Ok(())
     }
@@ -3095,6 +3172,17 @@ fn ensure_revision_six_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_revision_seven_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cloud_save_tombstones (
+            product_id INTEGER NOT NULL, namespace TEXT NOT NULL, path TEXT NOT NULL,
+            remote_etag TEXT NOT NULL, local_etag TEXT, deleted_at INTEGER NOT NULL,
+            PRIMARY KEY(product_id, namespace, path)
+         );",
+    )?;
+    Ok(())
+}
+
 fn data_path() -> PathBuf {
     crate::identity::database()
 }
@@ -4678,6 +4766,48 @@ mod tests {
         assert!(table_exists(&store.connection, "work_queue").unwrap());
         assert!(table_exists(&store.connection, "game_sessions").unwrap());
         assert!(column_exists(&store.connection, "game_preferences", "galaxy_language").unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn development_revision_six_gains_cloud_save_tombstones() {
+        let path = temp_database_path("development-revision-six");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE cloud_save_tombstones;
+                 UPDATE schema_state SET development_revision=6;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        let tombstone = CloudSaveTombstone {
+            product_id: 42,
+            namespace: "main".into(),
+            path: "save.dat".into(),
+            remote_etag: "remote".into(),
+            local_etag: Some("local".into()),
+            deleted_at: 10,
+        };
+        store.record_cloud_save_tombstone(&tombstone).unwrap();
+        assert_eq!(
+            store.cloud_save_tombstone(42, "main", "save.dat").unwrap(),
+            Some(tombstone)
+        );
+        store
+            .clear_cloud_save_tombstone(42, "main", "save.dat")
+            .unwrap();
+        assert_eq!(
+            store.cloud_save_tombstone(42, "main", "save.dat").unwrap(),
+            None
+        );
         drop(store);
         fs::remove_file(path).unwrap();
     }

@@ -12,7 +12,10 @@ use crate::domain::{
 };
 use anyhow::{Context, Result, bail};
 use api::Storage;
-pub use backup::{CloudExportManifest, export_cloud_saves};
+pub use backup::{
+    CloudDeletionReport, CloudExportManifest, cloud_inventory_objects, delete_cloud_saves,
+    export_cloud_saves,
+};
 
 #[derive(Debug, Clone)]
 pub struct CloudSyncRequest {
@@ -195,12 +198,13 @@ fn authenticated_storage(game: &InstalledGame) -> Result<api::CloudClient> {
 }
 
 fn summarize_inventory(objects: &[api::RemoteObject]) -> CloudSaveInventory {
+    let objects = objects.iter().filter(|object| !object.is_deleted());
     CloudSaveInventory {
-        file_count: objects.len(),
+        file_count: objects.clone().count(),
         total_size: objects
-            .iter()
+            .clone()
             .fold(0, |total, object| total.saturating_add(object.size)),
-        latest_modified_at: objects.iter().map(|object| object.modified_at).max(),
+        latest_modified_at: objects.map(|object| object.modified_at).max(),
     }
 }
 
@@ -256,6 +260,13 @@ mod tests {
                 size: 30,
                 modified_at: 20,
                 etag: "two".into(),
+            },
+            api::RemoteObject {
+                namespace: "saves".into(),
+                path: "deleted.sav".into(),
+                size: 99,
+                modified_at: 30,
+                etag: api::DELETION_ETAG.into(),
             },
         ];
         assert_eq!(

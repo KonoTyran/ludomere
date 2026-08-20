@@ -133,6 +133,7 @@ pub fn build_window(app: &adw::Application) {
     start_installation_monitor(&widgets, &model);
     tray::start_tray(&widgets, &model);
     schedule_activity_rollover(&widgets, &model);
+    schedule_update_checks(&widgets, &model);
 }
 
 fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
@@ -1530,5 +1531,93 @@ fn schedule_activity_rollover(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
             rebuild_sidebar_presentation(&widgets, &mut model.borrow_mut());
         }
         schedule_activity_rollover(&widgets, &model);
+    });
+}
+
+pub(super) fn start_update_check(
+    w: &Rc<Widgets>,
+    model: &Rc<RefCell<AppModel>>,
+    mode: crate::updates::CheckMode,
+    announce: bool,
+) {
+    let (config, games, token) = {
+        let state = model.borrow();
+        let Some(token) = state
+            .account_token
+            .clone()
+            .filter(|_| state.network_available)
+        else {
+            if announce {
+                show_status(w, "Connect to GOG to check for updates");
+            }
+            return;
+        };
+        (state.config.clone(), state.games.clone(), token)
+    };
+    if announce {
+        show_status(w, "Checking for game updates…");
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(crate::updates::check_and_queue(
+            &config, &games, &token, mode,
+        ));
+    });
+    let widgets = w.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(report)) => {
+                if report.already_running {
+                    if announce {
+                        show_status(&widgets, "An update check is already running");
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                for (product_id, error) in &report.failures {
+                    tracing::warn!(product_id, %error, "game update check failed");
+                }
+                rebuild_downloads_page(&widgets, &model.borrow());
+                if announce {
+                    show_status(
+                        &widgets,
+                        &format!(
+                            "Queued {} Galaxy update(s) and {} offline installer(s){}",
+                            report.galaxy_updates_queued,
+                            report.offline_installers_queued,
+                            if report.skipped_running > 0 {
+                                "; running games were left unchanged"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                }
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "automatic update check failed");
+                if announce {
+                    show_status(&widgets, "Could not check for updates");
+                }
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        }
+    });
+}
+
+fn schedule_update_checks(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
+    let widgets = w.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_secs(6 * 60 * 60), move || {
+        start_update_check(
+            &widgets,
+            &model,
+            crate::updates::CheckMode::Automatic,
+            false,
+        );
+        glib::ControlFlow::Continue
     });
 }

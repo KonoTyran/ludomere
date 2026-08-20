@@ -1,4 +1,41 @@
-use crate::{config::Config, domain::GamePreferences};
+use crate::{
+    auth::Token,
+    config::Config,
+    domain::{ArtifactKind, Game, GamePreferences, InstallationSource},
+    state::{DownloadState, StateStore},
+};
+use anyhow::Result;
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
+
+static CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckMode {
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateCheckReport {
+    pub already_running: bool,
+    pub galaxy_updates_queued: usize,
+    pub offline_installers_queued: usize,
+    pub skipped_running: usize,
+    pub failures: Vec<(i64, String)>,
+}
+
+struct CheckContext<'a> {
+    config: &'a Config,
+    token: &'a Token,
+    store: &'a StateStore,
+    client: &'a reqwest::blocking::Client,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatePolicy {
@@ -25,6 +62,260 @@ impl UpdatePolicy {
                 .or_else(|| config.installer_language.clone()),
         }
     }
+}
+
+pub fn check_and_queue(
+    config: &Config,
+    games: &[Game],
+    token: &Token,
+    mode: CheckMode,
+) -> Result<UpdateCheckReport> {
+    if CHECK_RUNNING.swap(true, Ordering::AcqRel) {
+        return Ok(UpdateCheckReport {
+            already_running: true,
+            ..UpdateCheckReport::default()
+        });
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CHECK_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    let _reset = Reset;
+    let store = StateStore::open()?;
+    let installed = crate::installation::reconcile_installed_games(&store, &config.game_libraries)?;
+    let client = reqwest::blocking::Client::new();
+    let context = CheckContext {
+        config,
+        token,
+        store: &store,
+        client: &client,
+    };
+    let mut report = UpdateCheckReport::default();
+    for installed_game in installed {
+        let Some(game) = games
+            .iter()
+            .find(|game| game.product_id == installed_game.product_id)
+        else {
+            continue;
+        };
+        let preferences = store.game_preferences(game.product_id)?;
+        let policy = UpdatePolicy::resolve(config, preferences.as_ref());
+        if crate::installation::is_game_running(game.product_id) {
+            report.skipped_running += 1;
+            continue;
+        }
+        let result = (|| -> Result<()> {
+            let marker = crate::installation::load_installation_marker(
+                &installed_game.installation_directory,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("managed installation marker is missing"))?;
+            if marker.source == InstallationSource::GalaxyDepot
+                && (mode == CheckMode::Manual || policy.auto_update_galaxy)
+                && crate::installation::depot_operation_snapshot_for_product(game.product_id)
+                    .is_none()
+                && queue_galaxy_update(&context, game, &installed_game, &marker, &policy)?
+            {
+                report.galaxy_updates_queued += 1;
+            }
+            if (mode == CheckMode::Manual || policy.auto_download_offline_installer)
+                && queue_offline_installer(&context, game, &installed_game)
+            {
+                report.offline_installers_queued += 1;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            report
+                .failures
+                .push((game.product_id, format!("{error:#}")));
+        }
+    }
+    Ok(report)
+}
+
+fn queue_galaxy_update(
+    context: &CheckContext<'_>,
+    game: &Game,
+    installed: &crate::domain::InstalledGame,
+    marker: &crate::installation::InstallationMarker,
+    policy: &UpdatePolicy,
+) -> Result<bool> {
+    let provenance = marker
+        .galaxy_depot
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Galaxy installation has no depot provenance"))?;
+    let platform = marker
+        .base
+        .operating_system
+        .clone()
+        .unwrap_or_else(|| "windows".into());
+    let builds = crate::gog::depot_service::list_builds(
+        context.store,
+        context.client,
+        &crate::gog::depot_service::BuildRequest {
+            user_id: context.token.user_id.clone(),
+            product_id: game.product_id,
+            platform,
+            generation: 2,
+            branch: provenance.branch.clone(),
+            supplied_password: None,
+        },
+    )?;
+    let build = match crate::gog::depot_service::resolve_operation_build(
+        &builds,
+        marker,
+        crate::domain::DepotOperationKind::Update,
+        None,
+    ) {
+        Ok(build) => build.clone(),
+        Err(error)
+            if error.downcast_ref::<crate::gog::depot_service::BuildResolutionError>()
+                == Some(&crate::gog::depot_service::BuildResolutionError::NoUpdate) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let selected_dlc = provenance
+        .dlc
+        .iter()
+        .map(|dlc| dlc.product_id)
+        .collect::<BTreeSet<_>>();
+    let language = depot_language(game, policy.galaxy_language.as_deref())
+        .or_else(|| provenance.language.clone())
+        .unwrap_or_else(|| "en".into());
+    let library_root = context
+        .config
+        .game_libraries
+        .iter()
+        .find(|library| library.id == installed.library_id)
+        .map(|library| library.path.clone())
+        .ok_or_else(|| anyhow::anyhow!("installed game library is no longer configured"))?;
+    crate::gog::depot_service::start_operation(
+        context.store,
+        context.client,
+        crate::gog::depot_service::PrepareOperationRequest {
+            build,
+            selection: crate::gog::depot_acquisition::Selection {
+                language,
+                bitness: provenance.architecture.clone(),
+                owned_dlc: selected_dlc.clone(),
+                selected_dlc,
+            },
+            operation_id: format!(
+                "{}-automatic-update-{}",
+                game.product_id,
+                chrono::Utc::now().timestamp_millis()
+            ),
+            kind: crate::domain::DepotOperationKind::Update,
+            library_id: installed.library_id.clone(),
+            library_root,
+            slug: game.slug.clone(),
+        },
+    )?;
+    Ok(true)
+}
+
+fn queue_offline_installer(
+    context: &CheckContext<'_>,
+    game: &Game,
+    installed: &crate::domain::InstalledGame,
+) -> bool {
+    let preferred_language = context.config.installer_language.as_deref();
+    let group = crate::download_selection::group_artifacts(&game.remote_artifacts)
+        .into_iter()
+        .filter(|group| group.kind == ArtifactKind::Installer && complete_group(group))
+        .filter(|group| {
+            installed
+                .installer_operating_system
+                .as_deref()
+                .is_none_or(|os| {
+                    group
+                        .operating_system
+                        .as_deref()
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(os))
+                })
+        })
+        .filter(|group| {
+            preferred_language.is_none_or(|language| {
+                group
+                    .language
+                    .as_deref()
+                    .is_none_or(|candidate| candidate.eq_ignore_ascii_case(language))
+            })
+        })
+        .max_by(|left, right| {
+            (
+                left.release_sort_key(),
+                left.version.as_deref().unwrap_or_default(),
+            )
+                .cmp(&(
+                    right.release_sort_key(),
+                    right.version.as_deref().unwrap_or_default(),
+                ))
+        });
+    let Some(group) = group else {
+        return false;
+    };
+    if context
+        .store
+        .download_job(&group.job_id)
+        .ok()
+        .flatten()
+        .is_some_and(|job| {
+            matches!(
+                job.state,
+                DownloadState::Queued | DownloadState::Downloading | DownloadState::Complete
+            )
+        })
+    {
+        return false;
+    }
+    let artifacts = group.artifacts;
+    let refs = artifacts.iter().collect::<Vec<_>>();
+    let destination =
+        crate::download::destination(&context.config.download_directory, &game.slug, None, &refs);
+    let (events, _) = mpsc::channel();
+    crate::download::enqueue(crate::download::DownloadRequest {
+        artifacts,
+        title: game.title.clone(),
+        access_token: context.token.access_token.clone(),
+        destination,
+        events,
+    });
+    true
+}
+
+fn complete_group(group: &crate::download_selection::ArtifactGroup) -> bool {
+    let expected = group
+        .artifacts
+        .iter()
+        .filter_map(|artifact| artifact.part_count)
+        .max()
+        .unwrap_or(1);
+    expected as usize == group.artifacts.len()
+        && (expected == 1
+            || group
+                .artifacts
+                .iter()
+                .filter_map(|artifact| artifact.part_number)
+                .collect::<BTreeSet<_>>()
+                == (1..=expected).collect())
+}
+
+fn depot_language(game: &Game, preferred: Option<&str>) -> Option<String> {
+    preferred.and_then(|preferred| {
+        game.metadata
+            .localizations
+            .iter()
+            .find(|localization| {
+                localization.language_code.eq_ignore_ascii_case(preferred)
+                    || localization.name.eq_ignore_ascii_case(preferred)
+            })
+            .map(|localization| localization.language_code.clone())
+    })
 }
 
 #[cfg(test)]

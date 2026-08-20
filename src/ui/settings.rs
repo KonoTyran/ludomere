@@ -225,10 +225,30 @@ pub(super) fn show_settings_page(
     refresh_metadata_button.set_valign(gtk::Align::Center);
     refresh_metadata.add_suffix(&refresh_metadata_button);
     maintenance.add(&refresh_metadata);
+    let check_updates = adw::ActionRow::new();
+    check_updates.set_title("Check for game updates");
+    check_updates.set_subtitle("Queue available Galaxy updates and current offline installers");
+    let check_updates_button = gtk::Button::with_label("Check Now");
+    check_updates_button.set_valign(gtk::Align::Center);
+    check_updates.add_suffix(&check_updates_button);
+    maintenance.add(&check_updates);
     let storage_maintenance_page = adw::PreferencesPage::new();
     storage_maintenance_page.set_title("Maintenance");
     storage_maintenance_page.set_icon_name(Some("emblem-system-symbolic"));
     storage_maintenance_page.add(&maintenance);
+
+    {
+        let widgets = w.clone();
+        let model = model.clone();
+        check_updates_button.connect_clicked(move |_| {
+            super::window::start_update_check(
+                &widgets,
+                &model,
+                crate::updates::CheckMode::Manual,
+                true,
+            );
+        });
+    }
 
     let appearance = adw::PreferencesGroup::new();
     appearance.set_title("Appearance");

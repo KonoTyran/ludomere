@@ -678,6 +678,12 @@ pub(super) fn start_owned_library_sync(
                 w.sync_progress.set_visible(false);
                 w.sync_status.set_visible(false);
                 record_sync_success();
+                super::window::start_update_check(
+                    &w,
+                    &model,
+                    crate::updates::CheckMode::Automatic,
+                    false,
+                );
                 glib::ControlFlow::Break
             }
             Ok(Err(error)) => {

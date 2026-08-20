@@ -1155,11 +1155,13 @@ fn installation_status_panel(
                     .as_deref()
                     .unwrap_or("Resume this installation or cancel it to start over"),
             );
-            progress.set_visible(snapshot.total_bytes > 0);
-            if snapshot.total_bytes > 0 {
-                progress.set_fraction(
-                    (snapshot.bytes_completed as f64 / snapshot.total_bytes as f64).min(1.0),
-                );
+            progress.set_visible(snapshot.download_total_bytes.is_some());
+            if let Some(total) = snapshot.download_total_bytes {
+                progress.set_fraction(if total == 0 {
+                    1.0
+                } else {
+                    (snapshot.bytes_downloaded as f64 / total as f64).min(1.0)
+                });
             }
             set_primary_button_content(&primary_action, "media-playback-start-symbolic", "Resume");
             primary_action.set_sensitive(true);
@@ -1171,7 +1173,10 @@ fn installation_status_panel(
         }
         if let Some(snapshot) =
             crate::installation::depot_operation_snapshot_for_product(product_id)
-            && !matches!(snapshot.state.as_str(), "complete" | "failed" | "cancelled")
+            && !matches!(
+                snapshot.state.as_str(),
+                "complete" | "failed" | "cancelled" | "abandoned"
+            )
         {
             panel_for_poll.set_visible(true);
             primary_action.set_sensitive(false);
@@ -1181,6 +1186,7 @@ fn installation_status_panel(
                 "preparing" => "PREPARING DOWNLOAD".to_owned(),
                 "verifying" => "VERIFYING FILES".to_owned(),
                 "verifying_existing" => "CHECKING EXISTING FILES".to_owned(),
+                "calculating" => "CALCULATING DOWNLOAD SIZE".to_owned(),
                 "downloading" => "STARTING DOWNLOAD".to_owned(),
                 "materializing" => "DOWNLOADING".to_owned(),
                 "committing" => "INSTALLING".to_owned(),
@@ -1188,12 +1194,19 @@ fn installation_status_panel(
                 _ => snapshot.state.replace('_', " ").to_uppercase(),
             };
             heading.set_label(&display_state);
-            if snapshot.total_bytes > 0 {
-                let fraction =
-                    (snapshot.bytes_completed as f64 / snapshot.total_bytes as f64).min(1.0);
+            if let Some(total) = snapshot.download_total_bytes {
+                let fraction = if total == 0 {
+                    1.0
+                } else {
+                    (snapshot.bytes_downloaded as f64 / total as f64).min(1.0)
+                };
                 progress.set_fraction(fraction);
                 determinate.set(true);
-                let mut text = format!("{:.0}% Complete", fraction * 100.0);
+                let mut text = format!(
+                    "{} / {}",
+                    human_size(snapshot.bytes_downloaded),
+                    human_size(total)
+                );
                 if snapshot.state == "materializing" {
                     if let Some(speed) = depot_rate
                         .borrow_mut()
@@ -1211,6 +1224,7 @@ fn installation_status_panel(
                 detail.set_label(match snapshot.state.as_str() {
                     "queued" => "Waiting to start",
                     "preparing" => "Reading game download information",
+                    "calculating" => "Checking which chunks require downloading",
                     "downloading" => "Preparing secure download",
                     _ => "Preparing Galaxy installation",
                 });

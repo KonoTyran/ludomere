@@ -1102,6 +1102,97 @@ where
     (verified, trusted)
 }
 
+pub(crate) fn pending_chunks(
+    manifest: &DepotManifest,
+    root: &Path,
+    journal_path: &Path,
+    trusted_files: &HashSet<String>,
+) -> Result<Vec<crate::gog::depot_manifest::DepotChunk>> {
+    let journal = journal_path
+        .exists()
+        .then(|| load_journal(root, journal_path, manifest))
+        .transpose()?;
+    let mut pending = Vec::new();
+    for (index, container) in manifest.small_files_containers.iter().enumerate() {
+        let all_trusted = manifest
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                DepotEntry::File(file)
+                    if file
+                        .small_file
+                        .is_some_and(|reference| reference.container_index == index) =>
+                {
+                    Some(file)
+                }
+                _ => None,
+            })
+            .all(|file| trusted_files.contains(&file.path));
+        if all_trusted {
+            continue;
+        }
+        let valid = journal
+            .as_ref()
+            .and_then(|journal| journal.container_chunks.get(index))
+            .map_or(0, |saved| {
+                let pseudo = DepotFile {
+                    path: ".ludomere-small-files.part".into(),
+                    size: container.chunks.iter().map(|chunk| chunk.size).sum(),
+                    executable: false,
+                    support: false,
+                    md5: None,
+                    sha256: None,
+                    chunks: container.chunks.clone(),
+                    small_file: None,
+                };
+                fs::OpenOptions::new()
+                    .read(true)
+                    .open(root.join(format!(".ludomere-small-files-{index}.part")))
+                    .ok()
+                    .and_then(|mut output| {
+                        validate_completed(
+                            &mut output,
+                            &pseudo,
+                            &JournalFile {
+                                path: pseudo.path.clone(),
+                                identity: file_identity(&pseudo),
+                                chunks: saved.clone(),
+                            },
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(0)
+            });
+        pending.extend(
+            container.chunks[valid.min(container.chunks.len())..]
+                .iter()
+                .cloned(),
+        );
+    }
+    for entry in &manifest.entries {
+        let DepotEntry::File(file) = entry else {
+            continue;
+        };
+        if file.small_file.is_some() || trusted_files.contains(&file.path) {
+            continue;
+        }
+        let saved = journal
+            .as_ref()
+            .and_then(|journal| journal.files.iter().find(|saved| saved.path == file.path));
+        let valid = saved
+            .filter(|saved| saved.identity == file_identity(file))
+            .and_then(|saved| {
+                part_path(&root.join(&file.path))
+                    .ok()
+                    .and_then(|part| fs::OpenOptions::new().read(true).open(part).ok())
+                    .and_then(|mut output| validate_completed(&mut output, file, saved).ok())
+            })
+            .unwrap_or(0);
+        pending.extend(file.chunks[valid.min(file.chunks.len())..].iter().cloned());
+    }
+    Ok(pending)
+}
+
 #[allow(dead_code)] // consumed by the forward transaction-planning slice
 pub(crate) fn journal_staged_bytes_at(
     manifest: &DepotManifest,
@@ -1981,6 +2072,11 @@ mod tests {
         assert!(root.join("game.dat.ludomere.part").is_file());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
         assert_eq!(journal_staged_bytes(&manifest, &root).unwrap(), 11);
+        assert!(
+            pending_chunks(&manifest, &root, &root.join(JOURNAL), &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
 
         let mut fetched = Vec::new();
         materialize_journaled(
@@ -2034,6 +2130,10 @@ mod tests {
         part.write_all(b"X").unwrap();
         drop(part);
         assert!(journal_staged_bytes(&manifest, &root).is_err());
+        assert_eq!(
+            pending_chunks(&manifest, &root, &root.join(JOURNAL), &HashSet::new()).unwrap(),
+            vec![second.clone()]
+        );
         let mut fetched = 0;
         materialize_journaled(
             &manifest,

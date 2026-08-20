@@ -352,25 +352,49 @@ fn load_current_sources(
         .galaxy_depot
         .as_ref()
         .context("installed depot provenance is missing")?;
-    provenance
-        .depots
+    let operating_system = marker
+        .base
+        .operating_system
+        .as_deref()
+        .context("installed depot operating system is missing")?;
+    let record = store
+        .depot_repository(marker.product_id, operating_system, &provenance.build_id)?
+        .context("installed depot repository is not cached; repair metadata must be reacquired")?;
+    if record.manifest_identity != provenance.repository_id {
+        bail!("cached installed depot repository does not match marker provenance");
+    }
+    let repository: crate::gog::types::GenerationTwoRepository =
+        serde_json::from_str(&record.repository_json)?;
+    let selected_dlc = provenance
+        .dlc
         .iter()
-        .map(|depot| (marker.product_id, depot))
-        .chain(
-            provenance
-                .dlc
-                .iter()
-                .flat_map(|dlc| dlc.depots.iter().map(move |depot| (dlc.product_id, depot))),
-        )
-        .map(|(product_id, depot)| {
+        .map(|dlc| dlc.product_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let selection = Selection {
+        language: provenance
+            .language
+            .clone()
+            .or_else(|| marker.base.language.clone())
+            .context("installed depot language is missing")?,
+        bitness: provenance.architecture.clone(),
+        owned_dlc: selected_dlc.clone(),
+        selected_dlc,
+    };
+    crate::gog::depot_acquisition::select_depots(&repository, &selection)?
+        .into_iter()
+        .map(|depot| {
+            let product_id = depot
+                .product_id
+                .parse()
+                .context("installed repository depot product ID is invalid")?;
             let record = store
-                .depot_manifest_for_depot(product_id, &provenance.build_id, &depot.depot_id)?
+                .depot_manifest_for_depot(product_id, &provenance.build_id, &depot.manifest_id)?
                 .context(
                     "installed depot manifest is not cached; repair metadata must be reacquired",
                 )?;
             Ok(DepotSource {
                 product_id,
-                depot_id: depot.depot_id.clone(),
+                depot_id: depot.manifest_id.clone(),
                 manifest_id: depot.manifest_id.clone(),
                 manifest_json: Some(record.manifest_json),
                 content_root: Some("/".into()),
@@ -527,6 +551,136 @@ mod tests {
         assert_eq!(cached.repository_id, "repository");
         assert_eq!(cached.sources.len(), 1);
         assert!(!format!("{operation:?}").contains("secret"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn current_sources_follow_installed_repository_order_across_dlc() {
+        let root = std::env::temp_dir().join(format!(
+            "ludomere-depot-current-order-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = StateStore::open_at(&root.join("state.db")).unwrap();
+        let depot = |product_id: i64, manifest_id: &str| RepositoryDepot {
+            manifest_id: manifest_id.into(),
+            product_id: product_id.to_string(),
+            languages: vec!["en-US".into()],
+            os_bitness: None,
+            compressed_size: None,
+            size: 1,
+            is_gog_depot: false,
+        };
+        let repository = GenerationTwoRepository {
+            generation: 2,
+            root_product_id: "7".into(),
+            build_id: Some("installed".into()),
+            platform: Some("windows".into()),
+            install_directory: "Game".into(),
+            products: Vec::new(),
+            depots: vec![
+                depot(20, "dlc-20-a"),
+                depot(10, "dlc-10"),
+                depot(7, "base"),
+                depot(20, "dlc-20-b"),
+            ],
+            dependencies: Vec::new(),
+        };
+        store
+            .save_depot_repository(&DepotRepositoryRecord {
+                product_id: 7,
+                operating_system: "windows".into(),
+                build_id: "installed".into(),
+                branch: None,
+                manifest_identity: "repository".into(),
+                repository_json: serde_json::to_string(&repository).unwrap(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+        for (product_id, manifest_id) in [
+            (7, "base"),
+            (10, "dlc-10"),
+            (20, "dlc-20-a"),
+            (20, "dlc-20-b"),
+        ] {
+            store
+                .save_depot_manifest(&DepotManifestRecord {
+                    manifest_identity: manifest_id.into(),
+                    product_id,
+                    build_id: "installed".into(),
+                    depot_id: manifest_id.into(),
+                    manifest_json: manifest_id.into(),
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                })
+                .unwrap();
+        }
+        let marker = InstallationMarker {
+            schema_version: 2,
+            product_id: 7,
+            slug: "game".into(),
+            base: InstalledComponent {
+                operating_system: Some("windows".into()),
+                language: Some("en-US".into()),
+                version: Some("1".into()),
+                revision_id: None,
+                installed_at: 1,
+            },
+            dlc: Vec::new(),
+            compatibility: None,
+            source: InstallationSource::GalaxyDepot,
+            galaxy_depot: Some(GalaxyDepotProvenance {
+                build_id: "installed".into(),
+                repository_id: "repository".into(),
+                manifest_fingerprint: "fingerprint".into(),
+                branch: None,
+                language: Some("en-US".into()),
+                architecture: None,
+                depots: vec![GalaxyDepotIdentity {
+                    depot_id: "base".into(),
+                    manifest_id: "base".into(),
+                }],
+                dlc: vec![
+                    GalaxyDepotDlcProvenance {
+                        product_id: 10,
+                        depots: vec![GalaxyDepotIdentity {
+                            depot_id: "dlc-10".into(),
+                            manifest_id: "dlc-10".into(),
+                        }],
+                        has_payload: true,
+                        entitlement_only_marker: false,
+                    },
+                    GalaxyDepotDlcProvenance {
+                        product_id: 20,
+                        depots: vec![
+                            GalaxyDepotIdentity {
+                                depot_id: "dlc-20-a".into(),
+                                manifest_id: "dlc-20-a".into(),
+                            },
+                            GalaxyDepotIdentity {
+                                depot_id: "dlc-20-b".into(),
+                                manifest_id: "dlc-20-b".into(),
+                            },
+                        ],
+                        has_payload: true,
+                        entitlement_only_marker: false,
+                    },
+                ],
+            }),
+            launch: None,
+            dependencies: Vec::new(),
+        };
+
+        let sources = load_current_sources(&store, &marker).unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.depot_id.as_str())
+                .collect::<Vec<_>>(),
+            ["base", "dlc-20-a", "dlc-10", "dlc-20-b"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -73,7 +73,7 @@ pub fn list_builds(
     client: &reqwest::blocking::Client,
     request: &BuildRequest,
 ) -> Result<Vec<GalaxyBuild>> {
-    list_with(
+    let builds = list_with(
         request,
         || {
             request
@@ -117,7 +117,9 @@ pub fn list_builds(
                 password,
             )
         },
-    )
+    )?;
+    store.observe_galaxy_builds(request.product_id, &request.platform, &builds)?;
+    Ok(builds)
 }
 
 pub fn forget_one(store: &StateStore, user_id: &str, product_id: i64, branch: &str) -> Result<()> {

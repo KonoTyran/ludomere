@@ -39,6 +39,18 @@ where
     )
 }
 
+pub(crate) fn pending_support_chunks(
+    manifest: &crate::gog::depot_manifest::DepotManifest,
+    operation_staging: &Path,
+) -> Result<Vec<crate::gog::depot_manifest::DepotChunk>> {
+    crate::download::depot::pending_chunks(
+        manifest,
+        &support_staging(operation_staging)?,
+        &support_journal(operation_staging)?,
+        &HashSet::new(),
+    )
+}
+
 pub fn remove_support_staging(operation_staging: &Path) -> Result<()> {
     let staging = support_staging(operation_staging)?;
     if fs::symlink_metadata(&staging).is_ok_and(|metadata| metadata.file_type().is_symlink()) {

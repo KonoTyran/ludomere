@@ -1150,7 +1150,8 @@ impl StateStore {
         self.connection
             .query_row(
                 "SELECT product_id, executable_path, launch_arguments_json, compatibility_json,
-                        created_at, updated_at
+                        auto_update_galaxy, auto_download_offline_installer,
+                        prune_superseded_installers, galaxy_language, created_at, updated_at
                  FROM game_preferences WHERE product_id = ?1",
                 params![product_id],
                 |row| {
@@ -1162,8 +1163,12 @@ impl StateStore {
                         compatibility: row
                             .get::<_, Option<String>>(3)?
                             .and_then(|value| serde_json::from_str(&value).ok()),
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
+                        auto_update_galaxy: row.get(4)?,
+                        auto_download_offline_installer: row.get(5)?,
+                        prune_superseded_installers: row.get(6)?,
+                        galaxy_language: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 },
             )
@@ -1175,12 +1180,17 @@ impl StateStore {
         self.connection.execute(
             "INSERT INTO game_preferences(
                 product_id, executable_path, launch_arguments_json, compatibility_json,
-                created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                auto_update_galaxy, auto_download_offline_installer,
+                prune_superseded_installers, galaxy_language, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(product_id) DO UPDATE SET
                 executable_path = excluded.executable_path,
                 launch_arguments_json = excluded.launch_arguments_json,
                 compatibility_json = excluded.compatibility_json,
+                auto_update_galaxy = excluded.auto_update_galaxy,
+                auto_download_offline_installer = excluded.auto_download_offline_installer,
+                prune_superseded_installers = excluded.prune_superseded_installers,
+                galaxy_language = excluded.galaxy_language,
                 updated_at = excluded.updated_at",
             params![
                 preferences.product_id,
@@ -1194,8 +1204,43 @@ impl StateStore {
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?,
+                preferences.auto_update_galaxy,
+                preferences.auto_download_offline_installer,
+                preferences.prune_superseded_installers,
+                preferences.galaxy_language,
                 preferences.created_at,
                 preferences.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_game_update_preferences(
+        &self,
+        product_id: i64,
+        auto_update_galaxy: Option<bool>,
+        auto_download_offline_installer: Option<bool>,
+        prune_superseded_installers: Option<bool>,
+        galaxy_language: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO game_preferences(
+                product_id, executable_path, launch_arguments_json, compatibility_json,
+                auto_update_galaxy, auto_download_offline_installer,
+                prune_superseded_installers, galaxy_language, created_at, updated_at)
+             VALUES (?1, NULL, '[]', NULL, ?2, ?3, ?4, ?5, unixepoch(), unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET
+                auto_update_galaxy = excluded.auto_update_galaxy,
+                auto_download_offline_installer = excluded.auto_download_offline_installer,
+                prune_superseded_installers = excluded.prune_superseded_installers,
+                galaxy_language = excluded.galaxy_language,
+                updated_at = unixepoch()",
+            params![
+                product_id,
+                auto_update_galaxy,
+                auto_download_offline_installer,
+                prune_superseded_installers,
+                galaxy_language,
             ],
         )?;
         Ok(())
@@ -3967,6 +4012,10 @@ mod tests {
                 profile: crate::compatibility::UmuProfile::fallback(),
                 pending_profile: None,
             }),
+            auto_update_galaxy: Some(false),
+            auto_download_offline_installer: Some(true),
+            prune_superseded_installers: None,
+            galaxy_language: Some("de-DE".into()),
             created_at: 50,
             updated_at: 200,
         };
@@ -3975,6 +4024,18 @@ mod tests {
             store.game_preferences(1449651388).unwrap(),
             Some(preferences)
         );
+        store
+            .set_game_update_preferences(1449651388, Some(true), None, Some(false), Some("fr-FR"))
+            .unwrap();
+        let updated = store.game_preferences(1449651388).unwrap().unwrap();
+        assert_eq!(
+            updated.executable_path,
+            Some(PathBuf::from("Grim Dawn.exe"))
+        );
+        assert_eq!(updated.auto_update_galaxy, Some(true));
+        assert_eq!(updated.auto_download_offline_installer, None);
+        assert_eq!(updated.prune_superseded_installers, Some(false));
+        assert_eq!(updated.galaxy_language.as_deref(), Some("fr-FR"));
         drop(store);
         fs::remove_file(path).unwrap();
     }

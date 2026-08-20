@@ -36,6 +36,12 @@ pub struct Config {
     pub max_concurrent_downloads: usize,
     #[serde(default)]
     pub download_bandwidth_limit_bps: Option<u64>,
+    #[serde(default = "default_true")]
+    pub auto_update_galaxy_installations: bool,
+    #[serde(default)]
+    pub auto_download_offline_installers: bool,
+    #[serde(default)]
+    pub prune_superseded_offline_installers: bool,
     #[serde(default = "default_game_libraries")]
     pub game_libraries: Vec<GameLibrary>,
     #[serde(default)]
@@ -122,6 +128,9 @@ impl Default for Config {
             show_retired_artifacts: false,
             max_concurrent_downloads: default_max_concurrent_downloads(),
             download_bandwidth_limit_bps: None,
+            auto_update_galaxy_installations: true,
+            auto_download_offline_installers: false,
+            prune_superseded_offline_installers: false,
             game_libraries,
             installer_library_id,
             library_card_size: default_library_card_size(),
@@ -334,6 +343,9 @@ enabled = true
         assert!(!config.download_patches_by_default);
         assert!(!config.show_retired_artifacts);
         assert_eq!(config.max_concurrent_downloads, 2);
+        assert!(config.auto_update_galaxy_installations);
+        assert!(!config.auto_download_offline_installers);
+        assert!(!config.prune_superseded_offline_installers);
         assert_eq!(config.game_libraries.len(), 1);
         assert!(config.game_libraries[0].default);
         let saved = toml::to_string(&config).unwrap();

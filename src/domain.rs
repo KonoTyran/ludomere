@@ -439,6 +439,10 @@ pub struct GamePreferences {
     pub executable_path: Option<std::path::PathBuf>,
     pub launch_arguments: Vec<String>,
     pub compatibility: Option<crate::compatibility::GameCompatibilityPreferences>,
+    pub auto_update_galaxy: Option<bool>,
+    pub auto_download_offline_installer: Option<bool>,
+    pub prune_superseded_installers: Option<bool>,
+    pub galaxy_language: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

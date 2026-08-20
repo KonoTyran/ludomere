@@ -18,4 +18,5 @@ pub mod screenshots;
 pub mod state;
 pub mod text;
 pub mod ui;
+pub mod updates;
 pub mod work_queue;

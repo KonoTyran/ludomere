@@ -223,6 +223,7 @@ pub fn save_game_preferences(
     store: &crate::state::StateStore,
     game: &crate::domain::InstalledGame,
 ) -> anyhow::Result<()> {
+    let existing = store.game_preferences(game.product_id)?;
     let executable_path = game.primary_executable.as_ref().and_then(|path| {
         path.strip_prefix(&game.installation_directory)
             .ok()
@@ -233,6 +234,14 @@ pub fn save_game_preferences(
         executable_path,
         launch_arguments: game.launch_arguments.clone(),
         compatibility: game.compatibility.clone(),
+        auto_update_galaxy: existing.as_ref().and_then(|value| value.auto_update_galaxy),
+        auto_download_offline_installer: existing
+            .as_ref()
+            .and_then(|value| value.auto_download_offline_installer),
+        prune_superseded_installers: existing
+            .as_ref()
+            .and_then(|value| value.prune_superseded_installers),
+        galaxy_language: existing.and_then(|value| value.galaxy_language),
         created_at: game.created_at,
         updated_at: game.updated_at,
     })?;

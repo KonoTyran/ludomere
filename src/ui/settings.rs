@@ -94,6 +94,25 @@ pub(super) fn show_settings_page(
     bandwidth_row.add_suffix(&bandwidth_controls);
     downloads.add(&bandwidth_row);
 
+    let galaxy_updates = adw::SwitchRow::new();
+    galaxy_updates.set_title("Automatically update Galaxy installations");
+    galaxy_updates.set_subtitle("Check after synchronization and every six hours while online");
+    galaxy_updates.set_active(model.borrow().config.auto_update_galaxy_installations);
+    downloads.add(&galaxy_updates);
+
+    let offline_updates = adw::SwitchRow::new();
+    offline_updates.set_title("Automatically download offline installer updates");
+    offline_updates
+        .set_subtitle("Download the newest complete primary installer without running it");
+    offline_updates.set_active(model.borrow().config.auto_download_offline_installers);
+    downloads.add(&offline_updates);
+
+    let prune_installers = adw::SwitchRow::new();
+    prune_installers.set_title("Move superseded installers to Trash");
+    prune_installers.set_subtitle("Only after the newest complete replacement has been verified");
+    prune_installers.set_active(model.borrow().config.prune_superseded_offline_installers);
+    downloads.add(&prune_installers);
+
     let rebuild_row = adw::ActionRow::new();
     rebuild_row.set_title("Rebuild downloaded-file index");
     rebuild_row.set_subtitle("Inspect the managed download directory without changing any files");
@@ -566,6 +585,24 @@ pub(super) fn show_settings_page(
             state.config.download_extras_by_default = row.is_active();
             if let Err(error) = state.config.save() {
                 tracing::warn!(%error, "could not save default extras preference");
+            }
+        });
+    }
+    for (row, setting) in [
+        (galaxy_updates, 0_u8),
+        (offline_updates, 1_u8),
+        (prune_installers, 2_u8),
+    ] {
+        let model = model.clone();
+        row.connect_active_notify(move |row| {
+            let mut state = model.borrow_mut();
+            match setting {
+                0 => state.config.auto_update_galaxy_installations = row.is_active(),
+                1 => state.config.auto_download_offline_installers = row.is_active(),
+                _ => state.config.prune_superseded_offline_installers = row.is_active(),
+            }
+            if let Err(error) = state.config.save() {
+                tracing::warn!(%error, "could not save automatic update preference");
             }
         });
     }

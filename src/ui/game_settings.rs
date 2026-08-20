@@ -211,10 +211,74 @@ pub(super) fn show_game_settings(
         }
     });
     compatibility_page.add(&fixes_group);
-    let updates_page = placeholder_page(
-        "Updates",
-        "Automatic updates",
-        "Per-game update policy will be available when installed-game update workflows are implemented. Offline installer backups remain managed separately.",
+    let updates_page = adw::PreferencesPage::new();
+    updates_page.set_title("Updates");
+    let updates_group = adw::PreferencesGroup::new();
+    updates_group.set_title("Automatic updates");
+    updates_group.set_description(Some(
+        "Game-specific choices override the defaults in Ludomere Settings.",
+    ));
+    let preferences = StateStore::open()
+        .and_then(|store| store.game_preferences(game.product_id))
+        .ok()
+        .flatten();
+    let galaxy_updates = policy_row(
+        "Galaxy installation updates",
+        preferences
+            .as_ref()
+            .and_then(|value| value.auto_update_galaxy),
+    );
+    let offline_updates = policy_row(
+        "Offline installer downloads",
+        preferences
+            .as_ref()
+            .and_then(|value| value.auto_download_offline_installer),
+    );
+    let prune_installers = policy_row(
+        "Move superseded installers to Trash",
+        preferences
+            .as_ref()
+            .and_then(|value| value.prune_superseded_installers),
+    );
+    updates_group.add(&galaxy_updates.0);
+    updates_group.add(&offline_updates.0);
+    updates_group.add(&prune_installers.0);
+
+    let mut languages = game.languages.clone();
+    languages.sort_by_key(|value| value.to_lowercase());
+    languages.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    languages.insert(0, "Inherit default".into());
+    let language_row = adw::ActionRow::new();
+    language_row.set_title("Galaxy installation language");
+    language_row.set_subtitle("A different language is applied by a queued reconciliation");
+    let language =
+        gtk::DropDown::from_strings(&languages.iter().map(String::as_str).collect::<Vec<_>>());
+    language.set_selected(
+        preferences
+            .as_ref()
+            .and_then(|value| value.galaxy_language.as_ref())
+            .and_then(|configured| {
+                languages
+                    .iter()
+                    .position(|value| value.eq_ignore_ascii_case(configured))
+            })
+            .unwrap_or(0) as u32,
+    );
+    language_row.add_suffix(&language);
+    updates_group.add(&language_row);
+    let update_status = gtk::Label::new(None);
+    update_status.set_xalign(0.0);
+    update_status.add_css_class("dim-label");
+    updates_group.add(&update_status);
+    updates_page.add(&updates_group);
+    wire_update_preferences(
+        game.product_id,
+        galaxy_updates.1,
+        offline_updates.1,
+        prune_installers.1,
+        language,
+        languages,
+        update_status,
     );
 
     let files_page = adw::PreferencesPage::new();
@@ -1709,19 +1773,71 @@ fn persist_launch_settings(
     }
 }
 
-fn placeholder_page(title: &str, group_title: &str, description: &str) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title(title);
-    let group = adw::PreferencesGroup::new();
-    group.set_title(group_title);
-    group.set_description(Some(description));
-    let status = adw::ActionRow::new();
-    status.set_title("Planned feature");
-    status.set_subtitle("Not available yet");
-    status.set_sensitive(false);
-    group.add(&status);
-    page.add(&group);
-    page
+fn policy_row(title: &str, value: Option<bool>) -> (adw::ActionRow, gtk::DropDown) {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    let selector = gtk::DropDown::from_strings(&["Inherit default", "On", "Off"]);
+    selector.set_selected(match value {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    });
+    row.add_suffix(&selector);
+    (row, selector)
+}
+
+fn wire_update_preferences(
+    product_id: i64,
+    galaxy: gtk::DropDown,
+    offline: gtk::DropDown,
+    prune: gtk::DropDown,
+    language: gtk::DropDown,
+    languages: Vec<String>,
+    status: gtk::Label,
+) {
+    let save = Rc::new({
+        let galaxy = galaxy.clone();
+        let offline = offline.clone();
+        let prune = prune.clone();
+        let language = language.clone();
+        move || {
+            let selected_language = (language.selected() > 0)
+                .then(|| languages.get(language.selected() as usize))
+                .flatten()
+                .map(String::as_str);
+            let result = StateStore::open().and_then(|store| {
+                store.set_game_update_preferences(
+                    product_id,
+                    policy_selection(galaxy.selected()),
+                    policy_selection(offline.selected()),
+                    policy_selection(prune.selected()),
+                    selected_language,
+                )
+            });
+            match result {
+                Ok(()) => {
+                    status.remove_css_class("error");
+                    status.set_label("Saved automatically");
+                }
+                Err(error) => {
+                    status.add_css_class("error");
+                    status.set_label(&format!("Could not save: {error}"));
+                }
+            }
+        }
+    });
+    for selector in [galaxy, offline, prune, language] {
+        let save = save.clone();
+        selector.connect_selected_notify(move |_| save());
+    }
+}
+
+fn policy_selection(selected: u32) -> Option<bool> {
+    match selected {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
 }
 
 fn info_row(title: &str, value: &str) -> adw::ActionRow {

@@ -18,11 +18,11 @@ Ludomere is currently developed and packaged for Linux. The Arch package require
 [`gtk4`](https://archlinux.org/packages/extra/x86_64/gtk4/),
 [`libadwaita`](https://archlinux.org/packages/extra/x86_64/libadwaita/),
 [`gdk-pixbuf2`](https://archlinux.org/packages/extra/x86_64/gdk-pixbuf2/),
-[`webkit2gtk-4.1`](https://archlinux.org/packages/extra/x86_64/webkit2gtk-4.1/), and
+[`webkitgtk-6.0`](https://archlinux.org/packages/extra/x86_64/webkitgtk-6.0/), and
 [`libsecret`](https://archlinux.org/packages/core/x86_64/libsecret/). Install them with:
 
 ```bash
-sudo pacman -S --needed gtk4 libadwaita gdk-pixbuf2 webkit2gtk-4.1 libsecret
+sudo pacman -S --needed gtk4 libadwaita gdk-pixbuf2 webkitgtk-6.0 libsecret
 ```
 
 Windows game installation and launching additionally require
@@ -49,7 +49,7 @@ SHA-256 checksums, and stores them under `$XDG_DATA_HOME/ludomere/tools/comet/`.
 To build from source on Arch, add the Rust toolchain and standard packaging tools:
 
 ```bash
-sudo pacman -S --needed base-devel rust gtk4 libadwaita gdk-pixbuf2 webkit2gtk-4.1 libsecret
+sudo pacman -S --needed base-devel rust gtk4 libadwaita gdk-pixbuf2 webkitgtk-6.0 libsecret
 ```
 
 [`rustup`](https://rustup.rs/) can provide the Rust toolchain instead of Arch's `rust` package.

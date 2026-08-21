@@ -23,7 +23,8 @@ Explicitly exclude overlays, store browsing/purchasing/redeeming, rollback suppo
 - Phase 3 complete: verified cloud-save exports, selective remote deletion with recovery snapshots and revision checks, and local tombstones.
 - Phase 4 local organization complete: saved views, cover/background overrides, hidden games, and full local tag management/filtering. Live account tag and hidden reads pass validation; remote mutation and two-way synchronization remain gated pending safe write validation.
 - Phase 5 read foundation complete for validated contracts: account-scoped friends/presence and achievement caches, Social UI, per-game achievements, and individual local-session Activity UI. Requests remain count-only; user search, block state, remote sessions, statistics, leaderboards, and comparisons remain visibly gated because their complete read contracts have not passed validation.
-- Phases 6 and 7 remain in progress.
+- Phase 6 foundation complete: account-scoped presence preferences, durable idempotent write outbox, and individual authoritative launcher sessions. All remote writes remain disabled because no mutation contract has passed the required live validation.
+- Phase 7 feasibility complete with a no-ship decision: no complete native chat transport passed the required history/send/receive/read-state gates, so no chat code, dependency, UI, or web fallback was added. See `docs/gog-chat-feasibility.md`.
 
 ## Phase 0: GOG Protocol Validation
 

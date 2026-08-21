@@ -31,6 +31,64 @@ pub(super) fn rebuild_social_page(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>
     status.add_css_class("dim-label");
     w.social.append(&status);
 
+    if let Some(account_id) = state
+        .account_profile
+        .as_ref()
+        .map(|profile| profile.user_id.clone())
+    {
+        let preferences = StateStore::open()
+            .and_then(|store| store.account_preferences(&account_id))
+            .unwrap_or_default();
+        let presence = adw::SwitchRow::builder()
+            .title("Online presence")
+            .subtitle(
+                "Stored for this GOG account; publication remains disabled until write validation",
+            )
+            .active(preferences.presence_enabled)
+            .build();
+        let activity = adw::SwitchRow::builder()
+            .title("Publish current game")
+            .subtitle("Never includes executable paths, arguments, compatibility details, or library paths")
+            .active(preferences.game_activity_enabled)
+            .sensitive(preferences.presence_enabled)
+            .build();
+        let group = adw::PreferencesGroup::new();
+        group.set_title("Presence preferences");
+        group.set_margin_top(14);
+        group.add(&presence);
+        group.add(&activity);
+        let account_for_presence = account_id.clone();
+        let activity_for_presence = activity.clone();
+        presence.connect_active_notify(move |presence| {
+            activity_for_presence.set_sensitive(presence.is_active());
+            if let Ok(store) = StateStore::open() {
+                let previous = store
+                    .account_preferences(&account_for_presence)
+                    .unwrap_or_default();
+                let _ = store.set_account_preferences(
+                    &account_for_presence,
+                    crate::state::AccountPreferences {
+                        presence_enabled: presence.is_active(),
+                        game_activity_enabled: previous.game_activity_enabled,
+                    },
+                );
+            }
+        });
+        activity.connect_active_notify(move |activity| {
+            if let Ok(store) = StateStore::open() {
+                let previous = store.account_preferences(&account_id).unwrap_or_default();
+                let _ = store.set_account_preferences(
+                    &account_id,
+                    crate::state::AccountPreferences {
+                        presence_enabled: previous.presence_enabled,
+                        game_activity_enabled: activity.is_active(),
+                    },
+                );
+            }
+        });
+        w.social.append(&group);
+    }
+
     let requests = gtk::Label::new(Some(&match state.invitation_count {
         Some(0) => "No incoming friend requests".into(),
         Some(count) => format!("{count} incoming friend request(s)"),

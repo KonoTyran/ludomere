@@ -296,9 +296,35 @@ pub struct GameSessionRecord {
     pub remote_state: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountPreferences {
+    pub presence_enabled: bool,
+    pub game_activity_enabled: bool,
+}
+
+impl Default for AccountPreferences {
+    fn default() -> Self {
+        Self {
+            presence_enabled: true,
+            game_activity_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOutboxRecord {
+    pub outbox_id: i64,
+    pub account_id: String,
+    pub kind: String,
+    pub idempotency_key: String,
+    pub payload_json: String,
+    pub attempts: u32,
+    pub next_attempt_at: i64,
+}
+
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 9;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 10;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -394,6 +420,17 @@ impl StateStore {
                 account_id TEXT NOT NULL, scope TEXT NOT NULL, cursor TEXT,
                 synchronized_at INTEGER NOT NULL, error TEXT,
                 PRIMARY KEY(account_id, scope)
+             );
+             CREATE TABLE IF NOT EXISTS account_preferences (
+                account_id TEXT PRIMARY KEY, presence_enabled INTEGER NOT NULL DEFAULT 1,
+                game_activity_enabled INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS gog_write_outbox (
+                outbox_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+                last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                UNIQUE(account_id, kind, idempotency_key)
              );
              CREATE TABLE IF NOT EXISTS account_cache (cache_key INTEGER PRIMARY KEY CHECK(cache_key = 1), profile_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS owned_products (product_id INTEGER PRIMARY KEY, synchronized_at INTEGER NOT NULL);
@@ -569,6 +606,7 @@ impl StateStore {
             ensure_revision_seven_schema(&connection)?;
             ensure_revision_eight_schema(&connection)?;
             ensure_revision_nine_schema(&connection)?;
+            ensure_revision_ten_schema(&connection)?;
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
@@ -1753,6 +1791,97 @@ impl StateStore {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn account_preferences(&self, account_id: &str) -> Result<AccountPreferences> {
+        self.connection
+            .query_row(
+                "SELECT presence_enabled, game_activity_enabled FROM account_preferences
+                 WHERE account_id = ?1",
+                params![account_id],
+                |row| {
+                    Ok(AccountPreferences {
+                        presence_enabled: row.get(0)?,
+                        game_activity_enabled: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map(Option::unwrap_or_default)
+            .map_err(Into::into)
+    }
+
+    pub fn set_account_preferences(
+        &self,
+        account_id: &str,
+        preferences: AccountPreferences,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO account_preferences(
+                account_id, presence_enabled, game_activity_enabled, updated_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(account_id) DO UPDATE SET
+                presence_enabled = excluded.presence_enabled,
+                game_activity_enabled = excluded.game_activity_enabled,
+                updated_at = excluded.updated_at",
+            params![
+                account_id,
+                preferences.presence_enabled,
+                preferences.game_activity_enabled
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_write(
+        &self,
+        account_id: &str,
+        kind: &str,
+        idempotency_key: &str,
+        payload: &serde_json::Value,
+    ) -> Result<bool> {
+        if account_id.is_empty() || kind.is_empty() || idempotency_key.is_empty() {
+            bail!("write outbox identity fields cannot be empty");
+        }
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO gog_write_outbox(
+                account_id, kind, idempotency_key, payload_json, state, attempts,
+                next_attempt_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 0, unixepoch(), unixepoch(), unixepoch())",
+                params![
+                    account_id,
+                    kind,
+                    idempotency_key,
+                    serde_json::to_string(payload)?
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(Into::into)
+    }
+
+    pub fn pending_write_outbox(&self, account_id: &str) -> Result<Vec<WriteOutboxRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT outbox_id, account_id, kind, idempotency_key, payload_json,
+                    attempts, next_attempt_at
+             FROM gog_write_outbox
+             WHERE account_id = ?1 AND state IN ('pending', 'retry')
+             ORDER BY next_attempt_at, outbox_id",
+        )?;
+        statement
+            .query_map(params![account_id], |row| {
+                Ok(WriteOutboxRecord {
+                    outbox_id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    idempotency_key: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    attempts: row.get(5)?,
+                    next_attempt_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
 
@@ -3605,6 +3734,23 @@ fn ensure_revision_nine_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_revision_ten_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_preferences (
+            account_id TEXT PRIMARY KEY, presence_enabled INTEGER NOT NULL DEFAULT 1,
+            game_activity_enabled INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS gog_write_outbox (
+            outbox_id INTEGER PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
+            last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            UNIQUE(account_id, kind, idempotency_key)
+         );",
+    )?;
+    Ok(())
+}
+
 fn saved_view_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
@@ -5404,6 +5550,67 @@ mod tests {
         store.record_game_session(42, 100, 60).unwrap();
         store.record_game_session(42, 200, 90).unwrap();
         assert_eq!(store.game_sessions(42).unwrap().len(), 2);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn development_revision_nine_gains_writeback_schema() {
+        let path = temp_database_path("development-revision-nine");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE account_preferences;
+                 DROP TABLE gog_write_outbox;
+                 UPDATE schema_state SET development_revision=9;",
+            )
+            .unwrap();
+        drop(store);
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        assert!(table_exists(&store.connection, "account_preferences").unwrap());
+        assert!(table_exists(&store.connection, "gog_write_outbox").unwrap());
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn account_preferences_and_session_outbox_are_scoped_and_idempotent() {
+        let path = temp_database_path("writeback-foundation");
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            store.account_preferences("account-a").unwrap(),
+            AccountPreferences::default()
+        );
+        let preferences = AccountPreferences {
+            presence_enabled: false,
+            game_activity_enabled: true,
+        };
+        store
+            .set_account_preferences("account-a", preferences)
+            .unwrap();
+        assert_eq!(store.account_preferences("account-a").unwrap(), preferences);
+        assert_eq!(
+            store.account_preferences("account-b").unwrap(),
+            AccountPreferences::default()
+        );
+        let payload = serde_json::json!({"session_id":"local-42-100-160"});
+        assert!(
+            store
+                .enqueue_write("account-a", "session", "local-42-100-160", &payload)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .enqueue_write("account-a", "session", "local-42-100-160", &payload)
+                .unwrap()
+        );
+        assert_eq!(store.pending_write_outbox("account-a").unwrap().len(), 1);
+        assert!(store.pending_write_outbox("account-b").unwrap().is_empty());
         drop(store);
         fs::remove_file(path).unwrap();
     }

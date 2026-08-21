@@ -804,6 +804,72 @@ pub(super) fn render_detail_page(
         );
     }
 
+    if game.owned && game.parent_id.is_none() {
+        let achievements = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        achievements.set_margin_top(12);
+        let account_id = model
+            .borrow()
+            .account_profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone());
+        let cached = account_id.as_deref().and_then(|account_id| {
+            StateStore::open()
+                .and_then(|store| store.cached_achievements(account_id, game.product_id))
+                .ok()
+        });
+        render_achievements(&achievements, cached.as_ref());
+        tabs.add_titled(&achievements, Some("achievements"), "Achievements");
+        let loaded = Rc::new(std::cell::Cell::new(false));
+        let token = model.borrow().account_token.clone();
+        let product_id = game.product_id;
+        let achievements_for_load = achievements.clone();
+        tabs.connect_visible_child_name_notify(move |tabs| {
+            if tabs.visible_child_name().as_deref() != Some("achievements") || loaded.replace(true)
+            {
+                return;
+            }
+            let Some(token) = token.clone() else {
+                return;
+            };
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<_> {
+                    let client = crate::gog::client()?;
+                    let values = crate::gog::gameplay::achievements(
+                        &client,
+                        &token,
+                        product_id,
+                        &token.user_id,
+                    )?;
+                    let store = StateStore::open()?;
+                    store.replace_achievements(&token.user_id, product_id, &values)?;
+                    store.cached_achievements(&token.user_id, product_id)
+                })();
+                let _ = sender.send(result);
+            });
+            let achievements = achievements_for_load.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(cached)) => {
+                        render_achievements(&achievements, Some(&cached));
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, product_id, "could not refresh GOG achievements");
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                }
+            });
+        });
+
+        let activity = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        activity.set_margin_top(12);
+        render_game_activity(&activity, game.product_id);
+        tabs.add_titled(&activity, Some("activity"), "Activity");
+    }
+
     let logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
     logs.set_margin_top(12);
     refresh_product_logs(&logs, game.product_id, &w.window);
@@ -875,6 +941,108 @@ pub(super) fn render_detail_page(
     w.content.set_visible_child_name("details");
     let adjustment = w.details_scroll.vadjustment();
     glib::idle_add_local_once(move || adjustment.set_value(adjustment.lower()));
+}
+
+fn render_achievements(container: &gtk::Box, cached: Option<&crate::state::CachedAchievements>) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+    let status = cached.map_or_else(
+        || "No cached GOG achievements; open this tab online to refresh".into(),
+        |cached| {
+            format!(
+                "Cached {} · {} unlocked",
+                format_last_played(Some(cached.updated_at)),
+                cached
+                    .achievements
+                    .iter()
+                    .filter(|achievement| achievement.unlocked_at.is_some())
+                    .count()
+            )
+        },
+    );
+    let status = gtk::Label::new(Some(&status));
+    status.set_xalign(0.0);
+    status.add_css_class("dim-label");
+    container.append(&status);
+    let group = adw::PreferencesGroup::new();
+    if let Some(cached) = cached {
+        for achievement in &cached.achievements {
+            if !achievement.visible && achievement.unlocked_at.is_none() {
+                continue;
+            }
+            let state = achievement
+                .unlocked_at
+                .as_deref()
+                .map_or("Locked".into(), |date| format!("Unlocked {date}"));
+            let description = if achievement.description.is_empty() {
+                state
+            } else {
+                format!("{} · {state}", achievement.description)
+            };
+            let row = adw::ActionRow::builder()
+                .title(if achievement.name.is_empty() {
+                    &achievement.key
+                } else {
+                    &achievement.name
+                })
+                .subtitle(&description)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(
+                if achievement.unlocked_at.is_some() {
+                    "achievement-unlocked-symbolic"
+                } else {
+                    "changes-prevent-symbolic"
+                },
+            ));
+            group.add(&row);
+        }
+    }
+    container.append(&group);
+    let partial = gtk::Label::new(Some(
+        "Rarity and progress are shown when GOG supplies them; this endpoint currently does not.",
+    ));
+    partial.set_xalign(0.0);
+    partial.set_wrap(true);
+    partial.add_css_class("dim-label");
+    container.append(&partial);
+}
+
+fn render_game_activity(container: &gtk::Box, product_id: i64) {
+    let sessions = StateStore::open()
+        .and_then(|store| store.game_sessions(product_id))
+        .unwrap_or_default();
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Sessions");
+    if sessions.is_empty() {
+        group.add(
+            &adw::ActionRow::builder()
+                .title("No individual local sessions recorded yet")
+                .build(),
+        );
+    }
+    for session in sessions {
+        group.add(
+            &adw::ActionRow::builder()
+                .title(format_last_played(Some(session.started_at)))
+                .subtitle(format!(
+                    "{} · {}",
+                    format_playtime(session.duration_seconds),
+                    session.source
+                ))
+                .build(),
+        );
+    }
+    container.append(&group);
+    let unsupported = adw::PreferencesGroup::new();
+    unsupported.set_title("GOG gameplay data");
+    unsupported.add(
+        &adw::ActionRow::builder()
+            .title("Remote sessions and statistics unavailable")
+            .subtitle("The current session endpoint failed live validation; statistics and leaderboards remain read-only gated.")
+            .build(),
+    );
+    container.append(&unsupported);
 }
 
 fn rerender_tagged_detail(

@@ -22,7 +22,8 @@ Explicitly exclude overlays, store browsing/purchasing/redeeming, rollback suppo
 - Phase 2 complete: inherited update policies, post-sync and six-hour checks, manual checks, language reconciliation, and verified installer retention.
 - Phase 3 complete: verified cloud-save exports, selective remote deletion with recovery snapshots and revision checks, and local tombstones.
 - Phase 4 local organization complete: saved views, cover/background overrides, hidden games, and full local tag management/filtering. Live account tag and hidden reads pass validation; remote mutation and two-way synchronization remain gated pending safe write validation.
-- Phases 5 through 7 remain in progress.
+- Phase 5 read foundation complete for validated contracts: account-scoped friends/presence and achievement caches, Social UI, per-game achievements, and individual local-session Activity UI. Requests remain count-only; user search, block state, remote sessions, statistics, leaderboards, and comparisons remain visibly gated because their complete read contracts have not passed validation.
+- Phases 6 and 7 remain in progress.
 
 ## Phase 0: GOG Protocol Validation
 

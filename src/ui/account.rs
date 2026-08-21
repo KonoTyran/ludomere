@@ -69,6 +69,7 @@ pub(super) fn start_account_restore(
             Ok(Ok(Some((token, profile)))) => {
                 cache_and_display_profile(&w, &model, token.clone(), profile);
                 start_owned_library_sync(&w, &model, token, false, false);
+                start_social_sync(&w, &model);
                 glib::ControlFlow::Break
             }
             Ok(Ok(None)) => {
@@ -106,6 +107,7 @@ pub(super) fn poll_account_result(
             Ok(Ok((token, profile))) => {
                 cache_and_display_profile(&w, &model, token.clone(), profile);
                 start_owned_library_sync(&w, &model, token, true, false);
+                start_social_sync(&w, &model);
                 w.sign_in.set_sensitive(true);
                 glib::ControlFlow::Break
             }

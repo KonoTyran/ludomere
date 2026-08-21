@@ -272,9 +272,33 @@ pub struct CloudSaveTombstone {
     pub deleted_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedFriend {
+    pub friend: crate::gog::friends::GogFriend,
+    pub presence: Option<crate::gog::presence::GogPresence>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedAchievements {
+    pub achievements: Vec<crate::gog::gameplay::GogAchievement>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameSessionRecord {
+    pub session_id: String,
+    pub product_id: i64,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub duration_seconds: u64,
+    pub source: String,
+    pub remote_state: String,
+}
+
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 8;
+const CURRENT_DEVELOPMENT_REVISION: i64 = 9;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -339,6 +363,37 @@ impl StateStore {
                 view_id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
                 query_json TEXT NOT NULL, position INTEGER NOT NULL, created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS social_friends (
+                account_id TEXT NOT NULL, user_id TEXT NOT NULL, friend_json TEXT NOT NULL,
+                presence_json TEXT, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, user_id)
+             );
+             CREATE TABLE IF NOT EXISTS social_invitations (
+                account_id TEXT NOT NULL, user_id TEXT NOT NULL, direction TEXT NOT NULL,
+                invitation_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, user_id, direction)
+             );
+             CREATE TABLE IF NOT EXISTS gog_achievements (
+                account_id TEXT NOT NULL, product_id INTEGER NOT NULL,
+                achievement_id TEXT NOT NULL, achievement_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, product_id, achievement_id)
+             );
+             CREATE TABLE IF NOT EXISTS gog_sessions (
+                account_id TEXT NOT NULL, product_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+                session_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, product_id, session_id)
+             );
+             CREATE TABLE IF NOT EXISTS gog_statistics (
+                account_id TEXT NOT NULL, product_id INTEGER NOT NULL, statistic_id TEXT NOT NULL,
+                statistic_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, product_id, statistic_id)
+             );
+             CREATE TABLE IF NOT EXISTS social_sync_state (
+                account_id TEXT NOT NULL, scope TEXT NOT NULL, cursor TEXT,
+                synchronized_at INTEGER NOT NULL, error TEXT,
+                PRIMARY KEY(account_id, scope)
              );
              CREATE TABLE IF NOT EXISTS account_cache (cache_key INTEGER PRIMARY KEY CHECK(cache_key = 1), profile_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS owned_products (product_id INTEGER PRIMARY KEY, synchronized_at INTEGER NOT NULL);
@@ -513,6 +568,7 @@ impl StateStore {
             ensure_revision_six_schema(&connection)?;
             ensure_revision_seven_schema(&connection)?;
             ensure_revision_eight_schema(&connection)?;
+            ensure_revision_nine_schema(&connection)?;
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
@@ -1523,6 +1579,15 @@ impl StateStore {
         started_at: i64,
         seconds: u64,
     ) -> Result<()> {
+        let ended_at = started_at.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
+        let session_id = format!("local-{product_id}-{started_at}-{ended_at}");
+        self.connection.execute(
+            "INSERT OR IGNORE INTO game_sessions(
+                session_id, product_id, started_at, ended_at, duration_seconds,
+                source, remote_state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'launcher', 'pending', unixepoch())",
+            params![session_id, product_id, started_at, ended_at, seconds],
+        )?;
         self.connection.execute(
             "INSERT INTO product_activity(product_id, last_played_at, playtime_seconds, updated_at, last_activity_at)
              VALUES (?1, ?2, ?3, unixepoch(), ?2)
@@ -1534,6 +1599,161 @@ impl StateStore {
             params![product_id, started_at, seconds],
         )?;
         Ok(())
+    }
+
+    pub fn game_sessions(&self, product_id: i64) -> Result<Vec<GameSessionRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT session_id, product_id, started_at, ended_at, duration_seconds,
+                    source, remote_state
+             FROM game_sessions WHERE product_id = ?1 ORDER BY started_at DESC",
+        )?;
+        statement
+            .query_map(params![product_id], |row| {
+                Ok(GameSessionRecord {
+                    session_id: row.get(0)?,
+                    product_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    duration_seconds: row.get(4)?,
+                    source: row.get(5)?,
+                    remote_state: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn replace_social_friends(
+        &self,
+        account_id: &str,
+        friends: &[crate::gog::friends::GogFriend],
+        presence: &[crate::gog::presence::GogPresence],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM social_friends WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        for friend in friends {
+            let status = presence
+                .iter()
+                .find(|status| status.user_id == friend.user_id);
+            transaction.execute(
+                "INSERT INTO social_friends(
+                    account_id, user_id, friend_json, presence_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch())",
+                params![
+                    account_id,
+                    friend.user_id,
+                    serde_json::to_string(friend)?,
+                    status.map(serde_json::to_string).transpose()?,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO social_sync_state(account_id, scope, synchronized_at, error)
+             VALUES (?1, 'friends', unixepoch(), NULL)
+             ON CONFLICT(account_id, scope) DO UPDATE SET
+                synchronized_at = excluded.synchronized_at, error = NULL",
+            params![account_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cached_friends(&self, account_id: &str) -> Result<Vec<CachedFriend>> {
+        let mut statement = self.connection.prepare(
+            "SELECT friend_json, presence_json, updated_at FROM social_friends
+             WHERE account_id = ?1 ORDER BY json_extract(friend_json, '$.username') COLLATE NOCASE",
+        )?;
+        statement
+            .query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (friend, presence, updated_at) = row?;
+                Ok(CachedFriend {
+                    friend: serde_json::from_str(&friend)?,
+                    presence: presence.as_deref().map(serde_json::from_str).transpose()?,
+                    updated_at,
+                })
+            })
+            .collect()
+    }
+
+    pub fn replace_achievements(
+        &self,
+        account_id: &str,
+        product_id: i64,
+        achievements: &[crate::gog::gameplay::GogAchievement],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM gog_achievements WHERE account_id = ?1 AND product_id = ?2",
+            params![account_id, product_id],
+        )?;
+        for achievement in achievements {
+            transaction.execute(
+                "INSERT INTO gog_achievements(
+                    account_id, product_id, achievement_id, achievement_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch())",
+                params![
+                    account_id,
+                    product_id,
+                    achievement.id,
+                    serde_json::to_string(achievement)?,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO social_sync_state(account_id, scope, synchronized_at, error)
+             VALUES (?1, ?2, unixepoch(), NULL)
+             ON CONFLICT(account_id, scope) DO UPDATE SET
+                synchronized_at = excluded.synchronized_at, error = NULL",
+            params![account_id, format!("achievements:{product_id}")],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cached_achievements(
+        &self,
+        account_id: &str,
+        product_id: i64,
+    ) -> Result<CachedAchievements> {
+        let mut statement = self.connection.prepare(
+            "SELECT achievement_json, updated_at FROM gog_achievements
+             WHERE account_id = ?1 AND product_id = ?2 ORDER BY achievement_id",
+        )?;
+        let mut achievements = Vec::new();
+        let mut updated_at = 0;
+        for row in statement.query_map(params![account_id, product_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (json, timestamp) = row?;
+            achievements.push(serde_json::from_str(&json)?);
+            updated_at = updated_at.max(timestamp);
+        }
+        Ok(CachedAchievements {
+            achievements,
+            updated_at,
+        })
+    }
+
+    pub fn social_synced_at(&self, account_id: &str, scope: &str) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                "SELECT synchronized_at FROM social_sync_state
+                 WHERE account_id = ?1 AND scope = ?2",
+                params![account_id, scope],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn preserve_product_activity(
@@ -3348,6 +3568,43 @@ fn ensure_revision_eight_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_revision_nine_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS social_friends (
+            account_id TEXT NOT NULL, user_id TEXT NOT NULL, friend_json TEXT NOT NULL,
+            presence_json TEXT, updated_at INTEGER NOT NULL,
+            PRIMARY KEY(account_id, user_id)
+         );
+         CREATE TABLE IF NOT EXISTS social_invitations (
+            account_id TEXT NOT NULL, user_id TEXT NOT NULL, direction TEXT NOT NULL,
+            invitation_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+            PRIMARY KEY(account_id, user_id, direction)
+         );
+         CREATE TABLE IF NOT EXISTS gog_achievements (
+            account_id TEXT NOT NULL, product_id INTEGER NOT NULL,
+            achievement_id TEXT NOT NULL, achievement_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(account_id, product_id, achievement_id)
+         );
+         CREATE TABLE IF NOT EXISTS gog_sessions (
+            account_id TEXT NOT NULL, product_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+            session_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+            PRIMARY KEY(account_id, product_id, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS gog_statistics (
+            account_id TEXT NOT NULL, product_id INTEGER NOT NULL, statistic_id TEXT NOT NULL,
+            statistic_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+            PRIMARY KEY(account_id, product_id, statistic_id)
+         );
+         CREATE TABLE IF NOT EXISTS social_sync_state (
+            account_id TEXT NOT NULL, scope TEXT NOT NULL, cursor TEXT,
+            synchronized_at INTEGER NOT NULL, error TEXT,
+            PRIMARY KEY(account_id, scope)
+         );",
+    )?;
+    Ok(())
+}
+
 fn saved_view_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
@@ -5055,6 +5312,98 @@ mod tests {
         store.delete_saved_view(first).unwrap();
         assert!(store.tags().unwrap().is_empty());
         assert_eq!(store.saved_views().unwrap().len(), 1);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn development_revision_eight_gains_account_scoped_social_schema() {
+        let path = temp_database_path("development-revision-eight");
+        let store = StateStore::open_at(&path).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE social_friends;
+                 DROP TABLE social_invitations;
+                 DROP TABLE gog_achievements;
+                 DROP TABLE gog_sessions;
+                 DROP TABLE gog_statistics;
+                 DROP TABLE social_sync_state;
+                 UPDATE schema_state SET development_revision=8;",
+            )
+            .unwrap();
+        drop(store);
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        for table in [
+            "social_friends",
+            "social_invitations",
+            "gog_achievements",
+            "gog_sessions",
+            "gog_statistics",
+            "social_sync_state",
+        ] {
+            assert!(table_exists(&store.connection, table).unwrap());
+        }
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn social_caches_are_account_scoped_and_sessions_are_individual() {
+        let path = temp_database_path("social-cache");
+        let store = StateStore::open_at(&path).unwrap();
+        let friend = crate::gog::friends::GogFriend {
+            user_id: "friend".into(),
+            username: "Ada".into(),
+            is_employee: false,
+            avatar_url: None,
+        };
+        let presence = crate::gog::presence::GogPresence {
+            user_id: "friend".into(),
+            client_id: Some("42".into()),
+            data: serde_json::json!({"status":"online"}),
+        };
+        store
+            .replace_social_friends("account-a", std::slice::from_ref(&friend), &[presence])
+            .unwrap();
+        assert_eq!(store.cached_friends("account-a").unwrap().len(), 1);
+        assert!(store.cached_friends("account-b").unwrap().is_empty());
+
+        let achievement = crate::gog::gameplay::GogAchievement {
+            id: "first".into(),
+            key: "FIRST".into(),
+            visible: true,
+            name: "First".into(),
+            description: String::new(),
+            unlocked_image_url: None,
+            locked_image_url: None,
+            unlocked_at: Some("2026-01-01".into()),
+        };
+        store
+            .replace_achievements("account-a", 42, &[achievement])
+            .unwrap();
+        assert_eq!(
+            store
+                .cached_achievements("account-a", 42)
+                .unwrap()
+                .achievements
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .cached_achievements("account-b", 42)
+                .unwrap()
+                .achievements
+                .is_empty()
+        );
+        store.record_game_session(42, 100, 60).unwrap();
+        store.record_game_session(42, 200, 90).unwrap();
+        assert_eq!(store.game_sessions(42).unwrap().len(), 2);
         drop(store);
         fs::remove_file(path).unwrap();
     }

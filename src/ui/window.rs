@@ -27,6 +27,16 @@ pub fn build_window(app: &adw::Application) {
         .unwrap_or_else(|| store.cached_online_games().unwrap_or_default());
     crate::custom_artwork::apply(&mut cached_games);
     let cached_profile = store.cached_profile().unwrap_or_default();
+    let friends = cached_profile
+        .as_ref()
+        .and_then(|profile| store.cached_friends(&profile.user_id).ok())
+        .unwrap_or_default();
+    let social_synced_at = cached_profile.as_ref().and_then(|profile| {
+        store
+            .social_synced_at(&profile.user_id, "friends")
+            .ok()
+            .flatten()
+    });
     let download_jobs = store.download_jobs().unwrap_or_default();
     let downloaded_products = downloaded_product_ids(&download_jobs);
     let downloaded_installer_products = downloaded_installer_product_ids(&download_jobs);
@@ -114,6 +124,9 @@ pub fn build_window(app: &adw::Application) {
         selected: None,
         account_profile: cached_profile,
         account_token: None,
+        friends,
+        invitation_count: None,
+        social_synced_at,
         token_refresh_in_progress: false,
         network_available: true,
         owned_product_count,
@@ -564,6 +577,10 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     collections_button.set_tooltip_text(Some("Collections"));
     collections_button.add_css_class("collections-button");
     collections_button.set_action_name(Some("win.collections"));
+    let social_button = gtk::Button::from_icon_name("system-users-symbolic");
+    social_button.set_tooltip_text(Some("Social"));
+    social_button.add_css_class("collections-button");
+    social_button.set_action_name(Some("win.social"));
     let sort_toggle = gtk::ToggleButton::new();
     sort_toggle.set_child(Some(&gtk::Image::from_icon_name(
         "document-open-recent-symbolic",
@@ -584,6 +601,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     library_views.add_css_class("sidebar-toolbar");
     library_views.append(&home);
     library_views.append(&collections_button);
+    library_views.append(&social_button);
     library_views.append(&sort_toggle);
     library_views.append(&playable_toggle);
     sidebar.append(&library_views);
@@ -855,6 +873,11 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&collections)
         .build();
+    let social = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let social_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&social)
+        .build();
     let details = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let details_scroll = gtk::ScrolledWindow::builder().child(&details).build();
     details_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
@@ -875,6 +898,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     content.set_transition_type(gtk::StackTransitionType::Crossfade);
     content.add_named(&home_scroll, Some("home"));
     content.add_named(&collections_scroll, Some("collections"));
+    content.add_named(&social_scroll, Some("social"));
     content.add_named(&details_scroll, Some("details"));
     content.add_named(&downloads_scroll, Some("downloads"));
     content.add_named(&empty, Some("empty"));
@@ -981,6 +1005,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         game_list,
         home_grid,
         collections,
+        social,
         content,
         empty,
         details,
@@ -1386,6 +1411,17 @@ pub(super) fn connect_actions(
         });
     }
     w.window.add_action(&collections_action);
+
+    let social_action = gio::SimpleAction::new("social", None);
+    {
+        let w = w.clone();
+        let model = model.clone();
+        social_action.connect_activate(move |_, _| {
+            rebuild_social_page(&w, &model);
+            w.content.set_visible_child_name("social");
+        });
+    }
+    w.window.add_action(&social_action);
 
     let downloads_action = gio::SimpleAction::new("downloads", None);
     {

@@ -21,6 +21,7 @@ mod files;
 mod game_settings;
 mod library;
 mod settings;
+mod social;
 mod style;
 mod sync;
 mod tray;
@@ -36,6 +37,7 @@ use downloads::*;
 use executable_chooser::*;
 use files::*;
 use game_settings::*;
+use social::*;
 
 fn present_cloud_launch_event(
     window: &adw::ApplicationWindow,
@@ -165,6 +167,9 @@ struct AppModel {
     selected: Option<i64>,
     account_profile: Option<auth::Profile>,
     account_token: Option<auth::Token>,
+    friends: Vec<crate::state::CachedFriend>,
+    invitation_count: Option<usize>,
+    social_synced_at: Option<i64>,
     token_refresh_in_progress: bool,
     network_available: bool,
     owned_product_count: usize,
@@ -458,6 +463,7 @@ struct Widgets {
     game_list: gtk::ListBox,
     home_grid: gtk::FlowBox,
     collections: gtk::Box,
+    social: gtk::Box,
     content: gtk::Stack,
     empty: adw::StatusPage,
     details: gtk::Box,
@@ -627,6 +633,7 @@ impl Widgets {
             game_list: self.game_list.clone(),
             home_grid: self.home_grid.clone(),
             collections: self.collections.clone(),
+            social: self.social.clone(),
             content: self.content.clone(),
             empty: self.empty.clone(),
             details: self.details.clone(),

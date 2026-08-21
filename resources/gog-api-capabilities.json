@@ -6,7 +6,7 @@
     { "name": "presence_read", "read": true, "write": false },
     { "name": "presence_write", "read": false, "write": false },
     { "name": "achievements_read", "read": true, "write": false },
-    { "name": "sessions_read", "read": true, "write": false },
+    { "name": "sessions_read", "read": false, "write": false },
     { "name": "sessions_write", "read": false, "write": false },
     { "name": "account_tags", "read": true, "write": false },
     { "name": "hidden_games", "read": true, "write": false },

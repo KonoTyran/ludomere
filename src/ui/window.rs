@@ -82,6 +82,8 @@ pub fn build_window(app: &adw::Application) {
         favorites,
         hidden_games,
         tags,
+        tag_filters: BTreeSet::new(),
+        all_tag_filters: false,
         saved_views,
         favorites_only: false,
         show_hidden: false,
@@ -653,6 +655,11 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     library_column.append(&favorite_filter);
     let show_hidden_filter = gtk::CheckButton::with_label("Show hidden");
     library_column.append(&show_hidden_filter);
+    library_column.append(&filter_heading("Personal tags"));
+    let all_tag_filter = gtk::CheckButton::with_label("Match all selected tags");
+    library_column.append(&all_tag_filter);
+    let personal_tag_filter_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    library_column.append(&personal_tag_filter_box);
     let downloaded_filter = gtk::CheckButton::with_label("Downloaded content");
     downloaded_filter.set_tooltip_text(Some("Show games with downloaded base-game or DLC content"));
     library_column.append(&downloaded_filter);
@@ -1008,6 +1015,8 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         property_filter_label,
         property_filter_search,
         property_filter_chips,
+        personal_tag_filter_box,
+        all_tag_filter,
         account_button_name,
         header_network_icon,
         header_network_slash,
@@ -1186,6 +1195,16 @@ pub(super) fn connect_actions(
     connect_check_filter(w, model, &w.show_hidden_filter, |m, active| {
         m.show_hidden = active
     });
+    rebuild_personal_tag_filters(w, model);
+    {
+        let w = w.clone();
+        let model = model.clone();
+        let button = w.all_tag_filter.clone();
+        button.connect_toggled(move |button| {
+            model.borrow_mut().all_tag_filters = button.is_active();
+            refresh_filters(&w, &model.borrow());
+        });
+    }
     connect_check_filter(w, model, &w.downloaded_filter, |m, active| {
         m.downloaded_only = active
     });
@@ -1255,6 +1274,8 @@ pub(super) fn connect_actions(
                 model.genre_theme_filters.clear();
                 model.game_mode_filters.clear();
                 model.property_filters.clear();
+                model.tag_filters.clear();
+                model.all_tag_filters = false;
             }
             w.favorite_filter.set_active(false);
             w.show_hidden_filter.set_active(false);
@@ -1268,6 +1289,8 @@ pub(super) fn connect_actions(
             w.cloud_saves_filter.set_active(false);
             w.achievements_filter.set_active(false);
             w.language_filter.set_selected(0);
+            w.all_tag_filter.set_active(false);
+            rebuild_personal_tag_filters(&w, &model);
             update_metadata_filter_options(&w, &model);
             refresh_filters(&w, &model.borrow());
         });
@@ -1309,6 +1332,9 @@ pub(super) fn connect_actions(
                     _ if key.starts_with("property:") => {
                         state.property_filters.remove(&key[9..]);
                     }
+                    _ if key.starts_with("tag:") => {
+                        state.tag_filters.remove(&key[4..]);
+                    }
                     _ => return,
                 }
             }
@@ -1344,6 +1370,7 @@ pub(super) fn connect_actions(
                 w.language_filter.set_selected(0);
             }
             update_metadata_filter_options(&w, &model);
+            rebuild_personal_tag_filters(&w, &model);
             refresh_filters(&w, &model.borrow());
         });
     }
@@ -1533,6 +1560,46 @@ pub(super) fn connect_actions(
         });
     }
     w.window.add_action(&hidden_action);
+}
+
+pub(super) fn rebuild_personal_tag_filters(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
+    while let Some(child) = w.personal_tag_filter_box.first_child() {
+        w.personal_tag_filter_box.remove(&child);
+    }
+    let state = model.borrow();
+    let mut tags = state
+        .tags
+        .values()
+        .flatten()
+        .map(|tag| tag.trim().to_owned())
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>();
+    tags.sort_by_key(|tag| tag.to_lowercase());
+    tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    for tag in tags {
+        let check = gtk::CheckButton::with_label(&tag);
+        check.set_active(
+            state
+                .tag_filters
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(&tag)),
+        );
+        let callback_w = w.clone_refs();
+        let model = model.clone();
+        check.connect_toggled(move |check| {
+            let mut state = model.borrow_mut();
+            if check.is_active() {
+                state.tag_filters.insert(tag.clone());
+            } else {
+                state
+                    .tag_filters
+                    .retain(|selected| !selected.eq_ignore_ascii_case(&tag));
+            }
+            drop(state);
+            refresh_filters(&callback_w, &model.borrow());
+        });
+        w.personal_tag_filter_box.append(&check);
+    }
 }
 
 fn update_sort_toggle(w: &Widgets, mode: SidebarSortMode) {

@@ -185,7 +185,13 @@ fn current_saved_view_query(model: &AppModel) -> SavedViewQuery {
             _ => None,
         },
         include_hidden: model.show_hidden,
+        tags: model.tag_filters.iter().cloned().collect(),
+        all_tags: model.all_tag_filters,
         operating_systems,
+        sort: match model.sidebar_sort_mode {
+            crate::config::SidebarSortMode::Alphabetical => SavedViewSort::Title,
+            crate::config::SidebarSortMode::LastPlayed => SavedViewSort::LastPlayed,
+        },
         ..Default::default()
     }
 }
@@ -208,9 +214,23 @@ fn saved_view_ids(model: &AppModel, query: &SavedViewQuery) -> Vec<i64> {
                 || query
                     .installed
                     .is_some_and(|expected| model.installed_products.contains(&id) != expected)
-                || query
-                    .downloaded
-                    .is_some_and(|expected| model.downloaded_products.contains(&id) != expected)
+                || query.downloaded.is_some_and(|expected| {
+                    let downloaded = model.downloaded_products.contains(&id)
+                        || game
+                            .installers
+                            .iter()
+                            .chain(&game.patches)
+                            .chain(&game.extras)
+                            .any(|file| file.path.is_file())
+                        || game.dlcs.iter().any(|dlc| {
+                            dlc.installers
+                                .iter()
+                                .chain(&dlc.extras)
+                                .any(|file| file.path.is_file())
+                                || model.downloaded_products.contains(&dlc.product_id)
+                        });
+                    downloaded != expected
+                })
             {
                 return false;
             }

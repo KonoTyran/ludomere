@@ -752,6 +752,19 @@ pub(super) fn game_matches_library_filters(model: &AppModel, id: i64) -> bool {
     {
         return false;
     }
+    if !model.tag_filters.is_empty() {
+        let assigned = model.tags.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let matches = |tag: &String| {
+            assigned
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(tag))
+        };
+        if (model.all_tag_filters && !model.tag_filters.iter().all(matches))
+            || (!model.all_tag_filters && !model.tag_filters.iter().any(matches))
+        {
+            return false;
+        }
+    }
     let query = model.query.to_lowercase();
     query.is_empty()
         || game.title.to_lowercase().contains(&query)
@@ -853,6 +866,7 @@ pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
         + model.genre_theme_filters.len()
         + model.game_mode_filters.len()
         + model.property_filters.len();
+    let active_count = active_count + model.tag_filters.len();
     for label in [
         &w.genre_theme_filter_label,
         &w.game_mode_filter_label,
@@ -924,6 +938,12 @@ fn rebuild_filter_chips(w: &Widgets, model: &AppModel) {
             .genre_theme_filters
             .iter()
             .map(|value| (format!("genre:{value}"), value.clone())),
+    );
+    chips.extend(
+        model
+            .tag_filters
+            .iter()
+            .map(|value| (format!("tag:{value}"), value.clone())),
     );
     chips.extend(
         model

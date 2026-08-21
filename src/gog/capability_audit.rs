@@ -23,6 +23,25 @@ pub fn run() -> Result<()> {
     let client = crate::gog::client()?;
     let mut checks = Vec::new();
 
+    let organization = check(&mut checks, GogCapability::AccountTags, || {
+        super::account::library_organization(&client, &token)
+    });
+    if let Some(organization) = organization {
+        checks.push(CapabilityCheck {
+            capability: GogCapability::HiddenGames,
+            ok: true,
+            item_count: Some(organization.hidden_product_ids.len()),
+            error: None,
+        });
+    } else {
+        checks.push(CapabilityCheck {
+            capability: GogCapability::HiddenGames,
+            ok: false,
+            item_count: None,
+            error: Some("GOG account organization endpoint failed".into()),
+        });
+    }
+
     let friends = check(&mut checks, GogCapability::FriendsRead, || {
         super::friends::list(&client, &token)
     });
@@ -140,6 +159,12 @@ impl<T> AuditCount for Vec<T> {
 impl AuditCount for usize {
     fn audit_count(&self) -> usize {
         *self
+    }
+}
+
+impl AuditCount for super::account::AccountLibraryOrganization {
+    fn audit_count(&self) -> usize {
+        self.tags.len() + self.assignments.len()
     }
 }
 

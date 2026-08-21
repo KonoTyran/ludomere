@@ -1,3 +1,4 @@
+use super::window::rebuild_personal_tag_filters;
 use super::*;
 
 pub(super) fn show_game(
@@ -700,14 +701,37 @@ pub(super) fn render_detail_page(
             .cloned()
             .unwrap_or_default();
         let tag_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let tag_heading_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let tag_heading = gtk::Label::new(Some("Personal tags"));
         tag_heading.set_xalign(0.0);
+        tag_heading.set_hexpand(true);
         tag_heading.add_css_class("section-title");
-        tag_box.append(&tag_heading);
+        tag_heading_row.append(&tag_heading);
+        let manage_tags = gtk::Button::with_label("Manage tags…");
+        manage_tags.add_css_class("flat");
+        tag_heading_row.append(&manage_tags);
+        tag_box.append(&tag_heading_row);
         let tag_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         for tag in &tags {
-            let chip = gtk::Label::new(Some(tag));
+            let chip = gtk::Button::with_label(&format!("{tag}  ×"));
             chip.add_css_class("tag-chip");
+            chip.set_tooltip_text(Some(&format!("Remove {tag} from this game")));
+            let w = w.clone_refs();
+            let model = model.clone();
+            let tag = tag.clone();
+            let detail_id = game.product_id;
+            let parent_id = game.parent_id;
+            chip.connect_clicked(move |_| {
+                if let Ok(store) = StateStore::open() {
+                    let _ = store.remove_tag(detail_id, &tag);
+                }
+                if let Some(assigned) = model.borrow_mut().tags.get_mut(&detail_id) {
+                    assigned.retain(|candidate| !candidate.eq_ignore_ascii_case(&tag));
+                }
+                rebuild_personal_tag_filters(&w, &model);
+                refresh_filters(&w, &model.borrow());
+                rerender_tagged_detail(&w, &model, detail_id, parent_id);
+            });
             tag_row.append(&chip);
         }
         let tag_entry = gtk::Entry::builder()
@@ -722,6 +746,13 @@ pub(super) fn render_detail_page(
         let model2 = model.clone();
         let detail_id = game.product_id;
         let detail_parent_id = game.parent_id;
+        {
+            let w = w.clone_refs();
+            let model = model.clone();
+            manage_tags.connect_clicked(move |_| {
+                present_manage_tags(&w, &model, detail_id, detail_parent_id)
+            });
+        }
         add_tag.connect_clicked(move |_| {
             let tag = tag_entry.text().trim().to_owned();
             if tag.is_empty() {
@@ -741,27 +772,9 @@ pub(super) fn render_detail_page(
             if let Ok(store) = StateStore::open() {
                 let _ = store.add_tag(detail_id, &tag);
             }
+            rebuild_personal_tag_filters(&w2, &model2);
             refresh_filters(&w2, &model2.borrow());
-            if let Some(parent_id) = detail_parent_id {
-                let parent = model2
-                    .borrow()
-                    .games
-                    .iter()
-                    .find(|parent| parent.product_id == parent_id)
-                    .cloned();
-                let dlc = parent.as_ref().and_then(|parent| {
-                    parent
-                        .dlcs
-                        .iter()
-                        .find(|dlc| dlc.product_id == detail_id)
-                        .cloned()
-                });
-                if let (Some(parent), Some(dlc)) = (parent, dlc) {
-                    render_detail_page(&w2, &model2, DetailPageModel::dlc(&parent, dlc));
-                }
-            } else {
-                show_game(&w2, &model2, detail_id, Some(false));
-            }
+            rerender_tagged_detail(&w2, &model2, detail_id, detail_parent_id);
         });
         overview.append(&tag_box);
     }
@@ -862,6 +875,147 @@ pub(super) fn render_detail_page(
     w.content.set_visible_child_name("details");
     let adjustment = w.details_scroll.vadjustment();
     glib::idle_add_local_once(move || adjustment.set_value(adjustment.lower()));
+}
+
+fn rerender_tagged_detail(
+    w: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    parent_id: Option<i64>,
+) {
+    if let Some(parent_id) = parent_id {
+        let state = model.borrow();
+        let parent = state
+            .games
+            .iter()
+            .find(|parent| parent.product_id == parent_id)
+            .cloned();
+        let dlc = parent.as_ref().and_then(|parent| {
+            parent
+                .dlcs
+                .iter()
+                .find(|dlc| dlc.product_id == product_id)
+                .cloned()
+        });
+        drop(state);
+        if let (Some(parent), Some(dlc)) = (parent, dlc) {
+            render_detail_page(w, model, DetailPageModel::dlc(&parent, dlc));
+        }
+    } else {
+        show_game(w, model, product_id, Some(false));
+    }
+}
+
+fn present_manage_tags(
+    w: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    parent_id: Option<i64>,
+) {
+    let mut tags = model
+        .borrow()
+        .tags
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    tags.sort_by_key(|tag| tag.to_lowercase());
+    tags.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if tags.is_empty() {
+        return;
+    }
+    let dialog = adw::AlertDialog::builder()
+        .heading("Manage personal tags")
+        .body("Rename a tag everywhere, or delete it and all of its assignments.")
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let options = gtk::StringList::new(&tags.iter().map(String::as_str).collect::<Vec<_>>());
+    let selected = gtk::DropDown::new(Some(options), gtk::Expression::NONE);
+    let replacement = gtk::Entry::builder()
+        .placeholder_text("New tag name")
+        .build();
+    content.append(&selected);
+    content.append(&replacement);
+    dialog.set_extra_child(Some(&content));
+    dialog.add_responses(&[
+        ("cancel", "Cancel"),
+        ("delete", "Delete tag"),
+        ("rename", "Rename"),
+    ]);
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+    let w = w.clone_refs();
+    let model = model.clone();
+    let window = w.window.clone();
+    dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+        let Some(old) = tags.get(selected.selected() as usize).cloned() else {
+            return;
+        };
+        if response == "rename" {
+            let new = replacement.text().trim().to_owned();
+            if new.is_empty() {
+                return;
+            }
+            if StateStore::open()
+                .and_then(|store| store.rename_tag(&old, &new))
+                .is_ok()
+            {
+                for assigned in model.borrow_mut().tags.values_mut() {
+                    for tag in assigned.iter_mut() {
+                        if tag.eq_ignore_ascii_case(&old) {
+                            *tag = new.clone();
+                        }
+                    }
+                    assigned.sort_by_key(|tag| tag.to_lowercase());
+                    assigned.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+                }
+                rebuild_personal_tag_filters(&w, &model);
+                refresh_filters(&w, &model.borrow());
+                rerender_tagged_detail(&w, &model, product_id, parent_id);
+            }
+        } else if response == "delete" {
+            confirm_delete_tag(&w, &model, product_id, parent_id, old);
+        }
+    });
+}
+
+fn confirm_delete_tag(
+    w: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    parent_id: Option<i64>,
+    tag: String,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Delete “{tag}”?"))
+        .body("This removes the tag from every game. This action does not delete any game data.")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+    let w = w.clone_refs();
+    let model = model.clone();
+    let window = w.window.clone();
+    dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+        if response != "delete" {
+            return;
+        }
+        if StateStore::open()
+            .and_then(|store| store.delete_tag(&tag))
+            .is_ok()
+        {
+            for assigned in model.borrow_mut().tags.values_mut() {
+                assigned.retain(|candidate| !candidate.eq_ignore_ascii_case(&tag));
+            }
+            model
+                .borrow_mut()
+                .tag_filters
+                .retain(|candidate| !candidate.eq_ignore_ascii_case(&tag));
+            rebuild_personal_tag_filters(&w, &model);
+            refresh_filters(&w, &model.borrow());
+            rerender_tagged_detail(&w, &model, product_id, parent_id);
+        }
+    });
 }
 
 fn cached_patch_notes(

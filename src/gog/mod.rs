@@ -1,3 +1,4 @@
+pub mod account;
 pub mod audit;
 pub mod builds;
 pub mod capabilities;

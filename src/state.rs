@@ -1722,6 +1722,13 @@ impl StateStore {
         if new.is_empty() {
             bail!("tag name cannot be empty");
         }
+        if old.eq_ignore_ascii_case(new) {
+            self.connection.execute(
+                "UPDATE custom_tags SET tag = ?2 WHERE tag = ?1 COLLATE NOCASE",
+                params![old, new],
+            )?;
+            return Ok(());
+        }
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT OR IGNORE INTO custom_tags(product_id, tag)

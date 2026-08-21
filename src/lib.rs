@@ -4,6 +4,7 @@ pub mod branch_credentials;
 pub mod cloud_saves;
 pub mod compatibility;
 pub mod config;
+pub mod custom_artwork;
 pub mod domain;
 pub mod download;
 pub mod download_selection;

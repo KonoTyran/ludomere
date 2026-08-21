@@ -100,6 +100,135 @@ pub(super) fn show_game_settings(
     save_status.set_margin_top(8);
     general_group.add(&save_status);
 
+    let artwork_group = adw::PreferencesGroup::new();
+    artwork_group.set_title("Custom artwork");
+    artwork_group.set_description(Some(
+        "Local PNG or JPEG overrides are copied into Ludomere and never uploaded.",
+    ));
+    for (title, subtitle, kind) in [
+        (
+            "Cover",
+            "Library cards and collection tiles",
+            crate::custom_artwork::ArtworkKind::Cover,
+        ),
+        (
+            "Background",
+            "The wide image on the game details page",
+            crate::custom_artwork::ArtworkKind::Background,
+        ),
+    ] {
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .build();
+        let choose = gtk::Button::with_label("Choose…");
+        choose.set_valign(gtk::Align::Center);
+        let reset = gtk::Button::with_label("Reset");
+        reset.set_valign(gtk::Align::Center);
+        reset.set_sensitive(crate::custom_artwork::override_path(game.product_id, kind).is_some());
+        row.add_suffix(&choose);
+        row.add_suffix(&reset);
+        let status = gtk::Label::new(None);
+        status.set_xalign(0.0);
+        status.add_css_class("dim-label");
+        row.add_suffix(&status);
+        {
+            let window = window.clone();
+            let model = model.clone();
+            let status = status.clone();
+            let reset = reset.clone();
+            let refresh = refresh_after_change.clone();
+            let product_id = game.product_id;
+            choose.connect_clicked(move |_| {
+                let picker = gtk::FileDialog::builder()
+                    .title("Choose custom artwork")
+                    .modal(true)
+                    .build();
+                let filter = gtk::FileFilter::new();
+                filter.set_name(Some("PNG and JPEG images"));
+                filter.add_mime_type("image/png");
+                filter.add_mime_type("image/jpeg");
+                let filters = gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                picker.set_filters(Some(&filters));
+                let model = model.clone();
+                let status = status.clone();
+                let reset = reset.clone();
+                let refresh = refresh.clone();
+                picker.open(Some(&window), gio::Cancellable::NONE, move |result| {
+                    let Ok(file) = result else { return };
+                    let Some(path) = file.path() else { return };
+                    status.set_label("Importing…");
+                    let (sender, receiver) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = sender.send(crate::custom_artwork::import(product_id, kind, &path));
+                    });
+                    let model = model.clone();
+                    let status = status.clone();
+                    let reset = reset.clone();
+                    let refresh = refresh.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match receiver.try_recv() {
+                            Ok(Ok(path)) => {
+                                update_custom_artwork_model(&model, product_id, kind, Some(path));
+                                status.set_label("Custom artwork active");
+                                reset.set_sensitive(true);
+                                refresh();
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status.set_label(&error.to_string());
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                status.set_label("Artwork import stopped unexpectedly");
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    });
+                });
+            });
+        }
+        {
+            let model = model.clone();
+            let status = status.clone();
+            let reset_button = reset.clone();
+            let refresh = refresh_after_change.clone();
+            let product_id = game.product_id;
+            reset.connect_clicked(move |_| {
+                status.set_label("Resetting…");
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(crate::custom_artwork::reset(product_id, kind));
+                });
+                let model = model.clone();
+                let status = status.clone();
+                let reset_button = reset_button.clone();
+                let refresh = refresh.clone();
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    match receiver.try_recv() {
+                        Ok(Ok(())) => {
+                            restore_remote_artwork_model(&model, product_id, kind);
+                            status.set_label("Using GOG artwork");
+                            reset_button.set_sensitive(false);
+                            refresh();
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&error.to_string());
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    }
+                });
+            });
+        }
+        artwork_group.add(&row);
+    }
+    general_page.add(&artwork_group);
+
     if installed.is_none() {
         executable.set_sensitive(false);
         browse_executable.set_sensitive(false);
@@ -2296,6 +2425,64 @@ fn policy_selection(selected: u32) -> Option<bool> {
         2 => Some(false),
         _ => None,
     }
+}
+
+fn update_custom_artwork_model(
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    kind: crate::custom_artwork::ArtworkKind,
+    path: Option<std::path::PathBuf>,
+) {
+    let mut state = model.borrow_mut();
+    for game in &mut state.games {
+        if game.product_id == product_id {
+            match kind {
+                crate::custom_artwork::ArtworkKind::Cover => game.artwork = path,
+                crate::custom_artwork::ArtworkKind::Background => game.detail_artwork = path,
+            }
+            return;
+        }
+        if let Some(dlc) = game
+            .dlcs
+            .iter_mut()
+            .find(|dlc| dlc.product_id == product_id)
+        {
+            match kind {
+                crate::custom_artwork::ArtworkKind::Cover => dlc.artwork = path,
+                crate::custom_artwork::ArtworkKind::Background => dlc.detail_artwork = path,
+            }
+            return;
+        }
+    }
+}
+
+fn restore_remote_artwork_model(
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+    kind: crate::custom_artwork::ArtworkKind,
+) {
+    let remote = StateStore::open()
+        .and_then(|store| store.normalized_games())
+        .ok()
+        .and_then(|games| {
+            games.into_iter().find_map(|game| {
+                if game.product_id == product_id {
+                    return Some(match kind {
+                        crate::custom_artwork::ArtworkKind::Cover => game.artwork,
+                        crate::custom_artwork::ArtworkKind::Background => game.detail_artwork,
+                    });
+                }
+                game.dlcs
+                    .into_iter()
+                    .find(|dlc| dlc.product_id == product_id)
+                    .map(|dlc| match kind {
+                        crate::custom_artwork::ArtworkKind::Cover => dlc.artwork,
+                        crate::custom_artwork::ArtworkKind::Background => dlc.detail_artwork,
+                    })
+            })
+        })
+        .flatten();
+    update_custom_artwork_model(model, product_id, kind, remote);
 }
 
 fn info_row(title: &str, value: &str) -> adw::ActionRow {

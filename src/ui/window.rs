@@ -20,11 +20,12 @@ pub fn build_window(app: &adw::Application) {
         tracing::error!(%error, "loading saved views");
         Vec::new()
     });
-    let cached_games = store
+    let mut cached_games = store
         .normalized_games()
         .ok()
         .filter(|games| !games.is_empty())
         .unwrap_or_else(|| store.cached_online_games().unwrap_or_default());
+    crate::custom_artwork::apply(&mut cached_games);
     let cached_profile = store.cached_profile().unwrap_or_default();
     let download_jobs = store.download_jobs().unwrap_or_default();
     let downloaded_products = downloaded_product_ids(&download_jobs);

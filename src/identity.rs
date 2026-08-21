@@ -41,6 +41,9 @@ pub fn runtime_logs() -> PathBuf {
 pub fn screenshots() -> PathBuf {
     cache_root().join("screenshots")
 }
+pub fn custom_artwork() -> PathBuf {
+    data_root().join("custom-artwork")
+}
 
 #[cfg(test)]
 mod tests {

@@ -65,11 +65,19 @@ pub(super) fn update_streamed_media(
     w: &Widgets,
     model: &Rc<RefCell<AppModel>>,
     product_id: i64,
-    artwork: Option<std::path::PathBuf>,
-    detail_artwork: Option<std::path::PathBuf>,
+    mut artwork: Option<std::path::PathBuf>,
+    mut detail_artwork: Option<std::path::PathBuf>,
     hero_logo: Option<std::path::PathBuf>,
     icon: Option<std::path::PathBuf>,
 ) {
+    artwork =
+        crate::custom_artwork::override_path(product_id, crate::custom_artwork::ArtworkKind::Cover)
+            .or(artwork);
+    detail_artwork = crate::custom_artwork::override_path(
+        product_id,
+        crate::custom_artwork::ArtworkKind::Background,
+    )
+    .or(detail_artwork);
     let selected_product = model.borrow().selected;
     let mut state = model.borrow_mut();
     let Some(game) = state

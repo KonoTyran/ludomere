@@ -817,6 +817,10 @@ fn run_depot_operation_inner(
     request: &DepotOperationRequest,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !super::is_game_running(request.product_id),
+        "Close the running game before resuming this Depot operation"
+    );
     if request
         .target_marker
         .base
@@ -2616,6 +2620,7 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
         return;
     }
     let product_id = persisted_plan.game.product_id;
+    let download_intent = persisted_plan.download_intent_id.clone();
     let running_message = if persisted_plan
         .game
         .installer_operating_system
@@ -2661,7 +2666,7 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
                     | InstallationEvent::Failed(_)
             );
             let shutting_down = MANAGER.lock().unwrap().shutting_down;
-            if shutting_down {
+            if shutting_down && !matches!(event, InstallationEvent::Complete { .. }) {
                 if terminal {
                     persist_existing_operation(
                         product_id,
@@ -2673,6 +2678,12 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
                 }
             } else {
                 update_installation_snapshot(product_id, &event);
+                if matches!(event, InstallationEvent::Complete { .. })
+                    && let Some(intent_id) = &download_intent
+                    && let Ok(store) = StateStore::open()
+                {
+                    let _ = store.complete_download_install_intent(product_id, intent_id);
+                }
                 publish(InstallationManagerEvent::Installation { product_id, event });
             }
             if terminal {
@@ -2735,7 +2746,7 @@ fn start_queued_uninstallation(plan: PersistedUninstallationPlan) {
                     | UninstallationEvent::Failed(_)
             );
             let shutting_down = MANAGER.lock().unwrap().shutting_down;
-            if shutting_down {
+            if shutting_down && !matches!(event, UninstallationEvent::Complete) {
                 if terminal {
                     persist_existing_operation(
                         product_id,

@@ -6,12 +6,14 @@ use std::{
 
 mod auto_install;
 mod cleanup;
+mod completion;
 pub mod depot;
 mod files;
 mod layout;
 mod manager;
 mod protocol;
 mod transfer;
+mod trash;
 mod verify;
 mod worker;
 
@@ -46,6 +48,7 @@ pub enum DownloadFailureKind {
     ManifestChanged,
     DiskFull,
     PermissionDenied,
+    Bookkeeping,
     Other,
 }
 
@@ -89,6 +92,19 @@ pub fn retry_install_after_download(product_id: i64) -> anyhow::Result<()> {
     manager::retry_install_after_download(product_id)
 }
 
+/// Automatic backups never create, replace or revoke installation consent.
+pub(crate) fn enqueue_backup(request: DownloadRequest, session: u64) -> anyhow::Result<()> {
+    manager::enqueue_backup(request, session)
+}
+
+pub(crate) fn check_installer_retention(
+    product_id: i64,
+    token: &str,
+    session: u64,
+) -> anyhow::Result<()> {
+    manager::check_retention(product_id, token, session)
+}
+
 #[derive(Debug, Clone)]
 pub enum DownloadManagerEvent {
     QueueSnapshot(Vec<crate::state::DownloadJobRecord>),
@@ -99,6 +115,12 @@ pub enum DownloadManagerEvent {
     },
     AuthenticationRequired,
     ManagedFilesChanged(i64),
+    BookkeepingFailed {
+        job_id: String,
+        product_id: i64,
+        message: String,
+        session: u64,
+    },
 }
 
 pub fn job_id(artifacts: &[&RemoteArtifact]) -> String {
@@ -385,6 +407,7 @@ mod tests {
             &sender,
             false,
             1,
+            crate::online::account_session(),
         )
     }
 
@@ -451,6 +474,80 @@ mod tests {
         );
         descriptor_thread.join().unwrap();
         cdn_thread.join().unwrap();
+    }
+
+    #[test]
+    fn automatic_backup_requests_keep_download_and_staging_layout_under_configured_root() {
+        let directory = TestDirectory::new("automatic-backup-layout");
+        let config = crate::config::Config {
+            download_directory: directory.0.join("downloads"),
+            ..Default::default()
+        };
+        let token = crate::auth::Token {
+            access_token: "inert".into(),
+            refresh_token: "inert".into(),
+            user_id: "fixture".into(),
+            expires_at: 0,
+        };
+        for (slug, expected_slug) in [
+            ("example_game", "example_game"),
+            ("../../outside", "outside"),
+            ("/outside", "outside"),
+            ("..", "123"),
+        ] {
+            let artifacts = vec![RemoteArtifact {
+                product_id: 123,
+                kind: crate::domain::ArtifactKind::Installer,
+                name: "Example".into(),
+                language: Some("English".into()),
+                operating_system: Some("windows".into()),
+                version: Some("1".into()),
+                release_date: None,
+                size_label: None,
+                size_bytes: None,
+                part_number: None,
+                part_count: None,
+                download_path: "/downloads/example".into(),
+                provider_group_id: None,
+                provider_file_id: None,
+                provider_category: None,
+            }];
+            let request = crate::updates::backup_request(
+                &config,
+                &crate::domain::Game {
+                    product_id: 123,
+                    slug: slug.into(),
+                    title: "Example".into(),
+                    ..Default::default()
+                },
+                &token,
+                artifacts,
+            );
+            assert_eq!(
+                request.destination,
+                config
+                    .download_directory
+                    .join(expected_slug)
+                    .join("installer/windows/english")
+            );
+            let id = job_id(&request.artifacts.iter().collect::<Vec<_>>());
+            let staging = staging_directory(&request.destination, &request.artifacts, &id);
+            assert_eq!(
+                staging,
+                config
+                    .download_directory
+                    .join(crate::identity::STAGING_DIRECTORY)
+                    .join(key(&id))
+            );
+            fs::create_dir_all(&staging).unwrap();
+            fs::write(staging.join("inert-part"), b"fixture").unwrap();
+            assert!(
+                staging
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(config.download_directory.canonicalize().unwrap())
+            );
+        }
     }
 
     #[test]
@@ -703,6 +800,7 @@ mod tests {
             &sender,
             false,
             2,
+            crate::online::account_session(),
         )
         .unwrap();
         server.join().unwrap();

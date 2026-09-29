@@ -1186,7 +1186,10 @@ pub fn fetch_product_section(
             let access_token = access_token.context("Sign in to load available Galaxy builds")?;
             let mut builds = Vec::new();
             for (os, supported) in [
-                ("windows", game.platforms.windows),
+                (
+                    "windows",
+                    game.platforms.windows || !game.platforms.linux && !game.platforms.macos,
+                ),
                 ("osx", game.platforms.macos),
             ] {
                 if !supported {
@@ -1233,7 +1236,10 @@ pub fn fetch_product_section(
     }
     if section == DetailSection::Builds {
         for (os, supported) in [
-            ("windows", game.platforms.windows),
+            (
+                "windows",
+                game.platforms.windows || !game.platforms.linux && !game.platforms.macos,
+            ),
             ("osx", game.platforms.macos),
         ] {
             if supported {
@@ -1383,8 +1389,8 @@ fn fetch_download_manifest(
         ))
         .bearer_auth(access_token)
         .send()?
-        .error_for_status()?
-        .text()?;
+        .error_for_status()?;
+    let response = String::from_utf8(crate::gog::product::bounded_metadata(response)?)?;
     let value: serde_json::Value = serde_json::from_str(&response)?;
     let dlc_manifests = normalize_dlc_download_artifacts(&value, dlcs);
     Ok((

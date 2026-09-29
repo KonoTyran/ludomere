@@ -1,6 +1,6 @@
 use super::*;
 
-type ManagedArtifactIdentity = (i64, String, Option<String>);
+pub(super) type ManagedArtifactIdentity = (i64, String, Option<String>);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum InstallerCoverage {
@@ -10,11 +10,11 @@ pub(super) enum InstallerCoverage {
     Complete,
 }
 
-pub(super) fn installer_backup_coverage(
+pub(super) fn installer_backup_coverage_from(
     game: &DetailPageModel,
     config: &Config,
+    managed_paths: &HashSet<ManagedArtifactIdentity>,
 ) -> InstallerCoverage {
-    let managed_paths = managed_artifact_paths();
     let mut required = 0_usize;
     let mut downloaded = 0_usize;
     for artifacts in std::iter::once(game.remote_artifacts.as_slice()).chain(
@@ -28,7 +28,7 @@ pub(super) fn installer_backup_coverage(
         downloaded += groups
             .iter()
             .filter(|group| {
-                dialog_artifact_state(group, &managed_paths) == DialogArtifactState::Downloaded
+                dialog_artifact_state(group, managed_paths) == DialogArtifactState::Downloaded
             })
             .count();
     }
@@ -79,32 +79,22 @@ pub(super) fn required_owned_dlc_ids(game: &DetailPageModel, config: &Config) ->
         .collect()
 }
 
-pub(super) fn default_installers_are_downloaded(game: &DetailPageModel, config: &Config) -> bool {
-    installer_backup_coverage(game, config) == InstallerCoverage::Complete
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct DlcActionState {
     pub(super) missing_download: bool,
     pub(super) missing_install: bool,
 }
 
-pub(super) fn owned_dlc_action_state(
+pub(super) fn owned_dlc_action_state_from(
     game: &DetailPageModel,
     config: &Config,
     base_installed: bool,
+    managed_paths: &HashSet<ManagedArtifactIdentity>,
+    installed_ids: &HashSet<i64>,
 ) -> DlcActionState {
     if game.parent_id.is_some() {
         return DlcActionState::default();
     }
-    let managed_paths = managed_artifact_paths();
-    let installed_ids = if base_installed {
-        StateStore::open()
-            .and_then(|store| crate::installation::installed_dlc_ids(&store, game.product_id))
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
     let mut state = DlcActionState::default();
     for dlc in game.dlcs.iter().filter(|dlc| {
         dlc.owned
@@ -116,7 +106,7 @@ pub(super) fn owned_dlc_action_state(
         let downloaded = product_default_installers_are_downloaded(
             &dlc.remote_artifacts,
             config,
-            &managed_paths,
+            managed_paths,
             false,
         );
         state.missing_download |= !downloaded;
@@ -260,6 +250,41 @@ pub(super) fn default_galaxy_selection(
         owned_dlc: owned_dlc.clone(),
         selected_dlc: owned_dlc,
     }
+}
+
+pub(super) fn show_primary_download(
+    w: &Rc<Widgets>,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+) {
+    let depot_first = {
+        let state = model.borrow();
+        detail.parent_id.is_none()
+            && !state.installed_products.contains(&detail.product_id)
+            && state
+                .games
+                .iter()
+                .find(|game| game.product_id == detail.product_id)
+                .is_some_and(|game| depot_is_preferred_download(&state.config, &game.platforms))
+    };
+    if depot_first {
+        show_install_dialog(&w.window, model, detail);
+    } else {
+        show_download_selector(w, model, detail);
+    }
+}
+
+fn depot_is_preferred_download(config: &Config, platforms: &crate::domain::Platforms) -> bool {
+    use crate::config::PreferredInstallationSource::*;
+    let windows = platforms.windows || (!platforms.linux && !platforms.macos);
+    config
+        .installation_source_order
+        .iter()
+        .find(|source| match source {
+            LinuxOffline => platforms.linux,
+            WindowsGalaxy | WindowsOffline => windows,
+        })
+        == Some(&WindowsGalaxy)
 }
 
 pub(super) fn show_repair_dialog(
@@ -676,7 +701,11 @@ fn populate_install_dialog(
                 state
                     .games
                     .iter()
-                    .find(|game| game.product_id == detail.product_id && game.platforms.windows)
+                    .find(|game| {
+                        game.product_id == detail.product_id
+                            && (game.platforms.windows
+                                || (!game.platforms.linux && !game.platforms.macos))
+                    })
                     .cloned()
             })
             .flatten()
@@ -733,7 +762,7 @@ fn populate_install_dialog(
         }));
     }
     let galaxy_ready = Rc::new(std::cell::Cell::new(!galaxy_builds.is_empty()));
-    let mut ranked_sources = if repair || existing_installation.is_some() {
+    let ranked_sources = if repair || existing_installation.is_some() {
         Vec::new()
     } else {
         crate::installation::rank_fresh_install_sources(
@@ -742,14 +771,6 @@ fn populate_install_dialog(
             !galaxy_builds.is_empty() || galaxy_request.is_some(),
         )
     };
-    if !galaxy_ready.get() {
-        ranked_sources.sort_by_key(|source| {
-            matches!(
-                source,
-                crate::installation::FreshInstallSource::GalaxyWindows
-            )
-        });
-    }
     let mut source_values = Vec::new();
     for source in &ranked_sources {
         let label = match source {
@@ -1224,6 +1245,21 @@ fn populate_install_dialog(
     }
     let installer_detail = adw::ActionRow::new();
     body.add(&installer_group);
+    if !repair && existing_installation.is_none() && detail.parent_id.is_none() {
+        let offline = gtk::Button::with_label("Offline installers and extras…");
+        let window = window.clone();
+        let dialog = dialog.clone();
+        let id = detail.product_id;
+        offline.connect_clicked(move |_| {
+            dialog.close();
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                &window,
+                "win.offline-download",
+                Some(&id.to_variant()),
+            );
+        });
+        installer_group.add(&offline);
+    }
 
     let destination_group = adw::PreferencesGroup::new();
     destination_group.set_title("INSTALL TO:");
@@ -1365,6 +1401,7 @@ fn populate_install_dialog(
     );
     if galaxy_selected.get() {
         install.set_sensitive(galaxy_ready.get() && !config.game_libraries.is_empty());
+        install.set_label("Download and install");
     }
     if config.game_libraries.is_empty() {
         install.set_sensitive(false);
@@ -1377,7 +1414,7 @@ fn populate_install_dialog(
         source.connect_selected_notify(move |_| {
             if galaxy_selected.get() {
                 install.set_sensitive(galaxy_ready.get() && has_library);
-                install.set_label("Install");
+                install.set_label("Download and install");
             }
         });
     }
@@ -1402,6 +1439,7 @@ fn populate_install_dialog(
             );
             if galaxy_selected.get() {
                 install.set_sensitive(galaxy_ready.get() && has_library);
+                install.set_label("Download and install");
             }
         });
     }
@@ -3688,7 +3726,40 @@ pub(super) struct DetailFileManagement {
 
 #[cfg(test)]
 mod installer_version_tests {
-    use super::{dlc_summary_text, versions_match};
+    use super::{depot_is_preferred_download, dlc_summary_text, versions_match};
+
+    #[test]
+    fn primary_download_respects_available_platforms_and_saved_source_preference() {
+        use crate::{
+            config::{Config, PreferredInstallationSource::*},
+            domain::Platforms,
+        };
+        let mut config = Config::default();
+        let windows = Platforms {
+            windows: true,
+            ..Default::default()
+        };
+        let both = Platforms {
+            windows: true,
+            linux: true,
+            ..Default::default()
+        };
+        assert!(depot_is_preferred_download(&config, &windows));
+        assert!(depot_is_preferred_download(&config, &both));
+        assert!(depot_is_preferred_download(&config, &Platforms::default()));
+        assert!(!depot_is_preferred_download(
+            &config,
+            &Platforms {
+                linux: true,
+                ..Default::default()
+            }
+        ));
+        config.installation_source_order = vec![LinuxOffline, WindowsGalaxy, WindowsOffline];
+        assert!(!depot_is_preferred_download(&config, &both));
+        assert!(depot_is_preferred_download(&config, &windows));
+        config.installation_source_order = vec![WindowsOffline, WindowsGalaxy, LinuxOffline];
+        assert!(!depot_is_preferred_download(&config, &windows));
+    }
 
     #[test]
     fn dlc_must_match_the_selected_base_version_exactly() {

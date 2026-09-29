@@ -1,3 +1,4 @@
+pub mod achievements;
 pub mod audit;
 pub mod builds;
 pub mod depot_acquisition;

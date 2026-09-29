@@ -69,6 +69,9 @@ pub fn exchange_scoped_token(
 }
 
 pub trait Storage {
+    fn account_id(&self) -> Option<&str> {
+        None
+    }
     fn list(&self) -> Result<Vec<RemoteObject>>;
     fn download(&self, namespace: &str, path: &str) -> Result<Vec<u8>>;
     fn upload(
@@ -78,6 +81,12 @@ pub trait Storage {
         data: &[u8],
         modified_at: i64,
     ) -> Result<RemoteObject>;
+    fn download_revision(&self, _object: &RemoteObject) -> Result<Vec<u8>> {
+        bail!("cloud storage does not support revision-checked exports")
+    }
+    fn delete_revision(&self, _object: &RemoteObject) -> Result<()> {
+        bail!("cloud storage does not support revision-checked deletion")
+    }
 }
 
 pub struct CloudClient {
@@ -136,6 +145,81 @@ impl CloudClient {
 }
 
 impl Storage for CloudClient {
+    fn account_id(&self) -> Option<&str> {
+        Some(&self.user_id)
+    }
+
+    fn download_revision(&self, object: &RemoteObject) -> Result<Vec<u8>> {
+        validate_remote_path(&object.namespace)?;
+        validate_remote_path(&object.path)?;
+        let revision = conditional_revision(&object.etag)?;
+        let mut response = self
+            .client
+            .get(self.object_url(&object.namespace, &object.path)?)
+            .bearer_auth(&self.access_token)
+            .header(header::IF_MATCH, revision)
+            .send()
+            .map_err(|_| anyhow::anyhow!("cloud-save export request failed"))?
+            .error_for_status()
+            .map_err(|_| {
+                anyhow::anyhow!("cloud save changed or could not be downloaded; refresh and retry")
+            })?;
+        let returned = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .trim_matches('"');
+        if returned != object.etag {
+            bail!("cloud server did not confirm the selected save revision; export refused");
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_RESPONSE as u64)
+        {
+            bail!("cloud-save object exceeds the safety limit");
+        }
+        let mut compressed = Vec::new();
+        response
+            .by_ref()
+            .take(MAX_RESPONSE as u64 + 1)
+            .read_to_end(&mut compressed)
+            .map_err(|_| anyhow::anyhow!("cloud-save export transfer failed"))?;
+        if compressed.len() > MAX_RESPONSE {
+            bail!("cloud-save object exceeds the safety limit");
+        }
+        let mut decoded = Vec::new();
+        GzDecoder::new(compressed.as_slice())
+            .take(MAX_RESPONSE as u64 + 1)
+            .read_to_end(&mut decoded)
+            .context("decoding cloud-save export")?;
+        if decoded.len() > MAX_RESPONSE {
+            bail!("expanded cloud-save object exceeds the safety limit");
+        }
+        Ok(decoded)
+    }
+
+    fn delete_revision(&self, object: &RemoteObject) -> Result<()> {
+        validate_remote_path(&object.namespace)?;
+        validate_remote_path(&object.path)?;
+        self.client
+            .delete(self.object_url(&object.namespace, &object.path)?)
+            .bearer_auth(&self.access_token)
+            .header(header::IF_MATCH, conditional_revision(&object.etag)?)
+            .send()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "cloud-save deletion response was not received; refresh to check the result"
+                )
+            })?
+            .error_for_status()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "cloud save changed or deletion was rejected; refresh before retrying"
+                )
+            })?;
+        Ok(())
+    }
     fn list(&self) -> Result<Vec<RemoteObject>> {
         let response = self
             .client
@@ -149,10 +233,7 @@ impl Storage for CloudClient {
         {
             bail!("cloud-save listing exceeds the safety limit");
         }
-        let bytes = response.bytes()?;
-        if bytes.len() > MAX_RESPONSE {
-            bail!("cloud-save listing exceeds the safety limit");
-        }
+        let bytes = bounded_listing(response, MAX_RESPONSE)?;
         let listed: Vec<ListedObject> =
             serde_json::from_slice(&bytes).context("decoding cloud-save listing")?;
         if listed.len() > MAX_FILES {
@@ -221,6 +302,26 @@ impl Storage for CloudClient {
     }
 }
 
+fn bounded_listing(reader: impl Read, maximum: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        bail!("cloud-save listing exceeds the safety limit");
+    }
+    Ok(bytes)
+}
+
+pub(super) fn conditional_revision(etag: &str) -> Result<String> {
+    if etag.is_empty()
+        || etag.starts_with("W/")
+        || etag.contains(['"', '\\'])
+        || !etag.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        bail!("cloud save has no usable strong revision; refresh before exporting or deleting");
+    }
+    Ok(format!("\"{etag}\""))
+}
+
 fn remote_object_from_listing(object: ListedObject) -> Result<RemoteObject> {
     let (namespace, path) = if object.namespace.is_empty() {
         object
@@ -280,6 +381,38 @@ fn validate_remote_path(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_listing_without_content_length_is_bounded_while_reading() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut buffer = [0_u8; 2048];
+            assert!(stream.read(&mut buffer).unwrap() > 0);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n9\r\n123456789\r\n0\r\n\r\n");
+        });
+        let response = Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .unwrap();
+        assert!(response.content_length().is_none());
+        assert!(
+            bounded_listing(response, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("safety limit")
+        );
+        worker.join().unwrap();
+        assert_eq!(bounded_listing(&b"[]"[..], 2).unwrap(), b"[]");
+    }
     #[test]
     fn gzip_is_deterministic() {
         assert_eq!(
@@ -322,5 +455,101 @@ mod tests {
                 etag: "etag".into(),
             }
         );
+    }
+
+    fn fixture_response(
+        status: &str,
+        etag: Option<&str>,
+        body: Vec<u8>,
+    ) -> (CloudClient, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+            body.len(),
+            etag.map_or_else(String::new, |etag| format!("ETag: \"{etag}\"\r\n"))
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            stream.write_all(headers.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (
+            CloudClient::new(
+                Client::builder().no_proxy().build().unwrap(),
+                "fixture-user".into(),
+                "fixture-client".into(),
+                "fixture-token".into(),
+            )
+            .with_base_url(format!("http://{address}/v1")),
+            server,
+        )
+    }
+
+    #[test]
+    fn revision_download_requires_matching_response_etag_and_sends_precondition() {
+        let object = RemoteObject {
+            namespace: "main".into(),
+            path: "save.dat".into(),
+            size: 4,
+            modified_at: 1,
+            etag: "selected-revision".into(),
+        };
+        let (cloud, server) = fixture_response(
+            "200 OK",
+            Some("selected-revision"),
+            deterministic_gzip(b"save").unwrap(),
+        );
+        assert_eq!(cloud.download_revision(&object).unwrap(), b"save");
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .to_lowercase()
+                .contains("if-match: \"selected-revision\"")
+        );
+        for returned in [None, Some("changed-revision")] {
+            let (cloud, server) =
+                fixture_response("200 OK", returned, deterministic_gzip(b"save").unwrap());
+            assert!(cloud.download_revision(&object).is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn deletion_sends_strong_precondition_and_redacts_failure_details() {
+        let object = RemoteObject {
+            namespace: "main".into(),
+            path: "save.dat".into(),
+            size: 4,
+            modified_at: 1,
+            etag: "selected-revision".into(),
+        };
+        let (cloud, server) = fixture_response(
+            "412 Precondition Failed",
+            None,
+            b"sensitive service response".to_vec(),
+        );
+        let error = cloud.delete_revision(&object).unwrap_err().to_string();
+        assert!(!error.contains("fixture-token"));
+        assert!(!error.contains("sensitive service response"));
+        let request = server.join().unwrap().to_lowercase();
+        assert!(request.starts_with("delete "));
+        assert!(request.contains("if-match: \"selected-revision\""));
+        for revision in ["", "W/weak", "a\"b", "bad\r\nheader"] {
+            assert!(conditional_revision(revision).is_err());
+        }
     }
 }

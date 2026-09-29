@@ -772,6 +772,7 @@ fn monitor_library_sync(
             update_account_library_status(&w, &model.borrow());
             refresh_filters(&w, &model.borrow());
             if complete && !image_retry {
+                update_policies::check_updates(&w, &model, false);
                 super::window::start_managed_reconciliation(&w, &model);
                 refresh_local_action_state(&w, &model);
                 update_metadata_filter_options(&w, &model);
@@ -801,6 +802,38 @@ fn monitor_library_sync(
             }
             tracing::debug!(complete, "library synchronization presentation complete");
             refresh_sync_status(&w, &model.borrow());
+            let state = model.borrow();
+            let failed_images = state
+                .cover_states
+                .values()
+                .chain(state.icon_states.values())
+                .filter(|state| matches!(state, CoverState::Failed(_)))
+                .count();
+            if state.sync_failed {
+                show_status(
+                    &w,
+                    state
+                        .sync_message
+                        .as_deref()
+                        .unwrap_or("Library synchronization failed"),
+                );
+            } else if failed_images > 0 {
+                show_status(
+                    &w,
+                    &format!(
+                        "Library synchronized; {failed_images} images failed. Use the image Retry control to try again."
+                    ),
+                );
+            } else {
+                show_status(
+                    &w,
+                    if image_retry {
+                        "Image retry completed"
+                    } else {
+                        "Library synchronized"
+                    },
+                );
+            }
             glib::ControlFlow::Break
         } else {
             refresh_sync_status(&w, &model.borrow());
@@ -1085,62 +1118,11 @@ pub(super) fn update_account_library_status(w: &Widgets, model: &AppModel) {
 
 pub(super) fn show_status(w: &Widgets, message: &str) {
     w.status.set_label(message);
-    w.status.set_visible(true);
 }
 
-pub(super) fn downloaded_product_ids(_jobs: &[DownloadJobRecord]) -> HashSet<i64> {
-    let mut products = HashSet::new();
-    if let Ok(store) = StateStore::open()
-        && let Ok(files) = store.managed_files()
-    {
-        products.extend(
-            files
-                .into_iter()
-                .filter(|file| file.present)
-                .map(|file| file.product_id),
-        );
-    }
-    products
-}
-
-pub(super) fn downloaded_installer_product_ids(_jobs: &[DownloadJobRecord]) -> HashSet<i64> {
-    let mut products = HashSet::new();
-    if let Ok(store) = StateStore::open()
-        && let Ok(files) = store.managed_files()
-    {
-        products.extend(
-            files
-                .into_iter()
-                .filter(|file| file.present && file.kind == ArtifactKind::Installer)
-                .map(|file| file.product_id),
-        );
-    }
-    products
-}
-
-pub(super) fn reconcile_managed_directory(model: &mut AppModel) -> String {
-    let result = (|| -> anyhow::Result<managed::RebuildSummary> {
-        let mut store = StateStore::open()?;
-        let summary = managed::rebuild(&mut store, &model.config.download_directory, &model.games)?;
-        let files = store.managed_files()?;
-        managed::apply_to_games(&mut model.games, &files);
-        managed::set_locations(&mut model.games, &model.config.download_directory);
-        model.download_jobs = store.download_jobs()?;
-        model.downloaded_products = downloaded_product_ids(&model.download_jobs);
-        model.downloaded_installer_products =
-            downloaded_installer_product_ids(&model.download_jobs);
-        Ok(summary)
-    })();
-    match result {
-        Ok(summary) => format!(
-            "Indexed {} files ({} matched, {} unmatched; {} partial downloads retained)",
-            summary.files, summary.matched, summary.unmatched, summary.partials
-        ),
-        Err(error) => {
-            tracing::warn!(%error, "could not rebuild managed-file index");
-            format!("Could not rebuild downloaded-file index: {error}")
-        }
-    }
+pub(super) fn show_progress(w: &Widgets, message: &str) {
+    w.live_status.set_label(message);
+    w.live_status.set_visible(!message.is_empty());
 }
 
 pub(super) fn local_files_exist(files: &[LibraryFile]) -> bool {

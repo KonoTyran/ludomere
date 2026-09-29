@@ -462,12 +462,16 @@ pub struct InstalledGame {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GamePreferences {
     pub product_id: i64,
     pub executable_path: Option<std::path::PathBuf>,
     pub launch_arguments: Vec<String>,
     pub compatibility: Option<crate::compatibility::GameCompatibilityPreferences>,
+    pub auto_update_galaxy: Option<bool>,
+    pub auto_download_offline_installer: Option<bool>,
+    pub prune_superseded_installers: Option<bool>,
+    pub galaxy_language: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

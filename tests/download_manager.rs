@@ -340,7 +340,8 @@ fn exercise_active_pause_and_resume(root: &std::path::Path) {
     });
 
     download::set_concurrency(1);
-    let artifact = artifact(5, format!("http://{address}/5"));
+    let mut artifact = artifact(5, format!("http://{address}/5"));
+    artifact.size_bytes = Some(body.len() as u64);
     let id = download::job_id(&[&artifact]);
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {

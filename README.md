@@ -21,6 +21,53 @@ navigation arrows over the next section.
 Ludomere can install native Linux offline builds, Windows offline installers, or
 ready-to-run Windows Galaxy builds. Downloads and installations can be paused, resumed after an
 interruption, cancelled, and repaired from the unified Downloads page.
+Completion refreshes the affected game's actions and library state without reopening its page.
+Transfer progress does not rescan downloaded files. If local-state inspection fails, Ludomere
+keeps the previous state and reports the error; use **Manage → Refresh local state** to retry. Uninstall checks the
+current downloaded files before offering optional cleanup, with a separate retry control.
+
+For eligible Windows games, Download opens the source chooser with generation-two Depot builds
+first and confirms **Download and install**. Source metadata loads independently; a failed check
+offers Retry rather than silently choosing another source. **Offline installers and extras…**
+opens the archive chooser. Customized source ordering is preserved; the former default order is
+migrated once to Depot first. Installed Depot games compare their installed build with Depot
+metadata, independently of any offline installer backups.
+
+Settings → Downloads includes automatic Depot updates (on), offline installer backups (off),
+and superseded-installer cleanup (off). Checks run after library synchronization and every six
+hours while signed in and online. **Check and queue updates** applies the same selected policies
+immediately. Per-game settings offer Inherit/On/Off controls and an explicit Depot language
+reconciliation; changing the global default language does not change existing installations.
+Saving a per-game language override affects future updates; applying it now may also update to
+the latest available build on the same branch.
+Running or busy games are skipped. Opt-in cleanup moves eligible old managed installers to Trash
+only after verified replacements exist; active work, install intents, extras and unmanaged files
+are protected. Results appear in Downloads.
+Trash cleanup requires space for a verified copy; failures keep the original files rather than
+falling back to permanent deletion.
+
+The lower-right Notifications button keeps the latest 200 results, warnings and errors from this
+session in a readable history. Hover over it for the latest full message. Compact message text
+expires after ten seconds; live progress remains separate and is not saved in history. Switching
+accounts or signing out clears the history.
+
+Manage → Hide game locally removes a title from the normal library, search and collections without
+affecting its files or update policy. **Library → Show hidden** reveals it again for Unhide. Personal tags
+support assignment/removal, global rename/delete, and any/all tag filters. These changes stay local.
+The Achievements tab loads on first opening, keeps a separate cache per GOG account, and offers
+Refresh with visible offline/error states. It shows unlock dates and any progress/rarity actually
+returned by GOG; it does not write achievements or add achievement notifications. Game-side achievement support
+continues to use Comet.
+
+Supported installed Windows games expose remote-save inventory and **Export remote saves** in
+their cloud settings. Exports keep the original remote paths and include a checksum manifest.
+**Manage… → Delete selected…** requires typed confirmation, a verified recovery copy, and fresh
+revision checks. Stop games and other cloud clients first: Ludomere cannot verify that GOG honors
+atomic delete-if-unchanged requests, so an upload after the final recheck could be deleted without
+recovery. Local saves remain unchanged; matching unchanged local files are not automatically
+reuploaded unless you modify them, explicitly Force upload, or reset the profile.
+Cloud recovery copies are preserved by full profile reset, while account-scoped synchronization
+and deletion tracking are reset; preserved local saves can upload again afterward.
 
 The one-time setup guide opens with your existing folder and Proton preferences. Both folder fields
 have a directory picker and remain editable. Changing the game folder suggests its `downloads`
@@ -265,10 +312,12 @@ result. Treat unavailable controls or unsupported game features as untested, not
 - Comet-backed GOG Galaxy authentication for supported Windows games
 - Unified download and installation queue with pause, resume, cancellation, speed history, and
   separate network and disk progress
-- Configurable installation-source priority; the default is Linux offline, Windows Galaxy, then
-  Windows offline
+- Configurable installation-source priority; the default is Windows Depot, Linux offline, then
+  Windows offline, with an explicit offline installer/extras route
 - Multiple game libraries with library-owned installation markers and operation recovery journals
-- Persistent favorites and personal tags in SQLite
+- Persistent favorites, local hiding and personal tags with global rename/delete and any/all filters
+- Account-scoped, read-only achievements with cached offline access
+- Inherited game-update, backup-download and installer-retention policies
 - Offline browsing after the first successful synchronization
 
 Galaxy installs use the newest available generation-two build on the selected branch. Master is
@@ -292,6 +341,8 @@ responsible for reconciling cloud and local saves.
 - Installation and runtime logs: `$XDG_DATA_HOME/ludomere/installation-logs/` and
   `$XDG_DATA_HOME/ludomere/runtime-logs/`
 - Replaceable artwork and screenshots: `$XDG_CACHE_HOME/ludomere/`
+- Cloud recovery copies: `$XDG_DATA_HOME/ludomere/cloud-save-backups/` and
+  `$XDG_DATA_HOME/ludomere/cloud-save-deletion-recovery/`
 - Offline installers, patches, and extras: the managed directory selected in Settings
 - Installed games and their operation state: the selected game library
 

@@ -188,7 +188,7 @@ pub fn select_depots<'a>(
     Ok(selected)
 }
 
-fn language_matches(depot: &str, selected: &str) -> bool {
+pub(crate) fn language_matches(depot: &str, selected: &str) -> bool {
     if depot == "*" || depot.eq_ignore_ascii_case(selected) {
         return true;
     }

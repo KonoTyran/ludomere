@@ -2,6 +2,324 @@
 
 Last meaningful update: 2026-09-29.
 
+## Current commit request
+
+- User authorized committing accumulated work and enumerating all features/fixes in the message.
+  P111 compatibility prepares explicit source/doc/test/record inventory and complete message;
+  security independently reviews content. Root coordinates; no additional source edits or push.
+  Existing final384unit/sixintegration/sixGTK/fmt/Clippy/debug evidence remains applicable.
+- P111 complete: independent content/message review cleared exactly50 intended source/doc/test/
+  record files, no artifacts/private fixtures/credential material or unrelated changes. Local commit
+  succeeded; comprehensive message covers R26–R32/R34–R37, fixes, tests and limits. Working tree
+  verified clean after creation; these closure records are included in the same local commit.
+  No push or publication. Final SHA is reported in the user handoff rather than self-referenced here.
+
+## Current sidebar, notifications and Comet request
+
+- Final disposition: R35–R37/P108–P110 complete with no unresolved scoped QA/security finding.
+  Sidebar Hide now dispatches before popup detachment, Show hidden is under Library, results/errors
+  have readable session history/hover/modal and10s compact expiry, live progress stays separate;
+  Comet local/release/automatic-peer presentation clarified without backend/dependency changes.
+- Manager reviewed owner reports and independent /tmp/ludomere-p110-review.md, final384unit/six
+  integration/sixGTK/fmt/Clippy/debug/diff evidence and actual hover/Comet/filter screenshots. P110
+  verified205 messages retain200, progress-only history empty, open-modal updates preserve selection,
+  actual signout removes old-account entries, fixed footer geometry and Comet consent/cancel states.
+  Final compiled fixture/source hash comparison unchanged. All private app/Xvfb processes stopped.
+  Comet fixture outcomes are presentation tests, not real downloads. No package/commit, user profile,
+  credentials or helper/game execution. Historical live-account/game/desktop gates remain P70;
+  no Prototype ready declaration. Milestone history follows.
+- R35–R37 authorized. P108 compatibility owns sidebar/filter and notification UI; P109 acquisition
+  owns Comet presentation; P110 security independent review follows checkpoint. Two notification
+  questions pending: session-only versus persisted history, and results/errors versus all progress.
+  Independent fixes proceed; no product implementation by manager or previous changes reverted.
+- Source confirms21-character footer limit without history, Show hidden appended after OS filters,
+  and Comet local/remote/peer state combined into one block. Sidebar action cause under investigation.
+  No real profile/account/package/game operations authorized; private fixture verification required.
+- Interview settled: session-only history of results/warnings/errors, live progress separate.
+  P108/P109 implementation and P110 independent preparation activated with bounded ownership and
+  private-fixture restrictions. Notification history does not need schema or persistent storage.
+- P109 confirmed local helper inspection currently waits behind remote metadata requests; the
+  presentation will publish verified local state first, separate official release and peer rows,
+  and hide irrelevant actions. Existing updater cannot supply same-baseline installation when
+  no helper exists; keep honest prepare/reinstall guidance rather than expand backend authority.
+- Sidebar investigation hypothesis: clicked→popdown triggers synchronous unparent before inherited
+  win.hidden action dispatch. P108/P110 must verify actual input; not yet a confirmed root cause.
+- P110 independently reproduced baseline with physical right-click→Hide: menu closes, all4 fixture
+  games remain, persisted hidden=0. P108 corrects explicit shared action dispatch before popdown;
+  final physical recheck pending. Notification implementation uses latest200 ephemeral messages,
+  consecutive duplicate suppression, separate live progress and guarded10s text expiry; clear
+  previous-account messages in history/modal/hover on signout/account change. No persistence changes.
+- User reiterated project-manager delegation. Confirmed all product/test implementation remains
+  P108/P109, independent review P110; manager only inspects and updates coordination records.
+- P109 implementation checkpoint complete in comet.rs; manager reviewed diff and4 passing focused
+  tests (/tmp/ludomere-p109-tests.log). Local verified state now publishes before network completion,
+  installation/release/automatic-peer rows separated, actionable Install/Update and active-only
+  Cancel controls. No backend/dependency edits. Required combined checks and independent GUI pending.
+- P110 authorized deterministic Comet result-boundary substitution only in disposable source, with
+  retained exact diff. Exercise real confirmation/cancel/presentation callbacks without network,
+  helper execution or file publication; fixture success is not real updater acceptance.
+- P108 candidate check/debug passes. P110 identical physical sidebar right-click→Hide now persists
+  hidden=1 and changes sidebar/grid4→3 while retaining Home; screenshot
+  /tmp/ludomere-p86-qa-p110-ecjie2yd/sidebar-hide-after.png. Notification button bottom-right and
+  centered Downloads observed; remaining filter/unhide/notification/Comet controls and full suite pending.
+- P110 physical Show hidden in Library and Unhide pass, persisted hidden returns0. Actual hover
+  exposed collapsed60px one-letter text layout; expiry also shifted notification button left200px.
+  Both are required R36 corrections routed P108; alignment fixed checkpoint, hover fix/recheck pending.
+  Modal wrapped/selectable content passed. No closure until final actual hover/expiry verified.
+- P108 checkpoint tests pass384 unit/six main integrations and6 separate GTK cases including
+  context-popover Hide dispatch. Manager read /tmp/ludomere-p108-report.md with footer-writer audit;
+  local widget-only statuses remain local, global terminal results/errors enter bounded history.
+- P110 actual timer replacement retains new message past old deadline, hides at10s, duplicate
+  remains hidden; open modal receives plain-text message while preserving selected text/focus.
+  Comet current/error/local-before-check and Update confirmation/decline pass. Corrected geometry,
+  remaining Comet cancellation/install/missing, bounded history and account clearing still pending.
+- Exact-final fmt, all-target Clippy -D warnings,384 unit/six main integrations/debug/diff checks
+  pass; six GTK cases separately pass. Manager inspected /tmp/ludomere-p108-{fmt,clippy,test,build}.log
+  and -gtk-*.log. Final debug19:25:15 is newer than final source19:25:01;19:29 build confirms current.
+- Corrected actual geometry passes:312-character unbroken hover text readable through its end,
+  selectable modal; after10s button remains x1243, Downloads centered x640. Comet Install/cancel
+  also passed deterministic fixture. Final bounded-history/account-clear evidence and reviewer
+  report/private cleanup pending; no further product issue reported. Source frozen.
+
+## Current database and action-refresh investigation
+
+- Final disposition: R34 fixes1–5 complete; P105/P106/P107 closed after independent review with
+  no unresolved scoped QA/security findings. Current-schema opens are read-only, progress coalesces
+  before DB work, affected-game completion uses shared priority snapshots, broader workers are
+  bounded, and failures retain known state with explicit retries and recoverable file registration.
+  WAL, schema25/dev7 and ordinary database timeout remain unchanged.
+- Exact-final verification after the auth/Complete correction: fmt, all-target Clippy -D warnings,
+  379 unit tests, six main integration cases, debug build and diff checks pass. Five display-dependent
+  cases separately pass. Final binary18:54:48 -0400,377942920 bytes. Manager inspected logs/reports:
+  /tmp/ludomere-p105-report.md, /tmp/ludomere-p106-report.md, /tmp/ludomere-p107-review.md and
+  /tmp/ludomere-p106-{fmt,clippy,test,build}.log. All private GUI fixtures stopped; payloads unchanged.
+  No real profile/account/game/helper use, package operation or commit. Live acceptance remains P70;
+  no Prototype ready declaration. Milestone history follows.
+- User authorized fixes1–5, explicitly deferring WAL. R34/P105 backend acquisition, P106 UI
+  compatibility and P107 independent security/QA. Implementation/verification now underway; preserve
+  all prior uncommitted selected-feature work. No material requirements question remains.
+- P105/P106 agreed scoped managed-file query, grouped presence summary and targeted installation
+  reconciliation APIs. Current-schema read snapshot and migration-lock revalidation implemented;
+  tests/review pending. P106 removes independent sidebar scan workers in favor of shared local state.
+- P107 authorized minimal event injection only in disposable test source with retained exact diff,
+  inert markers/payloads and private GUI roots to exercise real completion-to-UI paths without games.
+  Native Complete-to-queued shutdown boundary is being narrowly corrected where necessary to preserve
+  the touched terminal bookkeeping/no-replay contract; no general shutdown redesign.
+- Manager inspected37 passing state regressions (/tmp/ludomere-p105-state-tests.log), including
+  no-write read open under reserved writer, concurrent fresh/revision4 migration, damaged current
+  shape rejection and indexed scoped inventory. Initial integrated check passed before terminal
+  recovery edits; subsequent compile during partial API edits is not final verification.
+- Approved narrow transient completion receipt under existing job staging for DB-unavailable
+  completion: exact artifact/path validation, bounded nofollow/atomic storage, no tokens, no new
+  consent/queue/schema. Ordinary Complete/auto-install follows atomic job+index commit; failure is
+  visible and explicit retry reuses published files. Independent reviewer covers journal/lifecycle.
+- P107 caught account/SQLite lock inversion in new completion transaction; owner corrected to
+  consistent account→DB order with bounded nonblocking whole-transaction attempts and releases
+  between retries, restoring connection timeout afterward. Regression evidence pending.
+- P107 also confirmed new bookkeeping-error events could reach a different account after session
+  change despite guarded DB commit. Backend publication and UI delivery session guards assigned
+  owners; unresolved until reviewed. Receipt-creation disk/permission failure preserves files but
+  cannot promise offline bookkeeping-only retry without a valid receipt; no journal redesign added.
+- P106 runnable check/debug checkpoint passes. Preview checks are single-flight with Retry and
+  direct Manage Refresh local state; model snapshots own actions/files/presence/sidebar/filter state.
+  P107 actual private GUI burst of2000 Progress events adds zero DB opens/refreshes. Startup counter
+  includes pre-existing per-product metadata readiness reads (~1010 for505 games), outside this fix.
+- P107 reproduced permission failure with readable marker/unreadable payload directory causing
+  Play→Download while inert payload remained; P105 narrow fallible targeted traversal assigned.
+  Final corrected GUI and required suite still outstanding; checkpoint evidence is not final pass.
+- Backend frozen; manager inspected focused53 download/38 state/10 installation passing logs.
+  Covers receipt security/restart recovery, atomic trigger-induced rollback, removed/stale jobs,
+  short completion retries/account responsiveness and targeted nested-permission errors. P106
+  final fmt/Clippy/full suite/debug started after removing stale-account overlay mutation of base jobs.
+  P107 final actual GUI/probe and corrected source review remain outstanding.
+- P107 production-library probe passes: six concurrent fresh opens, held-writer current opens
+ 679/614/594µs, genuine write serialized/durable, schema25/journal=delete unchanged. Manager read
+  /tmp/ludomere-p107-db-probe.log. GUI2000-progress delta remains0; an unselected terminal used1 open/
+  1 targeted refresh, state observed by0.56s with open page preserved. Final review ongoing.
+- First final suite fmt/Clippy/378 unit passes, integration caught active-pause fixture advertising
+  10-byte artifact while serving600000. Owner independently confirmed failed private DB/receipt;
+  correct fixture size only, preserve new receipt validation. Full rerun follows focused integration.
+  P106 also fixes shared presence clearing for recorded unowned DLC after cleanup before final freeze.
+- Exact-final required fmt/Clippy378 unit/six integration/debug checks pass, manager inspected logs;
+  five ignored GTK/startup cases separately pass. Initial fixture failure retained at
+  /tmp/ludomere-p106-test-initial-manager-failure.log. Final debug18:45:39 -0400; diff check clean.
+- P107 physical final-path checks: permission error retains Play, restored permission/Manage refresh
+  succeeds; selected uninstall primary click opens chooser rather than stale launch; unselected
+  completion preserves current page. Exclusive-lock preview shows error, release/Retry settles with
+  cleanup unchecked, Cancel preserves payload. No guarded execution boundary fired. Final overlay/
+  DLC source alignment, review report and private-fixture shutdown pending.
+- P107 final controls and source review complete; manager inspected report and preview/recovery
+  screenshots. Current registration errors remain visible; obsolete-session errors are rejected,
+  with no unsolicited navigation. All scoped GUI processes stopped and inert payload hashes match.
+- Final review found genuine download Complete could be demoted to Queued when authentication was
+  disabled concurrently. P105 narrowly corrected terminal classification and suppresses automatic
+  install/retention follow-up without authentication/current session or during shutdown. Actual
+  manager-loop isolated regression passes (/tmp/ludomere-p105-terminal-auth-tests.log), manager and
+  independent reviewer inspected it. Exact-final required checks rerun after this backend-only fix;
+  completed unchanged UI evidence remains valid. No broader authentication redesign.
+
+- R33/P104 is analysis/proposal only. Reported lock happens before confirming uninstall; reported
+  local action/color delay exceeds ten seconds. Acquisition audits database contention, compatibility
+  audits UI/events/refresh; manager reviews evidence. No product changes authorized in this stage.
+- Initial source finding: every StateStore open takes BEGIN IMMEDIATE during initialization even
+  for current schemas/read previews. Actual live lock holder and elapsed UI cause remain unmeasured.
+- Production-library disposable probe confirms raw SELECT0ms versus two current-schema opens
+  blocked5005/5006ms by another writer, combined10011ms; uncontended open1ms. Manager inspected
+  private-HOME/all-XDG probe and log /tmp/ludomere-p104-db-probe.log plus backend report
+  /tmp/ludomere-p104-db-report.md. This reproduces unnecessary contention, not the user's exact
+  action timeline. No real profile inspected or application code changed.
+- Source confirms three database opens and two full managed-file scans per download progress event;
+  local-action/sidebar refreshes independently repeat whole-library work and discard obsolete
+  sidebar results only after that work completes. Current-schema opens, repeated scans, progress
+  backlog and swallowed errors can compound delay. Existing transfer persistence already throttles1s.
+- Proposed correction: migration-only write initialization with current-shape validation, batched/
+  targeted data reads, progress coalescing before DB work, bounded product-scoped filesystem checks
+  driving shared in-place action/color updates, explicit recoverable persistence/preview failures.
+  WAL is a secondary local-database option with unchanged durability/reset guarantees, not a fix
+  for repeated writer opens. Preserve atomic genuine writes and schema25/dev7; no new schema needed.
+- P104 investigation complete: manager reviewed both worker findings and source. Static500-base/
+  100-installed example for one paired action/sidebar pass yields1603 opens,1501 managed-file scans
+  and302 installation reconciliations (not a measured benchmark). The separate detail label timer
+  polls100ms; stopping a terminal status timer alone does not prove a permanently stale label.
+  Delayed state publication is confirmed. No product edits, full suite or GUI benchmark performed;
+  proposal delivered for user decision before implementation.
+
+## Current selected upstream integration
+
+- Final disposition: R26–R32 implemented, documented and independently reviewed. P100–P103 complete
+  for available local assurance; P70 live-account/game/desktop acceptance remains outstanding.
+  Manager reviewed /tmp/ludomere-p103-review.md, owner reports, final check logs and selected actual
+  GUI screenshots. No unresolved confirmed scoped defect. Final candidate passes fmt, all-target
+  Clippy with warnings denied,366 unit/six integration tests and debug/diff checks; four additional
+  GTK unit cases and startup separately pass. Final debug17:39:10 -0400. No package build or commit.
+- Physical review covers Depot loading/Retry/offline fallback/Cancel; Hide/Unhide persistence and
+  Show hidden without navigation; tag assignment/rename/delete/Cancel and any/all results; cached
+  achievement loading/error/empty; policy defaults/persistence/manual opt-out; language Cancel;
+  cloud inventory/selection/confirmation/failure/retry/recovery/export. Latest language copy verified.
+  P103 fixture driver exited0; scoped external process check confirms its private app/server/Xvfb
+  stopped. No real GOG account, game or save used. Populated-collection membership, every lifecycle
+  boundary, actual automatic payload application, six-hour soak, Wayland and host portal are not
+  claimed manually verified. Prototype readiness has not been declared.
+
+- Recovery checkpoint: worktree and reports survived interruption; initial sandbox process view
+  showed no Cargo/app/test processes or worker agents. Resume owners from saved reports; do not repeat
+  completed checks without cause. Final candidate verification and independent GUI review pending.
+- User accepted selected cloud deletion with verified recovery copy, rechecks and explicit warning
+  to stop games/other clients, including the disclosed concurrent-upload race. Temporary production
+  gate may now be removed by backend owner; UI/docs must explain the limitation accurately.
+- Resumed acquisition/compatibility/security through existing task identities. Acquisition owns
+  final cloud backend integration; compatibility owns final cloud UI/docs and complete check suite;
+  security remains independent. Manager inspected retained focused logs: cloud25, profile reset8,
+  downloads47 and update policies4 passed. Gate removal and exact-final review still pending.
+- Backend frozen after accepted deletion gate removal; cloud25, config9 and product6 pass. The
+  initial config run caught an obsolete Linux-first test expectation, corrected for the new default.
+  P103 independently verified both cloud findings against source and named passing regressions.
+- P103 identified asynchronous repeated Hide/Unhide saves could complete out of order; assigned
+  minimal pending-operation guard to P101 with independent validation. Exact-final checks follow.
+- P101 applied the per-product Hide pending guard; formatted candidate passes fmt and warnings-denied
+  all-target Clippy, with full tests/debug ongoing. P103 found retained private GUI processes outside
+  the sandbox view; their documented stop marker shut them down before restarting the fixture.
+- Full suite first caught a second obsolete Linux-first expectation in installation source ranking;
+  P100 corrected only that assertion. Exact subsequent fmt/Clippy/full tests/debug pass:365 unit,
+  four explicitly ignored display-dependent unit tests and six integration cases plus helpers.
+  Manager inspected /tmp/ludomere-p101-{fmt,clippy,test,build}.log; initial failed log retained as
+  /tmp/ludomere-p101-test-initial-default-expectation.log. P103 actual controls still underway.
+- All four display-dependent unit cases and the separate empty-profile startup test subsequently
+  pass in private Xvfb/HOME/all-XDG/D-Bus sessions; manager inspected their logs. Reports
+  /tmp/ludomere-p100-report.md and /tmp/ludomere-p101-report.md reviewed. Source frozen;
+  final debug binary timestamp17:28:00 -0400. Private-session portal warnings are not live desktop
+  acceptance. No package built, real account accessed, game/helper executed, or external save changed.
+- Manager found automatic backup queue used raw download_root.join(slug), bypassing canonical
+  sanitized slug/category/OS/language layout. P103 independently confirmed staging parent traversal
+  could then leave the configured root and retention would not recognize the files. Scoped blocker:
+  P100 must reuse download::destination and regress actual backup-request/staging paths, including
+  malicious slugs. P101 final checks will rerun after correction; prior passing logs are retained.
+- P100 now constructs actual backup requests through the shared canonical destination builder.
+  Production-request→staging regression covers normal, traversal, absolute and empty-normalized
+  slugs; manager reviewed passing /tmp/ludomere-p100-backup-layout-tests.log. P103 independently
+  verified the fix and closed the blocker subject to final combined checks, now running.
+- P103 real GTK cloud fixture passes selection, cancel, lowercase confirmation refusal, failed
+  DELETE with verified recovery and0/1 report, Refresh/retry then1/1, empty inventory, export picker
+  cancel/success. Reviewer independently checked manifest SHA256 and unchanged local-save sentinel;
+  only two synthetic local DELETE requests occurred. Organization and policy controls also exercised;
+  final inventory/disposition remains outstanding.
+- Post-layout corrected candidate passes exact fmt/Clippy/366 unit/six integration/debug checks;
+  manager inspected final logs. P103 verified global defaults/toggle persistence/manual all-off check,
+  per-game inherit/off/save and language draft cancellation, tag add/remove/rename/delete and
+  offline-fallback click/Cancel. Language copy will clarify saved overrides affect future updates
+  and immediate Apply may select the latest build on the same branch. This is text accuracy only,
+  with no new version-selection behavior; P101 owns final text/checks and P103 independent review.
+- Final policy/confirmation/README wording now explicitly describes future-update preferences and
+  possible latest-build reconciliation. Exact required checks pass again after this text-only change;
+  manager inspected current logs and diff check. Final debug timestamp17:39:10 -0400; no subsequent
+  product edits. Independent final report and private-fixture shutdown remain pending.
+- User authorized implementing R26–R32 after source comparison e2f7857 vs4717092. Generation-two
+  Depot first/fallback only, Depot updates on, offline backups/cleanup opt-in; achievements browser
+  with existing Comet. No generation one, social/chat/custom artwork/saved views/queue reordering.
+- P100 acquisition owns sole schema/persistence and update/retention backend; P101 compatibility
+  owns UI/achievements/README; P102 grid owns cloud backend/new isolated cloud UI module. P103
+  security independently reviews later. Preserve existing guards/features; no wholesale merge.
+- Asked source-order migration for existing profiles, hidden-game visibility/update semantics,
+  and installed-only vs uninstalled cloud management. Dependent choices remain pending; independent
+  persistence/API/UI/backend work proceeds. No real user data or account used during verification.
+- Shared schema25 revision histories collide; integrate one local revision7 with canonical24→25,
+  preserve known local revisions/auto-install intent and reject unidentified foreign shapes.
+- Implementation and independent checks outstanding. No new package build, commit or push requested.
+- Interview complete: migrate only the old default order, preserve custom; hidden games excluded
+  normal browsing with updates active; cloud controls limited to supported installed Windows games.
+  All three implementation owners notified; no outstanding requirements question at this checkpoint.
+- R26 primary flow must change: fresh Download opens immediate source/install chooser with Depot
+  pending until availability settles; explicit offline installers/extras route remains. Temporary
+  service errors offer Retry rather than silent fallback. Existing source-specific actions preserved.
+- Early review caught repeated source-order migration overriding later deliberate Linux-first choice;
+  P100 now uses a one-time persisted migration marker and restart regression.
+- P100 Trash design supports separate volumes using anchored verified copy before source unlink;
+  failure preserves source, no permanent-delete fallback. Needed to preserve existing safe cleanup
+  boundaries while supporting normal separate game/download volumes. No new dependency required.
+- P102 deletion tracking is account-scoped and persisted before remote deletion to cover uncertain
+  outcomes; recovery data survives reset but full reset removes suppression preferences. Exact
+  source/fixture verification and final independent review remain outstanding.
+- P102 discovered primary Swift DELETE reference does not document If-Match although GET does
+  (https://docs.openstack.org/api-ref/object-store/#delete-object). This cannot establish GOG's
+  atomic compare-and-delete guarantee. User asked whether to include recovery/recheck-protected
+  deletion with explicit concurrent-client warning or defer deletion. Enabling decision pending;
+  export/fixtures and all independent implementation continue. No real service delete attempted.
+- Interface contracts reviewed: main acquisition honors Depot loading/unavailable/error separately;
+  manual bulk check honors effective opt-in/per-game policies, unlike upstream's unconditional
+  manual override. Ordinary Depot updates preserve installed language; explicit language reconcile
+  uses the chosen override/default. Backend preparation moves outside shared account mutex.
+- Achievements read contract checked against primary reverse-engineering author source (Yepoleb
+  gogapidocs galaxy.rst): product ID is intentional. Incomplete responses preserve prior cache and
+  report failure; no invented progress fields. Live authenticated acceptance remains unexercised.
+- Early UI review requested Show hidden updates open collection membership and serialized tag edits
+  to prevent stale full-map result application. Both assigned P101, pending verification.
+- P102 handed off /tmp/ludomere-p102-report.md: anchored verified exports, account/session guards,
+  recovery-first deletion implementation and account-scoped suppression, management UI. Production
+  deletion explicitly disabled pending user decision; inventory/export usable. 21/23 cloud tests
+  passed, two loopback binds initially sandbox-denied; approved rerun hit peer compile typo now fixed.
+- Integrated all-target check passed /tmp/ludomere-p101-check.log (manager inspected). P103 independent
+  security/QA started using freed cloud slot; no product edits by reviewer. P100/P101 focused tests,
+  coordinated final required checks/debug and actual new-control GUI review remain outstanding.
+- P103 initial finding: cloud export final remote re-list could complete after cancellation and
+  still publish. Narrow post-list session/cancel recheck and delayed-list regression delegated to
+  P100 (grid handed off, concurrency slots full), with independent re-review required. No original
+  save loss or deletion-gate bypass reported; export lifecycle finding remains open until verified.
+- P100 persistence checkpoint:33 state tests pass in isolated HOME/allXDG/bus, manager inspected
+  /tmp/ludomere-p100-state-tests.log. Includes fresh/canonical/retained revisions, dev6→7 intent/user
+  preservation, foreign revision-shape rejection and account-scoped cache/tombstone transactions.
+- Multipart retention now matches managed artifact identities rather than relying on event order;
+  reversed-files regression added. Trash copy preservation is committed immediately after unlink,
+  before index reconciliation, and partial result counts reflect actual removed sources.
+- Intermediate debug build passes; P101 Hide/Unhide label refreshes on menu mapping without page
+  recreation. Source-order/unknown/native/custom preferences and Depot Play readiness regressions
+  added. Independent reviewer has the runnable checkpoint; final checks remain pending.
+- P103 confirmed legacy inventory read used by new cloud management buffered before enforcing its
+  size limit. Narrow streaming-bound fix for list() plus omitted-length regression delegated P100;
+  ordinary legacy cloud-download path outside scope. New export reads already bounded.
+- Retention cancellation polls account generation; no separate Cancel-retention control is claimed.
+  Full reset refuses while retention activity is running. Independent review may exercise pending
+  deletion controls only in explicitly fake/local disposable builds; production gate remains off.
+
 User explicitly authorized committing the accumulated session changes locally with a comprehensive
 feature inventory in the commit message. Independent commit-content review cleared the70-file
 source/docs/tests/tooling/records inventory; generated packages, caches and test profiles are excluded.

@@ -1,7 +1,166 @@
 # Project plan
 
+## P111 — Commit accumulated features and fixes
+
+- User explicitly authorized a local commit of current work with all features/fixes in its message.
+  Owner compatibility; independent content reviewer security; status complete.
+- Scope: accumulated selected-feature R26–R32, contention/refresh R34 and UI R35–R37 changes plus
+  README/tests/project records. Explicitly inventory/stage intended sources; exclude build artifacts,
+  private fixtures and packages. No new implementation, package operation, push or publication.
+- Acceptance: comprehensive accurate message, clean diff checks and reviewed staged inventory,
+  successful local commit and reported SHA/status. Existing exact-final tests remain applicable.
+- Independent review cleared exactly50 intended files and the comprehensive message. Local commit
+  succeeded with a clean working tree; final coordination closure included in the same commit.
+
+## P108 — Sidebar visibility and notification presentation
+
+- R35/R36; owner compatibility, complete; notification interview settled.
+- Own src/ui except comet.rs; scoped README and meaningful tests. Reuse current visibility action,
+  preserve in-place filters/collections, fix actual right-click input and move Show hidden to Library.
+- Use minimal bounded in-memory session history for results/warnings/errors; live progress separate.
+  Modal, hover popover,10-second text lifetime, keyboard/
+  empty/long-message/burst handling need actual GUI verification. No unrelated UI refactor.
+- All P108–P110 operations: source/docs/test edits only for implementation owners; private HOME/all
+  XDG/runtime/bus/Xvfb/local inert fixtures for tests; fmt, all-target Clippy -D warnings, cargo test,
+  debug build. No real profile/credentials/account/game/helper use, package build/install, commit,
+  external mutation or dependency modification. Preserve earlier work. Root owns records.
+  Stop for unapproved scope, security or access needs. P108 coordinates final checks.
+
+## P109 — Clear Comet Settings status
+
+- R37; owner acquisition, complete. Own src/ui/comet.rs and its focused tests only; coordinate
+  any necessary component API/README changes with manager/P108. No dependency/backend redesign.
+- Separate installed Comet state, actionable update/install status and Comet-managed peer state;
+  retain explanation and existing confirmed acquisition/cancel flow. Unknown/offline/checking must
+  not imply missing installation. Return control inventory, source findings and focused evidence.
+
+## P110 — Independent UI assurance
+
+- R35–R37; owner security, complete for scoped local assurance. Read-only product review; disposable
+  instrumented fixtures permitted with exact diff retained and no executor/account authority.
+- Exercise physical sidebar context Hide/Unhide, Library filter placement, notification button/
+  modal/hover/timer/long history and Comet checking/missing/current/update/failure/cancel states.
+  Review account isolation, bounded notifications, markup/error disclosure and background focus.
+  Report findings to owners, never quiet fixes. Real service/desktop limits remain explicit.
+- Final evidence: /tmp/ludomere-p108-report.md, /tmp/ludomere-p109-report.md and independent
+  /tmp/ludomere-p110-review.md; manager reviewed reports, exact-final check logs and screenshots.
+  Fmt/Clippy384unit+6integration/debug/diff and6 separate GTK checks pass. Physical contextHide,
+  LibraryShowhidden/Unhide, hover/modal/timer/historybounds/signout and inert Comet controls pass.
+  Three confirmed scoped defects closed; no unresolved finding. Private fixtures stopped.
+
+## P105 — Database access and truthful completion persistence
+
+- R34 items1/5 and backend support for2–4. Status complete; owner acquisition.
+- Own state.rs, download backend, installation.rs and necessary installation backend; coordinate
+  APIs with P106 before shared boundary edits. No UI/records. Preserve preceding feature work.
+- Current schemas open without writes; retain shape/revision validation and recheck under migration
+  lock for concurrent first opens. Genuine writes atomic; no WAL/timeout increase/schema bump.
+- Provide scoped/batched inventory and marker APIs needed by UI. Terminal persistence errors remain
+  recoverable and visible without falsifying payload state or replaying completed destructive work.
+- Evidence: held-writer read-open regression, concurrent initialization/migration/durable preservation,
+  terminal bookkeeping failure/recovery tests, focused checks and report.
+
+## P106 — Bounded local-state refresh and completion presentation
+
+- R34 items2–5; status complete, owner compatibility. Own src/ui/, README, focused tests.
+- Coalesce progress before database work; affected product/parent/DLC refresh takes priority over
+  broad scans; share loaded state across detail/sidebar/filter presentation, limit obsolete workers.
+  Preserve page/tab/scroll/focus and last-known state on errors; preview fresh/retryable and no GTK I/O.
+- Coordinate minimal backend interfaces with P105. No unrelated architecture/features/dependencies.
+- Evidence: synthetic500+ library/progress bursts and selected/unselected install/uninstall/download/
+  cleanup updates, stale/account/failure handling, preview retry/Cancel, meaningful final GUI checks.
+- P105/P106 authorization: scoped source/tests/docs, private HOME/allXDG/runtime/bus/Xvfb/local
+  inert fixtures, fmt/Clippy/test/debug. No real profile/credentials/account mutation/game/helper
+  execution, package build/install, commits/pushes. No WAL or public schema change. Root owns records.
+  Stop for new scope/access/security boundaries. P106 coordinates final required checks.
+
+## P107 — Independent contention and refresh assurance
+
+- R34; status complete for scoped local assurance, owner security. Read-only product review and disposable fixtures only.
+- Verify P105/P106 tests and changed controls, schema safety, atomicity and durable data,
+  file-outcome/bookkeeping distinction, no GTK blocking/unsolicited navigation and bounded refresh.
+- Return reproducible findings to owners, never quiet fixes. Same private-fixture restrictions as
+  P105/P106. Required final fmt, all-target Clippy -D warnings, cargo test and debug for GUI evidence.
+- Final evidence: /tmp/ludomere-p105-report.md, /tmp/ludomere-p106-report.md and independent
+  /tmp/ludomere-p107-review.md. Manager inspected source, reports, logs and actual GUI screenshots.
+  Final fmt/Clippy/379 unit/six integration/debug/diff checks pass; five GTK cases separately pass.
+  Held-writer current reads under1ms,2000 progress events zero DB work, selected/unselected terminal
+  updates and permission/preview retries independently exercised with505 synthetic products.
+  No unresolved scoped findings, WAL unchanged. Live game/account/desktop gates remain P70.
+
+## P104 — Database contention and local-state latency proposal
+
+- R33; complete (investigation/proposal, implementation pending). Manager coordinates read-only audits by acquisition (database) and
+  compatibility (UI/event/local refresh). No product/test/configuration edits authorized.
+- Acceptance: source-backed causes distinguished from hypotheses, minimal fix proposal, schema/
+  concurrency/lifecycle implications and regression plan. Inspect event completion ordering and
+  unnecessary whole-library work. Preserve all existing working-tree changes.
+- Authorize source/dependency reads, primary documentation and reports/private disposable probes
+  under /tmp only. No actual user profile/credentials, game/helper execution, network account use,
+  package build/install, commit or external mutation. Escalate scope/access needs. Manager owns records.
+- Evidence: /tmp/ludomere-p104-db-report.md and actual production-library private-profile probe
+  /tmp/ludomere-p104-db-probe.log. Manager independently inspected both UI refresh/event chains and
+  helper call counts. No full GUI latency benchmark or identification of the user's live writer.
+  Proposed fixes require a subsequent implementation task; no application changes made here.
+
 Manager: /root. Specification: PROJECT_SPEC.md. Arch Linux x86-64 only. Proton management precedes
 package implementation. Workers never edit .project-manager/. No product changes by the manager.
+
+## P100 — Persistence, Depot policies, scheduler and safe retention
+
+- R26–R32 shared persistence; R26/R29/R30 backend. Status complete; owner acquisition.
+- Own src/state.rs (sole schema/API writer), src/updates.rs, download backend/cleanup, minimal
+  Depot/installation integration, config.rs and lib.rs exports by coordination. No UI/records.
+- One local development revision7 under schema25; merge only selected tables/fields and canonical
+  migration, preserve intents/user data and reject foreign same-revision shapes actionably.
+- Coordinate hidden/tag/achievement/cloud APIs with P101/P102. No upstream social/outbox/saved-view/
+  global-queue tables. Migrate the exact former default source order once; preserve customized orders.
+- Acceptance: defaults/inheritance, fresh bounded scheduled acquisition, account/reset/busy safety,
+  verified replacement and protected Trash with truthful partial reporting. Existing auto-install,
+  native behavior and local profile survive. Meaningful migration/queue/cleanup regressions required.
+
+## P101 — Depot/defaults, organization, achievement and policy presentation
+
+- R26–R30/R32 UI; R28 achievement API. Status complete; owner compatibility.
+- Own src/ui (coordinate P102 cloud module), src/gog/achievements.rs plus minimal exports, README,
+  focused tests. No state/config/backend ownership except agreed interface contracts.
+- Acceptance: Depot-first new acquisition with fallback, complete existing operations/language flow;
+  hide/tag filters update in place, achievement sections show loading/cache/error/retry, all network/
+  filesystem work off GTK and stale-account results rejected. Policy controls inherit accurately.
+- Provide hooks/contracts to backend scheduler, cleanup status and P102 cloud UI. Hidden titles stay
+  eligible for updates and are excluded from normal browsing/search/collections. No new social UI.
+
+## P102 — Cloud export and selected remote deletion
+
+- R31. Status complete (deletion policy accepted); initial owner grid, final integration acquisition
+  (cloud backend) and compatibility (cloud UI/docs). Own src/cloud_saves/ and new src/ui/cloud_management.rs,
+  focused tests; coordinate only insertion/export hooks with P101 and persistence with P100.
+- Acceptance: use existing supported cloud integration, verified path-safe explicit exports, selected
+  deletion with recovery copy and revision confirmation, durable suppression and partial failure
+  handling; retain account/reset/activity safety. Only supported installed Windows games are in scope.
+  User accepted the disclosed concurrent-update race; confirmation warns to stop games and other
+  cloud clients, without claiming a verified server-side atomic compare-and-delete guarantee.
+- Export/delete only fixture saves during tests. No real credentials/profile or external mutation.
+
+## P103 — Independent selected-feature assurance
+
+- R26–R32. Status complete for available independent assurance; live acceptance remains P70.
+  Independent owner security (no product implementation).
+- Inventory/exercise changed controls in private GTK/XDG fixtures; review schema/data preservation,
+  network/session boundaries, automatic update/installation/cleanup and cloud deletion integrity.
+  Review findings return to owners; no quiet fixes. Manager reviews final evidence and disposition.
+- All P100–P103 authorization: scoped source/docs/tests, read-only authoritative upstream reference,
+  private HOME/allXDG/runtime/bus/local HTTP fixtures, fmt/Clippy/test/debug and required meaningful
+  GUI checks. No actual account, credentials, user profile, helper/game execution, system/package
+  install/build, dependency modification, commits/pushes or unrelated cleanup. Report any necessary
+  new dependency before adding. Required final cargo fmt --check, clippy --all-targets -D warnings,
+  cargo test; one owner coordinates final formatting/checks. Manager alone edits records.
+- Final evidence: /tmp/ludomere-p100-report.md, /tmp/ludomere-p101-report.md and independent
+  /tmp/ludomere-p103-review.md. Exact-final fmt/Clippy/366 unit/six integration/debug/diff checks pass;
+  four display-dependent unit cases and startup separately pass. Actual new controls exercised with
+  disposable local services. No unresolved confirmed scoped blocker. Real GOG/game/Comet/Wayland,
+  timer soak and exhaustive lifecycle/collection combinations remain explicit limits, not passes.
+  No Prototype ready declaration; no new package or commit. Final debug17:39:10 -0400.
 
 ## P91 — Download defaults and managed-file cleanup
 

@@ -158,6 +158,7 @@ pub(super) fn show_settings_page(
 
     let source_order = installation_source_order_group(model);
     downloads_page.add(&source_order);
+    downloads_page.add(&update_policies::global_group(w, model));
 
     let maintenance = adw::PreferencesGroup::new();
     maintenance.set_title("Storage and synchronization");
@@ -473,12 +474,58 @@ pub(super) fn show_settings_page(
     {
         let model = model.clone();
         let rebuild_row = rebuild_row.clone();
+        let w = w.clone();
         rebuild_button.connect_clicked(move |button| {
             button.set_sensitive(false);
             rebuild_row.set_subtitle("Inspecting managed files…");
-            let summary = reconcile_managed_directory(&mut model.borrow_mut());
-            rebuild_row.set_subtitle(&summary);
-            button.set_sensitive(true);
+            let (root, games, epoch) = {
+                let state = model.borrow();
+                (
+                    state.config.download_directory.clone(),
+                    state.games.clone(),
+                    state.account_epoch,
+                )
+            };
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = StateStore::open().and_then(|mut store| {
+                    let summary = managed::rebuild(&mut store, &root, &games)?;
+                    Ok((summary, store.managed_files()?, store.download_jobs()?))
+                });
+                let _ = sender.send(result);
+            });
+            let model = model.clone();
+            let w = w.clone();
+            let row = rebuild_row.clone();
+            let button = button.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if model.borrow().account_epoch != epoch {
+                    button.set_sensitive(true);
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(Ok((summary, files, jobs))) => {
+                        let mut state = model.borrow_mut();
+                        managed::apply_to_games(&mut state.games, &files);
+                        let directory = state.config.download_directory.clone();
+                        managed::set_locations(&mut state.games, &directory);
+                        state.download_jobs = jobs;
+                        drop(state);
+                        row.set_subtitle(&format!(
+                            "Indexed {} files ({} matched, {} unmatched)",
+                            summary.files, summary.matched, summary.unmatched
+                        ));
+                        refresh_local_action_state(&w, &model);
+                    }
+                    Ok(Err(error)) => {
+                        row.set_subtitle(&format!("Could not inspect files: {error}. Try again."))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => row.set_subtitle("File inspection stopped. Try again."),
+                }
+                button.set_sensitive(true);
+                glib::ControlFlow::Break
+            });
         });
     }
     {

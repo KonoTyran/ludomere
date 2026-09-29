@@ -88,12 +88,12 @@ fn fetch_from(
             .into(),
         );
     }
-    let response: BuildListResponse = response
+    let response = response
         .error_for_status()
-        .map_err(reqwest::Error::without_url)?
-        .json()
-        .map_err(reqwest::Error::without_url)
-        .with_context(|| format!("parsing {operating_system} builds for {product_id}"))?;
+        .map_err(reqwest::Error::without_url)?;
+    let response: BuildListResponse =
+        serde_json::from_slice(&crate::gog::product::bounded_metadata(response)?)
+            .with_context(|| format!("parsing {operating_system} builds for {product_id}"))?;
     let now = chrono::Utc::now().timestamp();
     Ok(response
         .items

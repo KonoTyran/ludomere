@@ -1,6 +1,7 @@
 //! GOG cloud saves for managed Windows/UMU installations.
 
 pub mod api;
+pub mod backup;
 pub mod metadata;
 pub mod paths;
 pub mod sync;
@@ -11,6 +12,66 @@ use crate::domain::{
 };
 use anyhow::{Context, Result, bail};
 use api::Storage;
+
+static OPERATIONS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+struct OperationGuard(i64);
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        OPERATIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|id| *id != self.0);
+    }
+}
+
+fn begin_operation(product_id: i64) -> Result<OperationGuard> {
+    let mut operations = OPERATIONS.lock().unwrap_or_else(|error| error.into_inner());
+    if operations.contains(&product_id) {
+        bail!("another cloud-save operation is running for this game; wait and retry");
+    }
+    operations.push(product_id);
+    Ok(OperationGuard(product_id))
+}
+
+fn authenticated_storage(game: &InstalledGame, account_id: &str) -> Result<api::CloudClient> {
+    if game.compatibility.is_none()
+        || !game
+            .installer_operating_system
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+    {
+        bail!("cloud saves require an installed managed Windows game");
+    }
+    let marker = crate::installation::load_installation_marker(&game.installation_directory)?
+        .context("the game is no longer installed")?;
+    if marker.product_id != game.product_id {
+        bail!("the installed game changed; reopen its settings");
+    }
+    let store = crate::state::StateStore::open()?;
+    if store.cloud_save_record(game.product_id)?.availability != CloudSaveAvailability::Supported {
+        bail!("GOG cloud saves are not supported for this game");
+    }
+    let token = crate::auth::load_saved_token()?.context("sign in to GOG to manage cloud saves")?;
+    if token.user_id != account_id {
+        bail!("the GOG account changed; reopen cloud-save management");
+    }
+    let builds = windows_builds(&store, game.product_id)?;
+    let exact = marker.galaxy_depot.map(|depot| depot.build_id);
+    let build =
+        metadata::select_build(&builds, exact.as_deref(), game.installed_version.as_deref())
+            .context("no generation-2 Windows build is available")?;
+    let client = api::client()?;
+    let credentials = metadata::fetch_credentials(&client, &build.repository_url)?;
+    let scoped = api::exchange_scoped_token(&client, &token.refresh_token, &credentials)?;
+    Ok(api::CloudClient::new(
+        client,
+        token.user_id,
+        credentials.client_id,
+        scoped,
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct CloudSyncRequest {
@@ -195,6 +256,7 @@ fn summarize_inventory(objects: &[api::RemoteObject]) -> CloudSaveInventory {
 
 pub fn sync(mut request: CloudSyncRequest) -> Result<CloudSyncResult> {
     let _activity = crate::profile_reset::begin_activity("cloud sync")?;
+    let _operation = begin_operation(request.game.product_id)?;
     if request.game.compatibility.is_none()
         || !request
             .game
@@ -243,6 +305,15 @@ pub fn sync(mut request: CloudSyncRequest) -> Result<CloudSyncResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_operations_exclude_concurrent_sync_for_the_same_product() {
+        let first = begin_operation(987654321).unwrap();
+        assert!(begin_operation(987654321).is_err());
+        assert!(begin_operation(987654322).is_ok());
+        drop(first);
+        assert!(begin_operation(987654321).is_ok());
+    }
 
     #[test]
     fn inventory_counts_files_size_and_latest_change() {

@@ -173,9 +173,75 @@ pub fn reconcile_installed_games(
             }
         }
     }
+    reconcile_discovered(store, discovered, true)
+}
+
+/// Refresh known products without enumerating other games or changing preferences.
+pub fn reconcile_installed_products(
+    store: &crate::state::StateStore,
+    libraries: &[GameLibrary],
+    products: &[(i64, String)],
+    existing: &HashMap<i64, crate::domain::InstalledGame>,
+) -> anyhow::Result<Vec<crate::domain::InstalledGame>> {
+    let mut discovered = HashMap::new();
+    for (id, slug) in products {
+        anyhow::ensure!(
+            std::path::Path::new(slug).components().count() == 1
+                && matches!(
+                    std::path::Path::new(slug).components().next(),
+                    Some(std::path::Component::Normal(_))
+                ),
+            "The game folder name is invalid; refresh the library before retrying"
+        );
+        for library in libraries {
+            let mut paths = vec![library.path.join(slug)];
+            if let Some(game) = existing.get(id)
+                && game.library_id == library.id
+                && game.installation_directory.starts_with(&library.path)
+                && !paths.contains(&game.installation_directory)
+            {
+                paths.push(game.installation_directory.clone());
+            }
+            for directory in paths {
+                match std::fs::metadata(marker::marker_path(&directory)) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                let Some(found_marker) = marker::load(&directory)? else {
+                    continue;
+                };
+                if found_marker.product_id != *id
+                    || depot::operation_staging_path(
+                        &library.path,
+                        &directory,
+                        &found_marker.slug,
+                        "reconcile",
+                    )
+                    .is_ok_and(|journal| journal.is_file())
+                {
+                    continue;
+                }
+                discovered.insert(*id, (library.id.clone(), directory, found_marker));
+            }
+        }
+    }
+    reconcile_discovered(store, discovered, false)
+}
+
+fn reconcile_discovered(
+    store: &crate::state::StateStore,
+    discovered: HashMap<i64, (String, PathBuf, marker::InstallationMarker)>,
+    save_discovered_preferences: bool,
+) -> anyhow::Result<Vec<crate::domain::InstalledGame>> {
     let mut reconciled = Vec::with_capacity(discovered.len());
     for (_, (library_id, directory, found_marker)) in discovered {
-        if !directory_has_installed_payload(&directory) {
+        let has_payload = if save_discovered_preferences {
+            directory_has_installed_payload(&directory)
+        } else {
+            checked_installed_payload(&directory, 0)?
+        };
+        if !has_payload {
             continue;
         }
         let preferences = store.game_preferences(found_marker.product_id)?;
@@ -205,10 +271,11 @@ pub fn reconcile_installed_games(
         let (last_played, playtime) = store.product_activity(game.product_id)?;
         game.last_played_at = last_played;
         game.playtime_seconds = playtime;
-        if preferences
-            .as_ref()
-            .and_then(|preferences| preferences.executable_path.as_ref())
-            .is_none()
+        if save_discovered_preferences
+            && preferences
+                .as_ref()
+                .and_then(|preferences| preferences.executable_path.as_ref())
+                .is_none()
             && game.primary_executable.is_some()
         {
             save_game_preferences(store, &game)?;
@@ -235,6 +302,7 @@ pub fn save_game_preferences(
         compatibility: game.compatibility.clone(),
         created_at: game.created_at,
         updated_at: game.updated_at,
+        ..Default::default()
     })?;
     store.preserve_product_activity(game.product_id, game.last_played_at, game.playtime_seconds)
 }
@@ -304,6 +372,49 @@ pub(crate) fn directory_has_installed_payload(directory: &std::path::Path) -> bo
         let path = entry.path();
         launchable_file(&path) || (path.is_dir() && directory_contains_launchable(&path, 0))
     })
+}
+
+fn checked_installed_payload(directory: &std::path::Path, depth: usize) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if depth == 0
+            && matches!(
+                entry.file_name().to_str(),
+                Some("installer" | "patch" | "extra" | "dlc" | crate::identity::STAGING_DIRECTORY)
+            )
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 != 0
+                || path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        ["exe", "com", "bat"]
+                            .iter()
+                            .any(|known| extension.eq_ignore_ascii_case(known))
+                    })
+            {
+                return Ok(true);
+            }
+        } else if metadata.is_dir() && depth < 4 && checked_installed_payload(&path, depth + 1)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn directory_contains_launchable(directory: &std::path::Path, depth: usize) -> bool {
@@ -979,7 +1090,44 @@ mod tests {
         assert_eq!(recovered[0].product_id, 77);
         assert_eq!(recovered[0].installation_directory, moved);
 
+        let known = HashMap::from([(77, recovered[0].clone())]);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let targeted =
+            reconcile_installed_products(&store, &libraries, &[(77, "game".into())], &known)
+                .unwrap();
+        assert_eq!(targeted, recovered);
+        writer.execute_batch("ROLLBACK").unwrap();
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::metadata(&moved).unwrap().permissions();
+            fs::set_permissions(&moved, fs::Permissions::from_mode(0o111)).unwrap();
+            let result =
+                reconcile_installed_products(&store, &libraries, &[(77, "game".into())], &known);
+            fs::set_permissions(&moved, permissions).unwrap();
+            assert!(
+                result.is_err(),
+                "Unreadable payload must not become an absent game"
+            );
+            let nested = moved.join("bin");
+            let permissions = fs::metadata(&nested).unwrap().permissions();
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o111)).unwrap();
+            let result =
+                reconcile_installed_products(&store, &libraries, &[(77, "game".into())], &known);
+            fs::set_permissions(&nested, permissions).unwrap();
+            assert!(
+                result.is_err(),
+                "Unreadable nested payload must preserve the prior snapshot"
+            );
+        }
+
         fs::remove_dir_all(&moved).unwrap();
+        assert!(
+            reconcile_installed_products(&store, &libraries, &[(77, "game".into())], &known)
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_dir_all(&second).unwrap();
         // With the library unavailable, no on-disk marker can assert installation.
         assert_eq!(
@@ -1061,8 +1209,8 @@ mod tests {
         assert_eq!(
             rank_fresh_install_sources(&Config::default(), &candidates, true),
             [
-                FreshInstallSource::OfflineInstaller(2),
                 FreshInstallSource::GalaxyWindows,
+                FreshInstallSource::OfflineInstaller(2),
                 FreshInstallSource::OfflineInstaller(0),
                 FreshInstallSource::OfflineInstaller(1),
             ]

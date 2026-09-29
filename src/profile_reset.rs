@@ -246,6 +246,7 @@ impl ResetReservation {
                 data.join("proton"),
                 data.join("umu"),
                 data.join("cloud-save-backups"),
+                data.join("cloud-save-deletion-recovery"),
                 data.join("comet"),
             ]);
             let store = crate::state::StateStore::open()?;
@@ -719,6 +720,7 @@ mod tests {
                 directory.path().join("data/proton"),
                 directory.path().join("data/umu"),
                 directory.path().join("data/cloud-save-backups"),
+                directory.path().join("data/cloud-save-deletion-recovery"),
                 directory.path().join("installers"),
             ],
         };
@@ -834,6 +836,23 @@ mod tests {
         std::os::unix::fs::symlink(&outside, plan.cache.join("parent")).unwrap();
         assert!(remove_owned(&plan.cache.join("parent/save")).is_err());
         assert!(outside.join("save").is_file());
+    }
+
+    #[test]
+    fn reset_refuses_profile_targets_overlapping_cloud_deletion_recovery() {
+        let (_root, mut plan) = fixture();
+        plan.cache = plan.data.join("cloud-save-deletion-recovery");
+        write(&plan.cache.join("media/recovered-save"));
+        assert!(
+            validate_plan(&plan, &roots(&plan))
+                .unwrap_err()
+                .to_string()
+                .contains("overlaps")
+        );
+        assert_eq!(
+            fs::read(plan.cache.join("media/recovered-save")).unwrap(),
+            b"fixture"
+        );
     }
 
     #[test]

@@ -47,6 +47,224 @@ pub struct CleanupResult {
     pub failures: Vec<String>,
 }
 
+pub(super) struct Retention {
+    snapshot: ManagedDownloads,
+    replacement: ManagedDownloads,
+    revision: i64,
+    trash: Vec<super::trash::PreparedTrash>,
+}
+
+pub(super) fn prepare_retention(
+    product_id: i64,
+    job_id: &str,
+    artifacts: &[crate::domain::RemoteArtifact],
+    paths: &[PathBuf],
+    token: &str,
+    session: u64,
+) -> Result<Option<Retention>> {
+    static VERIFYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _verification = VERIFYING.try_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "Another installer cleanup is being prepared; retry at the next update check"
+        )
+    })?;
+    let _activity = crate::profile_reset::begin_activity("installer retention verification")?;
+    let store = StateStore::open()?;
+    crate::online::with_account_session(session, || Ok(()))?;
+    if !crate::updates::UpdatePolicy::resolve(
+        &read_config(&Config::path())?,
+        store.game_preferences(product_id)?.as_ref(),
+    )
+    .prune_superseded_installers
+    {
+        return Ok(None);
+    }
+    ensure!(
+        !artifacts.is_empty()
+            && artifacts.len() == paths.len()
+            && artifacts
+                .iter()
+                .all(|artifact| artifact.kind == crate::domain::ArtifactKind::Installer),
+        "Only complete primary installers qualify for retention"
+    );
+    ensure_no_install_intent(&store, product_id)?;
+    // Historical completed jobs are not replacement candidates; do not let their obsolete
+    // checksum endpoints prevent a later, currently offered job from being considered.
+    if !store.offered_installer_job(job_id)? {
+        return Ok(None);
+    }
+    if let Some(revision) = store.verified_installer_revision_for_job(job_id)?
+        && store
+            .superseded_installer_files(product_id, revision)?
+            .is_empty()
+    {
+        return Ok(None);
+    }
+    let mut replacement = inspect(&store, &read_config(&Config::path())?, product_id)?;
+    replacement.files.retain(|file| paths.contains(&file.path));
+    ensure!(
+        replacement.files.len() == paths.len(),
+        "The replacement is not fully indexed as managed downloads"
+    );
+    let ordered_paths = artifact_files(artifacts, paths, &store.managed_files()?)?;
+    for (artifact, path) in artifacts.iter().zip(&ordered_paths) {
+        crate::online::with_account_session(session, || Ok(()))?;
+        let checksum = super::gog_checksum(artifact, token)?;
+        let (_, _, mut handle) = open_file(path)?;
+        let before = handle.metadata()?;
+        let expected = replacement
+            .files
+            .iter()
+            .find(|file| file.path == *path)
+            .unwrap();
+        ensure!(
+            matches_identity(&before, expected) && before.len() == checksum.size,
+            "The replacement changed before verification"
+        );
+        let mut md5 = md5::Context::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            crate::online::with_account_session(session, || Ok(()))?;
+            let count = std::io::Read::read(&mut handle, &mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            md5.consume(&buffer[..count]);
+        }
+        ensure!(
+            format!("{:x}", md5.compute()).eq_ignore_ascii_case(&checksum.md5)
+                && matches_identity(&handle.metadata()?, expected),
+            "Replacement checksum verification failed; older installers were retained"
+        );
+        crate::online::with_account_session(session, || {
+            store.mark_managed_file_verified(path, artifact, &checksum.md5)
+        })?;
+    }
+    let revision = store
+        .verified_installer_revision_for_job(job_id)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "The complete currently offered replacement revision could not be verified"
+            )
+        })?;
+    let older = store.superseded_installer_files(product_id, revision)?;
+    let mut snapshot = inspect(&store, &read_config(&Config::path())?, product_id)?;
+    snapshot.files.retain(|file| older.contains(&file.path));
+    if snapshot.files.is_empty() {
+        return Ok(None);
+    }
+    let mut trash = Vec::new();
+    for file in &snapshot.files {
+        let (_, _, mut handle) = open_file(&file.path)?;
+        ensure!(
+            matches_identity(&handle.metadata()?, file),
+            "An old installer changed before preparing Trash"
+        );
+        trash.push(super::trash::prepare(&mut handle, &file.path, || {
+            crate::online::account_session() != session
+        })?);
+    }
+    Ok(Some(Retention {
+        snapshot,
+        replacement,
+        revision,
+        trash,
+    }))
+}
+
+fn artifact_files(
+    artifacts: &[crate::domain::RemoteArtifact],
+    paths: &[PathBuf],
+    managed: &[ManagedFileRecord],
+) -> Result<Vec<PathBuf>> {
+    let mut ordered = Vec::new();
+    for artifact in artifacts {
+        let matches = managed
+            .iter()
+            .filter(|file| {
+                file.present
+                    && file.matched
+                    && paths.contains(&file.path)
+                    && file.product_id == artifact.product_id
+                    && file.kind == artifact.kind
+                    && file.artifact_path.as_deref() == Some(artifact.download_path.as_str())
+                    && file.version == artifact.version
+                    && (artifact.provider_file_id.is_none()
+                        || file.provider_file_id == artifact.provider_file_id)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matches.len() == 1 && !ordered.contains(&matches[0].path),
+            "The replacement file identity is ambiguous; older installers were retained"
+        );
+        ordered.push(matches[0].path.clone());
+    }
+    ensure!(
+        ordered.len() == paths.len(),
+        "The replacement file set is incomplete"
+    );
+    Ok(ordered)
+}
+
+pub(super) fn commit_retention(
+    store: &StateStore,
+    retention: Retention,
+    job_id: &str,
+) -> Result<CleanupResult> {
+    let _permit = crate::operation_gate::try_acquire()?;
+    let id = retention.snapshot.product_id;
+    ensure!(
+        crate::updates::UpdatePolicy::resolve(
+            &read_config(&Config::path())?,
+            store.game_preferences(id)?.as_ref()
+        )
+        .prune_superseded_installers,
+        "Installer cleanup was disabled; the original files were retained"
+    );
+    ensure_no_install_intent(store, id)?;
+    ensure!(
+        store.verified_installer_revision_for_job(job_id)? == Some(retention.revision),
+        "The offered replacement changed; the original files were retained"
+    );
+    for file in &retention.replacement.files {
+        let (_, _, handle) = open_file(&file.path)?;
+        ensure!(
+            matches_identity(&handle.metadata()?, file),
+            "The verified replacement changed; the original files were retained"
+        );
+    }
+    delete_locked_with_trash(store, retention.snapshot, false, Some(retention.trash))
+}
+
+fn ensure_no_install_intent(store: &StateStore, product_id: i64) -> Result<()> {
+    let jobs = store
+        .download_jobs()?
+        .into_iter()
+        .filter(|job| job.product_id == product_id)
+        .map(|job| job.job_id)
+        .collect::<std::collections::HashSet<_>>();
+    ensure!(
+        !store
+            .download_install_intents()?
+            .iter()
+            .any(|intent| (intent.product_id == product_id
+                || intent.job_ids.iter().any(|id| jobs.contains(id)))
+                && intent.state != "complete"),
+        "A pending installation uses these files; installer cleanup is deferred"
+    );
+    Ok(())
+}
+
+fn matches_identity(metadata: &std::fs::Metadata, file: &DownloadFile) -> bool {
+    metadata.is_file()
+        && metadata.nlink() == 1
+        && metadata.dev() == file.device
+        && metadata.ino() == file.inode
+        && metadata.len() == file.size
+        && metadata.mtime() == file.modified
+        && metadata.mtime_nsec() == file.modified_ns
+}
+
 /// Preview only indexed, recognized downloads; callers must confirm this exact snapshot.
 pub fn managed_downloads(product_id: i64) -> Result<ManagedDownloads> {
     inspect(
@@ -78,7 +296,7 @@ fn inspect(store: &StateStore, config: &Config, product_id: i64) -> Result<Manag
     let jobs = store.download_jobs()?;
     let mut files = Vec::new();
     for file in store
-        .managed_files()?
+        .managed_files_for_products(&ids)?
         .into_iter()
         .filter(|file| file.present && file.matched && ids.contains(&file.product_id))
     {
@@ -145,7 +363,7 @@ fn inspect(store: &StateStore, config: &Config, product_id: i64) -> Result<Manag
 }
 
 /// Directory descriptors anchor every component; no parent or final symlink is followed.
-fn open_file(path: &Path) -> Result<(File, CString, File)> {
+pub(super) fn open_file(path: &Path) -> Result<(File, CString, File)> {
     ensure!(path.is_absolute(), "Downloaded file path must be absolute");
     let mut parent = File::open("/")?;
     let components = path
@@ -201,6 +419,15 @@ fn delete_locked(
     snapshot: ManagedDownloads,
     after_uninstall: bool,
 ) -> Result<CleanupResult> {
+    delete_locked_with_trash(store, snapshot, after_uninstall, None)
+}
+
+fn delete_locked_with_trash(
+    store: &StateStore,
+    snapshot: ManagedDownloads,
+    after_uninstall: bool,
+    mut trash: Option<Vec<super::trash::PreparedTrash>>,
+) -> Result<CleanupResult> {
     let ids = snapshot
         .files
         .iter()
@@ -238,6 +465,9 @@ fn delete_locked(
     let current = inspect(store, &read_config(&Config::path())?, snapshot.product_id)?;
     // Revocation is checked and completed before any unlink, serialized by the queue manager.
     for job in &jobs {
+        if trash.is_some() {
+            continue;
+        }
         if snapshot
             .files
             .iter()
@@ -247,8 +477,13 @@ fn delete_locked(
         }
     }
     let mut result = CleanupResult::default();
+    if let Some(trash) = &mut trash {
+        trash.reverse();
+    }
     for file in snapshot.files {
-        let removed = (|| -> Result<bool> {
+        let mut prepared_trash = trash.as_mut().and_then(Vec::pop);
+        let mut removed_payload = false;
+        let removed = (|| -> Result<()> {
             ensure!(
                 indexed.iter().any(|current| same_record(current, &file)),
                 "The downloaded file changed in the index; inspect it again"
@@ -264,7 +499,6 @@ fn delete_locked(
                 }
                 Err(error) => return Err(error),
             };
-            let unlinked = opened.is_some();
             if let Some((parent, name, handle)) = opened {
                 ensure!(
                     current
@@ -275,20 +509,21 @@ fn delete_locked(
                 );
                 let metadata = handle.metadata()?;
                 ensure!(
-                    metadata.is_file()
-                        && metadata.nlink() == 1
-                        && metadata.dev() == file.device
-                        && metadata.ino() == file.inode
-                        && metadata.len() == file.size
-                        && metadata.mtime() == file.modified
-                        && metadata.mtime_nsec() == file.modified_ns,
+                    matches_identity(&metadata, &file),
                     "The downloaded file was replaced or modified; inspect it again"
                 );
+                if let Some(trash) = &prepared_trash {
+                    trash.verify_present()?;
+                }
                 ensure!(
                     unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0,
                     "Could not remove the downloaded file: {}",
                     std::io::Error::last_os_error()
                 );
+                removed_payload = true;
+                if let Some(trash) = &mut prepared_trash {
+                    trash.committed = true;
+                }
             }
             store.mark_managed_file_absent(&file.path)?;
             for mut job in store
@@ -323,10 +558,11 @@ fn delete_locked(
                     )?;
                 }
             }
-            Ok(unlinked)
+            Ok(())
         })();
+        result.deleted += usize::from(removed_payload);
         match removed {
-            Ok(unlinked) => result.deleted += usize::from(unlinked),
+            Ok(_) => {}
             Err(error) => result.failures.push(format!(
                 "{}: {error}",
                 file.path.file_name().unwrap_or_default().to_string_lossy()
@@ -348,6 +584,195 @@ mod tests {
     use super::*;
     use crate::domain::{ArtifactKind, Game, RemoteArtifact};
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn verified_retention_preserves_pending_installs_and_replaced_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, config, older) = fixture(root.path());
+        let mut old_artifacts = store.download_job("job").unwrap().unwrap().artifacts;
+        for (index, artifact) in old_artifacts.iter_mut().enumerate() {
+            artifact.version = Some("1".into());
+            artifact.provider_group_id = Some("linux-en".into());
+            artifact.provider_file_id = Some(format!("old-{index}"));
+            artifact.provider_category = Some(crate::domain::DownloadCategory::Installer);
+        }
+        store.observe_download_manifest(7, &old_artifacts).unwrap();
+        store
+            .record_completed_artifacts("job", "game", &old_artifacts, &older)
+            .unwrap();
+        let mut new_artifacts = old_artifacts.clone();
+        let replacement = older
+            .iter()
+            .enumerate()
+            .map(|(index, path)| path.with_file_name(format!("new-{index}.bin")))
+            .collect::<Vec<_>>();
+        for (index, (artifact, path)) in new_artifacts.iter_mut().zip(&replacement).enumerate() {
+            artifact.version = Some("2".into());
+            artifact.provider_file_id = Some(format!("new-{index}"));
+            artifact.download_path = format!("/new/{index}");
+            std::fs::write(path, b"inert fixture").unwrap();
+        }
+        store.observe_download_manifest(7, &new_artifacts).unwrap();
+        store
+            .save_download_job(&DownloadJobUpdate {
+                job_id: "replacement",
+                product_id: 7,
+                title: "Game",
+                artifacts: &new_artifacts,
+                destination: replacement[0].parent().unwrap(),
+                state: DownloadState::Complete,
+                bytes_downloaded: 26,
+                total_bytes: Some(26),
+                completed_files: &replacement,
+                error: None,
+            })
+            .unwrap();
+        store
+            .record_completed_artifacts("replacement", "game", &new_artifacts, &replacement)
+            .unwrap();
+        assert!(
+            store
+                .verified_installer_revision_for_job("replacement")
+                .unwrap()
+                .is_none()
+        );
+        for (artifact, path) in new_artifacts.iter().zip(&replacement) {
+            store
+                .mark_managed_file_verified(path, artifact, "fixture-verified")
+                .unwrap();
+        }
+        let revision = store
+            .verified_installer_revision_for_job("replacement")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.superseded_installer_files(7, revision).unwrap().len(),
+            2
+        );
+        let prepare = || {
+            let mut snapshot = inspect(&store, &config, 7).unwrap();
+            let mut replacement_snapshot = snapshot.clone();
+            snapshot.files.retain(|file| older.contains(&file.path));
+            replacement_snapshot
+                .files
+                .retain(|file| replacement.contains(&file.path));
+            let trash = snapshot
+                .files
+                .iter()
+                .map(|file| {
+                    super::super::trash::prepare(
+                        &mut File::open(&file.path).unwrap(),
+                        &file.path,
+                        || false,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            Retention {
+                snapshot,
+                replacement: replacement_snapshot,
+                revision,
+                trash,
+            }
+        };
+        store
+            .set_game_update_preferences(7, None, None, Some(true), None)
+            .unwrap();
+        store
+            .save_download_install_intent(&crate::state::DownloadInstallIntent {
+                product_id: 7,
+                intent_id: "consent".into(),
+                job_ids: vec!["job".into()],
+                plan_json: "{}".into(),
+                state: "waiting".into(),
+                error: None,
+            })
+            .unwrap();
+        assert!(commit_retention(&store, prepare(), "replacement").is_err());
+        assert!(older.iter().all(|path| path.exists()));
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].intent_id,
+            "consent"
+        );
+        store.clear_download_install_intent(7).unwrap();
+        let pending = prepare();
+        std::fs::remove_file(&older[1]).unwrap();
+        symlink(&replacement[1], &older[1]).unwrap();
+        let result = commit_retention(&store, pending, "replacement").unwrap();
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(!older[0].exists());
+        assert!(
+            replacement
+                .iter()
+                .all(|path| std::fs::read(path).unwrap() == b"inert fixture")
+        );
+        assert_eq!(
+            store.download_job("job").unwrap().unwrap().completed_files,
+            vec![older[1].clone()]
+        );
+        assert_eq!(
+            store
+                .download_job("replacement")
+                .unwrap()
+                .unwrap()
+                .completed_files,
+            replacement
+        );
+    }
+
+    #[test]
+    fn multipart_retention_matches_index_identity_even_when_completed_paths_are_reordered() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, _, files) = fixture(root.path());
+        let artifacts = store.download_job("job").unwrap().unwrap().artifacts;
+        let mut reordered = files.clone();
+        reordered.reverse();
+        assert_eq!(
+            artifact_files(&artifacts, &reordered, &store.managed_files().unwrap()).unwrap(),
+            files
+        );
+        reordered[1] = reordered[0].clone();
+        assert!(artifact_files(&artifacts, &reordered, &store.managed_files().unwrap()).is_err());
+    }
+
+    #[test]
+    fn trash_copies_survive_index_failure_after_actual_unlink_and_count_is_truthful() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, config, files) = fixture(root.path());
+        let snapshot = inspect(&store, &config, 7).unwrap();
+        let trash = snapshot
+            .files
+            .iter()
+            .map(|file| {
+                super::super::trash::prepare(
+                    &mut File::open(&file.path).unwrap(),
+                    &file.path,
+                    || false,
+                )
+                .unwrap()
+            })
+            .collect();
+        let trash_path = dirs::data_dir().unwrap().join("Trash/files");
+        let copies = std::fs::read_dir(&trash_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let database = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        database.execute_batch("CREATE TRIGGER fail_mark BEFORE UPDATE OF present ON managed_files WHEN NEW.present=0 BEGIN SELECT RAISE(ABORT,'fixture index failure'); END;").unwrap();
+        let result = delete_locked_with_trash(&store, snapshot, false, Some(trash)).unwrap();
+        assert_eq!(result.deleted, 2);
+        assert_eq!(result.failures.len(), 2);
+        assert!(files.iter().all(|file| !file.exists()));
+        assert!(copies.iter().all(|copy| copy.exists()));
+        assert!(
+            store
+                .managed_files()
+                .unwrap()
+                .iter()
+                .all(|file| file.present)
+        );
+    }
 
     #[test]
     fn cleanup_config_inspection_never_writes_preferences() {

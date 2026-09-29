@@ -4,7 +4,7 @@ pub(super) fn detail_file_management(
     game: &DetailPageModel,
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
-    installed: Option<crate::domain::InstalledGame>,
+    _installed: Option<crate::domain::InstalledGame>,
     refresh_after_change: Rc<dyn Fn()>,
     activate_primary_action: Rc<dyn Fn()>,
 ) -> DetailFileManagement {
@@ -69,8 +69,10 @@ pub(super) fn detail_file_management(
             ("process-stop-symbolic", "Cancel")
         },
     );
-    proxy_content.append(&gtk::Image::from_icon_name(proxy_icon));
-    proxy_content.append(&gtk::Label::new(Some(proxy_label)));
+    let proxy_image = gtk::Image::from_icon_name(proxy_icon);
+    let proxy_text = gtk::Label::new(Some(proxy_label));
+    proxy_content.append(&proxy_image);
+    proxy_content.append(&proxy_text);
     proxy_action.set_child(Some(&proxy_content));
     proxy_action.add_css_class("steam-primary-action");
     proxy_action.add_css_class("context-primary-action");
@@ -90,6 +92,30 @@ pub(super) fn detail_file_management(
     proxy_action.connect_clicked(move |_| activate_primary_action());
     actions.append(&proxy_action);
     main_actions.push(proxy_action);
+
+    if game.parent_id.is_none() {
+        let hidden = model.borrow().hidden_products.contains(&game.product_id);
+        let toggle = management_menu_button(if hidden {
+            "Unhide game"
+        } else {
+            "Hide game locally"
+        });
+        bind_hidden_action(&toggle, window, game.product_id);
+        toggle.connect_map({
+            let model = model.clone();
+            let id = game.product_id;
+            move |button| {
+                let hidden = model.borrow().hidden_products.contains(&id);
+                button.set_label(if hidden {
+                    "Unhide game"
+                } else {
+                    "Hide game locally"
+                });
+            }
+        });
+        actions.append(&toggle);
+        main_actions.push(toggle);
+    }
 
     if let Some(favorite) = game.favorite {
         let favorite_action = management_menu_button(if favorite {
@@ -123,6 +149,13 @@ pub(super) fn detail_file_management(
     manage_actions.set_margin_bottom(6);
     manage_actions.append(&check_updates);
     manage_actions.append(&verify);
+    let refresh_local = management_menu_button("Refresh local state");
+    {
+        let refresh = refresh_after_change.clone();
+        refresh_local.connect_clicked(move |_| refresh());
+    }
+    manage_actions.append(&refresh_local);
+    manage_submenu_actions.push(refresh_local);
     manage_submenu_actions.push(check_updates.clone());
     manage_submenu_actions.push(verify.clone());
 
@@ -134,36 +167,66 @@ pub(super) fn detail_file_management(
     delete_downloads.set_visible(false);
     manage_actions.append(&delete_downloads);
     manage_submenu_actions.push(delete_downloads.clone());
-    {
-        let (sender, receiver) = mpsc::channel();
+    let preview_busy = Rc::new(std::cell::Cell::new(false));
+    let preview_pending = Rc::new(std::cell::Cell::new(false));
+    let refresh_preview: Rc<dyn Fn()> = {
         let product_id = game.product_id;
-        let epoch = model.borrow().account_epoch;
-        std::thread::spawn(move || {
-            let _ = sender
-                .send(download::managed_downloads(product_id).map_err(|error| error.to_string()));
-        });
         let downloaded = downloaded.clone();
         let delete = delete_downloads.clone();
         let model = model.clone();
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-                return glib::ControlFlow::Break;
+        let busy = preview_busy.clone();
+        let status = status.clone();
+        let pending = preview_pending.clone();
+        let notice = cleanup_notice.clone();
+        Rc::new(move || {
+            *downloaded.borrow_mut() = None;
+            if busy.replace(true) {
+                pending.set(true);
+                return;
             }
-            match receiver.try_recv() {
-                Ok(result) => {
-                    delete.set_visible(result.as_ref().is_ok_and(|files| files.count() > 0));
-                    *downloaded.borrow_mut() = Some(result);
-                    glib::ControlFlow::Break
+            let epoch = model.borrow().account_epoch;
+            delete.set_sensitive(false);
+            let mut receiver = inspect_downloaded_files(product_id);
+            let downloaded = downloaded.clone();
+            let delete = delete.clone();
+            let model = model.clone();
+            let busy = busy.clone();
+            let status = status.clone();
+            let pending = pending.clone();
+            let notice = notice.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                    busy.set(false);
+                    return glib::ControlFlow::Break;
                 }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(_) => {
-                    *downloaded.borrow_mut() =
-                        Some(Err("Could not inspect downloaded files".into()));
-                    glib::ControlFlow::Break
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        if pending.replace(false) {
+                            receiver = inspect_downloaded_files(product_id);
+                            return glib::ControlFlow::Continue;
+                        }
+                        busy.set(false);
+                        if let Err(error) = &result {
+                            status.set_label(&format!("Could not inspect downloaded files: {error}. Reopen Manage or retry in Uninstall."));
+                            status.set_visible(true);
+                            hold_status_notice(notice.as_ref(), &status.label());
+                        }
+                        delete.set_visible(result.as_ref().is_ok_and(|files| files.count() > 0));
+                        delete.set_sensitive(true);
+                        *downloaded.borrow_mut() = Some(result);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(_) => {
+                        busy.set(false);
+                        *downloaded.borrow_mut() =
+                            Some(Err("Could not inspect downloaded files".into()));
+                        glib::ControlFlow::Break
+                    }
                 }
-            }
-        });
-    }
+            });
+        })
+    };
     {
         let downloaded = downloaded.clone();
         let window = window.clone();
@@ -199,9 +262,6 @@ pub(super) fn detail_file_management(
                 button.set_sensitive(false);
                 status.set_label("Deleting downloaded files…");
                 status.set_visible(true);
-                if let Some(notice) = &cleanup_notice {
-                    notice.set_label("Deleting downloaded files…");
-                }
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || {
                     let _ = sender.send(download::delete_managed_downloads(files));
@@ -227,14 +287,14 @@ pub(super) fn detail_file_management(
                                 }
                             }
                             status.set_visible(true);
-                            hold_cleanup_notice(cleanup_notice.as_ref(), &status.label());
+                            hold_status_notice(cleanup_notice.as_ref(), &status.label());
                             refresh();
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                         Err(_) => {
                             status.set_label("Downloaded-file cleanup stopped. Check the files and try again.");
-                            hold_cleanup_notice(cleanup_notice.as_ref(), &status.label());
+                            hold_status_notice(cleanup_notice.as_ref(), &status.label());
                             button.set_sensitive(true);
                             glib::ControlFlow::Break
                         }
@@ -244,13 +304,22 @@ pub(super) fn detail_file_management(
         });
     }
 
-    if let Some(installed) = installed.clone() {
+    if game.parent_id.is_none() {
         manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         let browse = management_menu_button("Browse Local Files");
         {
-            let path = installed.installation_directory.clone();
+            let product_id = game.product_id;
+            let model = model.clone();
             let window = window.clone();
             browse.connect_clicked(move |_| {
+                let Some(path) = model
+                    .borrow()
+                    .installed_games
+                    .get(&product_id)
+                    .map(|game| game.installation_directory.clone())
+                else {
+                    return;
+                };
                 super::widgets::file_open::open_directory(
                     &path,
                     &window,
@@ -259,7 +328,7 @@ pub(super) fn detail_file_management(
             });
         }
         manage_actions.append(&browse);
-        manage_submenu_actions.push(browse);
+        manage_submenu_actions.push(browse.clone());
 
         let repair = management_menu_button("Repair Installation");
         repair.set_tooltip_text(Some(
@@ -269,10 +338,15 @@ pub(super) fn detail_file_management(
             let window = window.clone();
             let game = game.clone();
             let model = model.clone();
-            repair.connect_clicked(move |_| show_repair_dialog(&window, &model, &game));
+            repair.connect_clicked(move |_| {
+                let current = current_detail(&model.borrow(), game.product_id, game.parent_id);
+                if let Some(current) = current {
+                    show_repair_dialog(&window, &model, &current);
+                }
+            });
         }
         manage_actions.append(&repair);
-        manage_submenu_actions.push(repair);
+        manage_submenu_actions.push(repair.clone());
         manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
         let uninstall = management_menu_button("Uninstall");
@@ -283,7 +357,38 @@ pub(super) fn detail_file_management(
         let downloaded = downloaded.clone();
         let model = model.clone();
         let status = status.clone();
+        let product_id = game.product_id;
+        let refresh_preview = refresh_preview.clone();
+        let installed_controls = [browse.clone(), repair.clone(), uninstall.clone()];
+        {
+            let model = model.clone();
+            let epoch = model.borrow().account_epoch;
+            let controls = installed_controls
+                .iter()
+                .map(|button| button.downgrade())
+                .collect::<Vec<_>>();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if model.borrow().account_epoch != epoch {
+                    return glib::ControlFlow::Break;
+                }
+                let visible = model.borrow().installed_games.contains_key(&product_id);
+                let mut alive = false;
+                for button in &controls {
+                    if let Some(button) = button.upgrade() {
+                        button.set_visible(visible);
+                        alive = true;
+                    }
+                }
+                if alive {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
+        }
         uninstall.connect_clicked(move |button| {
+                let Some(installed) = model.borrow().installed_games.get(&product_id).cloned() else { return; };
+                refresh_preview();
                 let epoch = model.borrow().account_epoch;
                 let confirmation = adw::AlertDialog::builder()
                 .heading(format!("Uninstall {title}?"))
@@ -300,26 +405,47 @@ pub(super) fn detail_file_management(
                 let extra = gtk::Box::new(gtk::Orientation::Vertical, 6);
                 extra.append(&cleanup);
                 extra.append(&cleanup_status);
+                let retry_preview = gtk::Button::with_label("Retry downloaded-file check");
+                extra.append(&retry_preview);
+                {
+                    let refresh = refresh_preview.clone();
+                    let cleanup = cleanup.clone();
+                    let busy = preview_busy.clone();
+                    retry_preview.connect_clicked(move |_| {
+                        if busy.get() { return; }
+                        cleanup.set_active(false);
+                        refresh();
+                    });
+                }
                 confirmation.set_extra_child(Some(&extra));
                 {
                     let downloaded = downloaded.clone();
                     let cleanup = cleanup.downgrade();
                     let cleanup_status = cleanup_status.clone();
+                    let retry_preview = retry_preview.clone();
+                    let busy = preview_busy.clone();
                     glib::timeout_add_local(Duration::from_millis(50), move || {
                         let Some(cleanup) = cleanup.upgrade() else {
                             return glib::ControlFlow::Break;
                         };
+                        retry_preview.set_sensitive(!busy.get());
                         match downloaded.borrow().as_ref() {
                             Some(Ok(files)) => {
                                 cleanup.set_sensitive(files.count() > 0);
                                 cleanup_status.set_label(&format!("{} managed files ({})", files.count(), human_size(files.bytes())));
-                                glib::ControlFlow::Break
+                                glib::ControlFlow::Continue
                             }
                             Some(Err(error)) => {
+                                cleanup.set_active(false);
+                                cleanup.set_sensitive(false);
                                 cleanup_status.set_label(error);
-                                glib::ControlFlow::Break
+                                glib::ControlFlow::Continue
                             }
-                            None => glib::ControlFlow::Continue,
+                            None => {
+                                cleanup.set_sensitive(false);
+                                cleanup_status.set_label("Checking downloaded files…");
+                                glib::ControlFlow::Continue
+                            },
                         }
                     });
                 }
@@ -393,7 +519,7 @@ pub(super) fn detail_file_management(
                                 button.set_sensitive(true);
                                 status.set_label(&error);
                                 status.set_visible(true);
-                                hold_cleanup_notice(cleanup_notice.as_ref(), &error);
+                                hold_status_notice(cleanup_notice.as_ref(), &error);
                                 refresh_after_change();
                                 glib::ControlFlow::Break
                             }
@@ -418,6 +544,10 @@ pub(super) fn detail_file_management(
     let manage_popover = gtk::Popover::new();
     manage_popover.add_css_class("game-management-popover");
     manage_popover.set_child(Some(&manage_actions));
+    {
+        let refresh = refresh_preview.clone();
+        manage_popover.connect_show(move |_| refresh());
+    }
     manage.set_popover(Some(&manage_popover));
     let hover = gtk::EventControllerMotion::new();
     {
@@ -432,10 +562,18 @@ pub(super) fn detail_file_management(
     {
         let window = window.clone();
         let game = game.clone();
-        let installed = installed.clone();
         let model = model.clone();
         let refresh_after_change = refresh_after_change.clone();
         game_settings.connect_clicked(move |_| {
+            let current = current_detail(&model.borrow(), game.product_id, game.parent_id);
+            let Some(game) = current else {
+                return;
+            };
+            let installed = model
+                .borrow()
+                .installed_games
+                .get(&game.product_id)
+                .cloned();
             show_game_settings(
                 &window,
                 &model,
@@ -452,6 +590,42 @@ pub(super) fn detail_file_management(
     popover.add_css_class("game-management-popover");
     popover.set_child(Some(&actions));
     menu.set_popover(Some(&popover));
+    {
+        let model = model.clone();
+        let id = game.product_id;
+        let parent = game.parent_id;
+        popover.connect_show(move |_| {
+            let action = current_primary_action(&model.borrow(), id, parent);
+            let active =
+                crate::installation::installation_operation_snapshot(id).is_some_and(|snapshot| {
+                    snapshot.queued
+                        || matches!(
+                            snapshot.state,
+                            crate::domain::InstallationState::Installing
+                                | crate::domain::InstallationState::Uninstalling
+                        )
+                });
+            let running = crate::installation::is_game_running(id);
+            let downloading = model.borrow().download_jobs.iter().any(|job| {
+                job.product_id == id
+                    && matches!(
+                        job.state,
+                        DownloadState::Queued | DownloadState::Downloading
+                    )
+            });
+            let (icon, text) = if active {
+                ("process-stop-symbolic", "Cancel")
+            } else if running {
+                ("media-playback-stop-symbolic", "Stop")
+            } else if downloading {
+                ("media-playback-pause-symbolic", "Pause")
+            } else {
+                (action.icon(), action.label())
+            };
+            proxy_image.set_icon_name(Some(icon));
+            proxy_text.set_label(text);
+        });
+    }
     for action in main_actions {
         let popover = popover.clone();
         action.connect_clicked(move |_| popover.popdown());
@@ -523,6 +697,17 @@ pub(super) fn detail_file_management(
     }
 }
 
+fn bind_hidden_action(button: &gtk::Button, window: &adw::ApplicationWindow, id: i64) {
+    let window = window.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(window) = window.upgrade()
+            && let Some(action) = window.lookup_action("hidden")
+        {
+            action.activate(Some(&id.to_variant()));
+        }
+    });
+}
+
 fn management_menu_button(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.add_css_class("flat");
@@ -532,19 +717,22 @@ fn management_menu_button(label: &str) -> gtk::Button {
     button
 }
 
-fn hold_cleanup_notice(label: Option<&gtk::Label>, message: &str) {
+fn inspect_downloaded_files(
+    product_id: i64,
+) -> mpsc::Receiver<Result<download::ManagedDownloads, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ =
+            sender.send(download::managed_downloads(product_id).map_err(|error| error.to_string()));
+    });
+    receiver
+}
+
+pub(super) fn hold_status_notice(label: Option<&gtk::Label>, message: &str) {
     let Some(label) = label else {
         return;
     };
     label.set_label(message);
-    label.set_tooltip_text(Some(message));
-    label.add_css_class("cleanup-notice");
-    let label = label.downgrade();
-    glib::timeout_add_local_once(Duration::from_secs(8), move || {
-        if let Some(label) = label.upgrade() {
-            label.remove_css_class("cleanup-notice");
-        }
-    });
 }
 
 pub(super) fn activate_context_primary_action(
@@ -668,7 +856,7 @@ pub(super) fn activate_context_primary_action(
             });
         }
         GamePrimaryAction::Download | GamePrimaryAction::DownloadUpdate => {
-            show_download_selector(widgets, model, &game);
+            show_primary_download(widgets, model, &game);
         }
     }
 }
@@ -3154,6 +3342,68 @@ fn inferred_local_artifact(file: &LibraryFile) -> Option<RemoteArtifact> {
 #[cfg(test)]
 mod unified_row_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, Xvfb and private D-Bus; exercises GTK action dispatch while sidebar popover detaches"]
+    fn sidebar_visibility_action_precedes_popover_detachment() {
+        adw::init().expect("private display required");
+        let app = adw::Application::builder()
+            .application_id("io.github.legendarylinux.Ludomere.HideTest")
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let list = gtk::ListBox::new();
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&gtk::Label::new(Some("Fixture game"))));
+        list.append(&row);
+        window.set_content(Some(&list));
+        let hidden = Rc::new(std::cell::Cell::new(false));
+        let calls = Rc::new(std::cell::Cell::new(0));
+        list.set_filter_func({
+            let hidden = hidden.clone();
+            move |_| !hidden.get()
+        });
+        let action = gio::SimpleAction::new("hidden", Some(&i64::static_variant_type()));
+        action.connect_activate({
+            let hidden = hidden.clone();
+            let calls = calls.clone();
+            let list = list.clone();
+            move |_, value| {
+                assert_eq!(value.and_then(|value| value.get::<i64>()), Some(42));
+                hidden.set(!hidden.get());
+                calls.set(calls.get() + 1);
+                list.invalidate_filter();
+            }
+        });
+        window.add_action(&action);
+        let button = gtk::Button::with_label("Hide game locally");
+        bind_hidden_action(&button, &window, 42);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&button));
+        popover.set_parent(&row);
+        popover.connect_closed(|popover| popover.unparent());
+        button.connect_clicked({
+            let popover = popover.clone();
+            move |_| popover.popdown()
+        });
+        window.present();
+        while glib::MainContext::default().iteration(false) {}
+        popover.popup();
+        while glib::MainContext::default().iteration(false) {}
+        button.emit_clicked();
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(calls.get(), 1);
+        assert!(hidden.get());
+        assert!(!row.is_child_visible());
+        button.emit_clicked();
+        assert_eq!(calls.get(), 2);
+        assert!(!hidden.get());
+        assert!(row.is_child_visible());
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+        window.close();
+    }
 
     #[test]
     fn local_identity_uses_managed_path_os_and_language() {

@@ -21,6 +21,7 @@ use std::{
 #[derive(Clone)]
 struct Request {
     id: String,
+    session: u64,
     artifacts: Vec<RemoteArtifact>,
     title: String,
     access_token: String,
@@ -35,12 +36,27 @@ struct Request {
 }
 
 enum Command {
+    RetainInstallers {
+        retention: super::cleanup::Retention,
+        job_id: String,
+        session: u64,
+    },
+    RetentionFailed {
+        job_id: String,
+        session: u64,
+        message: String,
+    },
     DeleteManaged(
         super::ManagedDownloads,
         bool,
         mpsc::Sender<anyhow::Result<super::CleanupResult>>,
     ),
     Enqueue(Request),
+    EnqueueBackup(
+        super::DownloadRequest,
+        u64,
+        mpsc::Sender<anyhow::Result<()>>,
+    ),
     EnqueueWithInstall(
         Vec<super::DownloadRequest>,
         Option<super::AutoInstallRequest>,
@@ -109,6 +125,46 @@ pub(super) fn subscribe() -> mpsc::Receiver<DownloadManagerEvent> {
     receiver
 }
 
+pub(super) fn enqueue_backup(request: super::DownloadRequest, session: u64) -> anyhow::Result<()> {
+    let (reply, result) = mpsc::channel();
+    manager()
+        .commands
+        .send(Command::EnqueueBackup(request, session, reply))?;
+    result.recv()?
+}
+
+pub(super) fn check_retention(product_id: i64, token: &str, session: u64) -> anyhow::Result<()> {
+    for job in StateStore::open()?
+        .download_jobs()?
+        .into_iter()
+        .filter(|job| {
+            job.product_id == product_id
+                && job.state == DownloadState::Complete
+                && !job.artifacts.is_empty()
+                && job
+                    .artifacts
+                    .iter()
+                    .all(|artifact| artifact.kind == crate::domain::ArtifactKind::Installer)
+        })
+    {
+        if let Some(retention) = super::cleanup::prepare_retention(
+            product_id,
+            &job.job_id,
+            &job.artifacts,
+            &job.completed_files,
+            token,
+            session,
+        )? {
+            manager().commands.send(Command::RetainInstallers {
+                retention,
+                job_id: job.job_id,
+                session,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn enqueue(
     artifacts: Vec<RemoteArtifact>,
     title: String,
@@ -116,19 +172,22 @@ pub(super) fn enqueue(
     destination: PathBuf,
     listener: mpsc::Sender<DownloadEvent>,
 ) -> Arc<AtomicBool> {
-    let request = request_from_download(super::DownloadRequest {
-        artifacts,
-        title,
-        access_token,
-        destination,
-        events: listener,
-    });
+    let request = request_from_download(
+        super::DownloadRequest {
+            artifacts,
+            title,
+            access_token,
+            destination,
+            events: listener,
+        },
+        crate::online::account_session(),
+    );
     let handle = request.handle.clone();
     let _ = manager().commands.send(Command::Enqueue(request));
     handle
 }
 
-fn request_from_download(request: super::DownloadRequest) -> Request {
+fn request_from_download(request: super::DownloadRequest, session: u64) -> Request {
     let super::DownloadRequest {
         artifacts,
         title,
@@ -141,6 +200,7 @@ fn request_from_download(request: super::DownloadRequest) -> Request {
     let handle = Arc::new(AtomicBool::new(false));
     Request {
         id,
+        session,
         artifacts,
         title,
         access_token,
@@ -288,6 +348,72 @@ fn run(
         };
         if let Some(command) = command {
             match command {
+                Command::RetentionFailed {
+                    job_id,
+                    session,
+                    message,
+                } => {
+                    let _ = crate::online::with_account_session(session, || {
+                        StateStore::open()?.set_download_job_status(
+                            &job_id,
+                            Some(&format!("Installer cleanup deferred: {message}")),
+                        )
+                    });
+                    publish_queue_snapshot(&subscribers);
+                }
+                Command::RetainInstallers {
+                    retention,
+                    job_id,
+                    session,
+                } => {
+                    let result = crate::online::with_account_session(session, || {
+                        anyhow::ensure!(shutdown_acknowledgement.is_none(), "Ludomere is closing");
+                        let _activity =
+                            crate::profile_reset::begin_activity("installer retention commit")?;
+                        super::cleanup::commit_retention(&StateStore::open()?, retention, &job_id)
+                    });
+                    let message = match result {
+                        Ok(result) => format!(
+                            "Installer cleanup: {} moved to Trash{}",
+                            result.deleted,
+                            if result.failures.is_empty() {
+                                String::new()
+                            } else {
+                                format!("; {}", result.failures.join("; "))
+                            }
+                        ),
+                        Err(error) => format!("Installer cleanup deferred: {error}"),
+                    };
+                    let _ = crate::online::with_account_session(session, || {
+                        StateStore::open()?.set_download_job_status(&job_id, Some(&message))
+                    });
+                    publish_queue_snapshot(&subscribers);
+                }
+                Command::EnqueueBackup(request, session, reply) => {
+                    let result = crate::online::with_account_session(session, || {
+                        let _activity = crate::profile_reset::begin_activity("backup scheduling")?;
+                        anyhow::ensure!(shutdown_acknowledgement.is_none(), "Ludomere is closing");
+                        let store = StateStore::open()?;
+                        let request = request_from_download(request, session);
+                        let id = request.artifacts[0].product_id;
+                        anyhow::ensure!(
+                            !crate::installation::is_game_running(id),
+                            "The game started while checking updates; retry after it closes"
+                        );
+                        anyhow::ensure!(!store.download_install_intents()?.iter().any(|intent| intent.product_id == id && intent.state != "complete"), "A pending installation uses these downloads");
+                        if !queued.iter().any(|other| other.id == request.id)
+                            && !active
+                                .lock()
+                                .is_ok_and(|active| active.contains_key(&request.id))
+                        {
+                            save_request(&store, &request, DownloadState::Queued)?;
+                            queued.push_back(request);
+                        }
+                        authentication_available = true;
+                        Ok(())
+                    });
+                    let _ = reply.send(result);
+                }
                 Command::DeleteManaged(files, after_uninstall, reply) => {
                     let product_id = files.product_id;
                     let result = StateStore::open()
@@ -323,7 +449,7 @@ fn run(
                             }
                             let count = requests.len();
                             for request in requests {
-                                let request = request_from_download(request);
+                                let request = request_from_download(request, session);
                                 if !queued.iter().any(|queued| queued.id == request.id)
                                     && !active
                                         .lock()
@@ -443,6 +569,21 @@ fn run(
                     if removing.remove(&request.id) {
                         cleanup_job(&request.id);
                         let _ = request.listener.send(DownloadEvent::Cancelled);
+                    } else if let DownloadEvent::Failed(failure) = &event
+                        && failure.kind == DownloadFailureKind::Bookkeeping
+                    {
+                        if request.session == crate::online::account_session() {
+                            publish(
+                                &subscribers,
+                                DownloadManagerEvent::BookkeepingFailed {
+                                    job_id: request.id.clone(),
+                                    product_id: request.artifacts[0].product_id,
+                                    message: failure.message.clone(),
+                                    session: request.session,
+                                },
+                            );
+                        }
+                        let _ = request.listener.send(event);
                     } else if shutdown_acknowledgement.is_some()
                         && !matches!(event, DownloadEvent::Complete { .. })
                     {
@@ -461,7 +602,8 @@ fn run(
                             let _ =
                                 commands.send(Command::ManifestRefreshed(request, failure, result));
                         });
-                    } else if !authentication_available
+                    } else if (!authentication_available
+                        && !matches!(event, DownloadEvent::Complete { .. }))
                         || matches!(&event, DownloadEvent::Failed(failure) if failure.kind == DownloadFailureKind::Authentication)
                     {
                         authentication_available = false;
@@ -484,10 +626,47 @@ fn run(
                         queued.push_back(request);
                     } else {
                         if matches!(event, DownloadEvent::Complete { .. }) {
-                            if shutdown_acknowledgement.is_none()
-                                && let Ok(store) = StateStore::open()
-                            {
+                            let follow_up = authentication_available
+                                && shutdown_acknowledgement.is_none()
+                                && request.session == crate::online::account_session();
+                            if follow_up && let Ok(store) = StateStore::open() {
                                 let _ = super::auto_install::process(&store);
+                            }
+                            if follow_up
+                                && let DownloadEvent::Complete { files } = &event
+                                && request.artifacts.iter().all(|artifact| {
+                                    artifact.kind == crate::domain::ArtifactKind::Installer
+                                })
+                            {
+                                let request = request.clone();
+                                let files = files.clone();
+                                let commands = commands.clone();
+                                std::thread::spawn(
+                                    move || match super::cleanup::prepare_retention(
+                                        request.artifacts[0].product_id,
+                                        &request.id,
+                                        &request.artifacts,
+                                        &files,
+                                        &request.access_token,
+                                        request.session,
+                                    ) {
+                                        Ok(Some(retention)) => {
+                                            let _ = commands.send(Command::RetainInstallers {
+                                                retention,
+                                                job_id: request.id,
+                                                session: request.session,
+                                            });
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            let _ = commands.send(Command::RetentionFailed {
+                                                job_id: request.id,
+                                                session: request.session,
+                                                message: crate::updates::status_error(&error),
+                                            });
+                                        }
+                                    },
+                                );
                             }
                             publish(
                                 &subscribers,
@@ -682,6 +861,7 @@ fn schedule(
             request.access_token.clone(),
             request.destination.clone(),
             concurrency,
+            request.session,
             worker_sender,
         );
         if let Ok(mut active) = active.lock() {
@@ -823,6 +1003,7 @@ fn recover_jobs(
         let _ = store.recover_download_job(&job.job_id, downloaded);
         let (listener, _) = mpsc::channel();
         queued.push_back(Request {
+            session: crate::online::account_session(),
             id: job.job_id,
             artifacts: job.artifacts,
             title: job.title,
@@ -868,6 +1049,7 @@ fn request_from_job(id: &str, access_token: String) -> Option<Request> {
     }
     let (listener, _) = mpsc::channel();
     Some(Request {
+        session: crate::online::account_session(),
         id: job.job_id,
         artifacts: job.artifacts,
         title: job.title,
@@ -974,6 +1156,121 @@ fn cleanup_job(id: &str) {
 mod tests {
     use super::{queue_insertion_index, should_refresh_manifest};
     use crate::download::DownloadFailureKind;
+
+    #[test]
+    fn committed_completion_survives_auth_disable_or_stale_session_without_follow_up() {
+        if std::env::var_os("LUDOMERE_TERMINAL_RACE_CHILD").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact","download::manager::tests::committed_completion_survives_auth_disable_or_stale_session_without_follow_up","--nocapture"])
+                .env("LUDOMERE_TERMINAL_RACE_CHILD","1");
+            for key in [
+                "HOME",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+            ] {
+                let path = root.path().join(key);
+                std::fs::create_dir(&path).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                command.env(key, path);
+            }
+            assert!(command.status().unwrap().success());
+            return;
+        }
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open().unwrap();
+        for (product, authenticated, session) in [
+            (71, false, crate::online::account_session()),
+            (72, true, crate::online::account_session().wrapping_sub(1)),
+        ] {
+            let artifacts:Vec<RemoteArtifact>=serde_json::from_value(serde_json::json!([
+                {"product_id":product,"kind":"installer","name":"Terminal fixture","size_bytes":4,"download_path":"/never-requested"}
+            ])).unwrap();
+            let files = vec![root.path().join(format!("{product}.bin"))];
+            fs::write(&files[0], b"data").unwrap();
+            let (listener, events) = mpsc::channel();
+            let request = request_from_download(
+                crate::download::DownloadRequest {
+                    artifacts,
+                    title: "Fixture".into(),
+                    access_token: "inert".into(),
+                    destination: root.path().to_owned(),
+                    events: listener,
+                },
+                session,
+            );
+            store
+                .save_download_job(&DownloadJobUpdate {
+                    job_id: &request.id,
+                    product_id: product,
+                    title: "Fixture",
+                    artifacts: &request.artifacts,
+                    destination: &request.destination,
+                    state: DownloadState::Complete,
+                    bytes_downloaded: 4,
+                    total_bytes: Some(4),
+                    completed_files: &files,
+                    error: None,
+                })
+                .unwrap();
+            // Invalid inert plan detects any unintended auto-install processing without executing a payload.
+            store
+                .save_download_install_intent(&crate::state::DownloadInstallIntent {
+                    product_id: product,
+                    intent_id: format!("consent-{product}"),
+                    job_ids: vec![request.id.clone()],
+                    plan_json: "{}".into(),
+                    state: "waiting".into(),
+                    error: None,
+                })
+                .unwrap();
+            let (commands, receiver) = mpsc::channel();
+            let active = Arc::new(Mutex::new(HashMap::new()));
+            let (subscriber, snapshots) = mpsc::channel();
+            let subscribers = Arc::new(Mutex::new(vec![subscriber]));
+            let worker_commands = commands.clone();
+            let worker =
+                std::thread::spawn(move || run(receiver, worker_commands, active, subscribers));
+            commands
+                .send(Command::SetAuthentication(authenticated))
+                .unwrap();
+            commands
+                .send(Command::Terminal(
+                    request.clone(),
+                    DownloadEvent::Complete {
+                        files: files.clone(),
+                    },
+                ))
+                .unwrap();
+            assert!(
+                matches!(events.recv_timeout(Duration::from_secs(2)).unwrap(),DownloadEvent::Complete {files:received} if received==files)
+            );
+            let (acknowledge, closed) = mpsc::channel();
+            commands.send(Command::Shutdown(acknowledge)).unwrap();
+            closed.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            let job = store.download_job(&request.id).unwrap().unwrap();
+            assert_eq!(job.state, DownloadState::Complete);
+            assert_eq!(job.completed_files, files);
+            assert_eq!(job.bytes_downloaded, 4);
+            assert!(
+                store
+                    .download_install_intents()
+                    .unwrap()
+                    .iter()
+                    .all(|intent| intent.state == "waiting")
+            );
+            assert!(snapshots.try_iter().any(
+                |event| matches!(event,DownloadManagerEvent::ManagedFilesChanged(id) if id==product)
+            ));
+            assert_eq!(fs::read(&files[0]).unwrap(), b"data");
+        }
+    }
 
     #[test]
     fn obsolete_captured_account_cannot_register_intent_or_restore_authentication() {

@@ -18,8 +18,8 @@ pub fn build_window(app: &adw::Application) {
     let tags = store.tags().unwrap_or_default();
     let cached_profile = store.cached_profile().unwrap_or_default();
     let download_jobs = store.download_jobs().unwrap_or_default();
-    let downloaded_products = downloaded_product_ids(&download_jobs);
-    let downloaded_installer_products = downloaded_installer_product_ids(&download_jobs);
+    let downloaded_products = HashSet::new();
+    let downloaded_installer_products = HashSet::new();
     let (owned_product_count, online_synced_at) = store.owned_library_status().unwrap_or_default();
     let card_width = [140, 180, 220, 260][config.library_card_size.min(3) as usize];
     let sidebar_sort_mode = config.sidebar_sort_mode;
@@ -41,6 +41,9 @@ pub fn build_window(app: &adw::Application) {
         local_actions: HashMap::new(),
         local_refresh_running: false,
         local_refresh_pending: false,
+        local_priority_running: false,
+        local_priority_pending: HashSet::new(),
+        local_versions: HashMap::new(),
         local_revision: 0,
         core_loading: false,
         sync_running: false,
@@ -51,6 +54,13 @@ pub fn build_window(app: &adw::Application) {
         patch_notes: HashMap::new(),
         favorites,
         tags,
+        hidden_products: store.hidden_product_ids().unwrap_or_default(),
+        hidden_pending: HashSet::new(),
+        show_hidden: false,
+        tag_filters: BTreeSet::new(),
+        tag_match_all: false,
+        organization_pending: false,
+        policy_saving: HashSet::new(),
         favorites_only: false,
         downloaded_only: false,
         installed_only: false,
@@ -94,6 +104,18 @@ pub fn build_window(app: &adw::Application) {
     let widgets = Rc::new(create_widgets(app, &model.borrow().config));
 
     connect_actions(&widgets, &model, &store);
+    organization::initialize(&widgets, &model);
+    {
+        let widgets = Rc::downgrade(&widgets);
+        let model = Rc::downgrade(&model);
+        glib::timeout_add_local(Duration::from_secs(6 * 60 * 60), move || {
+            let (Some(widgets), Some(model)) = (widgets.upgrade(), model.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            update_policies::check_updates(&widgets, &model, false);
+            glib::ControlFlow::Continue
+        });
+    }
     {
         let model = model.clone();
         widgets
@@ -217,8 +239,9 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let mut changed_products = HashSet::new();
         let mut terminal_products = HashSet::new();
+        let mut outcomes = HashMap::new();
         let mut activity_changed = false;
-        while let Ok(event) = events.try_recv() {
+        for event in events.try_iter().take(512) {
             match event {
                 crate::installation::InstallationManagerEvent::OperationQueued(snapshot) => {
                     changed_products.insert(snapshot.product_id);
@@ -235,12 +258,14 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                             .or_default();
                         activity.last_activity_at =
                             Some(activity.last_activity_at.map_or(now, |old| old.max(now)));
-                        if let Ok(store) = StateStore::open()
-                            && let Err(error) =
-                                store.record_product_activity(snapshot.product_id, now)
-                        {
-                            tracing::warn!(%error, product_id = snapshot.product_id, "recording attempted installation activity");
-                        }
+                        let product_id = snapshot.product_id;
+                        std::thread::spawn(move || {
+                            if let Ok(store) = StateStore::open()
+                                && let Err(error) = store.record_product_activity(product_id, now)
+                            {
+                                tracing::warn!(%error, product_id, "recording attempted installation activity");
+                            }
+                        });
                         activity_changed = true;
                     }
                 }
@@ -248,6 +273,7 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     changed_products.insert(snapshot.product_id);
                 }
                 crate::installation::InstallationManagerEvent::OperationCancelled(snapshot) => {
+                    outcomes.insert(snapshot.product_id, "Operation cancelled");
                     changed_products.insert(snapshot.product_id);
                     terminal_products.insert(snapshot.product_id);
                 }
@@ -256,6 +282,18 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     event,
                 } => {
                     changed_products.insert(product_id);
+                    match &event {
+                        crate::installation::InstallationEvent::Complete { .. } => {
+                            outcomes.insert(product_id, "Installed");
+                        }
+                        crate::installation::InstallationEvent::Cancelled => {
+                            outcomes.insert(product_id, "Installation cancelled");
+                        }
+                        crate::installation::InstallationEvent::Failed(_) => {
+                            outcomes.insert(product_id, "Installation failed; see game details");
+                        }
+                        _ => {}
+                    }
                     if matches!(
                         &event,
                         crate::installation::InstallationEvent::Complete { .. }
@@ -291,6 +329,21 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     event,
                 } => {
                     changed_products.insert(product_id);
+                    match &event {
+                        crate::installation::UninstallationEvent::Complete => {
+                            outcomes.insert(product_id, "Uninstalled");
+                        }
+                        crate::installation::UninstallationEvent::Cancelled => {
+                            outcomes.insert(product_id, "Uninstall cancelled");
+                        }
+                        crate::installation::UninstallationEvent::Failed(_) => {
+                            outcomes.insert(
+                                product_id,
+                                "Uninstall or cleanup failed; see game details",
+                            );
+                        }
+                        _ => {}
+                    }
                     if matches!(
                         event,
                         crate::installation::UninstallationEvent::Complete
@@ -302,8 +355,8 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                 }
             }
         }
-        while let Ok(crate::installation::DepotManagerEvent::Snapshot(snapshot)) =
-            depot_events.try_recv()
+        for crate::installation::DepotManagerEvent::Snapshot(snapshot) in
+            depot_events.try_iter().take(512)
         {
             let state_changed = depot_states
                 .insert(snapshot.operation_id, snapshot.state.clone())
@@ -317,6 +370,16 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
             }
             if terminal {
                 terminal_products.insert(snapshot.product_id);
+                if state_changed {
+                    outcomes.insert(
+                        snapshot.product_id,
+                        match snapshot.state.as_str() {
+                            "complete" => "Depot operation completed",
+                            "cancelled" | "abandoned" => "Depot operation cancelled",
+                            _ => "Depot operation failed; see Downloads",
+                        },
+                    );
+                }
             }
         }
         if activity_changed && model.borrow().sidebar_sort_mode == SidebarSortMode::LastPlayed {
@@ -350,11 +413,26 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     crate::domain::InstallationState::Pending => "Uninstalled",
                 }
             };
-            w.status.set_label(&format!("{action} {game_title}"));
+            if !terminal_products.contains(&product_id) {
+                show_progress(&w, &format!("{action} {game_title}"));
+            }
+        }
+        for (id, outcome) in outcomes {
+            let title = model
+                .borrow()
+                .games
+                .iter()
+                .find(|game| game.product_id == id)
+                .map(|game| game.title.clone())
+                .unwrap_or_else(|| "game".into());
+            if w.live_status.label().ends_with(&title) {
+                show_progress(&w, "");
+            }
+            show_status(&w, &format!("{title}: {outcome}"));
         }
 
         if !terminal_products.is_empty() {
-            refresh_local_action_state(&w, &model);
+            refresh_local_products(&w, &model, &terminal_products);
         }
         glib::ControlFlow::Continue
     });
@@ -423,9 +501,18 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
                 managed::apply_to_games(&mut state.games, &reconciliation.files);
                 managed::set_locations(&mut state.games, &download_directory);
                 state.download_jobs = reconciliation.jobs;
-                state.downloaded_products = downloaded_product_ids(&state.download_jobs);
-                state.downloaded_installer_products =
-                    downloaded_installer_product_ids(&state.download_jobs);
+                state.downloaded_products = reconciliation
+                    .files
+                    .iter()
+                    .filter(|file| file.present)
+                    .map(|file| file.product_id)
+                    .collect();
+                state.downloaded_installer_products = reconciliation
+                    .files
+                    .iter()
+                    .filter(|file| file.present && file.kind == ArtifactKind::Installer)
+                    .map(|file| file.product_id)
+                    .collect();
                 drop(state);
                 update_sidebar_download_styles(&w, &model.borrow());
                 refresh_local_action_state(&w, &model);
@@ -667,6 +754,8 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     let downloaded_filter = gtk::CheckButton::with_label("Downloaded content");
     downloaded_filter.set_tooltip_text(Some("Show games with downloaded base-game or DLC content"));
     library_column.append(&downloaded_filter);
+    let organization_filters = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    library_column.append(&organization_filters);
     library_column.append(&filter_heading("Operating system"));
     let windows_filter = gtk::CheckButton::with_label("Windows");
     let linux_filter = gtk::CheckButton::with_label("Linux");
@@ -952,7 +1041,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     download_content.set_valign(gtk::Align::Center);
     let download_heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     download_heading.set_valign(gtk::Align::Center);
-    let status = gtk::Label::new(Some("Ready"));
+    let status = gtk::Label::new(None);
     status.set_widget_name("application-status-message");
     status.set_xalign(0.0);
     status.set_valign(gtk::Align::Center);
@@ -960,7 +1049,15 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     status.set_width_chars(21);
     status.set_max_width_chars(21);
     status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    download_heading.append(&status);
+    let notifications = notifications::Notifications::new(&window, &status);
+    download_content.append(&notifications.root);
+    let live_status = gtk::Label::new(None);
+    live_status.set_widget_name("application-live-status");
+    live_status.set_xalign(0.0);
+    live_status.set_max_width_chars(24);
+    live_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    live_status.set_visible(false);
+    download_heading.append(&live_status);
     let download_percent = gtk::Label::new(None);
     download_percent.set_xalign(1.0);
     download_percent.set_valign(gtk::Align::Center);
@@ -993,6 +1090,8 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     Widgets {
         window,
         status,
+        live_status,
+        notifications,
         status_bar,
         sync_spinner,
         sync_status,
@@ -1019,6 +1118,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         playable_toggle,
         filter_count,
         filter_button,
+        organization_filters,
         clear_filters,
         favorite_filter,
         downloaded_filter,
@@ -1063,6 +1163,22 @@ pub(super) fn connect_actions(
     model: &Rc<RefCell<AppModel>>,
     store: &Rc<StateStore>,
 ) {
+    let offline = gio::SimpleAction::new("offline-download", Some(&i64::static_variant_type()));
+    offline.connect_activate({
+        let w = w.clone();
+        let model = model.clone();
+        move |_, value| {
+            let detail = value
+                .and_then(|value| value.get::<i64>())
+                .and_then(|id| current_detail(&model.borrow(), id, None));
+            if !model.borrow().logout_pending
+                && let Some(detail) = detail
+            {
+                show_download_selector(&w, &model, &detail);
+            }
+        }
+    });
+    w.window.add_action(&offline);
     {
         let w = w.clone();
         let model = model.clone();
@@ -1216,6 +1332,8 @@ pub(super) fn connect_actions(
                 None
             };
             cancel_cover_indicators(&w);
+            w.notifications.clear();
+            show_progress(&w, "");
             let (config, previous_sections) = {
                 let mut state = model.borrow_mut();
                 state.logout_pending = true;
@@ -1246,7 +1364,7 @@ pub(super) fn connect_actions(
             w.sync_dismiss.set_visible(false);
             w.sync_options.set_visible(false);
             w.account_popover.popdown();
-            show_status(&w, if config.clear_profile_on_sign_out {
+            show_progress(&w, if config.clear_profile_on_sign_out {
                 "Preparing profile reset; Ludomere will close…"
             } else {
                 "Signing out of GOG…"
@@ -1276,13 +1394,14 @@ pub(super) fn connect_actions(
                     Err(_) => Err(anyhow::anyhow!("Sign-out preparation stopped; try again")),
                 };
                 if matches!(result, Ok(true)) {
-                    show_status(&w, "Closing Ludomere to clear the profile…");
+                    show_progress(&w, "Closing Ludomere to clear the profile…");
                     if let Some(app) = w.window.application() {
                         app.quit();
                     }
                     return glib::ControlFlow::Break;
                 }
                 model.borrow_mut().logout_pending = false;
+                show_progress(&w, "");
                 w.sign_out.set_sensitive(true);
                 w.sign_in.set_sensitive(true);
                 for (window, sensitive) in &reset_windows {
@@ -1425,7 +1544,9 @@ pub(super) fn connect_actions(
                 model.genre_theme_filters.clear();
                 model.game_mode_filters.clear();
                 model.property_filters.clear();
+                model.tag_filters.clear();
             }
+            organization::rebuild_filters(&w, &model);
             w.favorite_filter.set_active(false);
             w.downloaded_filter.set_active(false);
             w.installed_filter.set_active(false);

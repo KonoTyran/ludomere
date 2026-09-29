@@ -72,11 +72,41 @@ fn run(
     keys.dedup();
     let mut result = CloudSyncResult::default();
     let mut next = baseline.clone();
+    let tombstones = cloud
+        .account_id()
+        .map(|account| store.cloud_save_tombstones(account, product_id))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (format!("{}/{}", entry.namespace, entry.path), entry))
+        .collect::<HashMap<_, _>>();
 
     for key in keys {
         let local_file = local.get(&key);
         let remote_file = remote.get(&key);
         let previous = baseline.get(&key);
+        if let Some(tombstone) = tombstones.get(&key) {
+            if mode != CloudSyncMode::ForceUpload
+                && remote_file.is_none()
+                && local_file.map(|file| &file.metadata.etag) == tombstone.local_etag.as_ref()
+            {
+                // The local copy was explicitly retained when its remote revision was deleted.
+                // Preserve the intent even if a DELETE response or the application was lost.
+                next.remove(&key);
+                continue;
+            }
+            if (mode == CloudSyncMode::ForceUpload
+                || local_file.map(|file| &file.metadata.etag) != tombstone.local_etag.as_ref())
+                && let Some(account) = cloud.account_id()
+            {
+                store.remove_cloud_save_tombstone(
+                    account,
+                    product_id,
+                    &tombstone.namespace,
+                    &tombstone.path,
+                )?;
+            }
+        }
         let local_changed =
             local_file.map(|f| Some(&f.metadata.etag)) != previous.map(|b| b.local_etag.as_ref());
         let remote_changed =
@@ -91,7 +121,7 @@ fn run(
             (Some(local), _, CloudSyncMode::ForceUpload)
             | (Some(local), None, _)
             | (Some(local), Some(_), CloudSyncMode::Normal)
-                if local_changed =>
+                if local_changed || mode == CloudSyncMode::ForceUpload =>
             {
                 let bytes = read_file(&local.path)?;
                 let uploaded = cloud.upload(

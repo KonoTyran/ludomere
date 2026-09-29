@@ -653,95 +653,51 @@ pub(super) fn rebuild_home_grid(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
 }
 
 pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
-    static REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let request = REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let games = model.games.clone();
-    let config = model.config.clone();
     let titles = model
         .games
         .iter()
         .map(|game| (game.product_id, game.title.clone()))
-        .collect::<HashMap<_, _>>();
-    let game_libraries = model.config.game_libraries.clone();
-    let show_backup_status = model.config.show_backup_status;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let snapshot = StateStore::open().and_then(|store| {
-            let mut coverage = HashMap::new();
-            let mut required_dlcs = HashMap::new();
-            for game in games {
-                let detail = DetailPageModel::game(game, false);
-                coverage.insert(
-                    detail.product_id,
-                    installer_backup_coverage(&detail, &config),
-                );
-                required_dlcs.insert(detail.product_id, required_owned_dlc_ids(&detail, &config));
-            }
-            let installed =
-                crate::installation::reconcile_installed_games(&store, &game_libraries)?;
-            let installed_updates = installed
-                .iter()
-                .filter(|game| store.installation_update_available(game).unwrap_or(false))
-                .map(|game| game.product_id)
-                .collect();
-            let installed_dlcs = installed
-                .iter()
-                .map(|game| {
-                    Ok((
-                        game.product_id,
-                        crate::installation::installed_dlc_ids(&store, game.product_id)?,
-                    ))
-                })
-                .collect::<anyhow::Result<HashMap<_, _>>>()?;
-            let dlc_updates = installed
-                .iter()
-                .map(|game| {
-                    Ok((
-                        game.product_id,
-                        crate::installation::installed_dlc_updates(&store, game.product_id)?,
-                    ))
-                })
-                .collect::<anyhow::Result<HashMap<_, _>>>()?;
-            Ok((
-                installed,
-                installed_updates,
-                installed_dlcs,
-                dlc_updates,
-                coverage,
-                required_dlcs,
-            ))
-        });
-        let _ = sender.send(snapshot);
-    });
-    let w = w.clone_refs();
-    glib::timeout_add_local(Duration::from_millis(16), move || {
-        let snapshot = match receiver.try_recv() {
-            Ok(Ok(snapshot)) => snapshot,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "could not load sidebar installation states");
-                return glib::ControlFlow::Break;
-            }
-            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
-        };
-        if request != REQUEST.load(std::sync::atomic::Ordering::Relaxed) {
-            return glib::ControlFlow::Break;
-        }
-        apply_sidebar_download_styles(
-            &w,
-            &snapshot.4,
-            &snapshot.5,
-            &titles,
-            SidebarInstallationSnapshot {
-                installed: &snapshot.0,
-                updates: &snapshot.1,
-                dlcs: &snapshot.2,
-                dlc_updates: &snapshot.3,
-            },
-            show_backup_status,
-        );
-        glib::ControlFlow::Break
-    });
+        .collect();
+    let coverage = model
+        .local_actions
+        .iter()
+        .map(|(&id, state)| (id, state.coverage))
+        .collect();
+    let required = model
+        .local_actions
+        .iter()
+        .map(|(&id, state)| (id, state.required_dlcs.clone()))
+        .collect();
+    let dlcs = model
+        .local_actions
+        .iter()
+        .map(|(&id, state)| (id, state.installed_dlcs.clone()))
+        .collect();
+    let dlc_updates = model
+        .local_actions
+        .iter()
+        .map(|(&id, state)| (id, state.dlc_updates.clone()))
+        .collect();
+    let updates = model
+        .local_actions
+        .iter()
+        .filter(|(_, state)| state.installed_update)
+        .map(|(&id, _)| id)
+        .collect();
+    let installed = model.installed_games.values().cloned().collect::<Vec<_>>();
+    apply_sidebar_download_styles(
+        w,
+        &coverage,
+        &required,
+        &titles,
+        SidebarInstallationSnapshot {
+            installed: &installed,
+            updates: &updates,
+            dlcs: &dlcs,
+            dlc_updates: &dlc_updates,
+        },
+        model.config.show_backup_status,
+    );
 }
 
 struct SidebarInstallationSnapshot<'a> {
@@ -877,6 +833,11 @@ fn apply_sidebar_download_styles(
 }
 
 pub(super) fn game_matches_library_filters(model: &AppModel, id: i64) -> bool {
+    if (!model.show_hidden && model.hidden_products.contains(&id))
+        || !organization::matches_tags(model.tags.get(&id), &model.tag_filters, model.tag_match_all)
+    {
+        return false;
+    }
     let Some(game) = model.games.iter().find(|game| game.product_id == id) else {
         return false;
     };
@@ -1146,7 +1107,8 @@ pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
     .count()
         + model.genre_theme_filters.len()
         + model.game_mode_filters.len()
-        + model.property_filters.len();
+        + model.property_filters.len()
+        + model.tag_filters.len();
     for label in [
         &w.genre_theme_filter_label,
         &w.game_mode_filter_label,

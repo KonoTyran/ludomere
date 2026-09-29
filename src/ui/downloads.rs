@@ -1,65 +1,150 @@
 use super::*;
 
+fn coalesce_download_events(
+    jobs: &mut Vec<DownloadJobRecord>,
+    changed: &mut HashSet<i64>,
+    failures: &mut HashMap<String, String>,
+    events: impl IntoIterator<Item = download::DownloadManagerEvent>,
+) -> (bool, Option<String>) {
+    let mut structural = false;
+    let mut error = None;
+    for event in events {
+        match event {
+            download::DownloadManagerEvent::QueueSnapshot(snapshot) => {
+                for job in &snapshot {
+                    if job.state == DownloadState::Complete {
+                        failures.remove(&job.job_id);
+                    }
+                }
+                *jobs = snapshot;
+                structural = true;
+            }
+            download::DownloadManagerEvent::Progress {
+                job_id,
+                downloaded,
+                total,
+            } => {
+                failures.remove(&job_id);
+                if let Some(job) = jobs.iter_mut().find(|job| job.job_id == job_id) {
+                    job.bytes_downloaded = downloaded;
+                    job.total_bytes = total.or(job.total_bytes);
+                    job.state = DownloadState::Downloading;
+                }
+            }
+            download::DownloadManagerEvent::ManagedFilesChanged(id) => {
+                changed.insert(id);
+                structural = true;
+            }
+            download::DownloadManagerEvent::BookkeepingFailed {
+                job_id,
+                product_id: _,
+                message,
+                session,
+            } => {
+                if session != online::account_session() {
+                    continue;
+                }
+                failures.insert(job_id.clone(), message.clone());
+                error = Some(message);
+            }
+            download::DownloadManagerEvent::AuthenticationRequired => {}
+        }
+    }
+    (structural, error)
+}
+
+fn apply_registration_failures(jobs: &mut [DownloadJobRecord], failures: &HashMap<String, String>) {
+    for job in jobs {
+        if let Some(message) = failures.get(&job.job_id) {
+            job.state = DownloadState::Failed;
+            job.error = Some(message.clone());
+            job.status_message = Some("Files downloaded; registration needs retry".into());
+        }
+    }
+}
+
 pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     struct Snapshot {
         jobs: Vec<DownloadJobRecord>,
         blocked_auto_installs: HashMap<String, i64>,
-        downloaded_products: HashSet<i64>,
-        downloaded_installer_products: HashSet<i64>,
         active_job_ids: HashSet<String>,
-        managed_files_changed: Option<i64>,
+        managed_files_changed: HashSet<i64>,
+        error: Option<String>,
+        session: u64,
     }
 
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(8);
     let (depot_sender, depot_receiver) = mpsc::channel();
     let manager_events = download::manager_events();
     std::thread::spawn(move || {
         let mut jobs = StateStore::open()
             .and_then(|store| store.download_jobs())
             .unwrap_or_default();
+        let mut blocked_auto_installs = HashMap::new();
+        let mut downloaded_products = HashSet::new();
+        let mut downloaded_installer_products = HashSet::new();
+        let mut failures = HashMap::new();
+        let mut session = online::account_session();
         while let Ok(event) = manager_events.recv() {
-            let mut managed_files_changed = None;
-            match event {
-                download::DownloadManagerEvent::QueueSnapshot(snapshot) => jobs = snapshot,
-                download::DownloadManagerEvent::Progress {
-                    job_id,
-                    downloaded,
-                    total,
-                } => {
-                    if let Some(job) = jobs.iter_mut().find(|job| job.job_id == job_id) {
-                        job.bytes_downloaded = downloaded;
-                        job.total_bytes = total.or(job.total_bytes);
-                        job.state = DownloadState::Downloading;
+            if session != online::account_session() {
+                session = online::account_session();
+                failures.clear();
+                blocked_auto_installs.clear();
+            }
+            let mut managed_files_changed = HashSet::new();
+            let (structural, mut error) = coalesce_download_events(
+                &mut jobs,
+                &mut managed_files_changed,
+                &mut failures,
+                std::iter::once(event).chain(manager_events.try_iter().take(511)),
+            );
+            if structural {
+                let result = StateStore::open().and_then(|store| {
+                    Ok((
+                        store.download_install_intents()?,
+                        store.managed_download_summary()?,
+                    ))
+                });
+                match result {
+                    Ok((intents, (products, installers))) => {
+                        managed_files_changed
+                            .extend(downloaded_products.symmetric_difference(&products).copied());
+                        managed_files_changed.extend(
+                            downloaded_installer_products
+                                .symmetric_difference(&installers)
+                                .copied(),
+                        );
+                        downloaded_products = products;
+                        downloaded_installer_products = installers;
+                        blocked_auto_installs = intents
+                            .into_iter()
+                            .filter(|intent| intent.state == "blocked")
+                            .filter_map(|intent| {
+                                intent
+                                    .job_ids
+                                    .first()
+                                    .map(|job| (job.clone(), intent.product_id))
+                            })
+                            .collect();
+                    }
+                    Err(failure) => {
+                        error = Some(failure.to_string());
                     }
                 }
-                download::DownloadManagerEvent::ManagedFilesChanged(product_id) => {
-                    tracing::debug!(product_id, "managed download files changed");
-                    managed_files_changed = Some(product_id);
-                }
-                download::DownloadManagerEvent::AuthenticationRequired => {}
             }
+            let mut presented_jobs = jobs.clone();
+            apply_registration_failures(&mut presented_jobs, &failures);
             let snapshot = Snapshot {
-                blocked_auto_installs: StateStore::open()
-                    .and_then(|store| store.download_install_intents())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|intent| intent.state == "blocked")
-                    .filter_map(|intent| {
-                        intent
-                            .job_ids
-                            .first()
-                            .map(|job| (job.clone(), intent.product_id))
-                    })
-                    .collect(),
-                downloaded_products: downloaded_product_ids(&jobs),
-                downloaded_installer_products: downloaded_installer_product_ids(&jobs),
+                blocked_auto_installs: blocked_auto_installs.clone(),
                 active_job_ids: jobs
                     .iter()
                     .filter(|job| download::is_active(&job.job_id))
                     .map(|job| job.job_id.clone())
                     .collect(),
                 managed_files_changed,
-                jobs: jobs.clone(),
+                error,
+                session,
+                jobs: presented_jobs,
             };
             if sender.send(snapshot).is_err() {
                 break;
@@ -87,16 +172,25 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
         // change the owning game's action state without changing the coarse set of
         // products that have at least one downloaded installer.
         let mut managed_file_changes = HashSet::new();
-        while let Ok(snapshot) = receiver.try_recv() {
-            if let Some(product_id) = snapshot.managed_files_changed {
-                managed_file_changes.insert(product_id);
+        for snapshot in receiver.try_iter().take(256) {
+            if snapshot.session != online::account_session() {
+                continue;
+            }
+            managed_file_changes.extend(snapshot.managed_files_changed.iter().copied());
+            if let Some(error) = &snapshot.error {
+                hold_status_notice(
+                    Some(&w.status),
+                    &format!(
+                        "Could not refresh downloaded files; previous state retained: {error}"
+                    ),
+                );
             }
             latest = Some(snapshot);
         }
         let mut depot_changed = false;
         {
             let mut state = model.borrow_mut();
-            while let Ok(snapshot) = depot_receiver.try_recv() {
+            for snapshot in depot_receiver.try_iter().take(512) {
                 if let Some(current) = state
                     .depot_operations
                     .iter_mut()
@@ -124,33 +218,31 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
                 .set_action_target_value(Some(&product_id.to_variant()));
             w.finish_setup.set_visible(true);
         }
-        let (should_refresh_filters, should_refresh_sidebar, jobs_changed) = {
+        let jobs_changed = {
             let mut state = model.borrow_mut();
-            let products_changed = state.downloaded_products != snapshot.downloaded_products;
-            let installers_changed =
-                state.downloaded_installer_products != snapshot.downloaded_installer_products;
-            let jobs_changed = download_job_structure_changed(&state.download_jobs, &snapshot.jobs)
+            for job in &snapshot.jobs {
+                if state
+                    .download_jobs
+                    .iter()
+                    .any(|old| old.job_id == job.job_id && old.state != job.state)
+                {
+                    let result = match job.state {
+                        DownloadState::Complete => Some("Download completed"),
+                        DownloadState::Failed => Some("Download failed; open Downloads to retry"),
+                        DownloadState::Paused => Some("Download paused"),
+                        _ => None,
+                    };
+                    if let Some(result) = result {
+                        show_status(&w, &format!("{}: {result}", job.title));
+                    }
+                }
+            }
+            let changed = download_job_structure_changed(&state.download_jobs, &snapshot.jobs)
                 || state.blocked_auto_installs != snapshot.blocked_auto_installs;
             state.blocked_auto_installs = snapshot.blocked_auto_installs;
-            if products_changed {
-                state.downloaded_products = snapshot.downloaded_products;
-            }
-            if installers_changed {
-                state.downloaded_installer_products = snapshot.downloaded_installer_products;
-            }
             state.download_jobs = snapshot.jobs;
-            (
-                products_changed && state.downloaded_only,
-                installers_changed,
-                jobs_changed,
-            )
+            changed
         };
-        if should_refresh_filters {
-            refresh_filters(&w, &model.borrow());
-        }
-        if should_refresh_sidebar {
-            update_sidebar_download_styles(&w, &model.borrow());
-        }
         if !managed_file_changes.is_empty() {
             let affected_games = owning_game_ids(&model.borrow(), &managed_file_changes);
             // Installation/update availability is derived from the managed-file
@@ -158,7 +250,7 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             // not change (for example, replacing an invalid part or downloading a
             // patch/DLC for a game that already has another installer).
             update_sidebar_download_styles(&w, &model.borrow());
-            refresh_selected_game_after_managed_change(&w, &model, &affected_games);
+            refresh_local_products(&w, &model, &affected_games);
             if model.borrow().downloaded_only {
                 refresh_filters(&w, &model.borrow());
             }
@@ -187,13 +279,14 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             let percent = total
                 .filter(|total| *total > 0)
                 .map(|total| ((job.bytes_downloaded as f64 / total as f64) * 100.0) as u64);
-            if !w.status.has_css_class("cleanup-notice") {
-                w.status.set_label(&if finalizing {
+            show_progress(
+                &w,
+                &if finalizing {
                     format!("Finalizing {title}")
                 } else {
                     title.to_owned()
-                });
-            }
+                },
+            );
             w.download_percent
                 .set_label(&percent.map(|value| format!("{value}%")).unwrap_or_default());
             w.download_percent.set_visible(percent.is_some());
@@ -224,14 +317,17 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
                 })
             });
             if let Some(blocking) = blocking {
-                if !w.status.has_css_class("cleanup-notice") {
-                    w.status
-                        .set_label(&format!("Downloads waiting  ·  {blocking}"));
-                }
+                show_progress(&w, &format!("Downloads waiting  ·  {blocking}"));
                 previously_active.set(false);
-            } else if previously_active.replace(false) && !w.status.has_css_class("cleanup-notice")
-            {
-                w.status.set_label("Downloads complete");
+            } else if previously_active.replace(false) {
+                show_progress(&w, "");
+                if state
+                    .download_jobs
+                    .iter()
+                    .all(|job| job.state == DownloadState::Complete)
+                {
+                    show_status(&w, "Downloads complete");
+                }
             }
         }
         drop(state);
@@ -313,7 +409,7 @@ fn sample_transfer_history(model: &mut AppModel) {
     }
 }
 
-fn owning_game_ids(model: &AppModel, changed_products: &HashSet<i64>) -> HashSet<i64> {
+pub(super) fn owning_game_ids(model: &AppModel, changed_products: &HashSet<i64>) -> HashSet<i64> {
     model
         .games
         .iter()
@@ -326,39 +422,6 @@ fn owning_game_ids(model: &AppModel, changed_products: &HashSet<i64>) -> HashSet
         })
         .map(|game| game.product_id)
         .collect()
-}
-
-fn refresh_selected_game_after_managed_change(
-    w: &Widgets,
-    model: &Rc<RefCell<AppModel>>,
-    affected_games: &HashSet<i64>,
-) {
-    let Some(selected) = model.borrow().selected else {
-        return;
-    };
-    if !affected_games.contains(&selected)
-        || w.content.visible_child_name().as_deref() != Some("details")
-    {
-        return;
-    }
-
-    let root: gtk::Widget = w.details.clone().upcast();
-    let visible_tab = find_named_descendant(&root, "game-tabs")
-        .and_downcast::<gtk::Stack>()
-        .and_then(|stack| stack.visible_child_name())
-        .map(|name| name.to_string());
-    let scroll_position = w.details_scroll.vadjustment().value();
-
-    show_game(w, model, selected, Some(false));
-
-    if let Some(visible_tab) = visible_tab {
-        let root: gtk::Widget = w.details.clone().upcast();
-        if let Some(stack) = find_named_descendant(&root, "game-tabs").and_downcast::<gtk::Stack>()
-        {
-            stack.set_visible_child_name(&visible_tab);
-        }
-    }
-    w.details_scroll.vadjustment().set_value(scroll_position);
 }
 
 pub(super) fn update_download_page_progress(
@@ -1512,6 +1575,7 @@ pub(super) fn download_job_card(
         retry.set_tooltip_text(Some("After resolving the reported prerequisites, retry using saved defaults. No components are downloaded automatically."));
         let status = w.status.clone();
         retry.connect_clicked(move |button| {
+            let session = online::account_session();
             button.set_sensitive(false);
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
@@ -1520,6 +1584,9 @@ pub(super) fn download_job_card(
             let button = button.clone();
             let status = status.clone();
             glib::timeout_add_local(Duration::from_millis(50), move || {
+                if online::account_session() != session {
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(Ok(())) => {
                         status.set_label("Installation retry requested");
@@ -1627,6 +1694,113 @@ pub(super) fn download_job_card(
 #[cfg(test)]
 mod active_transfer_tests {
     use super::*;
+
+    fn job() -> DownloadJobRecord {
+        DownloadJobRecord {
+            job_id: "fixture".into(),
+            product_id: 42,
+            title: "Fixture".into(),
+            artifacts: Vec::new(),
+            state: DownloadState::Downloading,
+            destination: "/unused".into(),
+            bytes_downloaded: 0,
+            total_bytes: Some(2000),
+            completed_files: Vec::new(),
+            error: None,
+            status_message: None,
+            queue_position: None,
+            retry_started_at: None,
+            next_retry_at: None,
+            created_at: 0,
+            updated_at: 0,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn progress_burst_needs_no_inventory_read_and_retains_terminal_products() {
+        let mut jobs = vec![job()];
+        let mut changed = HashSet::new();
+        let mut failures = HashMap::new();
+        let events = (1..=1000).map(|downloaded| download::DownloadManagerEvent::Progress {
+            job_id: "fixture".into(),
+            downloaded,
+            total: Some(2000),
+        });
+        let (read_inventory, error) =
+            coalesce_download_events(&mut jobs, &mut changed, &mut failures, events);
+        assert!(!read_inventory);
+        assert!(error.is_none());
+        assert_eq!(jobs[0].bytes_downloaded, 1000);
+        let events = [
+            download::DownloadManagerEvent::ManagedFilesChanged(42),
+            download::DownloadManagerEvent::ManagedFilesChanged(43),
+            download::DownloadManagerEvent::Progress {
+                job_id: "fixture".into(),
+                downloaded: 1500,
+                total: Some(2000),
+            },
+        ];
+        assert!(coalesce_download_events(&mut jobs, &mut changed, &mut failures, events).0);
+        assert_eq!(changed, HashSet::from([42, 43]));
+        assert_eq!(jobs[0].bytes_downloaded, 1500);
+    }
+
+    #[test]
+    fn registration_failure_survives_stale_database_snapshot_until_retry() {
+        let mut jobs = vec![job()];
+        let mut changed = HashSet::new();
+        let mut failures = HashMap::new();
+        coalesce_download_events(
+            &mut jobs,
+            &mut changed,
+            &mut failures,
+            [download::DownloadManagerEvent::BookkeepingFailed {
+                session: online::account_session(),
+                job_id: "fixture".into(),
+                product_id: 42,
+                message: "Registration failed; retry".into(),
+            }],
+        );
+        coalesce_download_events(
+            &mut jobs,
+            &mut changed,
+            &mut failures,
+            [download::DownloadManagerEvent::QueueSnapshot(vec![job()])],
+        );
+        let mut presented = jobs.clone();
+        apply_registration_failures(&mut presented, &failures);
+        assert_eq!(presented[0].state, DownloadState::Failed);
+        assert_eq!(
+            presented[0].error.as_deref(),
+            Some("Registration failed; retry")
+        );
+        assert!(jobs[0].error.is_none());
+        assert!(changed.is_empty());
+        let mut retry = job();
+        retry.state = DownloadState::Queued;
+        coalesce_download_events(
+            &mut jobs,
+            &mut changed,
+            &mut failures,
+            [download::DownloadManagerEvent::QueueSnapshot(vec![retry])],
+        );
+        let mut presented = jobs.clone();
+        apply_registration_failures(&mut presented, &failures);
+        assert_eq!(presented[0].state, DownloadState::Failed);
+        coalesce_download_events(
+            &mut jobs,
+            &mut changed,
+            &mut failures,
+            [download::DownloadManagerEvent::Progress {
+                job_id: "fixture".into(),
+                downloaded: 1500,
+                total: Some(2000),
+            }],
+        );
+        assert!(failures.is_empty());
+        assert_eq!(jobs[0].state, DownloadState::Downloading);
+    }
 
     #[test]
     fn depot_disk_progress_reserves_final_ten_percent() {

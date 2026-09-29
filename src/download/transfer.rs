@@ -31,6 +31,19 @@ pub(super) struct DownloadSnapshot<'a> {
     pub error: Option<&'a str>,
 }
 
+#[derive(Debug)]
+pub(super) struct BookkeepingError {
+    pub files: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for BookkeepingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Downloaded files were preserved, but recording completion failed. Retry to finish registering them.")
+    }
+}
+impl std::error::Error for BookkeepingError {}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     artifacts: &[RemoteArtifact],
     title: &str,
@@ -39,6 +52,7 @@ pub(super) fn run(
     cancelled: &AtomicBool,
     sender: &mpsc::Sender<DownloadEvent>,
     part_concurrency: usize,
+    session: u64,
 ) -> Result<()> {
     run_transfer(
         artifacts,
@@ -49,6 +63,7 @@ pub(super) fn run(
         sender,
         true,
         part_concurrency,
+        session,
     )
 }
 
@@ -62,6 +77,7 @@ pub(super) fn run_transfer(
     sender: &mpsc::Sender<DownloadEvent>,
     persist_state: bool,
     part_concurrency: usize,
+    session: u64,
 ) -> Result<()> {
     fs::create_dir_all(destination)?;
     let refs = artifacts.iter().collect::<Vec<_>>();
@@ -72,6 +88,27 @@ pub(super) fn run_transfer(
         .map(|artifact| artifact.size_bytes)
         .collect::<Option<Vec<_>>>()
         .map(|sizes| sizes.into_iter().sum());
+    if persist_state {
+        let completion = super::completion::Completion::load(&staging, artifacts, destination)
+            .map_err(|error| error.context(BookkeepingError { files: Vec::new() }))?;
+        if let Some(completion) = completion {
+            let store = StateStore::open().map_err(|error| {
+                error.context(BookkeepingError {
+                    files: completion.files(),
+                })
+            })?;
+            return register_completion(
+                &store,
+                completion,
+                artifacts,
+                title,
+                destination,
+                cancelled,
+                sender,
+                session,
+            );
+        }
+    }
     persist_if(
         persist_state,
         artifacts,
@@ -97,6 +134,7 @@ pub(super) fn run_transfer(
             persist_state,
             part_concurrency,
             expected_total,
+            session,
         );
     }
 
@@ -227,25 +265,17 @@ pub(super) fn run_transfer(
         bail!("download finished without all expected parts");
     }
     let _ = sender.send(DownloadEvent::Finalizing);
-    if persist_state && let Ok(store) = StateStore::open() {
-        let _ = store.set_download_job_status(&job_id(&refs), Some("Finalizing…"));
-    }
-    persist_if(
-        persist_state,
+    finish(
         artifacts,
         title,
-        DownloadSnapshot {
-            destination,
-            state: DownloadState::Complete,
-            downloaded: downloaded_before_part,
-            total: expected_total.or(Some(downloaded_before_part)),
-            files: &completed,
-            error: None,
-        },
-    );
-    let _ = sender.send(DownloadEvent::Complete { files: completed });
-    let _ = fs::remove_dir(&staging);
-    Ok(())
+        destination,
+        &staging,
+        completed,
+        cancelled,
+        sender,
+        persist_state,
+        session,
+    )
 }
 
 fn request_download_response(
@@ -288,6 +318,7 @@ fn run_parallel_parts(
     persist_state: bool,
     part_concurrency: usize,
     expected_total: Option<u64>,
+    session: u64,
 ) -> Result<()> {
     let mut completed = Vec::new();
     let mut completed_bytes = 0_u64;
@@ -319,6 +350,7 @@ fn run_parallel_parts(
                         &worker_events,
                         false,
                         1,
+                        session,
                     );
                     drop(worker_events);
                     let _ = result_sender.send((batch_index, result));
@@ -397,25 +429,119 @@ fn run_parallel_parts(
     if completed.len() != artifacts.len() {
         bail!("download finished without all expected parts");
     }
-    let refs = artifacts.iter().collect::<Vec<_>>();
     let _ = sender.send(DownloadEvent::Finalizing);
-    if persist_state && let Ok(store) = StateStore::open() {
-        let _ = store.set_download_job_status(&job_id(&refs), Some("Finalizing…"));
-    }
-    persist_if(
-        persist_state,
+    let staging = staging_directory(
+        destination,
+        artifacts,
+        &job_id(&artifacts.iter().collect::<Vec<_>>()),
+    );
+    finish(
         artifacts,
         title,
-        DownloadSnapshot {
+        destination,
+        &staging,
+        completed,
+        cancelled,
+        sender,
+        persist_state,
+        session,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    artifacts: &[RemoteArtifact],
+    title: &str,
+    destination: &Path,
+    staging: &Path,
+    files: Vec<PathBuf>,
+    cancelled: &AtomicBool,
+    sender: &mpsc::Sender<DownloadEvent>,
+    persist_state: bool,
+    session: u64,
+) -> Result<()> {
+    if persist_state {
+        let completion =
+            super::completion::Completion::record(staging, artifacts, destination, &files)
+                .map_err(|error| {
+                    error.context(BookkeepingError {
+                        files: files.clone(),
+                    })
+                })?;
+        let store = StateStore::open().map_err(|error| {
+            error.context(BookkeepingError {
+                files: files.clone(),
+            })
+        })?;
+        register_completion(
+            &store,
+            completion,
+            artifacts,
+            title,
             destination,
-            state: DownloadState::Complete,
-            downloaded: completed_bytes,
-            total: expected_total.or(Some(completed_bytes)),
-            files: &completed,
-            error: None,
-        },
-    );
-    let _ = sender.send(DownloadEvent::Complete { files: completed });
+            cancelled,
+            sender,
+            session,
+        )?;
+    } else {
+        let _ = sender.send(DownloadEvent::Complete { files });
+    }
+    let _ = fs::remove_dir(staging);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_completion(
+    store: &StateStore,
+    completion: super::completion::Completion,
+    artifacts: &[RemoteArtifact],
+    title: &str,
+    destination: &Path,
+    cancelled: &AtomicBool,
+    sender: &mpsc::Sender<DownloadEvent>,
+    session: u64,
+) -> Result<()> {
+    let files = completion.files();
+    let result = (|| -> Result<()> {
+        let downloaded = files
+            .iter()
+            .map(|path| path.metadata().map(|metadata| metadata.len()))
+            .sum::<std::io::Result<u64>>()?;
+        store.complete_download_job(
+            &DownloadJobUpdate {
+                job_id: &job_id(&artifacts.iter().collect::<Vec<_>>()),
+                product_id: artifacts[0].product_id,
+                title,
+                artifacts,
+                destination,
+                state: DownloadState::Complete,
+                bytes_downloaded: downloaded,
+                total_bytes: Some(downloaded),
+                completed_files: &files,
+                error: None,
+            },
+            &product_slug_from_destination(destination, &artifacts[0]),
+            session,
+            || {
+                anyhow::ensure!(
+                    !cancelled.load(Ordering::Relaxed),
+                    "Download registration cancelled; files preserved"
+                );
+                completion.validate(artifacts)
+            },
+        )?;
+        Ok(())
+    })();
+    result.map_err(|error| {
+        error.context(BookkeepingError {
+            files: files.clone(),
+        })
+    })?;
+    // SQLite already committed; a leftover receipt is harmless and must not turn success into retry.
+    if completion.remove().is_err() {
+        tracing::warn!("download completion committed; temporary receipt cleanup deferred");
+    }
+    let _ = sender.send(DownloadEvent::Complete { files });
     Ok(())
 }
 
@@ -516,6 +642,151 @@ pub(super) fn downloaded_on_disk(destination: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_files_survive_failed_atomic_registration_and_retry_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let store = StateStore::open_at(&path).unwrap();
+        let destination = root.path().join("game/installer");
+        let staging = root.path().join("staging");
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":7,"kind":"installer","name":"Fixture1","size_bytes":4,"download_path":"/never-requested1"},
+            {"product_id":7,"kind":"installer","name":"Fixture2","size_bytes":4,"download_path":"/never-requested2"}
+        ])).unwrap();
+        let files = vec![
+            destination.join("server-one.bin"),
+            destination.join("server-two.bin"),
+        ];
+        for file in &files {
+            fs::write(file, b"data").unwrap();
+        }
+        let id = job_id(&artifacts.iter().collect::<Vec<_>>());
+        store
+            .save_download_job(&DownloadJobUpdate {
+                job_id: &id,
+                product_id: 7,
+                title: "Fixture",
+                artifacts: &artifacts,
+                destination: &destination,
+                state: DownloadState::Downloading,
+                bytes_downloaded: 8,
+                total_bytes: Some(8),
+                completed_files: &[],
+                error: None,
+            })
+            .unwrap();
+        let control = rusqlite::Connection::open(&path).unwrap();
+        control.execute_batch("CREATE TRIGGER fail_index BEFORE INSERT ON managed_files WHEN NEW.filename='server-two.bin' BEGIN SELECT RAISE(ABORT,'inert fixture failure'); END;").unwrap();
+        let receipt = super::super::completion::Completion::record(
+            &staging,
+            &artifacts,
+            &destination,
+            &files,
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let session = crate::online::account_session();
+        let error = register_completion(
+            &store,
+            receipt,
+            &artifacts,
+            "Fixture",
+            &destination,
+            &AtomicBool::new(false),
+            &sender,
+            session,
+        )
+        .unwrap_err();
+        assert!(error.is::<BookkeepingError>());
+        assert_eq!(
+            super::super::worker::classify_download_error(&error).kind,
+            super::super::DownloadFailureKind::Bookkeeping
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            store.download_job(&id).unwrap().unwrap().state,
+            DownloadState::Downloading
+        );
+        assert!(store.managed_files().unwrap().is_empty());
+        assert!(files.iter().all(|file| fs::read(file).unwrap() == b"data"));
+        assert!(staging.join("completion.json").is_file());
+        control.execute_batch("DROP TRIGGER fail_index").unwrap();
+        let reopened = StateStore::open_at(&path).unwrap();
+        let receipt =
+            super::super::completion::Completion::load(&staging, &artifacts, &destination)
+                .unwrap()
+                .unwrap();
+        register_completion(
+            &reopened,
+            receipt,
+            &artifacts,
+            "Fixture",
+            &destination,
+            &AtomicBool::new(false),
+            &sender,
+            session,
+        )
+        .unwrap();
+        assert!(
+            matches!(receiver.try_recv().unwrap(), DownloadEvent::Complete { files: received } if received == files)
+        );
+        assert_eq!(
+            reopened.download_job(&id).unwrap().unwrap().state,
+            DownloadState::Complete
+        );
+        assert_eq!(reopened.managed_files().unwrap().len(), 2);
+        assert!(!staging.join("completion.json").exists());
+        assert!(reopened.download_install_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removed_or_stale_download_cannot_be_recreated_from_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let store = StateStore::open_at(&path).unwrap();
+        let destination = root.path().join("game/installer");
+        let staging = root.path().join("staging");
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":7,"kind":"installer","name":"Fixture","size_bytes":4,"download_path":"/never-requested"}
+        ])).unwrap();
+        let files = vec![destination.join("server.bin")];
+        fs::write(&files[0], b"data").unwrap();
+        super::super::completion::Completion::record(&staging, &artifacts, &destination, &files)
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        for session in [
+            crate::online::account_session().wrapping_sub(1),
+            crate::online::account_session(),
+        ] {
+            let receipt =
+                super::super::completion::Completion::load(&staging, &artifacts, &destination)
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                register_completion(
+                    &store,
+                    receipt,
+                    &artifacts,
+                    "Fixture",
+                    &destination,
+                    &AtomicBool::new(false),
+                    &sender,
+                    session
+                )
+                .is_err()
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(store.download_jobs().unwrap().is_empty());
+        assert!(store.managed_files().unwrap().is_empty());
+        assert_eq!(fs::read(&files[0]).unwrap(), b"data");
+        assert!(staging.join("completion.json").is_file());
+    }
 
     #[test]
     fn parallel_part_progress_is_aggregated_and_never_moves_backwards() {

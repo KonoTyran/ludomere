@@ -294,6 +294,10 @@ pub(super) fn show_game_settings(
             enabled.set_subtitle("Runs before launch and after the monitored game process exits");
             enabled.set_active(record.preference == crate::domain::CloudSavePreference::Enabled);
             let supported = record.availability == crate::domain::CloudSaveAvailability::Supported;
+            let management =
+                cloud_management::cloud_management_group(&window, model, installed_game);
+            management.set_visible(supported);
+            cloud_page.add(&management);
             let locations_state = Rc::new(RefCell::new(record.locations.clone()));
             enabled.set_sensitive(supported);
             let product_id = installed_game.product_id;
@@ -582,7 +586,13 @@ pub(super) fn show_game_settings(
                 let advanced = advanced.clone();
                 let backup = backup.clone();
                 let choose = choose.clone();
+                let management = management.clone();
+                let model = model.clone();
+                let epoch = model.borrow().account_epoch;
                 retry.connect_clicked(move |button| {
+                    if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                        return;
+                    }
                     button.set_sensitive(false);
                     status.remove_css_class("error");
                     status.set_label("Checking GOG cloud-save support…");
@@ -607,11 +617,20 @@ pub(super) fn show_game_settings(
                     let advanced = advanced.clone();
                     let backup = backup.clone();
                     let choose = choose.clone();
+                    let management = management.clone();
+                    let model = model.clone();
                     glib::timeout_add_local(Duration::from_millis(100), move || {
+                        if management.root().is_none()
+                            || model.borrow().account_epoch != epoch
+                            || model.borrow().logout_pending
+                        {
+                            return glib::ControlFlow::Break;
+                        }
                         match receiver.try_recv() {
                             Ok(Ok(discovery)) => {
                                 let supported = discovery.availability
                                     == crate::domain::CloudSaveAvailability::Supported;
+                                management.set_visible(supported);
                                 *locations.borrow_mut() = discovery.locations.clone();
                                 locations_row
                                     .set_subtitle(&cloud_location_summary(&discovery.locations));
@@ -735,6 +754,7 @@ pub(super) fn show_game_settings(
     reinstall_row.add_suffix(&reinstall);
     installation_group.add(&reinstall_row);
     installation_page.add(&installation_group);
+    installation_page.add(&update_policies::game_group(&window, model, game));
 
     if let Some(installed_game) = &installed
         && let Some(marker) = installation_marker

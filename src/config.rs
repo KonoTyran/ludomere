@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default = "default_installation_source_order")]
     pub installation_source_order: Vec<PreferredInstallationSource>,
     #[serde(default)]
+    pub depot_default_migrated: bool,
+    #[serde(default)]
     pub download_extras_by_default: bool,
     #[serde(default)]
     pub download_patches_by_default: bool,
@@ -39,6 +41,9 @@ pub struct Config {
     pub show_retired_artifacts: bool,
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
+    pub auto_update_galaxy_installations: bool,
+    pub auto_download_offline_installers: bool,
+    pub prune_superseded_offline_installers: bool,
     #[serde(default = "default_game_libraries")]
     pub game_libraries: Vec<GameLibrary>,
     #[serde(default)]
@@ -77,8 +82,8 @@ pub enum PreferredInstallationSource {
 
 pub fn default_installation_source_order() -> Vec<PreferredInstallationSource> {
     vec![
-        PreferredInstallationSource::LinuxOffline,
         PreferredInstallationSource::WindowsGalaxy,
+        PreferredInstallationSource::LinuxOffline,
         PreferredInstallationSource::WindowsOffline,
     ]
 }
@@ -121,6 +126,7 @@ impl Default for Config {
             installer_linux: true,
             installer_macos: true,
             installation_source_order: default_installation_source_order(),
+            depot_default_migrated: true,
             download_extras_by_default: false,
             download_patches_by_default: false,
             prefer_patch_updates: false,
@@ -128,6 +134,9 @@ impl Default for Config {
             interactive_installer_explanation_dismissed: false,
             show_retired_artifacts: false,
             max_concurrent_downloads: default_max_concurrent_downloads(),
+            auto_update_galaxy_installations: true,
+            auto_download_offline_installers: false,
+            prune_superseded_offline_installers: false,
             game_libraries,
             installer_library_id,
             library_card_size: default_library_card_size(),
@@ -168,6 +177,7 @@ impl Config {
             config.max_concurrent_downloads = config.max_concurrent_downloads.clamp(1, 4);
             config.library_card_size = config.library_card_size.min(3);
             config.normalize_game_libraries();
+            config.migrate_source_default();
             config.normalize_installation_source_order();
             write_config(&path, &config)?;
             return Ok(config);
@@ -251,6 +261,20 @@ impl Config {
         }
         self.installation_source_order = normalized;
     }
+
+    fn migrate_source_default(&mut self) {
+        if !self.depot_default_migrated
+            && self.installation_source_order
+                == [
+                    PreferredInstallationSource::LinuxOffline,
+                    PreferredInstallationSource::WindowsGalaxy,
+                    PreferredInstallationSource::WindowsOffline,
+                ]
+        {
+            self.installation_source_order = default_installation_source_order();
+        }
+        self.depot_default_migrated = true;
+    }
 }
 
 fn write_config(path: &std::path::Path, config: &Config) -> Result<()> {
@@ -304,6 +328,47 @@ fn default_max_concurrent_downloads() -> usize {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn depot_default_migrates_once_and_preserves_later_explicit_choices() {
+        let old = vec![
+            PreferredInstallationSource::LinuxOffline,
+            PreferredInstallationSource::WindowsGalaxy,
+            PreferredInstallationSource::WindowsOffline,
+        ];
+        let mut config: Config = toml::from_str(
+            "installation_source_order=['linux_offline','windows_galaxy','windows_offline']",
+        )
+        .unwrap();
+        assert!(!config.depot_default_migrated);
+        config.migrate_source_default();
+        assert_eq!(
+            config.installation_source_order,
+            default_installation_source_order()
+        );
+        config.installation_source_order = old.clone();
+        let mut reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        reloaded.migrate_source_default();
+        assert_eq!(reloaded.installation_source_order, old);
+        let mut custom: Config = toml::from_str(
+            "installation_source_order=['windows_offline','linux_offline','windows_galaxy']",
+        )
+        .unwrap();
+        let before = custom.installation_source_order.clone();
+        custom.migrate_source_default();
+        assert_eq!(custom.installation_source_order, before);
+        let mut missing: Config = toml::from_str("").unwrap();
+        missing.migrate_source_default();
+        assert_eq!(
+            missing.installation_source_order,
+            default_installation_source_order()
+        );
+        assert!(missing.auto_update_galaxy_installations);
+        assert!(
+            !missing.auto_download_offline_installers
+                && !missing.prune_superseded_offline_installers
+        );
+    }
 
     #[test]
     fn setup_visibility_and_deferral_persist_without_changing_existing_preferences() {
@@ -524,8 +589,8 @@ enabled = true
             config.installation_source_order,
             [
                 PreferredInstallationSource::WindowsOffline,
-                PreferredInstallationSource::LinuxOffline,
                 PreferredInstallationSource::WindowsGalaxy,
+                PreferredInstallationSource::LinuxOffline,
             ]
         );
     }

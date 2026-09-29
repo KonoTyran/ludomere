@@ -36,7 +36,26 @@ pub(super) fn render_detail_page(
         state.detail_generation = state.detail_generation.wrapping_add(1);
         state.detail_target = Some((game.product_id, game.parent_id));
     }
-    refresh_local_action_state(w, model);
+    refresh_local_products(
+        w,
+        model,
+        &HashSet::from([game.parent_id.unwrap_or(game.product_id)]),
+    );
+    if game.parent_id.is_none()
+        && model
+            .borrow()
+            .local_actions
+            .get(&game.product_id)
+            .is_some_and(|local| local.depot)
+    {
+        request_product_section(
+            w,
+            model,
+            game.product_id,
+            online::DetailSection::Builds,
+            false,
+        );
+    }
     while let Some(child) = w.details.first_child() {
         w.details.remove(&child);
     }
@@ -163,11 +182,11 @@ pub(super) fn render_detail_page(
     } else if primary_action == GamePrimaryAction::DownloadUpdate {
         "Download files for the latest GOG revision"
     } else if primary_action == GamePrimaryAction::InstallUpdate {
-        "Install the downloaded update"
+        "Review and apply the game update"
     } else if primary_action == GamePrimaryAction::Play {
         "Launch this game"
     } else {
-        "Choose installers, DLC, patches, and extras"
+        "Choose a download source, installers, DLC, or extras"
     }));
     let primary_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     primary_actions.add_css_class("detail-primary-actions");
@@ -436,7 +455,7 @@ pub(super) fn render_detail_page(
                 });
                 return;
             }
-            show_download_selector(&widgets, &model, &detail);
+            show_primary_download(&widgets, &model, &detail);
         });
     }
     if game.owned
@@ -532,8 +551,9 @@ pub(super) fn render_detail_page(
     let refresh_after_install: Rc<dyn Fn()> = {
         let widgets = w.clone_refs();
         let model = model.clone();
+        let product_id = game.parent_id.unwrap_or(game.product_id);
         Rc::new(move || {
-            refresh_local_action_state(&widgets, &model);
+            refresh_local_products(&widgets, &model, &HashSet::from([product_id]));
             update_sidebar_download_styles(&widgets, &model.borrow());
             refresh_filters(&widgets, &model.borrow());
         })
@@ -736,77 +756,7 @@ pub(super) fn render_detail_page(
                 content.upcast()
             }),
         ));
-        let tags = model
-            .borrow()
-            .tags
-            .get(&game.product_id)
-            .cloned()
-            .unwrap_or_default();
-        let tag_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        let tag_heading = gtk::Label::new(Some("Personal tags"));
-        tag_heading.set_xalign(0.0);
-        tag_heading.add_css_class("section-title");
-        tag_box.append(&tag_heading);
-        let tag_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        for tag in &tags {
-            let chip = gtk::Label::new(Some(tag));
-            chip.add_css_class("tag-chip");
-            tag_row.append(&chip);
-        }
-        let tag_entry = gtk::Entry::builder()
-            .placeholder_text("Add a tag")
-            .hexpand(true)
-            .build();
-        let add_tag = gtk::Button::with_label("Add");
-        tag_row.append(&tag_entry);
-        tag_row.append(&add_tag);
-        tag_box.append(&tag_row);
-        let w2 = w.clone_refs();
-        let model2 = model.clone();
-        let detail_id = game.product_id;
-        let detail_parent_id = game.parent_id;
-        add_tag.connect_clicked(move |_| {
-            let tag = tag_entry.text().trim().to_owned();
-            if tag.is_empty() {
-                return;
-            }
-            let mut m = model2.borrow_mut();
-            let existing = m.tags.entry(detail_id).or_default();
-            if existing
-                .iter()
-                .any(|value| value.eq_ignore_ascii_case(&tag))
-            {
-                return;
-            }
-            existing.push(tag.clone());
-            drop(m);
-            // The database is reopened briefly so this detail callback stays independent of widget lifetime.
-            if let Ok(store) = StateStore::open() {
-                let _ = store.add_tag(detail_id, &tag);
-            }
-            refresh_filters(&w2, &model2.borrow());
-            if let Some(parent_id) = detail_parent_id {
-                let parent = model2
-                    .borrow()
-                    .games
-                    .iter()
-                    .find(|parent| parent.product_id == parent_id)
-                    .cloned();
-                let dlc = parent.as_ref().and_then(|parent| {
-                    parent
-                        .dlcs
-                        .iter()
-                        .find(|dlc| dlc.product_id == detail_id)
-                        .cloned()
-                });
-                if let (Some(parent), Some(dlc)) = (parent, dlc) {
-                    render_detail_page(&w2, &model2, DetailPageModel::dlc(&parent, dlc));
-                }
-            } else {
-                show_game(&w2, &model2, detail_id, Some(false));
-            }
-        });
-        overview.append(&tag_box);
+        overview.append(&organization::tag_editor(w, model, game.product_id));
     }
     tabs.add_titled(&overview, Some("overview"), "Overview");
 
@@ -850,6 +800,24 @@ pub(super) fn render_detail_page(
             Some("patch-notes"),
             "Patch Notes",
         );
+    }
+
+    if game.owned && game.parent_id.is_none() {
+        let achievements = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        achievements.append(&gtk::Label::new(Some("Open this tab to load achievements")));
+        tabs.add_titled(&achievements, Some("achievements"), "Achievements");
+        let loaded = Rc::new(std::cell::Cell::new(false));
+        let model = model.clone();
+        let product_id = game.product_id;
+        tabs.connect_visible_child_name_notify(move |tabs| {
+            if tabs.visible_child_name().as_deref() == Some("achievements") && !loaded.replace(true)
+            {
+                while let Some(child) = achievements.first_child() {
+                    achievements.remove(&child);
+                }
+                achievements.append(&super::achievements::achievement_page(&model, product_id));
+            }
+        });
     }
 
     let logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -1961,7 +1929,8 @@ fn installation_status_panel(
                 cancel.set_visible(false);
                 cloud_decline.set_visible(false);
                 cloud_enable.set_visible(false);
-                primary_action.set_sensitive(false);
+                primary_action.set_sensitive(true);
+                refresh_after_install();
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || {
                     let result = (|| {

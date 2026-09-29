@@ -57,7 +57,7 @@ pub(super) fn begin_account_exchange(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
         return;
     }
     let epoch = model.borrow().account_epoch;
-    show_status(w, "Signing in to GOG…");
+    show_progress(w, "Signing in to GOG…");
     w.sign_in.set_sensitive(false);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -86,6 +86,7 @@ pub(super) fn start_account_restore(
             Ok(Ok(Some((token, profile)))) => {
                 cache_and_display_profile(&w, &model, token.clone(), profile);
                 start_owned_library_sync(&w, &model, token, false, false);
+                show_status(&w, "Signed in to GOG");
                 glib::ControlFlow::Break
             }
             Ok(Ok(None)) => {
@@ -128,13 +129,17 @@ pub(super) fn poll_account_result(
                 cache_and_display_profile(&w, &model, token.clone(), profile);
                 start_owned_library_sync(&w, &model, token, true, false);
                 w.sign_in.set_sensitive(true);
-                if w.status.label() == "Signing in to GOG…" {
-                    show_status(&w, "Signed in to GOG");
+                if w.live_status.label() == "Signing in to GOG…" {
+                    show_progress(&w, "");
                 }
+                show_status(&w, "Signed in to GOG");
                 glib::ControlFlow::Break
             }
             Ok(Err(_)) => {
                 w.sign_in.set_sensitive(true);
+                if w.live_status.label() == "Signing in to GOG…" {
+                    show_progress(&w, "");
+                }
                 show_status(
                     &w,
                     "GOG sign-in failed. Check your connection and try signing in again.",
@@ -144,7 +149,8 @@ pub(super) fn poll_account_result(
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(_) => {
                 w.sign_in.set_sensitive(true);
-                if w.status.label() == "Signing in to GOG…" {
+                if w.live_status.label() == "Signing in to GOG…" {
+                    show_progress(&w, "");
                     show_status(&w, "Sign-in did not finish. Try signing in again.");
                 }
                 glib::ControlFlow::Break
@@ -169,6 +175,8 @@ pub(super) fn cache_and_display_profile(
     });
     let mut state = model.borrow_mut();
     if state.account_profile.as_ref().map(|value| &value.user_id) != Some(&profile.user_id) {
+        w.notifications.clear();
+        show_progress(w, "");
         invalidate_section_requests(&mut state);
     }
     state.account_profile = Some(profile.clone());

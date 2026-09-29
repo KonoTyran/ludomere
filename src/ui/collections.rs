@@ -110,6 +110,7 @@ pub(super) fn refresh_collection_metadata(w: &Widgets, model: &Rc<RefCell<AppMod
         let games = state
             .games
             .iter()
+            .filter(|game| state.show_hidden || !state.hidden_products.contains(&game.product_id))
             .filter(|game| {
                 if name == "Favorites" {
                     state.favorites.contains(&game.product_id)
@@ -160,11 +161,17 @@ pub(super) fn refresh_collection_metadata(w: &Widgets, model: &Rc<RefCell<AppMod
             state
                 .games
                 .iter()
+                .filter(|game| {
+                    state.show_hidden || !state.hidden_products.contains(&game.product_id)
+                })
                 .filter(|game| state.favorites.contains(&game.product_id))
                 .map(|game| game.product_id)
                 .collect(),
         );
         for game in &state.games {
+            if !state.show_hidden && state.hidden_products.contains(&game.product_id) {
+                continue;
+            }
             for term in game.metadata.genres.iter().chain(&game.metadata.themes) {
                 if !term.name.trim().is_empty() {
                     groups

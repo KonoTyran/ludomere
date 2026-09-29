@@ -1,5 +1,6 @@
 use crate::domain::{ArtifactKind, DownloadCategory, RemoteArtifact};
 use anyhow::{Context, Result};
+use std::io::Read;
 
 pub const EXPANSIONS: &str =
     "downloads,expanded_dlcs,description,screenshots,videos,related_products,changelog";
@@ -13,13 +14,24 @@ pub fn fetch_expanded(
     product_id: i64,
     expansions: &str,
 ) -> Result<serde_json::Value> {
-    client
+    let response = client
         .get(format!("https://api.gog.com/products/{product_id}"))
         .query(&[("expand", expansions)])
         .send()?
-        .error_for_status()?
-        .json()
+        .error_for_status()?;
+    serde_json::from_slice(&bounded_metadata(response)?)
         .with_context(|| format!("parsing structured GOG product {product_id}"))
+}
+
+pub(crate) fn bounded_metadata(reader: impl Read) -> Result<Vec<u8>> {
+    const MAXIMUM: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    reader.take(MAXIMUM + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAXIMUM,
+        "GOG acquisition metadata exceeded its size limit"
+    );
+    Ok(bytes)
 }
 
 pub fn fetch_core(
@@ -185,6 +197,21 @@ fn identifier(value: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquisition_metadata_is_bounded_before_json_parsing() {
+        assert_eq!(
+            bounded_metadata(&b"{\"downloads\":[]}"[..]).unwrap(),
+            b"{\"downloads\":[]}"
+        );
+        assert!(bounded_metadata(std::io::repeat(b' ').take(16 * 1024 * 1024 + 1)).is_err());
+        assert_eq!(
+            bounded_metadata(std::io::repeat(b' ').take(16 * 1024 * 1024))
+                .unwrap()
+                .len(),
+            16 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn core_catalog_uses_fifty_and_recovers_only_missing_ids() {

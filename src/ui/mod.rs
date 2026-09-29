@@ -12,6 +12,8 @@ use crate::{
     text,
 };
 mod account;
+mod achievements;
+mod cloud_management;
 mod collections;
 mod comet;
 mod details;
@@ -21,6 +23,8 @@ mod executable_chooser;
 mod files;
 mod game_settings;
 mod library;
+mod notifications;
+mod organization;
 mod proton;
 mod sections;
 mod settings;
@@ -28,6 +32,7 @@ mod setup;
 mod style;
 mod sync;
 mod tray;
+mod update_policies;
 mod widgets;
 mod window;
 
@@ -151,6 +156,9 @@ struct AppModel {
     local_actions: HashMap<i64, LocalActionState>,
     local_refresh_running: bool,
     local_refresh_pending: bool,
+    local_priority_running: bool,
+    local_priority_pending: HashSet<i64>,
+    local_versions: HashMap<i64, u64>,
     local_revision: u64,
     core_loading: bool,
     sync_running: bool,
@@ -161,6 +169,13 @@ struct AppModel {
     patch_notes: HashMap<i64, Rc<Vec<PatchNote>>>,
     favorites: HashSet<i64>,
     tags: HashMap<i64, Vec<String>>,
+    hidden_products: HashSet<i64>,
+    hidden_pending: HashSet<i64>,
+    show_hidden: bool,
+    tag_filters: BTreeSet<String>,
+    tag_match_all: bool,
+    organization_pending: bool,
+    policy_saving: HashSet<i64>,
     favorites_only: bool,
     downloaded_only: bool,
     installed_only: bool,
@@ -457,6 +472,8 @@ impl DetailPageModel {
 struct Widgets {
     window: adw::ApplicationWindow,
     status: gtk::Label,
+    live_status: gtk::Label,
+    notifications: notifications::Notifications,
     status_bar: gtk::Box,
     sync_spinner: gtk::Spinner,
     sync_status: gtk::Label,
@@ -483,6 +500,7 @@ struct Widgets {
     playable_toggle: gtk::ToggleButton,
     filter_count: gtk::Label,
     filter_button: gtk::MenuButton,
+    organization_filters: gtk::Box,
     clear_filters: gtk::Button,
     favorite_filter: gtk::CheckButton,
     downloaded_filter: gtk::CheckButton,
@@ -627,6 +645,8 @@ impl Widgets {
         Rc::new(Self {
             window: self.window.clone(),
             status: self.status.clone(),
+            live_status: self.live_status.clone(),
+            notifications: self.notifications.clone(),
             status_bar: self.status_bar.clone(),
             sync_spinner: self.sync_spinner.clone(),
             sync_status: self.sync_status.clone(),
@@ -653,6 +673,7 @@ impl Widgets {
             playable_toggle: self.playable_toggle.clone(),
             filter_count: self.filter_count.clone(),
             filter_button: self.filter_button.clone(),
+            organization_filters: self.organization_filters.clone(),
             clear_filters: self.clear_filters.clone(),
             favorite_filter: self.favorite_filter.clone(),
             downloaded_filter: self.downloaded_filter.clone(),

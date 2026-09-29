@@ -1,5 +1,41 @@
 # Project specification
 
+## Sidebar hiding, notifications and Comet clarity — 2026-09-29
+
+User request:
+> Right clicking on a game in the games list and choosing "Hide Game Locally" does not hide the game. In the game detail view, clicking the gear and choosing "Hide Game Locally" does hide the game. Messages which appear in the lower right corner of the client are frequently cut off and therefore not readable as they cannot be expanded. Messages queued for user notification should be placed into a notifications list, openable in a modal with a button in the lower right where the notifications are now. Clicking this button should open the notifications modal. Hovering on the button should show a popover with the full text of the most recent notification. After ten seconds, the truncated notification text should disappear, leaving only the button. "Show Hidden" in the filters list should appear under the "Library" category rather than the "Operating System" category, where it is now. The GOG online services tab in settings is a bit confusing. The description of what Comet is is fine, but the availability and installation is confusing. Please clean that up.
+
+- R35: Sidebar right-click Hide/Unhide must use the same persistent action as detail Manage and
+  immediately update normal browsing/search/collections in place. Move Show hidden into Library.
+- R36: Replace lower-right transient messaging with notification history accessible through a
+  persistent button/modal. Hover shows full latest message in a popover; compact latest text hides
+  after10 seconds without removing the button/history. User selected current-session-only history
+  of results, warnings and errors; keep live progress separate. Preserve centered Downloads and
+  unrelated synchronization controls. No persistent notification database.
+- R37: Clarify Comet Settings availability/installation/update presentation, retaining its existing
+  explanation, unmodified official helper behavior, confirmation and cancellation. Distinguish local
+  Comet, available updates and automatically managed peer libraries. No dependency modification or
+  new installation authority.
+
+## Database contention and action refresh investigation — 2026-09-29
+
+> Investigate database problems like this and propose a fix to reduce the locking behavior where not necessary. I've also noticed the UI doesn't update immediately upon completion of a game uninstall, installation, and other actions involving game files and downloads. It seems to wait upwards of ten seconds to update the games list game color and detail view button to represent the state of the game (play, download, install, etc).
+
+- R33: Investigate unnecessary database contention and delayed local-action presentation; propose
+  a concrete correction before implementation. The reported database error appears in the uninstall
+  confirmation before pressing Uninstall. Preserve filesystem-authoritative installedness, durable
+  user data, schema validation and in-place asynchronous UI behavior. This stage is analysis only.
+
+Implementation authorized:
+> Definitely fix those problems. 1-5. WAL mode can wait.
+
+- R34: Implement the five P104 corrections: current-schema opens without initialization writes;
+  progress-only UI updates without database queries and coalescing before expensive work;
+  affected-game filesystem-authoritative completion refresh shared by actions/colors/filters;
+  shared datasets and bounded broader refreshes; retryable previews/refresh errors preserving known
+  state and truthful distinction between file success and bookkeeping failure. WAL/journal mode is
+  unchanged. Preserve schema25/dev7 validation and atomic migrations, user data and account/reset guards.
+
 Source: user messages in the repository conversation, preserved below. Material specification
 interview decisions are settled; implementation is authorized by the original request and answers.
 
@@ -309,3 +345,57 @@ Interview record: `{"user_answers":{"extras_default":"keep_preference_default_of
 
 No time, storage, or artifact-size cap was supplied. Use ordinary scoped project resources and
 escalate any material resource or security tradeoff before expanding the work.
+
+## Selected upstream features — authorized 2026-09-29
+
+User selection:
+> I definitely want full GOG Depot support as the default download option. I want to be able to hide games locally, I want achievement support, automatic old-installer cleanup, global and per-game update policies, cloud save support including exports, delete selected cloud saves, personal tags.
+
+User clarification and implementation authorization:
+> Full GOG depot support should include generation-two depots with offline installer fallback. Generation one does not need to be supported at this time. For automatic updates, I want depot auto-updates on with offline backup downloads and cleanup opt-in. Achievement support should have an achievement browser with existing comet integration. Since my chosen features are all feasable, do implement those. Ask me questions about ambiguities or gaps in feature requests.
+
+- R26: Prefer generation-two Windows Depot acquisition, with explicit offline-installer fallback
+  and source choices. Preserve existing install/update/repair/DLC/branch/resume behavior; complete
+  installed-language controls and correct Depot primary-action priority. Generation one excluded.
+  Existing-profile source-order migration is pending the user's answer; do not alter installed sources.
+- R27: Local persistent Hide/Unhide and Show hidden. Exact normal-view/search exclusion and hidden
+  auto-update behavior are pending clarification. Preserve hidden state across refresh/uninstall.
+- R28: Native achievement browser with cached unlock state/dates/descriptions and progress where
+  provided, independent loading/error/retry, offline use and account isolation. Retain unmodified
+  Comet integration; no desktop unlock notifications, social features or remote writeback.
+- R29: Inherited global/per-game Depot auto-update, offline-backup-download and old-installer-cleanup
+  policies. Defaults: Depot updates on, other two off. Implement post-sync/periodic online scheduling,
+  targeted fresh acquisition data, running/busy-game exclusion and safe account/reset lifecycle.
+- R30: Opt-in automatic removal of superseded managed installer revisions only after complete
+  replacement verification, using Trash and existing protected cleanup/operation boundaries.
+  Preserve in-use/queued-install files and user payloads; report partial failures accurately.
+- R31: Preserve current cloud synchronization/conflict handling and add explicit verified exports
+  and selected remote deletion with confirmation/recovery export/revision checks, unchanged-local
+  reupload suppression and visible partial errors. No actual user-account mutation during agent tests.
+  Installed-only versus uninstalled-game management is pending the user's answer.
+- R32: Extend existing local personal tags with assignment removal, global rename/delete and any/all
+  filters. Preserve case-insensitive semantics and active-filter coherence; no GOG tag synchronization.
+
+Implementation constraints: selectively adapt upstream 4717092, never overwrite this fork's lazy
+loading, setup, reset, UMU/Comet, cleanup or auto-install behavior. Keep public schema25 and one
+canonical24→25 migration; consolidate these changes into one new internal development revision and
+verify retained local revisions. Upstream same-number development revisions are different shapes,
+not implicitly compatible databases. Friends/chat/saved views/custom art/global queue reordering/
+bandwidth controls are outside this phase. Arch-only; no package build, commit or push requested.
+
+Final interview answers: change the old default order to Depot-first and preserve customized orders;
+hide from normal browsing and keep update policies active; supported installed Windows cloud games
+only for this phase. These settle all pending choices above.
+
+```json
+{"user_answers":{"depot_format":"generation_two_with_offline_fallback","update_defaults":"depot_on_backups_cleanup_opt_in","achievements":"browser_existing_comet","source_order_migration":"old_default_only_preserve_custom","hidden_games":"exclude_normal_browsing_keep_updates","cloud_scope":"supported_installed_windows"}}
+```
+
+Cloud-deletion clarification, 2026-09-29: the user was told that GOG's atomic conditional-delete
+guarantee could not be established and that a concurrent upload after the final recheck might be
+deleted without being present in the recovery copy. The user selected:
+> Include deletion with recovery copy, rechecks and explicit warning (Recommended)
+
+R31 therefore includes enabled selected deletion with verified recovery, revision rechecks and an
+explicit confirmation warning to stop games and other cloud clients. Do not claim guaranteed atomic
+compare-and-delete. This authorizes the product behavior, not tests against the user's real saves.

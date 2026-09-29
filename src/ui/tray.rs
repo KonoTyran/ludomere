@@ -202,7 +202,10 @@ fn launch_recent_game(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id
     if crate::installation::is_game_running(product_id) {
         return;
     }
-    let receiver = crate::installation::launch_game(game);
+    if game.installer_operating_system.as_deref() != Some("linux") && !w.window.is_visible() {
+        show_main_window(w);
+    }
+    let receiver = launch_with_components(&w.window, game);
     let widgets = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {

@@ -35,10 +35,10 @@ pub use manager::{
     InstallationManagerEvent, InstallationOperationSnapshot, abandon_depot_operation,
     cancel_depot_operation, cancel_operation, depot_operation_snapshot,
     depot_operation_snapshot_for_product, depot_operation_snapshots, enqueue_depot_operation,
-    enqueue_installation, enqueue_uninstallation, installation_operation_snapshot,
-    recover_depot_operations, recover_interrupted_operations, respond_to_installation,
-    resume_depot_operation, shutdown, start_recovered_operations, subscribe_depot_events,
-    subscribe_installation_events,
+    enqueue_downloaded_installation, enqueue_installation, enqueue_uninstallation,
+    enqueue_uninstallation_with_cleanup, installation_operation_snapshot, recover_depot_operations,
+    recover_interrupted_operations, respond_to_installation, resume_depot_operation, shutdown,
+    start_recovered_operations, subscribe_depot_events, subscribe_installation_events,
 };
 pub use marker::{
     InstallationMarker, InstalledDlc, from_game as installation_marker_from_game,
@@ -288,7 +288,7 @@ fn find_installed_game(
         .find(|game| game.product_id == product_id))
 }
 
-fn directory_has_installed_payload(directory: &std::path::Path) -> bool {
+pub(crate) fn directory_has_installed_payload(directory: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return false;
     };

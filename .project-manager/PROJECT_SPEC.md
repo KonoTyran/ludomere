@@ -1,0 +1,311 @@
+# Project specification
+
+Source: user messages in the repository conversation, preserved below. Material specification
+interview decisions are settled; implementation is authorized by the original request and answers.
+
+## User-supplied request
+
+> Let's fix up this documentation and testing environment setup, along with providing necessary components to enable core features without additional downloads. Use the $project-manager skill to accomplish this, and interview me about specific requirements. A build script which outputs an AppImage would also be good. The ability to download proton versions and choose the one to run with should be an added requirement, and potentially access to already-installed proton versions, including GE versions installed via ProtonPlus or similar programs.
+
+## Clarifications — 2026-09-28
+
+User response concerning bundled components:
+
+> I think specifically I want the program to use proton versions installed by other programs, and to decouple umu as a herd requirement. Most users will have a method of acquiring proton versions, but it may be advisable to include umu in the package to allow ludomere to invoke its own proton version downloads. What is Comet?
+
+User response concerning supported environments:
+
+> What are the consequences of supporting more than Arch?
+
+The interviewer proposed this Proton scope:
+
+> download UMU-Proton and GE-Proton releases, choose a global default, override it per game, automatically discover existing Steam/ProtonPlus installations, and allow manual folder selection. Externally managed versions would be used without modifying or deleting their installations.
+
+The user accepted it with this condition:
+
+> I accept this scope, provided umu is packaged with ludomere to allow the acquisition of proton versions.
+
+The user selected testing setup C: local setup/check scripts and documentation, a reproducible
+container for builds and automated tests, and GitHub Actions for checks and AppImage artifacts.
+
+The user requested that delivery priorities and limits be expanded into separate questions.
+
+### Further user clarifications
+
+Regarding the launch backend:
+
+> What are my options for launching proton? Is umu the best option?
+
+Regarding packaging and verification:
+
+> If we support Ubuntu, how do you plan to test that? What are my other options for packaging? Is a pacman package reasonable?
+
+The user selected Comet option A: bundle Comet and its Windows service helper, preserving the
+existing integration without its first-use component download.
+
+The user specified delivery order:
+
+> Proton management first, then packaged builds.
+
+The user specified the download policy:
+
+> Downloads are acceptable during the build process. Proton should not be packaged with ludomere. If the user does not specify a proton version and one can not be automatically detected, ludomere may then offer to download a proton version for the user.
+
+### Settled backend and packaging decisions
+
+The user supplied these answers:
+
+> 1. Bundle UMU, yes.
+> 2. If missing, Ludomere should offer to download it.
+> 3. GE, then UMU, then Valve
+> 4. Ask for a replacement.
+> 5. Drop Ubuntu support. ArchLinux is the only supported platform for now, so a pacman package is the target.
+
+Answer 1 selects bundled UMU as the Windows launch backend. Answer 2 concerns the Steam Linux
+Runtime. Answer 3 sets automatic Proton family priority. Answer 4 concerns an explicitly selected
+Proton installation that disappears. Answer 5 supersedes the earlier AppImage direction, including
+the CI artifact format; Ubuntu and other distributions are outside the supported platform scope.
+
+### Final interview answers
+
+> 1. When first choosing the proton runtime, save that as the default runtime and allow the user to override it for individual games.
+> 2. A
+> 3. A
+> 4. I can help with real-game verification, yes.
+
+Answer 2 selects available stable GE-Proton and UMU-Proton releases, including older releases.
+Valve Proton is discovered from existing installations rather than downloaded by Ludomere.
+Answer 3 selects native and Flatpak Steam locations, additional Steam libraries, and standard
+Heroic/Lutris Proton locations, including versions installed there by ProtonPlus. Manual folder
+selection remains available. Answer 4 commits to guided user real-game verification without
+sharing credentials.
+
+## Current accepted requirements
+
+### Follow-up discussion — 2026-09-29
+
+The user initially approved an explicit peer download offer, then requested bundling all peer
+libraries. Before implementation, the user paused that direction to ask:
+
+> Hold up. Are these peer libraries readily available for download? Would explicitly offering their download to the user, along with a description of what they are for, be a problem?
+
+The user then clarified:
+
+> I think bundling the proprietary files is fine. Users are already integrating with a proprietary service. Figure out the license part.
+
+Following the licence review, the user chose the explicit-download design:
+
+> Okay, go with that. Explicitly prompt the user to download the files.
+
+The user added:
+
+> Ludomere should check if a more recent version of Comet and its dependencies is available on launch, and have a button to check manually.
+
+This supersedes the proposed peer bundling. Comet and its service helper remain packaged; proprietary
+peer files are acquired from GOG only after an explicit, explanatory user prompt. Check Comet and
+its support components on application startup and via a manual control. Startup checks must obey
+the existing no-background-dialog/focus rule. No silent component installation/update is authorized.
+
+The user resolved that question:
+
+> Offer an in-app Comet update after confirmation
+
+At this point the design required application-owned Comet updates, preservation of a working version
+on failure, and an explicit peer-download boundary. The peer boundary and modified-dependency
+approach were subsequently rejected below; package ownership and Comet update confirmation remain.
+
+Further steering:
+
+> If comet is downloading its dependencies automatically, let's trust its author has permission to do so.
+
+The user accepts Comet's upstream dependency-download permission without a separate investigation.
+This is a project decision, not newly established legal evidence. The user then selected:
+
+> Ask before every dependency download or update
+
+This was subsequently superseded by the user's explicit dependency policy:
+
+> Have you modified Comet? If so, don't. If comet's inbuilt functionality is to automatically download peer dependencies silently with no option to override that, so be it. Don't recompile dependency code to satisfy my requirements. Just tell me if a dependency doesn't work the way I want and then I will decide if I want to modify and rebuild it.
+
+Use unmodified official Comet binaries. Remove the local Comet patch/source build and custom
+peer-download enforcement. Automatic upstream peer acquisition is accepted, superseding per-peer
+confirmation and Ludomere-owned peer verification/rollback promises. Explain that behavior in the
+UI/documentation. Comet itself still has confirmed in-app binary updates and startup/manual metadata
+checks. Before modifying or rebuilding a dependency to resolve any future behavior conflict, explain
+the conflict and let the user decide. Do not infer authority for such changes from feature requirements.
+
+The manager disclosed that Ludomere's UMU adapter replaces two Python acquisition hooks at launch
+without editing or rebuilding UMU files. The user explicitly selected:
+
+> Keep Ludomere's UMU adapter and download prompts
+
+The UMU adapter and explicit Proton/runtime acquisition policy therefore remain approved. This does
+not authorize a Comet patch or other dependency modifications.
+
+- R01: Correct local build/test requirements documentation and provide local setup/check scripts,
+  a reproducible build/test container, and GitHub Actions checks and package artifacts.
+- R02: Use bundled UMU as the Windows launch backend, removing the separately installed host UMU
+  requirement. This supersedes the repository's hard-coded /usr/bin/umu-run contract for this work.
+- R03: Discover existing Proton installations, including Steam/ProtonPlus-managed versions, and
+  allow manual folder selection. Search native and Flatpak Steam, additional Steam libraries, and
+  standard Heroic/Lutris locations. Do not modify or delete externally managed installations.
+- R04: Offer global Proton selection and per-game overrides. Automatic family priority is
+  GE-Proton, then UMU-Proton, then Valve Proton. Ask for a replacement when an explicitly selected
+  installation disappears; do not silently fall back. The first chosen version becomes the saved
+  application-wide default. It remains the default until changed; games may override it.
+- R05: Provide UMU-Proton and GE-Proton downloading. Never bundle Proton with Ludomere. When no
+  Proton version was specified and none can be detected, offer the user a download. Offer available
+  stable releases, including older releases. Valve Proton is discovery-only.
+- R06: Offer to download the Steam Linux Runtime when it is missing.
+- R07: Bundle Comet and its Windows service helper, preserving the current integration without
+  downloading those bundled helpers on first use. Proprietary GOG peer libraries are excluded from
+  the package and managed by unmodified Comet as described in R11.
+- R08: Support Arch Linux only and produce a pacman package. Ubuntu support and AppImage output
+  are superseded. Retain the repository's existing x86-64 package target unless the user changes it.
+- R09: Implement Proton management first, then packaged builds. Build-time downloads are allowed.
+- R10: The user will assist with guided real-game verification on Arch. Credentials remain with
+  the user. Do not mark interactive or real-game acceptance passed without actual evidence.
+- R11: Use unmodified official Comet binaries and explain that upstream automatically acquires and
+  updates proprietary peer libraries. No peer bundling or custom Comet patch/source rebuild; its
+  upstream automatic acquisition is accepted. Preserve normal operation when Comet is disabled.
+- R12: Check for newer Comet and its dependencies at Ludomere startup and through a manual button;
+  report status in place without unsolicited dialogs or silent downloads. Offer in-app Comet updates
+  after confirmation using verified official assets; install in application-owned storage and
+  preserve package-owned helpers. Dependency behavior conflicts must be explained before any
+  proposed dependency modification or rebuild.
+
+## Acceptance and repository constraints
+
+### Library loading — approved 2026-09-29
+
+User specification:
+
+> Find ways to improve this library load time. The priority for loading data should be: game names, then game images for the grid view. Game details views should download the necessary data when opened for the first time, with a small loading indicator on each widget as it loads. If a game's data is not loaded, buttons to download and play the game should remain available and usable.
+
+> Can we request more than ten games at a time? Filters should show a loading indicator if their required data is not yet available.
+
+Implementation authorization:
+
+> Implement the identified and suggested improvements with requests for 50 games at a time.
+
+- R13: Fetch lightweight core products in batches of 50; names precede grid covers, with bounded
+  work and cached results reused. Remove the one-event-per-50ms UI bottleneck and avoid repeated
+  full-grid rebuilds. Prioritize visible covers and move image file/decode work off GTK.
+- R14: Load rich detail data on first opening, independently per section with small loading and
+  failure/retry states. Update in place without changing focus, selected page, tab or scroll.
+  Deduplicate requests and prevent stale/account-crossing results from affecting current UI.
+- R15: Play remains usable from local installation state while remote metadata is unavailable.
+  Download opens its chooser promptly and fetches only required acquisition data with loading
+  feedback; decorative data does not gate actions. Preserve existing prerequisite and update rules.
+- R16: Show loading for filters missing required metadata and fetch that data in the background,
+  prioritizing active filters. Unknown data must not count as a confirmed non-match; partial results
+  are labelled and failed loads offer retry. Available local filters remain usable.
+- R17: Partial cache updates preserve ownership, pack-derived DLC entitlement, user data, rich
+  cached fields, platforms and relationships. Verify cold/warm/offline large-library behavior,
+  independent failures/retries, rapid page changes and persistence. No new platform/package scope.
+
+### Logout cache control — requested 2026-09-29
+
+> Also a button to settings to clear the cache when you log out.
+
+- R18: Add a Settings toggle that clears the full profile whenever the user signs out. User chose:
+  "A toggle that clears cache whenever I sign out" and "Full profile reset, including settings,
+  favorites, tags, playtime, and queue records". Installed games, installer payloads, Proton and
+  runtimes remain intact. Toggle defaults off; its copy explains the complete reset and application
+  close afterward so old workers/open database handles cannot recreate erased state. Toggling alone
+  never clears data. Agents exercise reset only on disposable test profiles, not user data.
+
+### Synchronization feedback and stalled images — requested 2026-09-29
+
+> When logging in after a cache clear, the sign-in process loaded my list of games and started loading images, but seemed to stop after loading the first batch. The remaining grid view images did not load, and the grey boxes in their place did not have a loading icon on them. The loading indicator in the bottom left which indicates the library is being synchronized should be updated to also show the stage of the synchronizing process. Loading games list, loading grid images, loading metadata, etc. The game detail view should also show loading indicators while that data is loading, to show the user the program is not being idle. If a synchronization error occurs, the user should be notified.
+
+- R19: Diagnose and fix cover loading that appears to stop after the first batch following a fresh
+  login/cache clear. Keep 50-game core requests and lazy detail loading. Grid placeholders and
+  detail widgets visibly indicate pending work; settle to loaded, unavailable or error states rather
+  than silent placeholders or indefinite spinners. Bottom-left synchronization feedback identifies
+  current real work (game list, grid images, metadata) with progress where known. Surface sync and
+  partial failures visibly without unsolicited focus changes; retain usable cached data and actions.
+  Follow-up answer: the synchronization spinner "disappeared" when the remaining images stopped.
+
+### Screenshot navigation, sidebar icons and footer — requested 2026-09-29
+
+> The browse screenshots modal should allow changing screenshots with the left/right arrow keys. The game icons on the games list are not populating until the game is clicked on - these images should populate in parallel with the grid images. The "Retry" button in the lower left opens the downloads view, but does not initiate a retry button. The retry button for the hero image on the game detail view does seem to work properly. Then the process is finished, the "Signing in to GOG..." text remains in the lower right. Looking closer, it appears the full bottom-bar is a button which opens the downloads view.
+
+- R20: Screenshot modal Left/Right keys navigate with the existing previous/next semantics.
+  Sidebar game icons acquire alongside grid covers without opening details, with bounded work and
+  persistent cache. Footer Retry performs synchronization retry without navigating to Downloads;
+  Downloads has a distinct navigation control. Clear obsolete sign-in status after completion.
+  Preserve independent hero retry, lazy details, 50-game batches and page/focus invariants.
+
+### Failed-image retry and initial setup — requested 2026-09-29
+
+> The Retry button on the footer retries the full synchronization, not just the failures. That button should only retry the failed images. A full re-sync should be a button in the options. It should also be possible to dismiss the failure notification. The "Downloads" button should be centered on the footer, with the "Signed in to GOG" text on the right. The "install after download" button should be checked by default. When attempting to install a game after downloading, a "Windows Compatability" modal opens, and informs me UMU is unavailable. The whole "Windows Compatibility" modal should really not appear like this. If anything, these settings should all assume the defaults set in Ludomere. When Ludomere launches for the first time, it should guide the user through the necessary steps to set up all required defaults.
+
+- R21: Footer Retry retries only failed images, without ownership/core product resynchronization or
+  unrelated metadata work. Full resynchronization belongs in Settings/options. Failure notification
+  is dismissible without falsifying error state. Center Downloads in the footer and keep sign-in
+  status on the right. Install after downloading is selected by default and must work as labelled.
+- R22: Use saved Ludomere defaults for ordinary Windows installation/launch rather than presenting
+  the full Windows compatibility modal each time. Diagnose missing bundled UMU in the development
+  flow. Provide first-launch guided setup of necessary defaults, retaining explicit consent for
+  missing Proton/runtime downloads, external Proton discovery and per-game overrides. User chose
+  folders, default Proton, runtime checks/download offers and optional GOG sign-in; allow deferring
+  Windows setup with Finish setup available; existing profiles get a one-time guide prefilled with
+  current settings. No dependency modifications or native-Linux dependence on Windows components.
+
+Interview answers:
+```json
+{"user_answers":{"setup_scope":"folders_proton_runtime_optional_gog","windows_setup_deferral":"allowed_with_finish_setup_action","existing_profiles":"one_time_prefilled_guide","constraints":{"platform":"Arch Linux x86-64"},"preferences":{"downloads":"explicit_user_confirmation"}}}
+```
+
+### Setup folder selection and final sign-in step — requested 2026-09-29
+
+> Adjustments to the initial setup modal: 1. There should be a direcotry select modal available for both paths. The download folder should automatically update to /chosen/directory/downloads when the game folder is chosen, but still allow the user to change the download folder, which should not change the game folder path. // 2. The path to the proton file is not fully visible. It should be possible to see the full path when selecting the version. // 3. GOG sign-in should occur after other settings are completed. This should be the last step, and be presented in a different modal.
+
+- R23: Both setup folder fields have directory pickers and remain editable. Choosing a game folder
+  sets its download suggestion to that folder's downloads child; changing downloads is independent.
+  Preserve existing prefilled paths until the user changes them. Full Proton paths are readable during
+  selection. Remove sign-in from the settings form; after successful completion/save, offer optional
+  sign-in as the final step in a separate modal. Invalid/failed/cancelled setup must not advance.
+  Retain Windows deferral, no silent component downloads and existing preference preservation.
+
+### Download cleanup and detail media — requested 2026-09-29
+
+> In the download window, in optional content, "Extras" should be uncheked by default. The manage menu on a game should include an option to delete downloaded files if they are present, like installer files, goodies, etc. It should also be a checkbox when uninstalling a game. If screenshots fail to download, the navigation arrows appear in place under the library information. [Image #1]. Also, image downloads seem to fail frequently on game detail pages.
+
+- R24: Extras defaults unchecked for new profiles; retain the Settings preference and existing
+  saved choices, per user's follow-up answer below. Game Manage offers deleting present
+  downloaded installers/extras and related managed downloads, also optional in uninstall. Delete
+  downloaded files only, preserving installed payloads/saves/preferences except the normal separately
+  confirmed uninstall. Uninstall cleanup checkbox defaults off. Reuse managed-file boundaries and
+  exclude active payload work; verify cancel, empty, partial failure and UI refresh.
+
+User answered the Extras preference question:
+> Keep the preference, but default it off for new profiles
+
+Interview record: `{"user_answers":{"extras_default":"keep_preference_default_off_new_profiles"}}`.
+- R25: Failed/empty screenshot content cannot leave navigation arrows overlapping library information.
+  Investigate detail image failures and correct demonstrated request/cache/loading/retry defects,
+  preserving lazy independent sections, page/focus, available actions and safe bounded requests.
+  Screenshot supplied at /tmp/codex-clipboard-c2D0BW.png; live cause is not established from image alone.
+
+- Preserve native Linux independence, installed payloads, durable preferences, activity, marker
+  formats, and repository schema policy. Use existing persistence shape where possible.
+- Filesystem traversal, network requests, and process operations run off the GTK thread. Background
+  operations update state in place and never navigate or present windows. Offers are triggered by
+  direct user actions; Ludomere-owned queued/recovered work must not silently acquire components.
+  Comet's automatic peer acquisition is the user-approved exception.
+- Validate Ludomere-managed downloads and archives, constrain its writes to application-owned
+  storage, and preserve external Proton installations. Upstream Comet's peer downloader retains its
+  own behavior. Never shell-concatenate commands or expose credentials.
+- Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test, and the release/package
+  checks appropriate to the changes. Verify discovery, persistence, command propagation, missing
+  components, download failure/cancellation, native independence, and packaging payload contents.
+- Provide an Arch build/check environment and CI artifact workflow with pinned or constrained,
+  verified bundled components and license notices. No release publishing or host package install
+  is requested.
+- Independent QA and security review are required by the invoked project-manager skill. Outstanding
+  interactive or real-game checks remain explicit gates; the manager does not perform implementation.
+
+No time, storage, or artifact-size cap was supplied. Use ordinary scoped project resources and
+escalate any material resource or security tradeoff before expanding the work.

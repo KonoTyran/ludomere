@@ -192,6 +192,7 @@ pub fn start_uninstallation(game: InstalledGame) -> UninstallationHandle {
         };
         match run_uninstallation(&game, &worker_cancellation) {
             Ok(()) => {
+                drop(_permit);
                 let _ = sender.send(UninstallationEvent::Complete);
             }
             Err(error) => {
@@ -360,6 +361,7 @@ fn reject_symlink_path(path: &Path) -> Result<()> {
 
 fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -> Result<()> {
     use crate::compatibility::{CompatibilityBackend, CompatibilityRunRequest};
+    let backend = crate::compatibility::backend_for_game(game.product_id)?;
     let compatibility = game
         .compatibility
         .as_ref()
@@ -374,7 +376,6 @@ fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -
     crate::compatibility::configure_library_drive(&prefix, library)
         .map_err(|e| anyhow::anyhow!(e))?;
     let log_path = uninstallation_log_path(game.product_id)?;
-    let backend = crate::compatibility::default_backend();
     let profile = crate::compatibility::profile_for_use(game.product_id, &compatibility.profile);
     let mut process = backend.run_executable(CompatibilityRunRequest {
         prefix,
@@ -608,7 +609,7 @@ fn run_windows_installation(
     if install_base {
         validate_plan(plan)?;
     }
-    let backend = crate::compatibility::default_backend();
+    let backend = crate::compatibility::backend_for_game(plan.product_id)?;
     let backend_status = backend.status()?;
     if !backend_status.available || !backend_status.healthy {
         bail!(
@@ -1320,12 +1321,24 @@ mod tests {
             super::super::depot::operation_staging_path(&library, &directory, "game", "").unwrap();
         fs::create_dir_all(journal.parent().unwrap()).unwrap();
         fs::write(&journal, b"journal").unwrap();
+        let preferences = library.join("config/proton.json");
+        fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+        let saved = serde_json::to_vec(&crate::compatibility::ProtonPreferences {
+            default: Some(PathBuf::from("/external/GE-Proton")),
+            overrides: std::collections::BTreeMap::from([(
+                "7".into(),
+                PathBuf::from("/external/UMU-Proton"),
+            )]),
+        })
+        .unwrap();
+        fs::write(&preferences, &saved).unwrap();
 
         run_depot_uninstallation(7, &directory, &AtomicBool::new(false)).unwrap();
 
         assert!(!directory.exists());
         assert!(!prefix.exists());
         assert!(!journal.exists());
+        assert_eq!(fs::read(preferences).unwrap(), saved);
         fs::remove_dir_all(library).unwrap();
     }
 

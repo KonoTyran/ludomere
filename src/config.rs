@@ -6,6 +6,11 @@ use std::{fs, path::PathBuf};
 #[serde(default)]
 pub struct Config {
     pub theme: Theme,
+    #[serde(default)]
+    pub clear_profile_on_sign_out: bool,
+    pub setup_seen: bool,
+    pub setup_completed: bool,
+    pub windows_setup_deferred: bool,
     #[serde(default = "default_download_directory")]
     pub download_directory: PathBuf,
     #[serde(default)]
@@ -18,7 +23,7 @@ pub struct Config {
     pub installer_macos: bool,
     #[serde(default = "default_installation_source_order")]
     pub installation_source_order: Vec<PreferredInstallationSource>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub download_extras_by_default: bool,
     #[serde(default)]
     pub download_patches_by_default: bool,
@@ -106,13 +111,17 @@ impl Default for Config {
             .unwrap_or_else(default_download_directory);
         Self {
             theme: Theme::System,
+            clear_profile_on_sign_out: false,
+            setup_completed: false,
+            setup_seen: false,
+            windows_setup_deferred: false,
             download_directory,
             installer_language: None,
             installer_windows: true,
             installer_linux: true,
             installer_macos: true,
             installation_source_order: default_installation_source_order(),
-            download_extras_by_default: true,
+            download_extras_by_default: false,
             download_patches_by_default: false,
             prefer_patch_updates: false,
             interactive_installer_prompts: false,
@@ -226,9 +235,6 @@ impl Config {
                 .default_game_library()
                 .map(|library| library.id.clone());
         }
-        if let Some(library) = self.installer_library() {
-            self.download_directory = library.path.clone();
-        }
     }
 
     pub fn normalize_installation_source_order(&mut self) {
@@ -300,6 +306,46 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn setup_visibility_and_deferral_persist_without_changing_existing_preferences() {
+        let mut config: Config =
+            toml::from_str("theme = 'dark'\ninstaller_language = 'French'").unwrap();
+        assert!(!config.setup_seen);
+        assert!(!config.setup_completed);
+        config.setup_seen = true;
+        config.windows_setup_deferred = true;
+        let saved: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(saved.setup_seen && saved.windows_setup_deferred);
+        assert!(!saved.setup_completed);
+        assert_eq!(saved.installer_language.as_deref(), Some("French"));
+        assert!(matches!(saved.theme, Theme::Dark));
+        assert_eq!(saved.download_directory, config.download_directory);
+        assert_eq!(
+            saved.installer_library().unwrap().path,
+            config.installer_library().unwrap().path
+        );
+    }
+
+    #[test]
+    fn profile_reset_is_opt_in_and_persists() {
+        assert!(!Config::default().clear_profile_on_sign_out);
+        assert!(
+            !toml::from_str::<Config>("theme = 'dark'")
+                .unwrap()
+                .clear_profile_on_sign_out
+        );
+        let configured = Config {
+            clear_profile_on_sign_out: true,
+            ..Config::default()
+        };
+        let saved = toml::to_string(&configured).unwrap();
+        assert!(
+            toml::from_str::<Config>(&saved)
+                .unwrap()
+                .clear_profile_on_sign_out
+        );
+    }
+
+    #[test]
     fn obsolete_roots_are_ignored_and_not_serialized() {
         let obsolete_key = ["library", "_roots"].concat();
         let old = format!(
@@ -324,14 +370,14 @@ enabled = true
         );
         assert_eq!(config.installer_language.as_deref(), Some("English"));
         assert!(!config.installer_windows);
-        assert!(config.download_extras_by_default);
+        assert!(!config.download_extras_by_default);
         assert!(!config.download_patches_by_default);
         assert!(!config.show_retired_artifacts);
         assert_eq!(config.max_concurrent_downloads, 2);
         assert_eq!(config.game_libraries.len(), 1);
         assert!(config.game_libraries[0].default);
         let saved = toml::to_string(&config).unwrap();
-        assert!(saved.contains("download_extras_by_default = true"));
+        assert!(saved.contains("download_extras_by_default = false"));
         assert!(saved.contains("download_patches_by_default = false"));
         assert!(saved.contains("show_retired_artifacts = false"));
         assert!(!saved.contains(&obsolete_key));
@@ -377,6 +423,87 @@ enabled = true
         );
         assert!(!config.game_libraries[0].id.is_empty());
         assert_eq!(config.game_libraries[0].name, "fast");
+    }
+
+    #[test]
+    fn extras_default_off_preserves_explicit_existing_preferences() {
+        assert!(!Config::default().download_extras_by_default);
+        assert!(
+            !toml::from_str::<Config>("")
+                .unwrap()
+                .download_extras_by_default
+        );
+        for enabled in [false, true] {
+            let config: Config =
+                toml::from_str(&format!("download_extras_by_default = {enabled}")).unwrap();
+            assert_eq!(config.download_extras_by_default, enabled);
+            assert_eq!(
+                toml::from_str::<Config>(&toml::to_string(&config).unwrap())
+                    .unwrap()
+                    .download_extras_by_default,
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn saved_download_folder_survives_loading_and_library_normalization() {
+        if std::env::var_os("LUDOMERE_CONFIG_ROUNDTRIP_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let download_directory = root.join("Independent Downloads");
+            let library = root.join("Game Library");
+            let config = Config {
+                download_directory: download_directory.clone(),
+                game_libraries: vec![GameLibrary {
+                    id: String::new(),
+                    name: String::new(),
+                    path: library.clone(),
+                    default: false,
+                }],
+                installer_library_id: Some("old-library-id".into()),
+                ..Config::default()
+            };
+            config.save().unwrap();
+            for _ in 0..2 {
+                let loaded = Config::load_or_create().unwrap();
+                assert_eq!(loaded.download_directory, download_directory);
+                assert_eq!(loaded.installer_library().unwrap().path, library);
+                assert_eq!(
+                    loaded.installer_library().unwrap().id,
+                    game_library_id(&library)
+                );
+                assert!(loaded.installer_library().unwrap().default);
+                loaded.save().unwrap();
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "config::tests::saved_download_folder_survives_loading_and_library_normalization",
+                "--nocapture",
+            ])
+            .env("LUDOMERE_CONFIG_ROUNDTRIP_CHILD", "1");
+        for (key, name) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
+            let path = root.path().join(name);
+            fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            child.env(key, path);
+        }
+        assert!(child.status().unwrap().success());
     }
 
     #[test]

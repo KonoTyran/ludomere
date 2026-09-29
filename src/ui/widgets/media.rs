@@ -3,16 +3,60 @@ use gdk_pixbuf::{InterpType, Pixbuf};
 use gtk::{gdk, gio, glib};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
-    path::PathBuf,
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
-type CardTextureKey = (PathBuf, i32, i32, u64, u128);
+type CardTextureKey = (PathBuf, i32, i32);
+type DecodedCard = (Vec<u8>, bool, i32);
+
+struct CardPictures {
+    pending: HashMap<CardTextureKey, Vec<glib::WeakRef<gtk::Picture>>>,
+    queue: VecDeque<CardTextureKey>,
+    sender: std::sync::mpsc::Sender<(u64, CardTextureKey)>,
+    receiver: std::sync::mpsc::Receiver<(u64, CardTextureKey, Option<DecodedCard>)>,
+    generation: u64,
+    active: usize,
+    polling: bool,
+}
+
+impl CardPictures {
+    fn new() -> Self {
+        let (sender, jobs) = std::sync::mpsc::channel::<(u64, CardTextureKey)>();
+        let jobs = std::sync::Arc::new(std::sync::Mutex::new(jobs));
+        let (results, receiver) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let jobs = jobs.clone();
+            let results = results.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let Ok((generation, key)) = jobs.lock().unwrap().recv() else {
+                        break;
+                    };
+                    let decoded = decode_card(&key.0, key.1, key.2);
+                    if results.send((generation, key, decoded)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Self {
+            pending: HashMap::new(),
+            queue: VecDeque::new(),
+            sender,
+            receiver,
+            active: 0,
+            generation: 0,
+            polling: false,
+        }
+    }
+}
 
 thread_local! {
     static CARD_TEXTURE_CACHE: RefCell<HashMap<CardTextureKey, gdk::Texture>> =
         RefCell::new(HashMap::new());
+    static CARD_PICTURES: RefCell<CardPictures> = RefCell::new(CardPictures::new());
 }
 
 pub(in crate::ui) fn picture(
@@ -189,29 +233,185 @@ pub(in crate::ui) fn card_picture(path: Option<&PathBuf>, width: i32, height: i3
     picture.set_vexpand(false);
     picture.add_css_class("hero-card");
 
-    if let Some(path) = path
-        && let Some(texture) = scaled_card_texture(path, width, height)
-    {
-        picture.set_paintable(Some(&texture));
+    if let Some(path) = path {
+        set_card_picture(&picture, path, width, height);
     }
     picture
 }
 
-pub(in crate::ui) fn scaled_card_texture(
-    path: &PathBuf,
+pub(in crate::ui) fn set_card_picture(
+    picture: &gtk::Picture,
+    path: &Path,
     width: i32,
     height: i32,
-) -> Option<gdk::Texture> {
-    let metadata = path.metadata().ok()?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos());
-    let key = (path.clone(), width, height, metadata.len(), modified);
+) {
+    let key = (path.to_path_buf(), width.max(1), height.max(1));
+    CARD_PICTURES.with(|state| {
+        for pictures in state.borrow_mut().pending.values_mut() {
+            pictures.retain(|candidate| candidate.upgrade().is_some_and(|value| value != *picture));
+        }
+    });
     if let Some(texture) = CARD_TEXTURE_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
-        return Some(texture);
+        picture.set_paintable(Some(&texture));
+        set_picture_status(picture, "image-ready", "Image loaded");
+        return;
     }
+    set_picture_status(picture, "image-loading", "Loading image…");
+    CARD_PICTURES.with(|state| {
+        let mut state = state.borrow_mut();
+        if !state.pending.contains_key(&key) {
+            state.queue.push_back(key.clone());
+        }
+        state
+            .pending
+            .entry(key)
+            .or_default()
+            .push(picture.downgrade());
+        if state.polling {
+            return;
+        }
+        state.polling = true;
+        glib::timeout_add_local(std::time::Duration::from_millis(16), || {
+            CARD_PICTURES.with(|state| {
+                let mut state = state.borrow_mut();
+                for _ in 0..16 {
+                    let Ok((generation, key, decoded)) = state.receiver.try_recv() else {
+                        break;
+                    };
+                    state.active -= 1;
+                    if generation != state.generation {
+                        continue;
+                    }
+                    let pictures = state.pending.remove(&key).unwrap_or_default();
+                    if pictures.is_empty() {
+                        continue;
+                    }
+                    if let Some((pixels, alpha, stride)) = decoded {
+                        let pixbuf = Pixbuf::from_bytes(
+                            &glib::Bytes::from_owned(pixels),
+                            gdk_pixbuf::Colorspace::Rgb,
+                            alpha,
+                            8,
+                            key.1,
+                            key.2,
+                            stride,
+                        );
+                        let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                        for picture in pictures.into_iter().filter_map(|picture| picture.upgrade())
+                        {
+                            picture.set_paintable(Some(&texture));
+                            set_picture_status(&picture, "image-ready", "Image loaded");
+                        }
+                        CARD_TEXTURE_CACHE.with(|cache| {
+                            let mut cache = cache.borrow_mut();
+                            // Limit memory when the user changes card sizes repeatedly.
+                            if cache.len() >= 1024 {
+                                cache.clear();
+                            }
+                            cache.insert(key, texture);
+                        });
+                    } else {
+                        for picture in pictures.into_iter().filter_map(|picture| picture.upgrade())
+                        {
+                            set_picture_status(
+                                &picture,
+                                "image-error",
+                                "Image could not be decoded",
+                            );
+                        }
+                    }
+                }
+                while state.active < 2 && !state.queue.is_empty() {
+                    let next = state
+                        .queue
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, key)| {
+                            state
+                                .pending
+                                .get(*key)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|picture| picture.upgrade())
+                                .map(|picture| picture_viewport_priority(&picture))
+                                .min()
+                                .unwrap_or(4)
+                        })
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    let key = state.queue.remove(next).unwrap();
+                    if state.pending.get(&key).is_none_or(|pictures| {
+                        pictures.iter().all(|picture| picture.upgrade().is_none())
+                    }) {
+                        state.pending.remove(&key);
+                        continue;
+                    }
+                    if state.sender.send((state.generation, key)).is_ok() {
+                        state.active += 1;
+                    }
+                }
+                if state.active == 0 && state.queue.is_empty() {
+                    state.polling = false;
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            })
+        });
+    });
+}
+
+pub(in crate::ui) fn clear_card_texture_cache() {
+    CARD_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
+    CARD_PICTURES.with(|state| {
+        let mut state = state.borrow_mut();
+        state.queue.clear();
+        state.pending.clear();
+        state.generation = state.generation.wrapping_add(1);
+    });
+}
+
+pub(in crate::ui) fn set_picture_status(picture: &gtk::Picture, status: &str, message: &str) {
+    picture.set_tooltip_text(Some(message));
+    for class in [
+        "image-pending",
+        "image-loading",
+        "image-ready",
+        "image-error",
+        "image-unavailable",
+    ] {
+        if class != status {
+            picture.remove_css_class(class);
+        }
+    }
+    picture.add_css_class(status);
+}
+
+fn picture_viewport_priority(picture: &gtk::Picture) -> u8 {
+    if !picture.is_mapped() {
+        return 3;
+    }
+    let Some(scroll) = picture
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+    else {
+        return 0;
+    };
+    let Some(bounds) = picture.compute_bounds(&scroll) else {
+        return 3;
+    };
+    if bounds.y() + bounds.height() >= 0.0 && bounds.y() <= scroll.height() as f32 {
+        0
+    } else if bounds.y() + bounds.height() >= -(scroll.height() as f32)
+        && bounds.y() <= 2.0 * scroll.height() as f32
+    {
+        1
+    } else {
+        2
+    }
+}
+
+fn decode_card(path: &PathBuf, width: i32, height: i32) -> Option<DecodedCard> {
     let source = Pixbuf::from_file(path).ok()?;
     let source_width = source.width();
     let source_height = source.height();
@@ -236,13 +436,188 @@ pub(in crate::ui) fn scaled_card_texture(
     };
     let cropped = source.new_subpixbuf(x, y, crop_width, crop_height);
     let scaled = cropped.scale_simple(width, height, InterpType::Bilinear)?;
-    let texture = gdk::Texture::for_pixbuf(&scaled);
-    CARD_TEXTURE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache.retain(|(cached_path, cached_width, cached_height, _, _), _| {
-            cached_path != path || *cached_width != width || *cached_height != height
-        });
-        cache.insert(key, texture.clone());
-    });
-    Some(texture)
+    Some((
+        scaled.read_pixel_bytes().to_vec(),
+        scaled.has_alpha(),
+        scaled.rowstride(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires isolated Xvfb and private D-Bus; exercises GTK image queue and card indicators"]
+    fn delayed_card_batches_settle_failures_and_discard_rebound_results() {
+        adw::init().expect("requires an isolated GTK display");
+        let directory = tempfile::tempdir().unwrap();
+        let images = (0..120)
+            .map(|id| {
+                let path = directory.path().join(format!("{id}.png"));
+                image::RgbImage::from_pixel(4, 4, image::Rgb([id, 40, 60]))
+                    .save(&path)
+                    .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let cards = (0..120)
+            .map(|id| {
+                let game = crate::domain::Game {
+                    product_id: id,
+                    title: format!("Game {id}"),
+                    ..Default::default()
+                };
+                let card = crate::ui::game_card(&game, false, 140);
+                crate::ui::apply_card_cover_state(
+                    card.upcast_ref(),
+                    Some(&crate::ui::CoverState::Pending),
+                );
+                card
+            })
+            .collect::<Vec<_>>();
+        let pictures = cards
+            .iter()
+            .map(|card| {
+                crate::ui::find_named_descendant(card.upcast_ref(), "card-art")
+                    .and_downcast::<gtk::Picture>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            pictures
+                .iter()
+                .all(|picture| picture.has_css_class("image-pending"))
+        );
+        for (picture, image) in pictures[..50].iter().zip(&images[..50]) {
+            set_card_picture(picture, image, 140, 78);
+        }
+        let drain = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while CARD_PICTURES.with(|state| state.borrow().polling) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "image decoder queue stalled"
+                );
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        drain();
+        assert!(
+            pictures[..50]
+                .iter()
+                .all(|picture| picture.has_css_class("image-ready"))
+        );
+        assert!(
+            pictures[50..]
+                .iter()
+                .all(|picture| picture.has_css_class("image-pending"))
+        );
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let corrupt = directory.path().join("corrupt.png");
+        std::fs::write(&corrupt, b"broken image").unwrap();
+        for (index, picture) in pictures[50..].iter().enumerate() {
+            set_card_picture(
+                picture,
+                if index == 3 {
+                    &corrupt
+                } else {
+                    &images[index + 50]
+                },
+                140,
+                78,
+            );
+        }
+        drain();
+        assert!(pictures[53].has_css_class("image-error"));
+        assert!(
+            pictures
+                .iter()
+                .enumerate()
+                .all(|(id, picture)| id == 53 || picture.has_css_class("image-ready"))
+        );
+        let status =
+            crate::ui::find_named_descendant(cards[53].upcast_ref(), "card-image-status").unwrap();
+        assert!(status.is_visible());
+        assert!(
+            !status
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Spinner>()
+                .unwrap()
+                .is_spinning()
+        );
+        // Rebinding to a cached image must detach an older failed request.
+        set_card_picture(&pictures[53], &corrupt, 140, 78);
+        set_card_picture(&pictures[53], &images[0], 140, 78);
+        drain();
+        assert!(pictures[53].has_css_class("image-ready"));
+        // A cache clear also invalidates any results still in flight.
+        set_card_picture(&pictures[53], &corrupt, 140, 78);
+        clear_card_texture_cache();
+        set_card_picture(&pictures[53], &images[53], 140, 78);
+        drain();
+        assert!(pictures[53].has_css_class("image-ready"));
+        assert!(!status.is_visible());
+    }
+
+    #[test]
+    fn cover_worker_crops_center_without_a_gtk_context() {
+        let directory = tempfile::tempdir().unwrap();
+        for (width, height) in [(12, 4), (4, 12)] {
+            let path = directory.path().join(format!("{width}-{height}.png"));
+            image::RgbImage::from_fn(width, height, |x, y| {
+                if (width == 12 && (4..8).contains(&x)) || (height == 12 && (4..8).contains(&y)) {
+                    image::Rgb([0, 0, 255])
+                } else {
+                    image::Rgb([255, 0, 0])
+                }
+            })
+            .save(&path)
+            .unwrap();
+            let (pixels, alpha, stride) =
+                std::thread::spawn(move || decode_card(&path, 2, 2).unwrap())
+                    .join()
+                    .unwrap();
+            assert!(!alpha);
+            for y in 0..2 {
+                for x in 0..2 {
+                    let offset = y * stride as usize + x * 3;
+                    assert_eq!(&pixels[offset..offset + 3], &[0, 0, 255]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_and_missing_covers_do_not_stop_workers() {
+        let directory = tempfile::tempdir().unwrap();
+        let corrupt = directory.path().join("corrupt.png");
+        std::fs::write(&corrupt, b"not an image").unwrap();
+        let valid = directory.path().join("valid.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([20, 40, 60, 128]))
+            .save(&valid)
+            .unwrap();
+        let workers = CardPictures::new();
+        for path in [corrupt, directory.path().join("missing.png"), valid.clone()] {
+            workers.sender.send((0, (path, 2, 2))).unwrap();
+        }
+        let results = (0..3)
+            .map(|_| {
+                let (_, key, decoded) = workers
+                    .receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                (key, decoded)
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            results.values().filter(|result| result.is_none()).count(),
+            2
+        );
+        let (pixels, alpha, _) = results.get(&(valid, 2, 2)).unwrap().as_ref().unwrap();
+        assert!(*alpha);
+        assert_eq!(&pixels[..4], &[20, 40, 60, 128]);
+    }
 }

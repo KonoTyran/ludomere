@@ -355,19 +355,31 @@ This table is generated from the dependency graph resolved by `Cargo.lock`. Lice
 | `zvariant_utils` | `2.1.0` | `MIT` | https://github.com/dbus2/zbus/ |
 | `zvariant_utils` | `4.0.0` | `MIT` | https://github.com/z-galaxy/zbus/ |
 
+Additional dependencies introduced for verified component archive handling:
+
+| Package | Version | License | Project |
+|---|---:|---|---|
+| `filetime` | `0.2.29` | `MIT/Apache-2.0` | https://github.com/alexcrichton/filetime |
+| `lzma-sys` | `0.1.20` | `MIT/Apache-2.0` | https://github.com/alexcrichton/xz2-rs |
+| `tar` | `0.4.46` | `MIT OR Apache-2.0` | https://github.com/composefs/tar-rs |
+| `xattr` | `1.6.1` | `MIT OR Apache-2.0` | https://github.com/Stebalien/xattr |
+| `xz2` | `0.1.7` | `MIT/Apache-2.0` | https://github.com/alexcrichton/xz2-rs |
+
 ## Native system libraries
 
-Ludomere dynamically links to GTK4, libadwaita, GDK-Pixbuf, WebKitGTK, and libsecret supplied by the host system. These libraries remain under their respective upstream licenses, principally the GNU Lesser General Public License and permissive licenses.
+Ludomere dynamically links to GTK4, libadwaita, GDK-Pixbuf, WebKitGTK, D-Bus, libsecret, and liblzma supplied by the host system. These libraries remain under their respective upstream licenses, principally the GNU Lesser General Public License and permissive licenses.
 
 ## External compatibility tools
 
-- [UMU Launcher](https://github.com/Open-Wine-Components/umu-launcher) is an optional, separately installed GPLv3 program invoked by Ludomere.
-- [Comet](https://github.com/imLinguin/comet) is GPLv3 software downloaded unchanged from its upstream release when an enabled compatibility fix needs it.
-- UMU may download Proton, Wine, and Steam Linux Runtime components. They remain separate programs under their respective upstream licenses and are not part of the Ludomere source distribution.
+- [UMU Launcher 1.4.4](https://github.com/Open-Wine-Components/umu-launcher/tree/1.4.4) is bundled under GPLv3. Its Python source is installed beneath `/usr/lib/ludomere/umu/vendor/umu`; Ludomere supplies the separate `resources/helpers/umu-run` consent adapter. The upstream source archive, including build metadata and bundled VDF parser attribution, is included in `/usr/share/doc/ludomere/sources/`. Python Xlib and urllib3 come from Arch packages under their upstream licenses; optional UMU delta-update libraries are not required.
+- UMU vendors [VDF 3.4](https://github.com/ValvePython/vdf/tree/8104cb27c0b222bd802b69df58204ab389fc714c), copyright 2015 Rossen Georgiev, under the MIT license. The complete notice is preserved in `resources/licenses/VDF-LICENSE.txt` and installed as `/usr/share/licenses/ludomere/VDF-LICENSE`. It was retrieved unchanged from the release commit's [LICENSE](https://raw.githubusercontent.com/ValvePython/vdf/8104cb27c0b222bd802b69df58204ab389fc714c/LICENSE), SHA-256 `87c46dbdd422e99400f428873b6a23fd5526d3362926ba17351db7c45771bdea`; upstream UMU's archive omits this notice.
+- [Comet v0.3.2](https://github.com/imLinguin/comet/tree/v0.3.2) and `GalaxyCommunication-dummy.exe` are bundled unchanged from the official release under Apache-2.0. The matching unmodified upstream source archive accompanies the package in `/usr/share/doc/ludomere/sources/`; its LICENSE is installed as `Comet-LICENSE`. Ludomere does not patch or recompile Comet.
+- The helper source/binary URLs and pinned SHA-256 values are recorded in `tools/prepare-helpers.py` and in the packaged `sources/manifest.json`. Upstream license files are installed in `/usr/share/licenses/ludomere/`. The Ludomere source archive includes the private adapter and packaging scripts.
+- Proton, Wine, and Steam Linux Runtime components are not bundled. Explicit user-requested downloads retain their upstream license files and are separate programs under their respective upstream licenses.
+- Proprietary GOG Galaxy Peer DLLs are not redistributed in the package. The unmodified Comet helper downloads and updates them directly from GOG according to its upstream behavior; Comet's open-source license does not grant rights in those DLLs.
 
 ## Artwork
 
 The Windows, Apple, and Linux platform icons under `resources/icons/platform/` are from Font Awesome Free 7.3.1, copyright 2026 Fonticons, Inc., and are licensed under CC BY 4.0. Attribution details are in `resources/icons/platform/LICENSE.fontawesome.txt`; the full license is in `resources/icons/platform/LICENSE.CC-BY-4.0.txt`.
 
 GOG game artwork and metadata are retrieved for the signed-in user's library and are not bundled with Ludomere.
-

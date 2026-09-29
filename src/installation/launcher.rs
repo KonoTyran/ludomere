@@ -58,6 +58,13 @@ pub enum LaunchEvent {
 
 pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
     let (sender, receiver) = mpsc::channel();
+    let activity = match crate::profile_reset::begin_activity("game or cloud sync") {
+        Ok(activity) => activity,
+        Err(error) => {
+            let _ = sender.send(LaunchEvent::Failed(error.to_string()));
+            return receiver;
+        }
+    };
     let (stop_sender, stop_receiver) = mpsc::channel();
     {
         let mut games = running_games().lock().unwrap();
@@ -68,6 +75,7 @@ pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
         games.insert(game.product_id, stop_sender);
     }
     thread::spawn(move || {
+        let _activity = activity;
         let product_id = game.product_id;
         match run_game(&game, &sender, &stop_receiver) {
             Ok((started_at, seconds, exit_code)) => {
@@ -135,6 +143,11 @@ fn run_game(
     stop: &mpsc::Receiver<()>,
 ) -> Result<(i64, u64, Option<i32>)> {
     let mut game = game.clone();
+    let backend = game
+        .compatibility
+        .as_ref()
+        .map(|_| crate::compatibility::backend_for_game(game.product_id))
+        .transpose()?;
     if refresh_fallback_profile(&mut game, crate::compatibility::resolve_profile) {
         game.updated_at = chrono::Utc::now().timestamp();
         if let Ok(store) = StateStore::open()
@@ -164,7 +177,7 @@ fn run_game(
         .and_then(|store| store.compatibility_fix_overrides(game.product_id))
         .unwrap_or_default();
     let fixes = crate::compatibility::effective_fixes(game.product_id, &fix_overrides);
-    let _comet = start_online_services_fix(&game, &fixes, &log_path);
+    let _comet = start_online_services_fix(&game, backend.as_ref(), &fixes, &log_path);
     let started_at = chrono::Utc::now().timestamp();
     let timer = Instant::now();
     let mut command = if let Some(compatibility) = &game.compatibility {
@@ -175,15 +188,18 @@ fn run_game(
         let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
         crate::compatibility::configure_library_drive(&prefix, library)
             .map_err(|error| anyhow::anyhow!(error))?;
-        let mut command = Command::new("/usr/bin/umu-run");
-        command
-            .env("WINEPREFIX", prefix)
-            .env("GAMEID", &compatibility.profile.game_id)
-            .env("STORE", "gog")
-            .env("PROTON_VERB", "waitforexitandrun")
-            .arg(executable)
-            .args(&game.launch_arguments);
-        command
+        backend
+            .as_ref()
+            .unwrap()
+            .command(&crate::compatibility::CompatibilityRunRequest {
+                prefix,
+                profile: compatibility.profile.clone(),
+                executable: executable.clone(),
+                arguments: game.launch_arguments.clone(),
+                working_directory: None,
+                log_path: log_path.clone(),
+                background: false,
+            })?
     } else {
         let mut command = Command::new(executable);
         command.args(&game.launch_arguments);
@@ -437,6 +453,7 @@ fn bundled_libraries(root: &std::path::Path) -> Vec<PathBuf> {
 
 fn start_online_services_fix(
     game: &InstalledGame,
+    backend: Option<&crate::compatibility::UmuBackend>,
     fixes: &[crate::compatibility::LaunchFixDefinition],
     log_path: &std::path::Path,
 ) -> Option<crate::compatibility::comet::CometSession> {
@@ -451,7 +468,7 @@ fn start_online_services_fix(
     let result = if let Some(compatibility) = &game.compatibility {
         let library = game.installation_directory.parent()?;
         let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
-        crate::compatibility::comet::start(&prefix, &compatibility.profile, log_path)
+        crate::compatibility::comet::start(backend?, &prefix, &compatibility.profile, log_path)
     } else {
         crate::compatibility::comet::start_native(log_path)
     };

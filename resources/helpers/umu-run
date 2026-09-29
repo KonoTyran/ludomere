@@ -1,0 +1,68 @@
+#!/usr/bin/python3 -I
+"""Ludomere's consent boundary for the bundled, pinned UMU 1.4.4.
+
+Install next to vendor/umu; -I excludes user site packages and PYTHONPATH.
+Distribution Python dependencies remain available through system site packages.
+No component acquisition is permitted by this entry point.
+"""
+import os
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+vendor = Path(__file__).resolve().parent / "vendor"
+sys.path.insert(0, str(vendor))
+
+import umu
+
+if umu.__version__ != "1.4.4" or not Path(umu.__file__).resolve().is_relative_to(vendor):
+    sys.exit("Ludomere requires its bundled UMU 1.4.4; reinstall the package")
+
+if sys.argv[1:] in (["--version"], ["-v"]):
+    print("umu-launcher version 1.4.4 (Ludomere; explicit component acquisition)")
+    sys.exit(0)
+
+# UMU debug logging dumps the complete environment, potentially including secrets.
+os.environ["UMU_LOG"] = "info"
+os.environ["UMU_RUNTIME_UPDATE"] = "0"
+for key in ("UMU_NO_PROTON", "UMU_NO_RUNTIME", "RUNTIMEPATH", "UMU_ZENITY"):
+    os.environ.pop(key, None)
+
+from umu import umu_run
+from umu.__main__ import main
+
+
+def selected_proton(env, _pools):
+    path = Path(os.environ.get("PROTONPATH", ""))
+    if not path.is_absolute() or not (path / "proton").is_file() or not (path / "toolmanifest.vdf").is_file():
+        raise RuntimeError("Choose an installed Proton version in Ludomere")
+    env["PROTONPATH"] = str(path)
+    return env
+
+
+def installed_runtime(local, runtime_version, _pools):
+    name, variant, _appid = runtime_version
+    root = Path(os.environ["UMU_FOLDERS_PATH"]) / "umu" / variant
+    if local != root or not all((root / item).is_file() for item in (
+        ".installed.ok", "_v2-entry-point", "toolmanifest.vdf",
+        "pressure-vessel/bin/pv-verify", "VERSIONS.txt",
+    )) or not any(path.is_dir() for path in root.glob(f"{name}_platform_*/files")):
+        raise RuntimeError("Download the missing Steam Linux Runtime in Ludomere")
+
+
+try:
+    if not Path(os.environ.get("UMU_FOLDERS_PATH", "")).is_absolute():
+        raise RuntimeError("Ludomere's private runtime directory was not configured")
+    selected_proton({}, None)
+    runtime = umu_run.resolve_runtime()
+    if runtime.name != "host":
+        installed_runtime(runtime.path, runtime.as_tuple(), None)
+    # These are the exact imported call sites in pinned UMU 1.4.4.
+    umu_run.get_umu_proton = selected_proton
+    umu_run.setup_umu = installed_runtime
+    if sys.argv[1:2] == ["--config"] or sys.argv[1:2] and sys.argv[1].startswith("--config="):
+        raise RuntimeError("UMU configuration files are not supported by Ludomere")
+    sys.exit(main())
+except (OSError, RuntimeError, ValueError, KeyError) as error:
+    sys.exit(str(error))

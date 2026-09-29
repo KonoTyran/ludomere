@@ -35,7 +35,19 @@ struct Request {
 }
 
 enum Command {
+    DeleteManaged(
+        super::ManagedDownloads,
+        bool,
+        mpsc::Sender<anyhow::Result<super::CleanupResult>>,
+    ),
     Enqueue(Request),
+    EnqueueWithInstall(
+        Vec<super::DownloadRequest>,
+        Option<super::AutoInstallRequest>,
+        u64,
+        mpsc::Sender<anyhow::Result<usize>>,
+    ),
+    RetryInstall(i64, mpsc::Sender<anyhow::Result<()>>),
     Pause(String),
     Resume {
         id: String,
@@ -104,10 +116,30 @@ pub(super) fn enqueue(
     destination: PathBuf,
     listener: mpsc::Sender<DownloadEvent>,
 ) -> Arc<AtomicBool> {
+    let request = request_from_download(super::DownloadRequest {
+        artifacts,
+        title,
+        access_token,
+        destination,
+        events: listener,
+    });
+    let handle = request.handle.clone();
+    let _ = manager().commands.send(Command::Enqueue(request));
+    handle
+}
+
+fn request_from_download(request: super::DownloadRequest) -> Request {
+    let super::DownloadRequest {
+        artifacts,
+        title,
+        access_token,
+        destination,
+        events: listener,
+    } = request;
     let refs = artifacts.iter().collect::<Vec<_>>();
     let id = job_id(&refs);
     let handle = Arc::new(AtomicBool::new(false));
-    let request = Request {
+    Request {
         id,
         artifacts,
         title,
@@ -120,9 +152,53 @@ pub(super) fn enqueue(
         ready_at: Instant::now(),
         queue_position: None,
         manifest_refresh_attempted: false,
-    };
-    let _ = manager().commands.send(Command::Enqueue(request));
-    handle
+    }
+}
+
+pub(super) fn enqueue_with_install(
+    requests: Vec<super::DownloadRequest>,
+    install: Option<super::AutoInstallRequest>,
+    session: u64,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        requests.iter().all(|request| !request.artifacts.is_empty()),
+        "A download group contains no files"
+    );
+    let (sender, receiver) = mpsc::channel();
+    manager()
+        .commands
+        .send(Command::EnqueueWithInstall(
+            requests, install, session, sender,
+        ))
+        .map_err(|_| anyhow::anyhow!("Download manager is unavailable"))?;
+    receiver
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Download registration stopped"))?
+}
+
+pub(super) fn retry_install_after_download(product_id: i64) -> anyhow::Result<()> {
+    let (sender, receiver) = mpsc::channel();
+    manager()
+        .commands
+        .send(Command::RetryInstall(product_id, sender))
+        .map_err(|_| anyhow::anyhow!("Download manager is unavailable"))?;
+    receiver
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Installation retry stopped"))?
+}
+
+pub(super) fn delete_managed_downloads(
+    files: super::ManagedDownloads,
+    after_uninstall: bool,
+) -> anyhow::Result<super::CleanupResult> {
+    let (reply, result) = mpsc::channel();
+    manager()
+        .commands
+        .send(Command::DeleteManaged(files, after_uninstall, reply))
+        .map_err(|_| anyhow::anyhow!("Download manager unavailable"))?;
+    result
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Downloaded file cleanup stopped"))?
 }
 
 pub(super) fn pause(id: &str) -> bool {
@@ -212,6 +288,85 @@ fn run(
         };
         if let Some(command) = command {
             match command {
+                Command::DeleteManaged(files, after_uninstall, reply) => {
+                    let product_id = files.product_id;
+                    let result = StateStore::open()
+                        .and_then(|store| super::cleanup::delete(&store, files, after_uninstall));
+                    publish(
+                        &subscribers,
+                        DownloadManagerEvent::ManagedFilesChanged(product_id),
+                    );
+                    let _ = reply.send(result);
+                }
+                Command::EnqueueWithInstall(requests, choice, session, reply) => {
+                    let result = crate::online::with_account_session(
+                        session,
+                        || -> anyhow::Result<usize> {
+                            anyhow::ensure!(
+                                shutdown_acknowledgement.is_none(),
+                                "Ludomere is closing; retry after restarting"
+                            );
+                            let store = StateStore::open()?;
+                            let intent = choice
+                                .as_ref()
+                                .map(|choice| {
+                                    super::auto_install::intent(&store, &requests, choice)
+                                })
+                                .transpose()?
+                                .flatten();
+                            super::auto_install::clear_for_requests(&store, &requests)?;
+                            if let Some(choice) = choice {
+                                store.clear_download_install_intent(choice.product_id)?;
+                            }
+                            if let Some(intent) = intent {
+                                store.save_download_install_intent(&intent)?;
+                            }
+                            let count = requests.len();
+                            for request in requests {
+                                let request = request_from_download(request);
+                                if !queued.iter().any(|queued| queued.id == request.id)
+                                    && !active
+                                        .lock()
+                                        .is_ok_and(|active| active.contains_key(&request.id))
+                                    && !store.download_job(&request.id)?.is_some_and(|job| {
+                                        job.state == DownloadState::Complete
+                                            && !job.completed_files.is_empty()
+                                            && job.completed_files.iter().all(|path| path.is_file())
+                                    })
+                                {
+                                    save_request(&store, &request, DownloadState::Queued)?;
+                                    queued.push_back(request);
+                                }
+                            }
+                            authentication_available = true;
+                            Ok(count)
+                        },
+                    )
+                    .and_then(|count| {
+                        super::auto_install::process(&StateStore::open()?)?;
+                        Ok(count)
+                    });
+                    let _ = reply.send(result);
+                }
+                Command::RetryInstall(product_id, reply) => {
+                    let result = (|| -> anyhow::Result<()> {
+                        anyhow::ensure!(shutdown_acknowledgement.is_none(), "Ludomere is closing");
+                        let store = StateStore::open()?;
+                        let intent = store
+                            .download_install_intents()?
+                            .into_iter()
+                            .find(|intent| {
+                                intent.product_id == product_id && intent.state == "blocked"
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("No blocked automatic installation was found")
+                            })?;
+                        store.set_download_install_state(&intent.intent_id, "waiting", None)?;
+                        super::auto_install::process(&store)?;
+                        Ok(())
+                    })();
+                    let _ = reply.send(result);
+                }
                 Command::Enqueue(request) => {
                     authentication_available = true;
                     if !queued.iter().any(|queued| queued.id == request.id)
@@ -261,6 +416,18 @@ fn run(
                     }
                 }
                 Command::Remove(id) => {
+                    if StateStore::open()
+                        .and_then(|store| store.clear_download_install_intent_for_job(&id))
+                        .is_err()
+                    {
+                        set_waiting_status(
+                            &id,
+                            Some(
+                                "Could not remove the saved installation request; retry removing this download",
+                            ),
+                        );
+                        continue;
+                    }
                     if active.lock().is_ok_and(|active| active.contains_key(&id)) {
                         removing.insert(id.clone());
                         cancel_worker(&id);
@@ -317,6 +484,11 @@ fn run(
                         queued.push_back(request);
                     } else {
                         if matches!(event, DownloadEvent::Complete { .. }) {
+                            if shutdown_acknowledgement.is_none()
+                                && let Ok(store) = StateStore::open()
+                            {
+                                let _ = super::auto_install::process(&store);
+                            }
                             publish(
                                 &subscribers,
                                 DownloadManagerEvent::ManagedFilesChanged(
@@ -336,6 +508,20 @@ fn run(
                         if request.id != old_id {
                             // A refreshed mutable GOG slot can represent different bytes. Never
                             // append those bytes to partial files belonging to the old revision.
+                            if StateStore::open()
+                                .and_then(|store| {
+                                    super::auto_install::block_replaced_job(
+                                        &store,
+                                        &old_id,
+                                        &request.id,
+                                    )
+                                })
+                                .is_err()
+                            {
+                                failure.message = "Could not update the saved installation request. Retry this download after restarting.".into();
+                                let _ = request.listener.send(DownloadEvent::Failed(failure));
+                                continue;
+                            }
                             cleanup_job(&old_id);
                         }
                         if queued.iter().any(|queued| queued.id == request.id)
@@ -377,6 +563,9 @@ fn run(
                         set_waiting_status(&request.id, None);
                     }
                     recover_jobs(&mut queued, &active, token);
+                    if let Ok(store) = StateStore::open() {
+                        let _ = super::auto_install::process(&store);
+                    }
                 }
                 Command::SetNetwork(available) => {
                     if available && !network_available {
@@ -575,26 +764,30 @@ fn persist_queued(request: &Request) {
 }
 
 fn persist_state(request: &Request, state: DownloadState) {
+    if let Ok(store) = StateStore::open() {
+        let _ = save_request(&store, request, state);
+    }
+}
+
+fn save_request(store: &StateStore, request: &Request, state: DownloadState) -> anyhow::Result<()> {
     let total = request
         .artifacts
         .iter()
         .map(|artifact| artifact.size_bytes)
         .collect::<Option<Vec<_>>>()
         .map(|sizes| sizes.into_iter().sum());
-    if let Ok(store) = StateStore::open() {
-        let _ = store.save_download_job(&DownloadJobUpdate {
-            job_id: &request.id,
-            product_id: request.artifacts[0].product_id,
-            title: &request.title,
-            artifacts: &request.artifacts,
-            destination: &request.destination,
-            state,
-            bytes_downloaded: 0,
-            total_bytes: total,
-            completed_files: &[],
-            error: None,
-        });
-    }
+    store.save_download_job(&DownloadJobUpdate {
+        job_id: &request.id,
+        product_id: request.artifacts[0].product_id,
+        title: &request.title,
+        artifacts: &request.artifacts,
+        destination: &request.destination,
+        state,
+        bytes_downloaded: 0,
+        total_bytes: total,
+        completed_files: &[],
+        error: None,
+    })
 }
 
 fn set_waiting_status(id: &str, message: Option<&str>) {
@@ -781,6 +974,29 @@ fn cleanup_job(id: &str) {
 mod tests {
     use super::{queue_insertion_index, should_refresh_manifest};
     use crate::download::DownloadFailureKind;
+
+    #[test]
+    fn obsolete_captured_account_cannot_register_intent_or_restore_authentication() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::state::StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let queued_session = crate::online::account_session().wrapping_sub(1);
+        let mut authentication_available = false;
+        let result = crate::online::with_account_session(queued_session, || {
+            store.save_download_install_intent(&crate::state::DownloadInstallIntent {
+                product_id: 7,
+                intent_id: "obsolete-account".into(),
+                job_ids: vec!["job".into()],
+                plan_json: "{}".into(),
+                state: "waiting".into(),
+                error: None,
+            })?;
+            authentication_available = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!authentication_available);
+        assert!(store.download_install_intents().unwrap().is_empty());
+    }
 
     #[test]
     fn resumed_job_returns_to_its_persisted_queue_position() {

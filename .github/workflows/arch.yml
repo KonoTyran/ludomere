@@ -1,0 +1,25 @@
+name: Arch checks and package
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  arch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build Arch environment
+        run: docker build --build-arg BUILD_UID="$(id -u)" --tag ludomere-arch --file tools/Containerfile tools
+      - name: Check and package in Arch
+        run: |
+          docker run --rm --init --volume "$PWD:/workspace" ludomere-arch bash -c 'bash tools/check.sh && python3 tools/build-package.py'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ludomere-arch-x86_64
+          path: |
+            dist/*.pkg.tar.zst
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error

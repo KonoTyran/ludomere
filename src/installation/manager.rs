@@ -327,6 +327,8 @@ struct PersistedInstallationPlan {
     additional_installers: Vec<AdditionalInstaller>,
     install_base: bool,
     interactive_prompts: bool,
+    #[serde(default)]
+    download_intent_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -338,14 +340,22 @@ enum OperationControl {
 #[derive(Clone)]
 enum QueuedOperation {
     Installation(PersistedInstallationPlan),
-    Uninstallation(InstalledGame),
+    Uninstallation(PersistedUninstallationPlan),
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedUninstallationPlan {
+    #[serde(flatten)]
+    game: InstalledGame,
+    #[serde(default)]
+    cleanup: Option<crate::download::ManagedDownloads>,
 }
 
 impl QueuedOperation {
     fn product_id(&self) -> i64 {
         match self {
             Self::Installation(plan) => plan.game.product_id,
-            Self::Uninstallation(game) => game.product_id,
+            Self::Uninstallation(plan) => plan.game.product_id,
         }
     }
 }
@@ -807,6 +817,15 @@ fn run_depot_operation_inner(
     request: &DepotOperationRequest,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
+    if request
+        .target_marker
+        .base
+        .operating_system
+        .as_deref()
+        .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+    {
+        crate::compatibility::preflight_windows(Some(request.product_id))?;
+    }
     publish_depot(DepotOperationSnapshot {
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
@@ -1562,7 +1581,7 @@ fn finalize_depot_metadata(
         if request.library_id.is_empty() {
             anyhow::bail!("Windows depot operation has no library identity");
         }
-        let backend = crate::compatibility::default_backend();
+        let backend = crate::compatibility::backend_for_game(request.product_id)?;
         let log_path = super::executor::installation_log_path(request.product_id)?;
         std::fs::File::create(&log_path)?;
         for (name, path) in [
@@ -2331,6 +2350,7 @@ pub fn enqueue_installation(
         additional_installers: additional_installers.clone(),
         install_base,
         interactive_prompts,
+        download_intent_id: None,
     };
     let queue_position = {
         let mut manager = MANAGER.lock().unwrap();
@@ -2375,8 +2395,138 @@ pub fn enqueue_installation(
     true
 }
 
-pub fn enqueue_uninstallation(game: InstalledGame) -> bool {
+/// Persist the runnable journal and consume the explicit download intent before scheduling.
+pub fn enqueue_downloaded_installation(
+    store: &StateStore,
+    intent_id: &str,
+    game: InstalledGame,
+    additional_installers: Vec<AdditionalInstaller>,
+) -> anyhow::Result<()> {
     let product_id = game.product_id;
+    let plan = PersistedInstallationPlan {
+        game,
+        additional_installers,
+        install_base: true,
+        interactive_prompts: false,
+        download_intent_id: Some(intent_id.to_owned()),
+    };
+    let mut manager = MANAGER.lock().unwrap();
+    anyhow::ensure!(
+        !manager.shutting_down,
+        "Ludomere is closing; retry installation after restarting"
+    );
+    anyhow::ensure!(
+        !manager.active.contains_key(&product_id)
+            && !manager
+                .queue
+                .iter()
+                .any(|queued| queued.product_id() == product_id),
+        "An installation operation already exists for this game"
+    );
+    manager.next_queue_position += 1;
+    persist_download_handoff(store, &plan, manager.next_queue_position)?;
+    manager.queue.push_back(QueuedOperation::Installation(plan));
+    let snapshot = InstallationOperationSnapshot {
+        product_id,
+        state: crate::domain::InstallationState::Pending,
+        message: Some("Queued for automatic installation".into()),
+        percentage: None,
+        queued: true,
+    };
+    manager.snapshots.insert(product_id, snapshot.clone());
+    drop(manager);
+    publish(InstallationManagerEvent::OperationQueued(snapshot));
+    schedule_next();
+    Ok(())
+}
+
+fn persist_download_handoff(
+    store: &StateStore,
+    plan: &PersistedInstallationPlan,
+    position: i64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        download_intent_matches(store, plan)?,
+        "The automatic installation request was removed or replaced"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let record = InstallationOperationRecord {
+        product_id: plan.game.product_id,
+        operation: "install".into(),
+        state: "queued".into(),
+        plan_json: serde_json::to_string(plan)?,
+        message: Some("Queued for automatic installation".into()),
+        percentage: None,
+        queue_position: Some(position),
+        created_at: now,
+        updated_at: now,
+        completed_at: None,
+    };
+    let path = super::operation_journal::offline_path(&record)?;
+    if path.exists() {
+        let super::operation_journal::OperationJournal::Offline {
+            record: existing, ..
+        } = super::operation_journal::read(&path)?
+        else {
+            anyhow::bail!("Another installation operation needs attention");
+        };
+        let existing: PersistedInstallationPlan = serde_json::from_str(&existing.plan_json)?;
+        anyhow::ensure!(
+            existing.download_intent_id == plan.download_intent_id,
+            "Another installation operation needs attention"
+        );
+    } else {
+        super::operation_journal::write_offline(&path, &record)?;
+    }
+    store.set_download_install_state(
+        plan.download_intent_id.as_deref().unwrap(),
+        "handed_off",
+        None,
+    )?;
+    Ok(())
+}
+
+fn download_intent_matches(
+    store: &StateStore,
+    plan: &PersistedInstallationPlan,
+) -> anyhow::Result<bool> {
+    let Some(id) = &plan.download_intent_id else {
+        return Ok(true);
+    };
+    Ok(store.download_install_intents()?.iter().any(|intent| {
+        intent.intent_id == *id
+            && intent.product_id == plan.game.product_id
+            && matches!(intent.state.as_str(), "waiting" | "blocked" | "handed_off")
+    }))
+}
+
+fn authorize_recovered_download(
+    store: &StateStore,
+    path: &std::path::Path,
+    plan: &PersistedInstallationPlan,
+) -> anyhow::Result<bool> {
+    if !download_intent_matches(store, plan)? {
+        std::fs::remove_file(path)?;
+        return Ok(false);
+    }
+    store.set_download_install_state(
+        plan.download_intent_id.as_deref().unwrap(),
+        "handed_off",
+        None,
+    )?;
+    Ok(true)
+}
+
+pub fn enqueue_uninstallation(game: InstalledGame) -> bool {
+    enqueue_uninstallation_with_cleanup(game, None)
+}
+
+pub fn enqueue_uninstallation_with_cleanup(
+    game: InstalledGame,
+    cleanup: Option<crate::download::ManagedDownloads>,
+) -> bool {
+    let product_id = game.product_id;
+    let plan = PersistedUninstallationPlan { game, cleanup };
     let queue_position = {
         let mut manager = MANAGER.lock().unwrap();
         if manager.active.contains_key(&product_id)
@@ -2391,7 +2541,7 @@ pub fn enqueue_uninstallation(game: InstalledGame) -> bool {
         let position = manager.next_queue_position;
         manager
             .queue
-            .push_back(QueuedOperation::Uninstallation(game.clone()));
+            .push_back(QueuedOperation::Uninstallation(plan.clone()));
         manager.snapshots.insert(
             product_id,
             InstallationOperationSnapshot {
@@ -2408,7 +2558,7 @@ pub fn enqueue_uninstallation(game: InstalledGame) -> bool {
         product_id,
         "uninstall",
         "queued",
-        &game,
+        &plan,
         Some("Queued for uninstallation"),
         None,
         Some(queue_position),
@@ -2436,6 +2586,35 @@ fn schedule_next() {
 }
 
 fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
+    let authorization = if persisted_plan.download_intent_id.is_some() {
+        StateStore::open().and_then(|store| download_intent_matches(&store, &persisted_plan))
+    } else {
+        Ok(true)
+    };
+    if !matches!(authorization, Ok(true)) {
+        persist_existing_operation(
+            persisted_plan.game.product_id,
+            if authorization.is_err() {
+                "interrupted"
+            } else {
+                "cancelled"
+            },
+            Some(if authorization.is_err() {
+                "Could not verify the automatic installation request; retry after restarting"
+            } else {
+                "Automatic installation request was removed"
+            }),
+            None,
+            None,
+        );
+        MANAGER
+            .lock()
+            .unwrap()
+            .snapshots
+            .remove(&persisted_plan.game.product_id);
+        schedule_next();
+        return;
+    }
     let product_id = persisted_plan.game.product_id;
     let running_message = if persisted_plan
         .game
@@ -2505,9 +2684,9 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
     });
 }
 
-fn start_queued_uninstallation(game: InstalledGame) {
-    let product_id = game.product_id;
-    let handle = super::executor::start_uninstallation(game);
+fn start_queued_uninstallation(plan: PersistedUninstallationPlan) {
+    let product_id = plan.game.product_id;
+    let handle = super::executor::start_uninstallation(plan.game);
     {
         let mut manager = MANAGER.lock().unwrap();
         manager.active.insert(
@@ -2536,7 +2715,19 @@ fn start_queued_uninstallation(game: InstalledGame) {
         );
     }
     thread::spawn(move || {
-        while let Ok(event) = handle.events.recv() {
+        while let Ok(mut event) = handle.events.recv() {
+            event = cleanup_successful_uninstall(event, plan.cleanup.as_ref(), |cleanup| {
+                // The payload is already uninstalled. Cleanup failures are retried from Manage,
+                // never by replaying the native uninstaller on the next launch.
+                persist_existing_operation(
+                    product_id,
+                    "complete",
+                    Some("Game uninstalled; finishing downloaded-file cleanup"),
+                    None,
+                    Some(chrono::Utc::now().timestamp()),
+                );
+                crate::download::cleanup_after_uninstall(cleanup.clone())
+            });
             let terminal = matches!(
                 event,
                 UninstallationEvent::Complete
@@ -2565,6 +2756,28 @@ fn start_queued_uninstallation(game: InstalledGame) {
         MANAGER.lock().unwrap().active.remove(&product_id);
         schedule_next();
     });
+}
+
+fn cleanup_successful_uninstall(
+    event: UninstallationEvent,
+    cleanup: Option<&crate::download::ManagedDownloads>,
+    delete: impl FnOnce(
+        &crate::download::ManagedDownloads,
+    ) -> anyhow::Result<crate::download::CleanupResult>,
+) -> UninstallationEvent {
+    let Some(cleanup) = cleanup.filter(|_| matches!(event, UninstallationEvent::Complete)) else {
+        return event;
+    };
+    match delete(cleanup) {
+        Ok(result) if result.failures.is_empty() => UninstallationEvent::Complete,
+        Ok(result) => UninstallationEvent::Failed(format!(
+            "Game uninstalled, but some downloaded files could not be removed: {}. Retry from Manage.",
+            result.failures.join("; ")
+        )),
+        Err(error) => UninstallationEvent::Failed(format!(
+            "Game uninstalled, but downloaded-file cleanup failed: {error}. Retry from Manage."
+        )),
+    }
 }
 
 pub fn respond_to_installation(product_id: i64, response: String) -> bool {
@@ -2638,8 +2851,10 @@ pub fn recover_interrupted_operations() -> anyhow::Result<usize> {
         let queued = match operation.operation.as_str() {
             "install" => serde_json::from_str::<PersistedInstallationPlan>(&operation.plan_json)
                 .map(QueuedOperation::Installation),
-            "uninstall" => serde_json::from_str::<InstalledGame>(&operation.plan_json)
-                .map(QueuedOperation::Uninstallation),
+            "uninstall" => {
+                serde_json::from_str::<PersistedUninstallationPlan>(&operation.plan_json)
+                    .map(QueuedOperation::Uninstallation)
+            }
             _ => continue,
         };
         let Ok(queued) = queued else {
@@ -2654,6 +2869,14 @@ pub fn recover_interrupted_operations() -> anyhow::Result<usize> {
             continue;
         };
         let product_id = queued.product_id();
+        if let QueuedOperation::Installation(plan) = &queued
+            && plan.download_intent_id.is_some()
+        {
+            let store = StateStore::open()?;
+            if !authorize_recovered_download(&store, &path, plan)? {
+                continue;
+            }
+        }
         let message = if operation.operation == "uninstall" {
             "Queued for resumed uninstallation"
         } else {
@@ -2955,6 +3178,174 @@ mod tests {
         },
         installation::marker::{InstallationMarker, InstalledComponent},
     };
+
+    #[test]
+    fn uninstall_cleanup_is_opt_in_durable_and_runs_only_after_success() {
+        let cleanup: crate::download::ManagedDownloads =
+            serde_json::from_value(serde_json::json!({"product_id":7,"files":[]})).unwrap();
+        let game = super::super::marker::game_from_marker(
+            &marker(false),
+            "test".into(),
+            PathBuf::from("/fixture/game"),
+            None,
+        );
+        let legacy: PersistedUninstallationPlan =
+            serde_json::from_value(serde_json::to_value(&game).unwrap()).unwrap();
+        assert!(legacy.cleanup.is_none());
+        let encoded = serde_json::to_vec(&PersistedUninstallationPlan {
+            game,
+            cleanup: Some(cleanup.clone()),
+        })
+        .unwrap();
+        let restored: PersistedUninstallationPlan = serde_json::from_slice(&encoded).unwrap();
+        assert!(restored.cleanup.is_some());
+        for event in [
+            UninstallationEvent::Started,
+            UninstallationEvent::Cancelled,
+            UninstallationEvent::Failed("fixture".into()),
+        ] {
+            cleanup_successful_uninstall(event, Some(&cleanup), |_| {
+                panic!("non-success triggered deletion")
+            });
+        }
+        cleanup_successful_uninstall(UninstallationEvent::Complete, None, |_| {
+            panic!("unchecked cleanup triggered deletion")
+        });
+        let called = std::cell::Cell::new(false);
+        let event = cleanup_successful_uninstall(
+            UninstallationEvent::Complete,
+            restored.cleanup.as_ref(),
+            |_| {
+                called.set(true);
+                Ok(crate::download::CleanupResult {
+                    deleted: 1,
+                    failures: vec!["fixture file busy".into()],
+                })
+            },
+        );
+        assert!(called.get());
+        assert!(
+            matches!(event,UninstallationEvent::Failed(message) if message.starts_with("Game uninstalled, but"))
+        );
+    }
+
+    #[test]
+    fn download_handoff_is_durable_and_revoked_or_replaced_intents_cannot_recover() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let store = StateStore::open_at(&database).unwrap();
+        let plan = PersistedInstallationPlan {
+            game: super::super::marker::game_from_marker(
+                &marker(false),
+                "library".into(),
+                root.path().join("library/game"),
+                None,
+            ),
+            additional_installers: vec![],
+            install_base: true,
+            interactive_prompts: false,
+            download_intent_id: Some("explicit-choice".into()),
+        };
+        let mut intent = crate::state::DownloadInstallIntent {
+            product_id: 7,
+            intent_id: "explicit-choice".into(),
+            job_ids: vec!["job".into()],
+            plan_json: "{}".into(),
+            state: "waiting".into(),
+            error: None,
+        };
+        store.save_download_install_intent(&intent).unwrap();
+        persist_download_handoff(&store, &plan, 1).unwrap();
+        let journal = root
+            .path()
+            .join("library/.ludomere/staging/game.operation.json");
+        assert!(journal.is_file());
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "handed_off"
+        );
+        drop(store);
+        let store = StateStore::open_at(&database).unwrap();
+        assert!(download_intent_matches(&store, &plan).unwrap());
+        // Crash window: runnable journal exists, but the SQLite handoff did not commit.
+        store
+            .set_download_install_state("explicit-choice", "waiting", None)
+            .unwrap();
+        std::fs::remove_file(&journal).unwrap();
+        let fault = rusqlite::Connection::open(&database).unwrap();
+        fault.execute_batch("CREATE TRIGGER reject_handoff BEFORE UPDATE ON download_install_intents BEGIN SELECT RAISE(FAIL, 'fixture handoff failure'); END;").unwrap();
+        assert!(persist_download_handoff(&store, &plan, 1).is_err());
+        assert!(journal.is_file());
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "waiting"
+        );
+        fault.execute_batch("DROP TRIGGER reject_handoff").unwrap();
+        assert!(authorize_recovered_download(&store, &journal, &plan).unwrap());
+        assert_eq!(store.download_install_intents().unwrap().len(), 1);
+        // Remove/unchecked consent must prevent both recovery and a queued start.
+        store.clear_download_install_intent_for_job("job").unwrap();
+        assert!(!download_intent_matches(&store, &plan).unwrap());
+        assert!(
+            store
+                .set_download_install_state("explicit-choice", "handed_off", None)
+                .is_err()
+        );
+        assert!(persist_download_handoff(&store, &plan, 1).is_err());
+        assert!(!authorize_recovered_download(&store, &journal, &plan).unwrap());
+        assert!(!journal.exists());
+        store.save_download_install_intent(&intent).unwrap();
+        persist_download_handoff(&store, &plan, 1).unwrap();
+        intent.intent_id = "replacement-choice".into();
+        store.save_download_install_intent(&intent).unwrap();
+        assert!(!download_intent_matches(&store, &plan).unwrap());
+        assert!(!authorize_recovered_download(&store, &journal, &plan).unwrap());
+        assert!(!journal.exists());
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "waiting"
+        );
+    }
+
+    #[test]
+    fn failed_download_handoff_keeps_intent_unconsumed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let library = root.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join(".ludomere"), b"preserve").unwrap();
+        let plan = PersistedInstallationPlan {
+            game: super::super::marker::game_from_marker(
+                &marker(false),
+                "library".into(),
+                library.join("game"),
+                None,
+            ),
+            additional_installers: vec![],
+            install_base: true,
+            interactive_prompts: false,
+            download_intent_id: Some("choice".into()),
+        };
+        store
+            .save_download_install_intent(&crate::state::DownloadInstallIntent {
+                product_id: 7,
+                intent_id: "choice".into(),
+                job_ids: vec!["job".into()],
+                plan_json: "{}".into(),
+                state: "waiting".into(),
+                error: None,
+            })
+            .unwrap();
+        assert!(persist_download_handoff(&store, &plan, 1).is_err());
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "waiting"
+        );
+        assert_eq!(
+            std::fs::read(library.join(".ludomere")).unwrap(),
+            b"preserve"
+        );
+    }
 
     fn marker(dlc: bool) -> InstallationMarker {
         InstallationMarker {

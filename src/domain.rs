@@ -80,6 +80,35 @@ pub struct ExternalLinks {
     pub support: Option<String>,
 }
 
+impl From<Dlc> for Game {
+    fn from(dlc: Dlc) -> Self {
+        Self {
+            product_id: dlc.product_id,
+            slug: dlc.slug,
+            title: dlc.title,
+            release_date: dlc.release_date,
+            description: dlc.description,
+            changelog: dlc.changelog,
+            platforms: dlc.platforms,
+            languages: dlc.languages,
+            metadata: dlc.metadata,
+            galaxy_builds: dlc.galaxy_builds,
+            location: dlc.location,
+            artwork: dlc.artwork,
+            detail_artwork: dlc.detail_artwork,
+            hero_logo: dlc.hero_logo,
+            icon: dlc.icon,
+            screenshots: dlc.screenshots,
+            links: dlc.links,
+            installers: dlc.installers,
+            extras: dlc.extras,
+            remote_artifacts: dlc.remote_artifacts,
+            disk_usage: dlc.disk_usage,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Screenshot {
     pub id: String,

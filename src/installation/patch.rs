@@ -42,6 +42,7 @@ fn run_patch_worker(
     target_version: Option<&str>,
     events: &mpsc::Sender<PatchEvent>,
 ) -> Result<()> {
+    let _activity = crate::profile_reset::begin_activity("game patch")?;
     let mut game = game.clone();
     if !patch.is_file() {
         bail!("patch file is missing: {}", patch.display());
@@ -68,6 +69,7 @@ fn run_patch_worker(
         .parent()
         .context("installation directory has no library root")?;
     let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
+    let backend = crate::compatibility::backend_for_game(game.product_id)?;
     crate::compatibility::validate_ownership(&prefix, &compatibility.prefix_slug)?;
     crate::compatibility::configure_library_drive(&prefix, library)?;
 
@@ -78,7 +80,6 @@ fn run_patch_worker(
             log_path: log_path.clone(),
         })
         .ok();
-    let backend = crate::compatibility::default_backend();
     let mut process = backend.run_executable(CompatibilityRunRequest {
         prefix,
         profile,

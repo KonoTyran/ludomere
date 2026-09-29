@@ -6,6 +6,7 @@ use std::{
 };
 
 pub fn delete_completed_files(destination: &Path, files: &[PathBuf]) -> Result<()> {
+    let _activity = crate::profile_reset::begin_activity("installer deletion")?;
     for file in files {
         if !file.starts_with(destination) {
             bail!("refusing to delete a file outside its managed download directory");

@@ -13,6 +13,7 @@ use crate::{
 };
 mod account;
 mod collections;
+mod comet;
 mod details;
 mod download_chooser;
 mod downloads;
@@ -20,7 +21,10 @@ mod executable_chooser;
 mod files;
 mod game_settings;
 mod library;
+mod proton;
+mod sections;
 mod settings;
+mod setup;
 mod style;
 mod sync;
 mod tray;
@@ -99,6 +103,8 @@ use gdk_pixbuf::InterpType;
 use gdk_pixbuf::prelude::PixbufLoaderExt;
 use gtk::{gdk, gio, glib};
 use library::*;
+use proton::*;
+use sections::*;
 use settings::*;
 use std::{
     cell::RefCell,
@@ -112,7 +118,8 @@ pub(crate) use tray::shutdown_tray;
 use widgets::content::{empty_dash, expandable_section, section, text_excerpt};
 use widgets::gallery::screenshot_strip;
 use widgets::media::{
-    card_picture, install_smooth_wheel_scroll, parallax_detail_hero, picture, scaled_card_texture,
+    card_picture, install_smooth_wheel_scroll, parallax_detail_hero, picture, set_card_picture,
+    set_picture_status,
 };
 pub use window::build_window;
 
@@ -129,6 +136,28 @@ struct VerificationDisplayState {
 struct AppModel {
     config: Config,
     games: Vec<Game>,
+    section_states: HashMap<(i64, online::DetailSection), SectionState>,
+    section_queue: VecDeque<(i64, online::DetailSection)>,
+    section_active: HashSet<(i64, online::DetailSection)>,
+    section_forced: HashSet<(i64, online::DetailSection)>,
+    account_epoch: u64,
+    logout_pending: bool,
+    sync_generation: u64,
+    sync_session: Option<u64>,
+    dismissed_sync_error: Option<String>,
+    detail_generation: u64,
+    detail_target: Option<(i64, Option<i64>)>,
+    installed_games: HashMap<i64, crate::domain::InstalledGame>,
+    local_actions: HashMap<i64, LocalActionState>,
+    local_refresh_running: bool,
+    local_refresh_pending: bool,
+    local_revision: u64,
+    core_loading: bool,
+    sync_running: bool,
+    sync_message: Option<String>,
+    sync_failed: bool,
+    cover_states: HashMap<i64, CoverState>,
+    icon_states: HashMap<i64, CoverState>,
     patch_notes: HashMap<i64, Rc<Vec<PatchNote>>>,
     favorites: HashSet<i64>,
     tags: HashMap<i64, Vec<String>>,
@@ -142,6 +171,7 @@ struct AppModel {
     downloaded_products: HashSet<i64>,
     downloaded_installer_products: HashSet<i64>,
     download_jobs: Vec<DownloadJobRecord>,
+    blocked_auto_installs: HashMap<String, i64>,
     depot_operations: Vec<crate::installation::DepotOperationSnapshot>,
     transfer_history: Rc<RefCell<VecDeque<TransferHistorySample>>>,
     transfer_totals: Option<(std::time::Instant, u64, u64)>,
@@ -342,6 +372,8 @@ struct DownloadDialogWidgets {
     authenticated: bool,
     online: bool,
     download_directory: std::path::PathBuf,
+    artifact_states: RefCell<HashMap<String, DialogArtifactState>>,
+    directory_available: std::cell::Cell<bool>,
 }
 
 impl DetailPageModel {
@@ -425,10 +457,14 @@ impl DetailPageModel {
 struct Widgets {
     window: adw::ApplicationWindow,
     status: gtk::Label,
-    status_bar: gtk::Button,
+    status_bar: gtk::Box,
     sync_spinner: gtk::Spinner,
     sync_status: gtk::Label,
     sync_progress: gtk::ProgressBar,
+    sync_retry: gtk::Button,
+    sync_dismiss: gtk::Button,
+    sync_options: gtk::Button,
+    finish_setup: gtk::Button,
     download_artwork: gtk::Image,
     download_percent: gtk::Label,
     download_status_progress: gtk::ProgressBar,
@@ -595,6 +631,10 @@ impl Widgets {
             sync_spinner: self.sync_spinner.clone(),
             sync_status: self.sync_status.clone(),
             sync_progress: self.sync_progress.clone(),
+            sync_retry: self.sync_retry.clone(),
+            sync_dismiss: self.sync_dismiss.clone(),
+            sync_options: self.sync_options.clone(),
+            finish_setup: self.finish_setup.clone(),
             download_artwork: self.download_artwork.clone(),
             download_percent: self.download_percent.clone(),
             download_status_progress: self.download_status_progress.clone(),
@@ -906,7 +946,6 @@ const CSS: &str = r#"
 .gallery-controls { background: alpha(#111820, .90); border-radius: 999px; padding: 7px 10px; color: white; }
 .gallery-close { margin: 16px; min-width: 38px; min-height: 38px; border-radius: 999px; background: alpha(#111820, .90); color: white; }
 .application-status-bar { border-radius: 0; border: 0; border-top: 1px solid alpha(@borders, .55); padding: 4px 14px; min-height: 38px; background: @headerbar_bg_color; }
-.application-status-bar:hover { background: alpha(@accent_bg_color, .10); }
 .download-status-icon { min-width: 24px; min-height: 24px; }
 .downloads-title { font-size: 1.8em; font-weight: 800; }
 .download-section-heading { margin-top: 8px; }

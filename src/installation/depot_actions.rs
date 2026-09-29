@@ -852,7 +852,13 @@ mod tests {
             },
         ];
         assert!(
-            execute_actions(&crate::compatibility::UmuBackend, &context, &actions, false).is_err()
+            execute_actions(
+                &crate::compatibility::UmuBackend::default(),
+                &context,
+                &actions,
+                false
+            )
+            .is_err()
         );
         let log = fs::read_to_string(&context.log_path).unwrap();
         assert!(log.contains(&format!(

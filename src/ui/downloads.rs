@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     struct Snapshot {
         jobs: Vec<DownloadJobRecord>,
+        blocked_auto_installs: HashMap<String, i64>,
         downloaded_products: HashSet<i64>,
         downloaded_installer_products: HashSet<i64>,
         active_job_ids: HashSet<String>,
@@ -38,6 +39,18 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
                 download::DownloadManagerEvent::AuthenticationRequired => {}
             }
             let snapshot = Snapshot {
+                blocked_auto_installs: StateStore::open()
+                    .and_then(|store| store.download_install_intents())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|intent| intent.state == "blocked")
+                    .filter_map(|intent| {
+                        intent
+                            .job_ids
+                            .first()
+                            .map(|job| (job.clone(), intent.product_id))
+                    })
+                    .collect(),
                 downloaded_products: downloaded_product_ids(&jobs),
                 downloaded_installer_products: downloaded_installer_product_ids(&jobs),
                 active_job_ids: jobs
@@ -106,12 +119,19 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             }
             return glib::ControlFlow::Continue;
         };
+        if let Some(product_id) = snapshot.blocked_auto_installs.values().next() {
+            w.finish_setup
+                .set_action_target_value(Some(&product_id.to_variant()));
+            w.finish_setup.set_visible(true);
+        }
         let (should_refresh_filters, should_refresh_sidebar, jobs_changed) = {
             let mut state = model.borrow_mut();
             let products_changed = state.downloaded_products != snapshot.downloaded_products;
             let installers_changed =
                 state.downloaded_installer_products != snapshot.downloaded_installer_products;
-            let jobs_changed = download_job_structure_changed(&state.download_jobs, &snapshot.jobs);
+            let jobs_changed = download_job_structure_changed(&state.download_jobs, &snapshot.jobs)
+                || state.blocked_auto_installs != snapshot.blocked_auto_installs;
+            state.blocked_auto_installs = snapshot.blocked_auto_installs;
             if products_changed {
                 state.downloaded_products = snapshot.downloaded_products;
             }
@@ -167,11 +187,13 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             let percent = total
                 .filter(|total| *total > 0)
                 .map(|total| ((job.bytes_downloaded as f64 / total as f64) * 100.0) as u64);
-            w.status.set_label(&if finalizing {
-                format!("Finalizing {title}")
-            } else {
-                title.to_owned()
-            });
+            if !w.status.has_css_class("cleanup-notice") {
+                w.status.set_label(&if finalizing {
+                    format!("Finalizing {title}")
+                } else {
+                    title.to_owned()
+                });
+            }
             w.download_percent
                 .set_label(&percent.map(|value| format!("{value}%")).unwrap_or_default());
             w.download_percent.set_visible(percent.is_some());
@@ -202,10 +224,13 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
                 })
             });
             if let Some(blocking) = blocking {
-                w.status
-                    .set_label(&format!("Downloads waiting  ·  {blocking}"));
+                if !w.status.has_css_class("cleanup-notice") {
+                    w.status
+                        .set_label(&format!("Downloads waiting  ·  {blocking}"));
+                }
                 previously_active.set(false);
-            } else if previously_active.replace(false) {
+            } else if previously_active.replace(false) && !w.status.has_css_class("cleanup-notice")
+            {
                 w.status.set_label("Downloads complete");
             }
         }
@@ -432,7 +457,7 @@ pub(super) fn rebuild_downloads_page(w: &Widgets, model: &AppModel) {
         })
         .flatten();
     if let Some(operation) = featured_depot {
-        page.append(&active_depot_header(operation, model));
+        page.append(&active_depot_header(operation, model, &w.window));
     } else if let Some(job) = featured_job {
         page.append(&active_download_header(job, model, w));
     } else if !model.transfer_history.borrow().is_empty() {
@@ -928,6 +953,7 @@ fn active_download_header(job: &DownloadJobRecord, model: &AppModel, w: &Widgets
 fn active_depot_header(
     operation: &crate::installation::DepotOperationSnapshot,
     model: &AppModel,
+    window: &adw::ApplicationWindow,
 ) -> gtk::Box {
     let game = model
         .games
@@ -1017,13 +1043,20 @@ fn active_depot_header(
             .as_ref()
             .map(|token| token.access_token.clone());
         let resume_id = operation_id.clone();
-        resume.connect_clicked(move |button| {
-            if let Some(token) = token.clone()
-                && crate::installation::resume_depot_operation(resume_id.clone(), token)
-            {
-                button.set_sensitive(false);
-            }
-        });
+        let product_id = operation.product_id;
+        connect_windows_action(
+            &resume,
+            window,
+            true,
+            move || Some(product_id),
+            move |button| {
+                if let Some(token) = token.clone()
+                    && crate::installation::resume_depot_operation(resume_id.clone(), token)
+                {
+                    button.set_sensitive(false);
+                }
+            },
+        );
         footer.append(&resume);
         let cancel = gtk::Button::from_icon_name("user-trash-symbolic");
         cancel.set_tooltip_text(Some("Cancel permanently"));
@@ -1142,13 +1175,20 @@ fn depot_operation_card(
             .account_token
             .as_ref()
             .map(|token| token.access_token.clone());
-        resume.connect_clicked(move |button| {
-            if let Some(token) = token.clone()
-                && crate::installation::resume_depot_operation(operation_id.clone(), token)
-            {
-                button.set_sensitive(false);
-            }
-        });
+        let product_id = operation.product_id;
+        connect_windows_action(
+            &resume,
+            &w.window,
+            true,
+            move || Some(product_id),
+            move |button| {
+                if let Some(token) = token.clone()
+                    && crate::installation::resume_depot_operation(operation_id.clone(), token)
+                {
+                    button.set_sensitive(false);
+                }
+            },
+        );
         row.append(&resume);
     }
     if operation.state != "complete" {
@@ -1388,6 +1428,9 @@ pub(super) fn download_job_card(
     });
     copy.append(&title);
     let state_detail = match job.state.as_str() {
+        "complete" if job.status_message.is_some() => {
+            job.status_message.clone().unwrap_or_default()
+        }
         "complete" => {
             let completed = chrono::DateTime::from_timestamp(job.updated_at, 0)
                 .map(|date| {
@@ -1464,6 +1507,40 @@ pub(super) fn download_job_card(
         copy.append(&progress);
     }
     row.append(&copy);
+    if let Some(product_id) = model.blocked_auto_installs.get(&job.job_id).copied() {
+        let retry = gtk::Button::with_label("Retry installation");
+        retry.set_tooltip_text(Some("After resolving the reported prerequisites, retry using saved defaults. No components are downloaded automatically."));
+        let status = w.status.clone();
+        retry.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(download::retry_install_after_download(product_id));
+            });
+            let button = button.clone();
+            let status = status.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(())) => {
+                        status.set_label("Installation retry requested");
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        status.set_label(&format!("Installation could not start: {error}"));
+                        button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(_) => {
+                        status.set_label("Installation retry stopped. Try again.");
+                        button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+        row.append(&retry);
+    }
     if featured {
         let pause = gtk::Button::from_icon_name("media-playback-pause-symbolic");
         pause.set_tooltip_text(Some("Pause download"));

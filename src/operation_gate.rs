@@ -10,7 +10,22 @@ struct State {
 static GATE: LazyLock<(Mutex<State>, Condvar)> =
     LazyLock::new(|| (Mutex::new(State::default()), Condvar::new()));
 
-pub struct Permit;
+pub struct Permit {
+    _activity: crate::profile_reset::ActivityGuard,
+}
+
+pub(crate) fn try_acquire() -> anyhow::Result<Permit> {
+    let mut state = GATE.0.lock().unwrap();
+    anyhow::ensure!(
+        !state.running && state.queue.is_empty(),
+        "Finish or pause active downloads and installations before deleting downloaded files"
+    );
+    let activity = crate::profile_reset::begin_activity("downloaded file deletion")?;
+    state.running = true;
+    Ok(Permit {
+        _activity: activity,
+    })
+}
 
 pub fn acquire(cancelled: impl Fn() -> bool) -> Option<Permit> {
     let (lock, wake) = &*GATE;
@@ -26,8 +41,11 @@ pub fn acquire(cancelled: impl Fn() -> bool) -> Option<Permit> {
         }
         if !state.running && state.queue.front() == Some(&ticket) {
             state.queue.pop_front();
+            let activity = crate::profile_reset::begin_activity("installation or download").ok()?;
             state.running = true;
-            return Some(Permit);
+            return Some(Permit {
+                _activity: activity,
+            });
         }
         state = wake
             .wait_timeout(state, std::time::Duration::from_millis(100))

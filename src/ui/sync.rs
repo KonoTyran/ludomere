@@ -1,64 +1,145 @@
 use super::*;
 
-enum SyncPersistence {
-    Catalog(Vec<Game>),
-    Manifest(i64, Vec<RemoteArtifact>),
-    Builds {
-        product_id: i64,
-        builds: Vec<crate::domain::GalaxyBuild>,
-        windows_observed: bool,
-        macos_observed: bool,
-    },
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CoverState {
+    Pending,
+    Loading,
+    Loaded,
+    Unavailable,
+    Failed(String),
 }
 
-fn start_sync_persistence_worker() -> mpsc::Sender<SyncPersistence> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let Ok(store) = StateStore::open() else {
-            return;
+pub(super) fn sync_error_fingerprint(model: &AppModel) -> String {
+    let mut failures = Vec::new();
+    for (kind, states) in [("cover", &model.cover_states), ("icon", &model.icon_states)] {
+        failures.extend(states.iter().filter_map(|(id, state)| match state {
+            CoverState::Failed(error) => Some(format!("{kind}:{id}:{error}")),
+            _ => None,
+        }));
+    }
+    failures.extend(
+        model
+            .section_states
+            .iter()
+            .filter_map(|(key, state)| match state {
+                SectionState::Failed(error) => Some(format!("{key:?}:{error}")),
+                _ => None,
+            }),
+    );
+    if model.sync_failed {
+        failures.push(format!("sync:{:?}", model.sync_message));
+    }
+    failures.sort();
+    failures.join("\n")
+}
+
+pub(super) fn refresh_sync_status(w: &Widgets, model: &AppModel) {
+    let pending = model
+        .section_states
+        .values()
+        .filter(|state| matches!(state, SectionState::Loading))
+        .count();
+    let metadata_pending = model
+        .section_states
+        .iter()
+        .filter(|((_, section), state)| {
+            *section == online::DetailSection::Metadata && matches!(state, SectionState::Loading)
+        })
+        .count();
+    let failed = model
+        .section_states
+        .values()
+        .filter(|state| matches!(state, SectionState::Failed(_)))
+        .count();
+    let cover_failed = model
+        .cover_states
+        .values()
+        .chain(model.icon_states.values())
+        .filter(|state| matches!(state, CoverState::Failed(_)))
+        .count();
+    let errors_visible =
+        model.dismissed_sync_error.as_ref() != Some(&sync_error_fingerprint(model));
+    let message = if model.sync_running {
+        model.sync_message.clone()
+    } else if pending > 0 {
+        let stage = if metadata_pending > 0 {
+            "Metadata and game details"
+        } else {
+            "Game details"
         };
-        while let Ok(task) = receiver.recv() {
-            match task {
-                SyncPersistence::Catalog(games) => {
-                    if let Err(error) = store.cache_online_games(&games) {
-                        tracing::warn!(%error, "could not cache online catalog");
-                    }
-                    if let Err(error) = store.upsert_normalized_library(&games) {
-                        tracing::warn!(%error, "could not persist normalized product catalog");
-                    }
-                }
-                SyncPersistence::Manifest(product_id, artifacts) => {
-                    if let Err(error) = store.observe_download_manifest(product_id, &artifacts) {
-                        tracing::warn!(product_id, %error, "could not observe structured manifest");
-                    }
-                    if let Err(error) = store.cache_download_manifest(product_id, &artifacts) {
-                        tracing::warn!(product_id, %error, "could not update compatibility manifest cache");
-                    }
-                }
-                SyncPersistence::Builds {
-                    product_id,
-                    builds,
-                    windows_observed,
-                    macos_observed,
-                } => {
-                    for (os, observed) in [("windows", windows_observed), ("osx", macos_observed)] {
-                        if !observed {
-                            continue;
-                        }
-                        let values = builds
-                            .iter()
-                            .filter(|build| build.operating_system == os)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        if let Err(error) = store.observe_galaxy_builds(product_id, os, &values) {
-                            tracing::warn!(product_id, os, %error, "could not persist Galaxy builds");
-                        }
-                    }
-                }
+        Some(
+            if errors_visible && (model.sync_failed || cover_failed > 0) {
+                format!("{stage} · {pending} pending · some sync work failed")
+            } else {
+                format!("{stage} · {pending} pending")
+            },
+        )
+    } else if model.sync_failed && errors_visible {
+        model.sync_message.clone()
+    } else if cover_failed > 0 && errors_visible {
+        Some(format!("Library images · {cover_failed} failed"))
+    } else if failed > 0 && errors_visible {
+        Some(format!("Game details · {failed} failed"))
+    } else {
+        None
+    };
+    let active = model.sync_running || pending > 0;
+    w.sync_spinner.set_spinning(active);
+    w.sync_spinner.set_visible(active);
+    w.sync_progress.set_visible(model.sync_running);
+    w.sync_status.set_visible(message.is_some());
+    w.sync_status
+        .set_label(message.as_deref().unwrap_or_default());
+    w.sync_status.set_tooltip_text(message.as_deref());
+    w.sync_retry.set_visible(
+        !model.sync_running
+            && errors_visible
+            && cover_failed > 0
+            && model.sync_session.is_some_and(online::has_failed_images),
+    );
+    w.sync_options
+        .set_visible(!model.sync_running && errors_visible && model.sync_failed);
+    w.sync_dismiss.set_visible(
+        !model.sync_running
+            && errors_visible
+            && (model.sync_failed || failed > 0 || cover_failed > 0),
+    );
+}
+
+pub(super) fn update_cover_state(
+    w: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    id: i64,
+    state: CoverState,
+) {
+    model.borrow_mut().cover_states.insert(id, state.clone());
+    let mut child = w.home_grid.first_child();
+    while let Some(wrapper) = child {
+        if let Some(card) = wrapper.first_child()
+            && card.widget_name() == id.to_string()
+        {
+            apply_card_cover_state(&card, Some(&state));
+            break;
+        }
+        child = wrapper.next_sibling();
+    }
+}
+
+pub(super) fn cancel_cover_indicators(w: &Widgets) {
+    let mut child = w.home_grid.first_child();
+    while let Some(wrapper) = child {
+        if let Some(art) =
+            find_named_descendant(&wrapper, "card-art").and_downcast::<gtk::Picture>()
+            && (art.has_css_class("image-pending") || art.has_css_class("image-loading"))
+        {
+            if art.paintable().is_some() {
+                set_picture_status(&art, "image-ready", "Image loaded");
+            } else {
+                set_picture_status(&art, "image-unavailable", "Image loading cancelled");
             }
         }
-    });
-    sender
+        child = wrapper.next_sibling();
+    }
 }
 
 pub(super) fn update_streamed_media(
@@ -70,7 +151,7 @@ pub(super) fn update_streamed_media(
     hero_logo: Option<std::path::PathBuf>,
     icon: Option<std::path::PathBuf>,
 ) {
-    let selected_product = model.borrow().selected;
+    let selected_product = model.borrow().detail_target.map(|(id, _)| id);
     let mut state = model.borrow_mut();
     let Some(game) = state
         .games
@@ -177,10 +258,8 @@ pub(super) fn update_streamed_media(
             if let Some(picture) =
                 find_named_descendant(&widget, "game-icon").and_downcast::<gtk::Picture>()
                 && let Some(path) = &icon
-                && let Some(texture) = scaled_card_texture(path, 23, 23)
             {
-                picture.set_size_request(23, 23);
-                picture.set_paintable(Some(&texture));
+                set_card_picture(&picture, path, 23, 23);
             }
             break;
         }
@@ -195,10 +274,8 @@ pub(super) fn update_streamed_media(
             if let Some(picture) =
                 find_named_descendant(&card, "card-art").and_downcast::<gtk::Picture>()
                 && let Some(path) = &artwork
-                && let Some(texture) = scaled_card_texture(path, card_width, card_width * 9 / 16)
             {
-                picture.set_size_request(card_width, card_width * 9 / 16);
-                picture.set_paintable(Some(&texture));
+                set_card_picture(&picture, path, card_width, card_width * 9 / 16);
             }
             break;
         }
@@ -346,105 +423,6 @@ pub(super) fn apply_builds_to_model(
     }
 }
 
-pub(super) fn merge_remote_artifacts(source: &[Game], target: &mut [Game]) {
-    for target_game in target {
-        if target_game.remote_artifacts.is_empty()
-            && let Some(source_game) = source
-                .iter()
-                .find(|game| game.product_id == target_game.product_id)
-        {
-            target_game.remote_artifacts = source_game.remote_artifacts.clone();
-        }
-        if let Some(source_game) = source
-            .iter()
-            .find(|game| game.product_id == target_game.product_id)
-        {
-            target_game.location = source_game.location.clone();
-            target_game.installers = source_game.installers.clone();
-            target_game.patches = source_game.patches.clone();
-            target_game.extras = source_game.extras.clone();
-            target_game.disk_usage = source_game.disk_usage;
-            merge_product_metadata(&mut target_game.metadata, source_game.metadata.clone());
-            if target_game.galaxy_builds.is_empty() {
-                target_game.galaxy_builds = source_game.galaxy_builds.clone();
-            }
-        }
-        for target_dlc in &mut target_game.dlcs {
-            if target_dlc.owned
-                && target_dlc.remote_artifacts.is_empty()
-                && let Some(source_dlc) = source
-                    .iter()
-                    .flat_map(|game| game.dlcs.iter())
-                    .find(|dlc| dlc.product_id == target_dlc.product_id)
-            {
-                target_dlc.remote_artifacts = source_dlc.remote_artifacts.clone();
-            }
-            if let Some(source_dlc) = source
-                .iter()
-                .flat_map(|game| game.dlcs.iter())
-                .find(|dlc| dlc.product_id == target_dlc.product_id)
-            {
-                target_dlc.location = source_dlc.location.clone();
-                target_dlc.installers = source_dlc.installers.clone();
-                target_dlc.extras = source_dlc.extras.clone();
-                target_dlc.disk_usage = source_dlc.disk_usage;
-                merge_product_metadata(&mut target_dlc.metadata, source_dlc.metadata.clone());
-                if target_dlc.galaxy_builds.is_empty() {
-                    target_dlc.galaxy_builds = source_dlc.galaxy_builds.clone();
-                }
-            }
-        }
-    }
-}
-
-pub(super) fn merge_cached_media(source: &[Game], target: &mut [Game]) {
-    for target_game in target {
-        if let Some(source_game) = source
-            .iter()
-            .find(|game| game.product_id == target_game.product_id)
-        {
-            retain_cached_path(&mut target_game.artwork, &source_game.artwork);
-            retain_cached_path(&mut target_game.detail_artwork, &source_game.detail_artwork);
-            retain_cached_path(&mut target_game.hero_logo, &source_game.hero_logo);
-            retain_cached_path(&mut target_game.icon, &source_game.icon);
-        }
-        for target_dlc in &mut target_game.dlcs {
-            if let Some(source_dlc) = source
-                .iter()
-                .flat_map(|game| game.dlcs.iter())
-                .find(|dlc| dlc.product_id == target_dlc.product_id)
-            {
-                retain_cached_path(&mut target_dlc.artwork, &source_dlc.artwork);
-                retain_cached_path(&mut target_dlc.detail_artwork, &source_dlc.detail_artwork);
-                retain_cached_path(&mut target_dlc.hero_logo, &source_dlc.hero_logo);
-                retain_cached_path(&mut target_dlc.icon, &source_dlc.icon);
-            }
-        }
-    }
-}
-
-fn retain_patch_note_cache(
-    mut cache: HashMap<i64, Rc<Vec<PatchNote>>>,
-    previous: &[Game],
-    current: &[Game],
-) -> HashMap<i64, Rc<Vec<PatchNote>>> {
-    cache.retain(|product_id, _| {
-        let previous = previous.iter().find(|game| game.product_id == *product_id);
-        let current = current.iter().find(|game| game.product_id == *product_id);
-        matches!((previous, current), (Some(previous), Some(current)) if previous.changelog == current.changelog)
-    });
-    cache
-}
-
-pub(super) fn retain_cached_path(
-    target: &mut Option<std::path::PathBuf>,
-    cached: &Option<std::path::PathBuf>,
-) {
-    if cached.as_ref().is_some_and(|path| path.is_file()) {
-        *target = cached.clone();
-    }
-}
-
 pub(super) fn start_owned_library_sync(
     w: &Rc<Widgets>,
     model: &Rc<RefCell<AppModel>>,
@@ -455,252 +433,428 @@ pub(super) fn start_owned_library_sync(
     w.sync_spinner.set_visible(true);
     w.sync_spinner.set_spinning(true);
     w.sync_status.set_visible(true);
-    w.sync_status.set_label("Updating library");
+    w.sync_status.set_label("Game list · connecting…");
     w.sync_progress.set_fraction(0.01);
     w.sync_progress.set_visible(true);
     w.account_library_status.set_label("Synchronizing…");
-    let persistence = start_sync_persistence_worker();
-    let installer_language = model.borrow().config.installer_language.clone();
+    let (epoch, generation, language) = {
+        let mut state = model.borrow_mut();
+        state.sync_generation = state.sync_generation.wrapping_add(1);
+        if force_gamesdb_refresh {
+            state
+                .section_states
+                .retain(|_, state| matches!(state, SectionState::Loading));
+        }
+        state.core_loading = true;
+        state.sync_running = true;
+        state.sync_failed = false;
+        state.dismissed_sync_error = None;
+        state.sync_message = Some("Game list · connecting…".into());
+        state.cover_states.clear();
+        state.icon_states.clear();
+        (
+            state.account_epoch,
+            state.sync_generation,
+            state.config.installer_language.clone(),
+        )
+    };
+    let session = online::begin_library_session();
+    model.borrow_mut().sync_session = Some(session);
     let (sender, receiver) = mpsc::channel::<anyhow::Result<online::SyncEvent>>();
     std::thread::spawn(move || {
         let result = (|| {
             let ids = auth::fetch_owned_product_ids(&token)?;
-            let mut store = StateStore::open()?;
-            for stage in [
-                "ownership",
-                "products",
-                "manifests",
-                "metadata",
-                "builds",
-                "artwork",
-                "library_sync",
-            ] {
-                store.mark_sync_stage_started(stage)?;
-            }
-            store.replace_owned_products(&ids)?;
-            store.mark_sync_stage_finished("ownership", true, None)?;
             sender.send(Ok(online::SyncEvent::Ownership(ids.len())))?;
             online::stream_owned_games(
                 &ids,
                 &token.access_token,
                 &sender,
                 force_gamesdb_refresh,
-                installer_language.as_deref(),
+                language.as_deref(),
+                session,
             )
         })();
         if let Err(error) = result {
             let _ = sender.send(Err(error));
         }
     });
+    tracing::debug!(announce, "starting library synchronization");
+    monitor_library_sync(w, model, receiver, epoch, generation, false, None);
+}
+
+pub(super) fn retry_failed_images(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
+    let (session, epoch, generation, prior_error) = {
+        let mut state = model.borrow_mut();
+        if state.sync_running || state.logout_pending {
+            return;
+        }
+        let Some(session) = state.sync_session else {
+            state.sync_failed = true;
+            state.sync_message = Some("Open Options to synchronize this library first".into());
+            state.dismissed_sync_error = None;
+            drop(state);
+            refresh_sync_status(w, &model.borrow());
+            return;
+        };
+        state.sync_generation = state.sync_generation.wrapping_add(1);
+        let prior_error = state
+            .sync_failed
+            .then(|| state.sync_message.clone())
+            .flatten();
+        state.sync_running = true;
+        state.sync_failed = false;
+        state.dismissed_sync_error = None;
+        state.sync_message = Some("Retrying failed images…".into());
+        (
+            session,
+            state.account_epoch,
+            state.sync_generation,
+            prior_error,
+        )
+    };
+    refresh_sync_status(w, &model.borrow());
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Err(error) = online::retry_failed_images(&sender, session) {
+            let _ = sender.send(Err(error));
+        }
+    });
+    monitor_library_sync(w, model, receiver, epoch, generation, true, prior_error);
+}
+
+fn monitor_library_sync(
+    w: &Rc<Widgets>,
+    model: &Rc<RefCell<AppModel>>,
+    receiver: mpsc::Receiver<anyhow::Result<online::SyncEvent>>,
+    epoch: u64,
+    generation: u64,
+    image_retry: bool,
+    prior_error: Option<String>,
+) {
     let w = w.clone();
     let model = model.clone();
     let sync_fraction = Rc::new(std::cell::Cell::new(0.01_f64));
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        match receiver.try_recv() {
-            Ok(Ok(online::SyncEvent::Ownership(count))) => {
-                let mut state = model.borrow_mut();
-                state.owned_product_count = count;
-                update_account_library_status(&w, &state);
-                update_sync_progress(&w, &sync_fraction, 0.04);
-                glib::ControlFlow::Continue
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if model.borrow().account_epoch != epoch || model.borrow().sync_generation != generation {
+            return glib::ControlFlow::Break;
+        }
+        let started = std::time::Instant::now();
+        let mut changed = false;
+        let mut terminal = false;
+        let mut complete = false;
+        // Bound both backlog work and presentation work per GTK turn.
+        for _ in 0..32 {
+            if started.elapsed() >= Duration::from_millis(4) {
+                break;
             }
-            Ok(Ok(online::SyncEvent::BasicBatch {
-                games,
-                current,
-                total,
-            })) => {
-                let mut state = model.borrow_mut();
-                let existing = state
-                    .games
-                    .iter()
-                    .map(|game| game.product_id)
-                    .collect::<HashSet<_>>();
-                let additions = games
-                    .into_iter()
-                    .filter(|game| !existing.contains(&game.product_id))
-                    .collect::<Vec<_>>();
-                let changed = !additions.is_empty();
-                let added_at = chrono::Utc::now().timestamp();
-                for game in &additions {
-                    state
-                        .product_activity
-                        .entry(game.product_id)
-                        .or_default()
-                        .last_activity_at = Some(added_at);
+            match receiver.try_recv() {
+                Ok(Ok(online::SyncEvent::Ownership(count))) => {
+                    model.borrow_mut().owned_product_count = count;
+                    model.borrow_mut().sync_message = Some(format!("Game list · 0/{count}"));
+                    update_account_library_status(&w, &model.borrow());
                 }
-                state.games.extend(additions);
-                state.games.sort_by_key(|game| game.title.to_lowercase());
-                drop(state);
-                if changed {
-                    rebuild_library(&w, &model);
-                }
-                update_sync_stage_progress(&w, &sync_fraction, 0.05, 0.15, current, total);
-                glib::ControlFlow::Continue
-            }
-            Ok(Ok(online::SyncEvent::Catalog { mut games })) => {
-                merge_remote_artifacts(&model.borrow().games, &mut games);
-                merge_cached_media(&model.borrow().games, &mut games);
-                let mut state = model.borrow_mut();
-                let cache = std::mem::take(&mut state.patch_notes);
-                let cache = retain_patch_note_cache(cache, &state.games, &games);
-                state.patch_notes = cache;
-                let needs_initial_render = state.games.is_empty();
-                let existing = state
-                    .games
-                    .iter()
-                    .map(|game| game.product_id)
-                    .collect::<HashSet<_>>();
-                let added_at = chrono::Utc::now().timestamp();
-                for game in &games {
-                    if !existing.contains(&game.product_id) {
-                        state
-                            .product_activity
-                            .entry(game.product_id)
-                            .or_default()
-                            .last_activity_at = Some(added_at);
+                Ok(Ok(online::SyncEvent::BasicBatch {
+                    games,
+                    current,
+                    total,
+                })) => {
+                    for game in &games {
+                        if game.artwork.is_none() {
+                            model
+                                .borrow_mut()
+                                .cover_states
+                                .insert(game.product_id, CoverState::Pending);
+                        }
                     }
+                    merge_core_catalog(&mut model.borrow_mut().games, games, false);
+                    model.borrow_mut().sync_message =
+                        Some(format!("Game list · {current}/{total}"));
+                    changed = true;
+                    update_sync_stage_progress(&w, &sync_fraction, 0.04, 0.40, current, total);
                 }
-                state.games = games;
-                let games_to_persist = state.games.clone();
-                drop(state);
-                if needs_initial_render {
-                    rebuild_library(&w, &model);
+                Ok(Ok(online::SyncEvent::Catalog { games })) => {
+                    model.borrow_mut().core_loading = false;
+                    merge_core_catalog(&mut model.borrow_mut().games, games, true);
+                    changed = true;
+                    model.borrow_mut().sync_message = Some("Grid images · preparing…".into());
+                    update_sync_progress(&w, &sync_fraction, 0.45);
                 }
-                let _ = persistence.send(SyncPersistence::Catalog(games_to_persist));
-                update_sync_progress(&w, &sync_fraction, 0.20);
-                record_sync_stage_finished("products", true);
-                glib::ControlFlow::Continue
-            }
-            Ok(Ok(online::SyncEvent::FileMetadata {
-                product_id,
-                artifacts,
-                current,
-                total,
-            })) => {
-                apply_remote_artifacts_to_model(
-                    &mut model.borrow_mut().games,
+                Ok(Ok(online::SyncEvent::CoversQueued { product_ids })) => {
+                    model
+                        .borrow_mut()
+                        .cover_states
+                        .extend(product_ids.into_iter().map(|id| (id, CoverState::Pending)));
+                    let mut child = w.home_grid.first_child();
+                    while let Some(wrapper) = child {
+                        if let Some(card) = wrapper.first_child()
+                            && let Ok(id) = card.widget_name().parse::<i64>()
+                        {
+                            apply_card_cover_state(&card, model.borrow().cover_states.get(&id));
+                        }
+                        child = wrapper.next_sibling();
+                    }
+                    update_image_sync_progress(&w, &model, &sync_fraction);
+                }
+                Ok(Ok(online::SyncEvent::IconsQueued { product_ids })) => {
+                    model
+                        .borrow_mut()
+                        .icon_states
+                        .extend(product_ids.into_iter().map(|id| (id, CoverState::Pending)));
+                    update_image_sync_progress(&w, &model, &sync_fraction);
+                }
+                Ok(Ok(online::SyncEvent::IconStarted { product_id })) => {
+                    model
+                        .borrow_mut()
+                        .icon_states
+                        .insert(product_id, CoverState::Loading);
+                }
+                Ok(Ok(online::SyncEvent::IconFinished {
                     product_id,
-                    artifacts.clone(),
-                );
-                let _ = persistence.send(SyncPersistence::Manifest(product_id, artifacts));
-                update_sync_stage_progress(&w, &sync_fraction, 0.20, 0.30, current, total);
-                finish_sync_stage_at_end("manifests", current, total);
-                glib::ControlFlow::Continue
-            }
-            Ok(Ok(online::SyncEvent::Enrichment {
-                product_id,
-                metadata,
-                current,
-                total,
-            })) => {
-                apply_metadata_to_model(&mut model.borrow_mut().games, product_id, *metadata);
-                update_sync_stage_progress(&w, &sync_fraction, 0.50, 0.18, current, total);
-                finish_sync_stage_at_end("metadata", current, total);
-                glib::ControlFlow::Continue
-            }
-            Ok(Ok(online::SyncEvent::Builds {
-                product_id,
-                builds,
-                windows_observed,
-                macos_observed,
-                current,
-                total,
-            })) => {
-                apply_builds_to_model(&mut model.borrow_mut().games, product_id, builds.clone());
-                let _ = persistence.send(SyncPersistence::Builds {
+                    outcome,
+                    ..
+                })) => {
+                    let state = match outcome {
+                        online::CoverOutcome::Loaded(path) => {
+                            update_streamed_media(
+                                &w,
+                                &model,
+                                product_id,
+                                None,
+                                None,
+                                None,
+                                Some(path),
+                            );
+                            CoverState::Loaded
+                        }
+                        online::CoverOutcome::Unavailable => CoverState::Unavailable,
+                        online::CoverOutcome::Failed(error) => CoverState::Failed(error),
+                    };
+                    model.borrow_mut().icon_states.insert(product_id, state);
+                    update_image_sync_progress(&w, &model, &sync_fraction);
+                }
+                Ok(Ok(online::SyncEvent::CoverStarted { product_id })) => {
+                    update_cover_state(&w, &model, product_id, CoverState::Loading);
+                }
+                Ok(Ok(online::SyncEvent::CoverFinished {
                     product_id,
-                    builds,
-                    windows_observed,
-                    macos_observed,
-                });
-                update_sync_stage_progress(&w, &sync_fraction, 0.68, 0.14, current, total);
-                finish_sync_stage_at_end("builds", current, total);
-                glib::ControlFlow::Continue
-            }
-            Ok(Ok(online::SyncEvent::Media {
-                product_id,
-                artwork,
-                detail_artwork,
-                hero_logo,
-                icon,
-                current,
-                total,
-            })) => {
-                update_streamed_media(
-                    &w,
-                    &model,
+                    outcome,
+                    ..
+                })) => {
+                    let state = match outcome {
+                        online::CoverOutcome::Loaded(path) => {
+                            update_streamed_media(
+                                &w,
+                                &model,
+                                product_id,
+                                Some(path),
+                                None,
+                                None,
+                                None,
+                            );
+                            CoverState::Loaded
+                        }
+                        online::CoverOutcome::Unavailable => CoverState::Unavailable,
+                        online::CoverOutcome::Failed(error) => CoverState::Failed(error),
+                    };
+                    update_cover_state(&w, &model, product_id, state);
+                    update_image_sync_progress(&w, &model, &sync_fraction);
+                }
+                Ok(Ok(online::SyncEvent::Media {
                     product_id,
                     artwork,
                     detail_artwork,
                     hero_logo,
                     icon,
-                );
-                update_sync_stage_progress(&w, &sync_fraction, 0.82, 0.17, current, total);
-                finish_sync_stage_at_end("artwork", current, total);
-                glib::ControlFlow::Continue
-            }
-            Ok(Ok(online::SyncEvent::Complete { mut games })) => {
-                let count = model.borrow().owned_product_count;
-                tracing::info!(count, "owned GOG library synchronization complete");
-                merge_remote_artifacts(&model.borrow().games, &mut games);
-                merge_cached_media(&model.borrow().games, &mut games);
-                let games_to_persist = games.clone();
-                let _ = persistence.send(SyncPersistence::Catalog(games_to_persist));
-                let mut state = model.borrow_mut();
-                let cache = std::mem::take(&mut state.patch_notes);
-                let cache = retain_patch_note_cache(cache, &state.games, &games);
-                state.patch_notes = cache;
-                state.online_synced_at = Some(chrono::Utc::now().timestamp());
-                let existing = state
-                    .games
-                    .iter()
-                    .map(|game| game.product_id)
-                    .collect::<HashSet<_>>();
-                let added_at = chrono::Utc::now().timestamp();
-                for game in &games {
-                    if !existing.contains(&game.product_id) {
-                        state
-                            .product_activity
-                            .entry(game.product_id)
-                            .or_default()
-                            .last_activity_at = Some(added_at);
-                    }
+                    current,
+                    total,
+                })) => {
+                    update_streamed_media(
+                        &w,
+                        &model,
+                        product_id,
+                        artwork,
+                        detail_artwork,
+                        hero_logo,
+                        icon,
+                    );
+                    update_sync_stage_progress(&w, &sync_fraction, 0.45, 0.54, current, total);
                 }
-                state.games = games;
-                update_account_library_status(&w, &state);
-                drop(state);
-                super::window::start_managed_reconciliation(&w, &model);
-                update_metadata_filter_options(&w, &model);
-                refresh_filters(&w, &model.borrow());
-                w.sync_spinner.set_spinning(false);
-                w.sync_spinner.set_visible(false);
-                w.sync_progress.set_fraction(1.0);
-                w.sync_progress.set_visible(false);
-                w.sync_status.set_visible(false);
-                record_sync_success();
-                glib::ControlFlow::Break
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "owned GOG library synchronization failed");
-                w.sync_spinner.set_spinning(false);
-                w.sync_spinner.set_visible(false);
-                w.sync_progress.set_visible(false);
-                w.sync_status.set_visible(false);
-                update_account_library_status(&w, &model.borrow());
-                tracing::debug!(announce, "library synchronization status cleared");
-                record_sync_failure();
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(_) => {
-                w.sync_spinner.set_spinning(false);
-                w.sync_spinner.set_visible(false);
-                w.sync_progress.set_visible(false);
-                w.sync_status.set_visible(false);
-                glib::ControlFlow::Break
+                Ok(Ok(online::SyncEvent::FileMetadata {
+                    product_id,
+                    artifacts,
+                    ..
+                })) => apply_remote_artifacts_to_model(
+                    &mut model.borrow_mut().games,
+                    product_id,
+                    artifacts,
+                ),
+                Ok(Ok(online::SyncEvent::Enrichment {
+                    product_id,
+                    metadata,
+                    ..
+                })) => {
+                    apply_metadata_to_model(&mut model.borrow_mut().games, product_id, *metadata)
+                }
+                Ok(Ok(online::SyncEvent::Builds {
+                    product_id, builds, ..
+                })) => apply_builds_to_model(&mut model.borrow_mut().games, product_id, builds),
+                Ok(Ok(online::SyncEvent::Complete { games })) => {
+                    merge_core_catalog(&mut model.borrow_mut().games, games, true);
+                    model.borrow_mut().online_synced_at = Some(chrono::Utc::now().timestamp());
+                    changed = true;
+                    terminal = true;
+                    complete = true;
+                    break;
+                }
+                Ok(Ok(online::SyncEvent::ImageRetryComplete)) => {
+                    complete = true;
+                    terminal = true;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(message = %online::sync_error_message(&error), "owned GOG library synchronization failed");
+                    model.borrow_mut().sync_failed = true;
+                    model.borrow_mut().sync_message = Some(format!(
+                        "Library sync failed · {}",
+                        online::sync_error_message(&error)
+                    ));
+                    record_sync_failure(image_retry);
+                    terminal = true;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    model.borrow_mut().sync_failed = true;
+                    model.borrow_mut().sync_message =
+                        Some("Library sync interrupted · open Options to refresh".into());
+                    record_sync_failure(image_retry);
+                    terminal = true;
+                    break;
+                }
             }
         }
+        if changed {
+            model
+                .borrow_mut()
+                .games
+                .sort_by_cached_key(|game| game.title.to_lowercase());
+            rebuild_library(&w, &model);
+            refresh_collection_metadata(&w, &model);
+        }
+        if terminal {
+            model.borrow_mut().core_loading = false;
+            model.borrow_mut().sync_running = false;
+            if let Some(error) = &prior_error {
+                model.borrow_mut().sync_failed = true;
+                model.borrow_mut().sync_message = Some(error.clone());
+            }
+            let unfinished = model
+                .borrow()
+                .cover_states
+                .iter()
+                .filter_map(|(id, state)| {
+                    matches!(state, CoverState::Pending | CoverState::Loading).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for id in unfinished {
+                update_cover_state(
+                    &w,
+                    &model,
+                    id,
+                    CoverState::Failed("Image loading did not finish".into()),
+                );
+            }
+            for state in model.borrow_mut().icon_states.values_mut() {
+                if matches!(state, CoverState::Pending | CoverState::Loading) {
+                    *state = CoverState::Failed("Icon loading did not finish".into());
+                }
+            }
+            update_account_library_status(&w, &model.borrow());
+            refresh_filters(&w, &model.borrow());
+            if complete && !image_retry {
+                super::window::start_managed_reconciliation(&w, &model);
+                refresh_local_action_state(&w, &model);
+                update_metadata_filter_options(&w, &model);
+                refresh_filters(&w, &model.borrow());
+                let state = model.borrow();
+                record_sync_completion(
+                    state
+                        .cover_states
+                        .values()
+                        .chain(state.icon_states.values())
+                        .filter(|state| matches!(state, CoverState::Failed(_)))
+                        .count(),
+                    false,
+                );
+            }
+            if complete && image_retry {
+                let state = model.borrow();
+                record_sync_completion(
+                    state
+                        .cover_states
+                        .values()
+                        .chain(state.icon_states.values())
+                        .filter(|state| matches!(state, CoverState::Failed(_)))
+                        .count(),
+                    true,
+                );
+            }
+            tracing::debug!(complete, "library synchronization presentation complete");
+            refresh_sync_status(&w, &model.borrow());
+            glib::ControlFlow::Break
+        } else {
+            refresh_sync_status(&w, &model.borrow());
+            glib::ControlFlow::Continue
+        }
     });
+}
+
+fn update_image_sync_progress(
+    w: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    fraction: &std::cell::Cell<f64>,
+) {
+    let mut state = model.borrow_mut();
+    let total = state.cover_states.len() + state.icon_states.len();
+    let finished = state
+        .cover_states
+        .values()
+        .chain(state.icon_states.values())
+        .filter(|state| !matches!(state, CoverState::Pending | CoverState::Loading))
+        .count();
+    let failed = state
+        .cover_states
+        .values()
+        .chain(state.icon_states.values())
+        .filter(|state| matches!(state, CoverState::Failed(_)))
+        .count();
+    state.sync_message = Some(if failed == 0 {
+        format!("Grid images + icons · {finished}/{total}")
+    } else {
+        format!("Grid images + icons · {finished}/{total} · {failed} failed")
+    });
+    drop(state);
+    update_sync_stage_progress(w, fraction, 0.45, 0.54, finished, total);
+}
+
+fn merge_core_catalog(current: &mut Vec<Game>, incoming: Vec<Game>, authoritative: bool) {
+    let ids = incoming
+        .iter()
+        .map(|game| game.product_id)
+        .collect::<HashSet<_>>();
+    for game in incoming {
+        if let Some(existing) = current
+            .iter_mut()
+            .find(|existing| existing.product_id == game.product_id)
+        {
+            online::apply_core_product(existing, game);
+        } else {
+            current.push(game);
+        }
+    }
+    if authoritative {
+        current.retain(|game| ids.contains(&game.product_id));
+    }
 }
 
 fn update_sync_stage_progress(
@@ -729,33 +883,13 @@ fn update_sync_progress(w: &Widgets, current_fraction: &std::cell::Cell<f64>, es
     w.sync_progress.set_fraction(estimate);
 }
 
-fn finish_sync_stage_at_end(stage: &'static str, current: usize, total: usize) {
-    if current >= total {
-        record_sync_stage_finished(stage, true);
-    }
-}
-
-fn record_sync_stage_finished(stage: &'static str, succeeded: bool) {
+fn record_sync_failure(images_only: bool) {
     std::thread::spawn(move || {
         if let Ok(store) = StateStore::open() {
-            let message = (!succeeded).then_some("Synchronization stage failed");
-            let _ = store.mark_sync_stage_finished(stage, succeeded, message);
-        }
-    });
-}
-
-fn record_sync_failure() {
-    std::thread::spawn(|| {
-        if let Ok(store) = StateStore::open() {
-            for stage in [
-                "ownership",
-                "products",
-                "manifests",
-                "metadata",
-                "builds",
-                "artwork",
-                "library_sync",
-            ] {
+            for stage in ["ownership", "products", "artwork", "library_sync"] {
+                if images_only && matches!(stage, "ownership" | "products") {
+                    continue;
+                }
                 let _ = store.mark_sync_stage_finished(
                     stage,
                     false,
@@ -766,19 +900,18 @@ fn record_sync_failure() {
     });
 }
 
-fn record_sync_success() {
-    std::thread::spawn(|| {
+fn record_sync_completion(image_failures: usize, images_only: bool) {
+    std::thread::spawn(move || {
         if let Ok(store) = StateStore::open() {
-            for stage in [
-                "ownership",
-                "products",
-                "manifests",
-                "metadata",
-                "builds",
-                "artwork",
-                "library_sync",
-            ] {
-                let _ = store.mark_sync_stage_finished(stage, true, None);
+            for stage in ["ownership", "products", "artwork", "library_sync"] {
+                if images_only && matches!(stage, "ownership" | "products") {
+                    continue;
+                }
+                let failed = image_failures > 0 && matches!(stage, "artwork" | "library_sync");
+                let message = failed.then(|| {
+                    format!("{image_failures} library images failed; retry synchronization")
+                });
+                let _ = store.mark_sync_stage_finished(stage, !failed, message.as_deref());
             }
         }
     });
@@ -789,79 +922,17 @@ pub(super) fn start_product_file_refresh(
     model: &Rc<RefCell<AppModel>>,
     target_id: i64,
 ) {
-    let Some(token) = model.borrow().account_token.clone() else {
-        show_status(w, "Sign in to refresh GOG files");
-        return;
-    };
-    let request = model.borrow().games.iter().find_map(|game| {
-        let is_target =
-            game.product_id == target_id || game.dlcs.iter().any(|dlc| dlc.product_id == target_id);
-        is_target.then(|| {
-            (
-                game.product_id,
-                game.title.clone(),
-                game.dlcs
-                    .iter()
-                    .filter(|dlc| dlc.owned)
-                    .map(|dlc| (dlc.product_id, dlc.title.clone()))
-                    .collect::<Vec<_>>(),
-            )
+    let id = model
+        .borrow()
+        .games
+        .iter()
+        .find(|game| {
+            game.product_id == target_id || game.dlcs.iter().any(|dlc| dlc.product_id == target_id)
         })
-    });
-    let Some((base_product_id, title, dlcs)) = request else {
-        show_status(w, "Could not find this product in the library");
-        return;
-    };
-    show_status(w, &format!("Refreshing files for {title}…"));
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result =
-            online::fetch_product_file_metadata(&token.access_token, base_product_id, &dlcs);
-        let _ = sender.send(result);
-    });
-    let w = w.clone();
-    let model = model.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        match receiver.try_recv() {
-            Ok(Ok(manifests)) => {
-                let mut persistence = Vec::new();
-                for (product_id, artifacts, _raw_json) in manifests {
-                    apply_remote_artifacts_to_model(
-                        &mut model.borrow_mut().games,
-                        product_id,
-                        artifacts.clone(),
-                    );
-                    persistence.push((product_id, artifacts));
-                }
-                std::thread::spawn(move || {
-                    let Ok(store) = StateStore::open() else {
-                        return;
-                    };
-                    for (product_id, artifacts) in persistence {
-                        if let Err(error) = store.observe_download_manifest(product_id, &artifacts)
-                        {
-                            tracing::warn!(product_id, %error, "could not observe targeted file manifest");
-                        }
-                        if let Err(error) = store.cache_download_manifest(product_id, &artifacts) {
-                            tracing::warn!(product_id, %error, "could not cache targeted file manifest");
-                        }
-                    }
-                });
-                if model.borrow().selected == Some(target_id) {
-                    render_product_details(&w, &model, target_id);
-                }
-                show_status(&w, "GOG file list updated");
-                glib::ControlFlow::Break
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(target_id, %error, "targeted GOG file refresh failed");
-                show_status(&w, &format!("Could not refresh this game’s files: {error}"));
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
+        .map(|game| game.product_id);
+    if let Some(id) = id {
+        request_product_section(w, model, id, online::DetailSection::Acquisition, true);
+    }
 }
 
 pub(super) fn render_product_details(w: &Widgets, model: &Rc<RefCell<AppModel>>, product_id: i64) {
@@ -1081,99 +1152,53 @@ mod media_cache_tests {
     use super::*;
 
     #[test]
-    fn library_scan_keeps_only_unchanged_patch_note_caches() {
-        let unchanged = Rc::new(vec![PatchNote {
-            title: "Patch 1".into(),
-            version: Some("1".into()),
-            date: None,
-            body_markup: "Cached".into(),
-        }]);
-        let changed = Rc::new(Vec::new());
-        let cache = HashMap::from([(1, unchanged.clone()), (2, changed)]);
-        let previous = vec![
-            Game {
-                product_id: 1,
-                changelog: "same".into(),
-                ..Game::default()
-            },
-            Game {
-                product_id: 2,
-                changelog: "old".into(),
-                ..Game::default()
-            },
-        ];
-        let current = vec![
-            Game {
-                product_id: 1,
-                changelog: "same".into(),
-                ..Game::default()
-            },
-            Game {
-                product_id: 2,
-                changelog: "new".into(),
-                ..Game::default()
-            },
-        ];
-
-        let cache = retain_patch_note_cache(cache, &previous, &current);
-
-        assert!(Rc::ptr_eq(cache.get(&1).unwrap(), &unchanged));
-        assert!(!cache.contains_key(&2));
-    }
-
-    #[test]
-    fn catalog_refresh_preserves_local_managed_content() {
-        let local = LibraryFile {
-            name: "setup_1.3.0.5.exe".into(),
-            path: "/games/grim-dawn/setup_1.3.0.5.exe".into(),
-            size: 42,
-        };
-        let source = vec![Game {
-            product_id: 42,
-            location: "/games/grim-dawn".into(),
-            installers: vec![local.clone()],
-            disk_usage: 42,
+    fn core_batches_preserve_late_detail_results_and_local_files() {
+        let mut current = vec![Game {
+            product_id: 1,
+            title: "Old title".into(),
+            description: "Opened detail".into(),
+            detail_artwork: Some("cached.png".into()),
+            installers: vec![LibraryFile {
+                name: "setup".into(),
+                path: "/tmp/setup".into(),
+                size: 42,
+            }],
             ..Default::default()
         }];
-        let mut target = vec![Game {
-            product_id: 42,
-            title: "Grim Dawn".into(),
-            ..Default::default()
-        }];
-
-        merge_remote_artifacts(&source, &mut target);
-
-        assert_eq!(target[0].installers, vec![local]);
-        assert_eq!(
-            target[0].location,
-            std::path::PathBuf::from("/games/grim-dawn")
+        merge_core_catalog(
+            &mut current,
+            vec![
+                Game {
+                    product_id: 1,
+                    title: "New title".into(),
+                    ..Default::default()
+                },
+                Game {
+                    product_id: 2,
+                    title: "Second".into(),
+                    ..Default::default()
+                },
+            ],
+            false,
         );
-        assert_eq!(target[0].disk_usage, 42);
-    }
-
-    #[test]
-    fn catalog_refresh_retains_existing_cached_header_media() {
-        let path = std::env::temp_dir().join(format!(
-            "ludomere-media-cache-test-{}.png",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"cached").unwrap();
-        let source = vec![Game {
-            product_id: 42,
-            detail_artwork: Some(path.clone()),
-            hero_logo: Some(path.clone()),
-            ..Default::default()
-        }];
-        let mut target = vec![Game {
-            product_id: 42,
-            detail_artwork: Some("new-api-background.jpg".into()),
-            ..Default::default()
-        }];
-
-        merge_cached_media(&source, &mut target);
-
-        assert_eq!(target[0].detail_artwork.as_ref(), Some(&path));
-        assert_eq!(target[0].hero_logo.as_ref(), Some(&path));
-        let _ = std::fs::remove_file(path);
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].title, "New title");
+        assert_eq!(current[0].description, "Opened detail");
+        assert_eq!(
+            current[0].detail_artwork.as_deref(),
+            Some(std::path::Path::new("cached.png"))
+        );
+        assert_eq!(current[0].installers.len(), 1);
+        merge_core_catalog(
+            &mut current,
+            vec![Game {
+                product_id: 1,
+                title: "New title".into(),
+                ..Default::default()
+            }],
+            true,
+        );
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].description, "Opened detail");
     }
 }

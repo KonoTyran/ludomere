@@ -194,6 +194,7 @@ fn summarize_inventory(objects: &[api::RemoteObject]) -> CloudSaveInventory {
 }
 
 pub fn sync(mut request: CloudSyncRequest) -> Result<CloudSyncResult> {
+    let _activity = crate::profile_reset::begin_activity("cloud sync")?;
     if request.game.compatibility.is_none()
         || !request
             .game

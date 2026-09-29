@@ -176,7 +176,8 @@ pub(super) fn show_settings_page(
     maintenance.add(&clear_images);
     let refresh_metadata = adw::ActionRow::new();
     refresh_metadata.set_title("Refresh all online metadata");
-    refresh_metadata.set_subtitle("Synchronize owned games, manifests, and artwork");
+    refresh_metadata
+        .set_subtitle("Refresh names and covers; reload other metadata when next opened");
     let refresh_metadata_button = gtk::Button::with_label("Refresh");
     refresh_metadata_button.set_valign(gtk::Align::Center);
     refresh_metadata.add_suffix(&refresh_metadata_button);
@@ -296,10 +297,22 @@ pub(super) fn show_settings_page(
             storage_maintenance_page.upcast::<gtk::Widget>(),
         ),
         (
+            "proton",
+            "Proton",
+            "applications-games-symbolic",
+            proton_page(&settings_window).upcast::<gtk::Widget>(),
+        ),
+        (
             "appearance",
             "Appearance",
             "applications-graphics-symbolic",
             appearance_page.upcast::<gtk::Widget>(),
+        ),
+        (
+            "comet",
+            "GOG online services",
+            "network-server-symbolic",
+            comet::comet_page(&settings_window).upcast::<gtk::Widget>(),
         ),
     ] {
         let row = settings_navigation_row(name, title, icon);
@@ -332,7 +345,9 @@ pub(super) fn show_settings_page(
         "library",
         "storage",
         "maintenance",
+        "proton",
         "appearance",
+        "comet",
     ]
     .iter()
     .position(|page| *page == initial_page)
@@ -350,20 +365,31 @@ pub(super) fn show_settings_page(
     }
     {
         let row = clear_images.clone();
+        let model = model.clone();
         clear_images_button.connect_clicked(move |button| {
             button.set_sensitive(false);
             row.set_subtitle("Clearing replaceable images…");
             let cache = crate::identity::cache_root();
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = clear_replaceable_images_at(&cache);
+                let result = clear_replaceable_images_at(&cache)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|()| {
+                        online::invalidate_all_section_cache(online::DetailSection::Artwork)
+                    });
                 let _ = sender.send(result);
             });
             let button = button.clone();
             let row = row.clone();
+            let model = model.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
                     Ok(Ok(())) => {
+                        model
+                            .borrow_mut()
+                            .section_states
+                            .retain(|(_, scope), _| *scope != online::DetailSection::Artwork);
+                        widgets::media::clear_card_texture_cache();
                         row.set_subtitle(
                             "Image cache cleared; artwork will return on the next refresh",
                         );
@@ -756,6 +782,38 @@ fn settings_account_page(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) -> adw:
         }
     }
     page.add(&profile_group);
+
+    let privacy = adw::PreferencesGroup::new();
+    privacy.set_title("Signing out");
+    let clear_profile = adw::SwitchRow::new();
+    clear_profile.set_title("Clear full profile when signing out");
+    const RESET_DESCRIPTION: &str = "Clears settings, favorites, tags, playtime, queue records, login data, images and metadata. Ludomere then closes. Games, downloaded installers, Proton versions and runtimes are kept. Turning this on does not clear anything now.";
+    clear_profile.set_subtitle(RESET_DESCRIPTION);
+    clear_profile.set_active(model.borrow().config.clear_profile_on_sign_out);
+    clear_profile.connect_active_notify({
+        let model = model.clone();
+        move |row| {
+            let mut state = model.borrow_mut();
+            let previous = state.config.clear_profile_on_sign_out;
+            if previous == row.is_active() {
+                return;
+            }
+            state.config.clear_profile_on_sign_out = row.is_active();
+            if let Err(error) = state.config.save() {
+                state.config.clear_profile_on_sign_out = previous;
+                drop(state);
+                row.set_active(previous);
+                row.set_subtitle(&format!(
+                    "Could not save this setting: {error}. {RESET_DESCRIPTION}"
+                ));
+            } else {
+                drop(state);
+                row.set_subtitle(RESET_DESCRIPTION);
+            }
+        }
+    });
+    privacy.add(&clear_profile);
+    page.add(&privacy);
 
     let connection = adw::PreferencesGroup::new();
     connection.set_title("Connection");

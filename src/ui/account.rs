@@ -2,6 +2,10 @@ use super::*;
 
 pub(super) fn show_gog_login(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     use webkit6::prelude::*;
+    if model.borrow().logout_pending {
+        return;
+    }
+    let epoch = model.borrow().account_epoch;
 
     let web_view = webkit6::WebView::new();
     web_view.load_uri(&auth::login_url());
@@ -24,6 +28,11 @@ pub(super) fn show_gog_login(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
         let w = w.clone();
         let model = model.clone();
         web_view.connect_decide_policy(move |_, decision, _| {
+            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                decision.ignore();
+                dialog.close();
+                return true;
+            }
             let uri = decision
                 .clone()
                 .downcast::<webkit6::NavigationPolicyDecision>()
@@ -44,13 +53,17 @@ pub(super) fn show_gog_login(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
 }
 
 pub(super) fn begin_account_exchange(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, code: String) {
+    if model.borrow().logout_pending {
+        return;
+    }
+    let epoch = model.borrow().account_epoch;
     show_status(w, "Signing in to GOG…");
     w.sign_in.set_sensitive(false);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(auth::exchange_code(&code));
     });
-    poll_account_result(w, model, receiver);
+    poll_account_result(w, model, receiver, epoch);
 }
 
 pub(super) fn start_account_restore(
@@ -58,6 +71,7 @@ pub(super) fn start_account_restore(
     model: &Rc<RefCell<AppModel>>,
     _store: &Rc<StateStore>,
 ) {
+    let epoch = model.borrow().account_epoch;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(auth::restore());
@@ -65,6 +79,9 @@ pub(super) fn start_account_restore(
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
+        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(Ok(Some((token, profile)))) => {
                 cache_and_display_profile(&w, &model, token.clone(), profile);
@@ -98,25 +115,38 @@ pub(super) fn poll_account_result(
     w: &Rc<Widgets>,
     model: &Rc<RefCell<AppModel>>,
     receiver: mpsc::Receiver<anyhow::Result<(auth::Token, auth::Profile)>>,
+    epoch: u64,
 ) {
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
+        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(Ok((token, profile))) => {
                 cache_and_display_profile(&w, &model, token.clone(), profile);
                 start_owned_library_sync(&w, &model, token, true, false);
                 w.sign_in.set_sensitive(true);
+                if w.status.label() == "Signing in to GOG…" {
+                    show_status(&w, "Signed in to GOG");
+                }
                 glib::ControlFlow::Break
             }
-            Ok(Err(error)) => {
+            Ok(Err(_)) => {
                 w.sign_in.set_sensitive(true);
-                show_status(&w, &format!("GOG sign-in failed: {error}"));
+                show_status(
+                    &w,
+                    "GOG sign-in failed. Check your connection and try signing in again.",
+                );
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(_) => {
                 w.sign_in.set_sensitive(true);
+                if w.status.label() == "Signing in to GOG…" {
+                    show_status(&w, "Sign-in did not finish. Try signing in again.");
+                }
                 glib::ControlFlow::Break
             }
         }
@@ -138,6 +168,9 @@ pub(super) fn cache_and_display_profile(
         }
     });
     let mut state = model.borrow_mut();
+    if state.account_profile.as_ref().map(|value| &value.user_id) != Some(&profile.user_id) {
+        invalidate_section_requests(&mut state);
+    }
     state.account_profile = Some(profile.clone());
     state.account_token = Some(token);
     if let Some(token) = state.account_token.as_ref() {
@@ -154,7 +187,7 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
     glib::timeout_add_local(Duration::from_secs(60), move || {
         let token = {
             let mut state = model.borrow_mut();
-            if state.token_refresh_in_progress {
+            if state.token_refresh_in_progress || state.logout_pending {
                 return glib::ControlFlow::Continue;
             }
             let needs_refresh = state
@@ -169,6 +202,7 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
             state.token_refresh_in_progress = true;
             state.account_token.clone()
         };
+        let epoch = model.borrow().account_epoch;
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let result = match token {
@@ -180,6 +214,9 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
         let w = w.clone();
         let model = model.clone();
         glib::timeout_add_local(Duration::from_millis(100), move || {
+            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                return glib::ControlFlow::Break;
+            }
             match receiver.try_recv() {
                 Ok(Ok(Some((token, profile)))) => {
                     cache_and_display_profile(&w, &model, token, profile);

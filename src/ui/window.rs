@@ -1,6 +1,7 @@
 use super::*;
 
 pub fn build_window(app: &adw::Application) {
+    comet::start_component_check();
     if let Some(window) = app.active_window() {
         window.present();
         return;
@@ -15,63 +16,38 @@ pub fn build_window(app: &adw::Application) {
     let _ = store.prune_completed_download_history(chrono::Utc::now().timestamp() - 30 * 86_400);
     let favorites = store.favorites().unwrap_or_default();
     let tags = store.tags().unwrap_or_default();
-    let cached_games = store
-        .normalized_games()
-        .ok()
-        .filter(|games| !games.is_empty())
-        .unwrap_or_else(|| store.cached_online_games().unwrap_or_default());
     let cached_profile = store.cached_profile().unwrap_or_default();
     let download_jobs = store.download_jobs().unwrap_or_default();
     let downloaded_products = downloaded_product_ids(&download_jobs);
     let downloaded_installer_products = downloaded_installer_product_ids(&download_jobs);
-    let reconciled = crate::installation::reconcile_installed_games(&store, &config.game_libraries)
-        .unwrap_or_default();
-    let installed_products = reconciled
-        .iter()
-        .filter(|game| {
-            game.state == crate::domain::InstallationState::Installed
-                && crate::installation::resolve_installation_directory(game, &config.game_libraries)
-                    .is_some()
-        })
-        .map(|game| game.product_id)
-        .collect();
-    let playable_products = reconciled
-        .iter()
-        .filter(|game| sidebar_game_is_playable(game, &config.game_libraries))
-        .map(|game| game.product_id)
-        .collect();
-    let (activity_sender, activity_receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let activity = StateStore::open()
-            .and_then(|store| store.all_product_activity())
-            .unwrap_or_default();
-        let _ = activity_sender.send(activity);
-    });
-    let mut product_activity = activity_receiver.recv().unwrap_or_default();
-    // Seed durable activity from existing installation markers once. The marker
-    // timestamp is the installation event, not a reconciliation/uninstall time.
-    for installed in &reconciled {
-        if let Some(installed_at) = installed.installed_at {
-            let activity = product_activity.entry(installed.product_id).or_default();
-            if activity
-                .last_activity_at
-                .is_none_or(|previous| installed_at > previous)
-            {
-                activity.last_activity_at = Some(installed_at);
-                if let Err(error) =
-                    store.record_product_activity(installed.product_id, installed_at)
-                {
-                    tracing::warn!(%error, product_id = installed.product_id, "seeding installation activity");
-                }
-            }
-        }
-    }
     let (owned_product_count, online_synced_at) = store.owned_library_status().unwrap_or_default();
     let card_width = [140, 180, 220, 260][config.library_card_size.min(3) as usize];
     let sidebar_sort_mode = config.sidebar_sort_mode;
     let model = Rc::new(RefCell::new(AppModel {
         config,
-        games: cached_games,
+        games: Vec::new(),
+        section_states: HashMap::new(),
+        section_queue: VecDeque::new(),
+        section_active: HashSet::new(),
+        section_forced: HashSet::new(),
+        account_epoch: 0,
+        logout_pending: false,
+        sync_generation: 0,
+        sync_session: None,
+        dismissed_sync_error: None,
+        detail_generation: 0,
+        detail_target: None,
+        installed_games: HashMap::new(),
+        local_actions: HashMap::new(),
+        local_refresh_running: false,
+        local_refresh_pending: false,
+        local_revision: 0,
+        core_loading: false,
+        sync_running: false,
+        sync_message: None,
+        sync_failed: false,
+        cover_states: HashMap::new(),
+        icon_states: HashMap::new(),
         patch_notes: HashMap::new(),
         favorites,
         tags,
@@ -80,11 +56,12 @@ pub fn build_window(app: &adw::Application) {
         installed_only: false,
         played_only: false,
         unplayed_only: false,
-        installed_products,
-        playable_products,
+        installed_products: HashSet::new(),
+        playable_products: HashSet::new(),
         downloaded_products,
         downloaded_installer_products,
         download_jobs,
+        blocked_auto_installs: HashMap::new(),
         depot_operations: crate::installation::depot_operation_snapshots(),
         transfer_history: Rc::new(RefCell::new(VecDeque::new())),
         transfer_totals: None,
@@ -107,7 +84,7 @@ pub fn build_window(app: &adw::Application) {
         network_available: true,
         owned_product_count,
         online_synced_at,
-        product_activity,
+        product_activity: HashMap::new(),
         sidebar_sort_mode,
         sidebar_playable_only: false,
         collapsed_activity_sections: HashSet::new(),
@@ -117,27 +94,123 @@ pub fn build_window(app: &adw::Application) {
     let widgets = Rc::new(create_widgets(app, &model.borrow().config));
 
     connect_actions(&widgets, &model, &store);
+    {
+        let model = model.clone();
+        widgets
+            .content
+            .connect_visible_child_name_notify(move |stack| {
+                if stack.visible_child_name().as_deref() != Some("details") {
+                    let mut state = model.borrow_mut();
+                    state.detail_generation = state.detail_generation.wrapping_add(1);
+                    state.detail_target = None;
+                }
+            });
+    }
+    initialize_library_loading(&widgets, &model);
     update_account_widgets(&widgets, model.borrow().account_profile.as_ref());
     update_account_library_status(&widgets, &model.borrow());
     start_network_monitor(&widgets, &model);
     widgets.window.present();
-    if !model.borrow().games.is_empty() {
-        rebuild_library(&widgets, &model);
-        widgets.content.set_visible_child_name("home");
-    }
-    start_managed_reconciliation(&widgets, &model);
+    load_cached_library(&widgets, &model);
     start_account_restore(&widgets, &model, &store);
     start_token_renewal_monitor(&widgets, &model);
     start_download_monitor(&widgets, &model);
     start_installation_monitor(&widgets, &model);
     tray::start_tray(&widgets, &model);
     schedule_activity_rollover(&widgets, &model);
+    let show_setup = !model.borrow().config.setup_seen;
+    if show_setup {
+        setup::show_setup(&widgets, &model, None);
+    }
+}
+
+fn load_cached_library(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
+    let epoch = model.borrow().account_epoch;
+    let generation = model.borrow().sync_generation;
+    let (sender, receiver) = mpsc::channel();
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = StateStore::open().map(|store| {
+            store
+                .normalized_games()
+                .ok()
+                .filter(|games| !games.is_empty())
+                .unwrap_or_else(|| store.cached_online_games().unwrap_or_default())
+        });
+        let ids = result
+            .as_ref()
+            .map(|games| games.iter().map(|game| game.product_id).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = sender.send(result);
+        let mut ready = Vec::new();
+        for id in ids {
+            for scope in [
+                online::DetailSection::Metadata,
+                online::DetailSection::Acquisition,
+            ] {
+                if online::section_ready(id, scope).unwrap_or(false) {
+                    ready.push((id, scope));
+                }
+            }
+        }
+        let _ = ready_sender.send(ready);
+    });
+    {
+        let w = w.clone();
+        let model = model.clone();
+        glib::timeout_add_local(Duration::from_millis(32), move || {
+            if model.borrow().account_epoch != epoch || model.borrow().sync_generation != generation
+            {
+                return glib::ControlFlow::Break;
+            }
+            match ready_receiver.try_recv() {
+                Ok(ready) => {
+                    let mut state = model.borrow_mut();
+                    for key in ready {
+                        state
+                            .section_states
+                            .entry(key)
+                            .or_insert(SectionState::Ready);
+                    }
+                    drop(state);
+                    refresh_filters(&w, &model.borrow());
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(_) => glib::ControlFlow::Break,
+            }
+        });
+    }
+    let w = w.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        if model.borrow().account_epoch != epoch {
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Ok(Ok(games)) => {
+                let mut state = model.borrow_mut();
+                if state.sync_generation == generation && state.games.is_empty() {
+                    state.games = games;
+                }
+                drop(state);
+                rebuild_library(&w, &model);
+                refresh_local_action_state(&w, &model);
+                start_managed_reconciliation(&w, &model);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            _ => {
+                refresh_local_action_state(&w, &model);
+                glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     let events = crate::installation::subscribe_installation_events();
     let depot_events = crate::installation::subscribe_depot_events();
-    let (state_sender, state_receiver) = mpsc::channel::<(HashSet<i64>, HashSet<i64>)>();
     let mut depot_states = HashMap::<String, String>::new();
     let w = w.clone();
     let model = model.clone();
@@ -246,14 +319,6 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                 terminal_products.insert(snapshot.product_id);
             }
         }
-        while let Ok((installed_products, playable_products)) = state_receiver.try_recv() {
-            let mut state = model.borrow_mut();
-            state.installed_products = installed_products;
-            state.playable_products = playable_products;
-            drop(state);
-            update_sidebar_download_styles(&w, &model.borrow());
-            refresh_filters(&w, &model.borrow());
-        }
         if activity_changed && model.borrow().sidebar_sort_mode == SidebarSortMode::LastPlayed {
             rebuild_sidebar_presentation(&w, &mut model.borrow_mut());
         }
@@ -289,34 +354,7 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
         }
 
         if !terminal_products.is_empty() {
-            let game_libraries = model.borrow().config.game_libraries.clone();
-            let state_sender = state_sender.clone();
-            std::thread::spawn(move || {
-                let games = StateStore::open()
-                    .and_then(|store| {
-                        crate::installation::reconcile_installed_games(&store, &game_libraries)
-                    })
-                    .unwrap_or_default();
-                let installed_products = games
-                    .iter()
-                    .filter(|game| game.state == crate::domain::InstallationState::Installed)
-                    .map(|game| game.product_id)
-                    .collect();
-                let playable_products = games
-                    .iter()
-                    .filter(|game| sidebar_game_is_playable(game, &game_libraries))
-                    .map(|game| game.product_id)
-                    .collect();
-                let _ = state_sender.send((installed_products, playable_products));
-            });
-            if model
-                .borrow()
-                .selected
-                .is_some_and(|selected| terminal_products.contains(&selected))
-            {
-                let selected = model.borrow().selected.unwrap();
-                render_product_details(&w, &model, selected);
-            }
+            refresh_local_action_state(&w, &model);
         }
         glib::ControlFlow::Continue
     });
@@ -353,6 +391,7 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
         jobs: Vec<DownloadJobRecord>,
     }
 
+    let epoch = model.borrow().account_epoch;
     let root = model.borrow().config.download_directory.clone();
     let games = model.borrow().games.clone();
     let (sender, receiver) = mpsc::channel();
@@ -374,12 +413,11 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
+        if model.borrow().account_epoch != epoch {
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(Ok(reconciliation)) => {
-                let visible_detail_tab =
-                    find_named_descendant(w.details.upcast_ref::<gtk::Widget>(), "game-tabs")
-                        .and_downcast::<gtk::Stack>()
-                        .and_then(|stack| stack.visible_child_name().map(|name| name.to_string()));
                 let mut state = model.borrow_mut();
                 let download_directory = state.config.download_directory.clone();
                 managed::apply_to_games(&mut state.games, &reconciliation.files);
@@ -388,25 +426,9 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
                 state.downloaded_products = downloaded_product_ids(&state.download_jobs);
                 state.downloaded_installer_products =
                     downloaded_installer_product_ids(&state.download_jobs);
-                let selected = state.selected;
                 drop(state);
                 update_sidebar_download_styles(&w, &model.borrow());
-                if let Some(product_id) = selected {
-                    render_product_details(&w, &model, product_id);
-                    if let Some(tab) = visible_detail_tab {
-                        let details = w.details.clone();
-                        glib::idle_add_local_once(move || {
-                            if let Some(stack) = find_named_descendant(
-                                details.upcast_ref::<gtk::Widget>(),
-                                "game-tabs",
-                            )
-                            .and_downcast::<gtk::Stack>()
-                            {
-                                stack.set_visible_child_name(&tab);
-                            }
-                        });
-                    }
-                }
+                refresh_local_action_state(&w, &model);
                 if let Err(error) = reconciliation.summary {
                     tracing::warn!(%error, "could not reconcile managed downloads during startup");
                     show_status(&w, &format!("Could not check downloaded files: {error}"));
@@ -445,10 +467,13 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     header.pack_start(&app_icon);
     let title = adw::WindowTitle::new(crate::identity::APP_NAME, "Local collection");
     header.set_title_widget(Some(&title));
-    let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh.set_tooltip_text(Some("Refresh library (Ctrl+R)"));
-    refresh.set_action_name(Some("win.refresh"));
     let settings = gtk::Button::from_icon_name("emblem-system-symbolic");
+    let finish_setup = gtk::Button::with_label("Finish setup");
+    finish_setup.set_widget_name("finish-setup");
+    finish_setup.set_action_name(Some("win.finish-setup"));
+    finish_setup.set_action_target_value(Some(&0i64.to_variant()));
+    finish_setup.set_visible(!config.setup_completed || config.windows_setup_deferred);
+    header.pack_start(&finish_setup);
     settings.set_tooltip_text(Some("Settings"));
     settings.set_action_name(Some("win.settings"));
     let header_network_button = gtk::Button::new();
@@ -539,7 +564,6 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     header.pack_end(&account_button);
     header.pack_end(&header_network_button);
     header.pack_end(&settings);
-    header.pack_end(&refresh);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.set_width_request(328);
     sidebar.add_css_class("library-sidebar");
@@ -865,11 +889,9 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     paned.set_resize_start_child(false);
     paned.set_shrink_start_child(false);
     paned.set_position(328);
-    let status_bar = gtk::Button::new();
+    let status_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     status_bar.add_css_class("application-status-bar");
-    status_bar.set_action_name(Some("win.downloads"));
-    status_bar.set_tooltip_text(Some("Open downloads"));
-    let status_content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let status_content = gtk::CenterBox::new();
     status_content.set_height_request(34);
     status_content.set_vexpand(false);
     status_content.set_valign(gtk::Align::Center);
@@ -888,17 +910,31 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     sync_status.set_xalign(0.0);
     sync_status.set_valign(gtk::Align::Center);
     sync_status.set_visible(false);
+    sync_status.set_max_width_chars(36);
+    sync_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
     sync_heading.append(&sync_status);
+    let sync_retry = gtk::Button::with_label("Retry");
+    sync_retry.set_widget_name("library-sync-retry");
+    sync_retry.add_css_class("flat");
+    sync_retry.set_visible(false);
+    sync_heading.append(&sync_retry);
+    let sync_dismiss = gtk::Button::from_icon_name("window-close-symbolic");
+    sync_dismiss.set_widget_name("library-sync-dismiss");
+    sync_dismiss.set_tooltip_text(Some("Dismiss this error notification"));
+    sync_dismiss.add_css_class("flat");
+    sync_dismiss.set_visible(false);
+    sync_heading.append(&sync_dismiss);
+    let sync_options = gtk::Button::with_label("Options");
+    sync_options.set_tooltip_text(Some("Full library synchronization options"));
+    sync_options.set_visible(false);
+    sync_heading.append(&sync_options);
     sync_content.append(&sync_heading);
     let sync_progress = gtk::ProgressBar::new();
     sync_progress.set_visible(false);
     sync_progress.set_valign(gtk::Align::Center);
     sync_content.append(&sync_progress);
-    status_content.append(&sync_content);
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    spacer.set_valign(gtk::Align::Center);
-    status_content.append(&spacer);
+    status_content.set_start_widget(Some(&sync_content));
+    let transfer_content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let download_artwork = gtk::Image::new();
     download_artwork.set_pixel_size(24);
     download_artwork.set_size_request(24, 24);
@@ -908,7 +944,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     download_artwork.set_valign(gtk::Align::Center);
     download_artwork.add_css_class("download-status-icon");
     download_artwork.set_visible(false);
-    status_content.append(&download_artwork);
+    transfer_content.append(&download_artwork);
     let download_content = gtk::Box::new(gtk::Orientation::Vertical, 2);
     download_content.set_size_request(230, -1);
     download_content.set_hexpand(false);
@@ -917,6 +953,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     let download_heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     download_heading.set_valign(gtk::Align::Center);
     let status = gtk::Label::new(Some("Ready"));
+    status.set_widget_name("application-status-message");
     status.set_xalign(0.0);
     status.set_valign(gtk::Align::Center);
     status.set_hexpand(false);
@@ -935,11 +972,16 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     download_status_progress.set_visible(false);
     download_status_progress.set_valign(gtk::Align::Center);
     download_content.append(&download_status_progress);
-    status_content.append(&download_content);
-    let status_arrow = gtk::Image::from_icon_name("go-next-symbolic");
-    status_arrow.set_valign(gtk::Align::Center);
-    status_content.append(&status_arrow);
-    status_bar.set_child(Some(&status_content));
+    transfer_content.append(&download_content);
+    status_content.set_end_widget(Some(&transfer_content));
+    let downloads_button = gtk::Button::with_label("Downloads");
+    downloads_button.set_widget_name("footer-downloads");
+    downloads_button.set_action_name(Some("win.downloads"));
+    downloads_button.set_tooltip_text(Some("Open downloads"));
+    downloads_button.add_css_class("flat");
+    status_content.set_center_widget(Some(&downloads_button));
+    status_content.set_hexpand(true);
+    status_bar.append(&status_content);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header);
@@ -954,6 +996,10 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         status_bar,
         sync_spinner,
         sync_status,
+        sync_retry,
+        sync_dismiss,
+        sync_options,
+        finish_setup,
         sync_progress,
         download_artwork,
         download_percent,
@@ -1018,8 +1064,49 @@ pub(super) fn connect_actions(
     store: &Rc<StateStore>,
 ) {
     {
+        let w = w.clone();
+        let model = model.clone();
+        w.sync_retry.clone().connect_clicked(move |_| {
+            retry_failed_images(&w, &model);
+        });
+    }
+    {
+        let w = w.clone();
+        let model = model.clone();
+        w.sync_dismiss.clone().connect_clicked(move |_| {
+            let fingerprint = sync_error_fingerprint(&model.borrow());
+            model.borrow_mut().dismissed_sync_error = Some(fingerprint);
+            refresh_sync_status(&w, &model.borrow());
+        });
+    }
+    {
+        let w = w.clone();
+        let model = model.clone();
+        w.sync_options
+            .clone()
+            .connect_clicked(move |_| show_settings_page(&w, &model, "maintenance"));
+    }
+    let finish_setup = gio::SimpleAction::new("finish-setup", Some(&i64::static_variant_type()));
+    {
+        let w = w.clone();
+        let model = model.clone();
+        finish_setup.connect_activate(move |_, value| {
+            setup::show_setup(
+                &w,
+                &model,
+                value
+                    .and_then(|value| value.get::<i64>())
+                    .filter(|id| *id != 0),
+            );
+        });
+    }
+    w.window.add_action(&finish_setup);
+    {
         let model = model.clone();
         w.window.connect_close_request(move |window| {
+            if model.borrow().logout_pending && model.borrow().config.clear_profile_on_sign_out {
+                return glib::Propagation::Stop;
+            }
             let maximized = window.is_maximized();
             let mut state = model.borrow_mut();
             state.config.window_maximized = maximized;
@@ -1114,23 +1201,124 @@ pub(super) fn connect_actions(
         let model = model.clone();
         let button = w.sign_out.clone();
         button.connect_clicked(move |_| {
-            if let Err(error) = auth::logout() {
-                show_status(&w, &format!("Could not sign out: {error}"));
+            if model.borrow().logout_pending {
                 return;
             }
-            let mut state = model.borrow_mut();
-            state.account_profile = None;
-            state.account_token = None;
-            drop(state);
-            download::set_authenticated(false);
-            update_header_network_indicator(&w, &model.borrow());
-            if let Ok(store) = StateStore::open() {
-                let _ = store.clear_cached_profile();
-            }
-            update_account_widgets(&w, None);
-            update_account_library_status(&w, &model.borrow());
+            let reservation = if model.borrow().config.clear_profile_on_sign_out {
+                match crate::profile_reset::reserve() {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        show_status(&w, &format!("Could not sign out: {error}"));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            cancel_cover_indicators(&w);
+            let (config, previous_sections) = {
+                let mut state = model.borrow_mut();
+                state.logout_pending = true;
+                state.token_refresh_in_progress = false;
+                state.core_loading = false;
+                let previous = state.section_states.clone();
+                invalidate_section_requests(&mut state);
+                (state.config.clone(), previous)
+            };
+            w.sign_out.set_sensitive(false);
+            w.sign_in.set_sensitive(false);
+            let reset_windows = if config.clear_profile_on_sign_out {
+                w.window.application().map(|app| {
+                    app.windows().into_iter().map(|window| {
+                        let sensitive = window.is_sensitive();
+                        window.set_sensitive(false);
+                        (window, sensitive)
+                    }).collect::<Vec<_>>()
+                }).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            w.sync_spinner.set_spinning(false);
+            w.sync_spinner.set_visible(false);
+            w.sync_progress.set_visible(false);
+            w.sync_status.set_visible(false);
+            w.sync_retry.set_visible(false);
+            w.sync_dismiss.set_visible(false);
+            w.sync_options.set_visible(false);
             w.account_popover.popdown();
-            show_status(&w, "Signed out of GOG");
+            show_status(&w, if config.clear_profile_on_sign_out {
+                "Preparing profile reset; Ludomere will close…"
+            } else {
+                "Signing out of GOG…"
+            });
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<bool> {
+                    if let Some(reservation) = reservation {
+                        reservation.prepare(&config)?.commit()?;
+                        return Ok(true);
+                    }
+                    auth::logout()?;
+                    if let Ok(store) = StateStore::open() {
+                        let _ = store.clear_cached_profile();
+                    }
+                    Ok(false)
+                })();
+                let _ = sender.send(result);
+            });
+            let w = w.clone();
+            let model = model.clone();
+            let mut previous_sections = Some(previous_sections);
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!("Sign-out preparation stopped; try again")),
+                };
+                if matches!(result, Ok(true)) {
+                    show_status(&w, "Closing Ludomere to clear the profile…");
+                    if let Some(app) = w.window.application() {
+                        app.quit();
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                model.borrow_mut().logout_pending = false;
+                w.sign_out.set_sensitive(true);
+                w.sign_in.set_sensitive(true);
+                for (window, sensitive) in &reset_windows {
+                    window.set_sensitive(*sensitive);
+                }
+                match result {
+                    Ok(false) => {
+                        {
+                            let mut state = model.borrow_mut();
+                            state.account_profile = None;
+                            state.account_token = None;
+                            state.token_refresh_in_progress = false;
+                        }
+                        download::set_authenticated(false);
+                        update_header_network_indicator(&w, &model.borrow());
+                        update_account_widgets(&w, None);
+                        update_account_library_status(&w, &model.borrow());
+                        show_status(&w, "Signed out of GOG");
+                    }
+                    Err(error) => {
+                        model.borrow_mut().section_states = previous_sections.take().unwrap_or_default()
+                            .into_iter().map(|(key, state)| {
+                                (key, if matches!(state, SectionState::Loading) {
+                                    SectionState::Failed("Loading was interrupted while signing out. Retry.".into())
+                                } else {
+                                    state
+                                })
+                            }).collect();
+                        refresh_filters(&w, &model.borrow());
+                        refresh_collection_metadata(&w, &model);
+                        show_status(&w, &format!("Could not sign out: {error}. Reopen game details to resume loading."));
+                    }
+                    Ok(true) => unreachable!(),
+                }
+                glib::ControlFlow::Break
+            });
         });
     }
     {
@@ -1354,15 +1542,15 @@ pub(super) fn connect_actions(
         let w = w.clone();
         let model = model.clone();
         refresh_action.connect_activate(move |_, _| {
-            let summary = reconcile_managed_directory(&mut model.borrow_mut());
-            tracing::info!(%summary, "managed download directory reconciled");
-            if let Some(token) = model.borrow().account_token.clone() {
+            start_managed_reconciliation(&w, &model);
+            let token = model.borrow().account_token.clone();
+            if let Some(token) = token {
                 start_owned_library_sync(&w, &model, token, true, true);
             } else {
                 rebuild_library(&w, &model);
                 show_status(
                     &w,
-                    "Managed downloads refreshed; sign in to synchronize GOG",
+                    "Refreshing managed downloads; sign in to synchronize GOG",
                 );
             }
         });
@@ -1497,7 +1685,7 @@ fn update_sort_toggle(w: &Widgets, mode: SidebarSortMode) {
     }
 }
 
-fn sidebar_game_is_playable(
+pub(super) fn sidebar_game_is_playable(
     game: &crate::domain::InstalledGame,
     libraries: &[crate::config::GameLibrary],
 ) -> bool {

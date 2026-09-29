@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, atomic::AtomicBool, mpsc},
 };
 
+mod auto_install;
+mod cleanup;
 pub mod depot;
 mod files;
 mod layout;
@@ -13,7 +15,16 @@ mod transfer;
 mod verify;
 mod worker;
 
+pub use cleanup::{CleanupResult, ManagedDownloads, managed_downloads};
 pub use files::{delete_completed_files, prune_empty_directories};
+
+pub fn delete_managed_downloads(files: ManagedDownloads) -> anyhow::Result<CleanupResult> {
+    manager::delete_managed_downloads(files, false)
+}
+
+pub(crate) fn cleanup_after_uninstall(files: ManagedDownloads) -> anyhow::Result<CleanupResult> {
+    manager::delete_managed_downloads(files, true)
+}
 pub use layout::destination;
 use layout::{key, staging_directory};
 pub use verify::{GogChecksum, file_md5_with_progress, gog_checksum};
@@ -56,6 +67,26 @@ pub struct DownloadRequest {
     pub access_token: String,
     pub destination: PathBuf,
     pub events: mpsc::Sender<DownloadEvent>,
+}
+
+pub struct AutoInstallRequest {
+    pub product_id: i64,
+    pub slug: String,
+    pub title: String,
+    pub config: crate::config::Config,
+}
+
+/// Worker-only: persist the explicit install choice before any selected download can complete.
+pub fn enqueue_with_install(
+    requests: Vec<DownloadRequest>,
+    install: Option<AutoInstallRequest>,
+    session: u64,
+) -> anyhow::Result<usize> {
+    manager::enqueue_with_install(requests, install, session)
+}
+
+pub fn retry_install_after_download(product_id: i64) -> anyhow::Result<()> {
+    manager::retry_install_after_download(product_id)
 }
 
 #[derive(Debug, Clone)]

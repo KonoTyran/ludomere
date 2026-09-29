@@ -1,0 +1,434 @@
+# Project plan
+
+Manager: /root. Specification: PROJECT_SPEC.md. Arch Linux x86-64 only. Proton management precedes
+package implementation. Workers never edit .project-manager/. No product changes by the manager.
+
+## P91 — Download defaults and managed-file cleanup
+
+- Requirements R24; status complete. Backend acquisition, UI compatibility, independent security.
+- Scope: existing managed downloads/delete APIs and minimal uninstall wiring; config/chooser default,
+  Manage action/confirmation, optional unchecked uninstall cleanup, scoped README and regression tests.
+  No real user deletion, schema/dependency/package changes or broader cleanup architecture.
+- Acceptance: Extras defaults off for new profiles, retains saved preference; action only for present
+  managed downloads; cancel changes nothing;
+  delete preserves installed payload/saves/preferences, respects active download/install work and
+  symlink/shared-root boundaries; uninstall checkbox correctly honors choice with visible failures.
+- Authorization: scoped source/tests/docs and private HOME/allXDG/bus/GUI/local fixtures, required
+  checks/debug; no actual profile/account/helper/game use. Escalate new scope/security boundaries.
+- Evidence: backend contract, destructive-path sentinel regressions, changed-control GUI inventory,
+  final checks and independent QA/security report. Root records only.
+- Result: new/missing Extras preference off, existing choices preserved; Manage confirmation and
+  unchecked uninstall cleanup implemented. Independent cancel/symlink partial failure/fresh retry
+  preserve payload/saves/preferences;5 cleanup and opt-in uninstall regressions pass. Exact-final
+  required checks pass332 unit/six integration. Reports /tmp/ludomere-p91-{backend,ui}-report.md and
+  /tmp/ludomere-p91-review.md. No scoped blocker; real uninstaller execution remains unverified.
+
+## P92 — Detail-image reliability and failed screenshot layout
+
+- Requirements R25 and R14/R19/R20; status complete. Backend acquisition, UI compatibility;
+  independent QA/security security. Own online.rs/backend and UI media/gallery/details respectively.
+- Acceptance: diagnose reproducible cause(s), failed/empty screenshots do not overlay information,
+  independent images settle/retry sensibly and usable cache survives partial failures; no speculative
+  retry flood or full-library refresh. Preserve screenshot keys, lazy loading and stale/session guards.
+- Authorization: scoped code/tests and bounded anonymous primary-service diagnostics if needed;
+  private HTTP/GUI fixtures, no credentials/private caches. No dependency/package changes.
+- Evidence: concrete diagnosis, request counts and failure/cache regressions, real GTK loading/
+  failure/partial/retry/empty screenshot layout and independent report. Live original cause remains
+  explicitly unverified unless reproduced; no unrelated UI changes.
+- Result: empty/failed screenshot layout and bounded validated locked cache fixed; useful Artwork
+  survives optional failures with Retry. Independent physical Retry→keys/wrap/Escape and empty/
+  partial views pass; two GTK regressions and final checks pass. Intermediate window-only key fix
+  rejected after real-input test; final overlay/direct-user-focus fix verified. DLC parser inference
+  disproved and unnecessary change removed; exact live Product failure remains unverified. Same reports.
+
+## P90 — Setup pickers, full Proton paths and separate final sign-in
+
+- Requirements: R23, R22. Status: complete. Owner /root/compatibility; independent QA/security
+  /root/security. Manager owns records only.
+- Scope: src/ui/setup.rs/proton.rs and minimal necessary account integration; focused tests/README.
+  Necessary config.rs normalization correction preserves independently chosen download paths on load.
+  Exclude backend queue/schema/dependencies/packages/unrelated changes.
+- Acceptance: actual folder pickers select/cancel safely; game choice derives downloads child;
+  download override cannot change game folder and prefilled values stay intact until user editing;
+  full long Proton paths readable by mouse/keyboard selection; only successfully saved setup advances
+  to separate optional sign-in modal. Cancel/skip/no-account/known-account states preserve settings.
+- Authorization: scoped source/docs/tests, private HOME/allXDG/runtime/bus/Xvfb and inert/local HTTP
+  fixtures, required fmt/Clippy/test/debug. No real profile/keyring/account traffic/helper execution,
+  package build/install or external mutation. Stop for new scope/security/permission boundary.
+- Evidence: source/control inventory, actual picker/path/final-step GUI states, config persistence
+  and save-failure behavior, required checks, independent report. No new requirements interview needed.
+- Result: both picker select/cancel and one-way path changes pass, full Proton paths readable with
+  pointer/keyboard, save failure cannot advance, final optional login follows successful save only.
+  Independent restart verifies distinct folders persist and cancelled drafts neither save nor sign in.
+  Corrected fmt/Clippy/debug and serial324 unit/six integration pass; initial parallel Comet lock
+  failure retained as a test limitation. Reports /tmp/ludomere-p90-ui-report.md and
+  /tmp/ludomere-p90-review.md. No scoped blocker; live desktop/account gates remain P70.
+
+## P88 — Targeted image retry and footer/download defaults
+
+- Requirements: R21. Status: complete. Backend owner /root/acquisition; UI owner
+  /root/compatibility; independent QA/security /root/security.
+- Acceptance: retry issues only failed cover/icon requests, preserving good cache and core catalog;
+  notification dismissal persists through ordinary UI refresh but new failures remain visible;
+  full re-sync is explicit in Settings, Downloads truly centered and status on right. Install after
+  downloading defaults on and works with saved defaults, with no background dialog/focus theft.
+- Paths: acquisition online/state and minimal download/install queue backend by agreement;
+  compatibility src/ui/config/README/tests. Existing disabled install-after placeholder requires
+  lifecycle inspection before implementation; owners report minimal contract before shared edits.
+- Authorization: scoped source/docs/tests/debug, disposable HTTP/GUI fixtures and required checks.
+  Every test private HOME/XDG/runtime/bus; no real account/profile, payload/helper execution, package
+  build/install, dependency changes or unrelated cleanup. Escalate schema/consent/scope conflicts.
+- Evidence: request-count retry regressions, dismiss/new-failure and footer pointer GUI, download
+  completion lifecycle with inert fixtures, required checks and independent reports. Depends on
+  R22 choices only where first-launch/compatibility setup behavior changes.
+- Necessary backend support: persist automatic-install intent in SQLite, preferring safe reuse of
+  existing operation plans; if a dedicated table is needed, keep target25 and advance only internal
+  development revision, update canonical24→25 and verify every retained revision. No new file-backed
+  parallel queue. Require idempotent completion/recovery, removal cancellation and visible failures.
+- Result: physical Retry requests exactly failed images; Dismiss/new-failure/Settings full refresh/
+  centered footer pass GUI. Default-on installation uses durable intent and existing installer queue;
+  cancellation/recovery/session protections pass inert regressions. Final fmt/Clippy/323 unit/six
+  integration/debug/diff checks pass. Reports: /tmp/ludomere-p88-backend-report.md,
+  /tmp/ludomere-p88-ui-report.md and /tmp/ludomere-p88-review.md. No scoped review blocker;
+  actual game installation remains user acceptance.
+
+## P89 — Guided defaults and unobtrusive Windows prerequisite handling
+
+- Requirements: R22 and R02–R06. Status: complete; interview complete.
+  UI lead /root/compatibility; backend support /root/acquisition; independent /root/security.
+- Scope: first-launch defaults flow, existing runtime/default reuse, clear missing-component actions,
+  source-run UMU detection/setup documentation. No helper modification/rebuild or package build.
+- Acceptance: guide folders, Proton, runtime readiness and optional GOG sign-in; existing profiles
+  get one-time guide prefilled with current settings; allow deferral and Finish setup. Ready Windows
+  actions proceed using defaults without settings modal. Preserve explicit acquisition consent and
+  native independence; startup guide is explicitly requested, unrelated background dialogs excluded.
+- Authorization: scoped source/config/docs/tests, local build-artifact inspection and disposable
+  fixtures/debug checks. No actual credentials/profile inspected or payload/helper execution.
+- Evidence: exact UMU cause, guided-flow/control inventory and persistence/cancel/missing/ready tests,
+  ordinary ready install with no compatibility modal, independent security/GUI review.
+- Result: debug source run finds staged UMU without CWD/PATH search; ready Windows action proceeds
+  without modal, missing selection exposes Finish setup. Fresh/existing guide prefill, optional sign-in
+  cancel, invalid-folder refusal, chosen-folder persistence, deferral and one-time relaunch pass GUI.
+  Inert real-GTK ready/missing test passes. Reports above and /tmp/ludomere-p89-ready-gtk.log,
+  /tmp/ludomere-p89-fresh-evidence.log. Real game/component/desktop gates remain P70.
+
+## P87 — Screenshot keys, parallel icons and usable footer controls
+
+- Requirements: R20, R13–R19. Status: complete. Backend: /root/acquisition;
+  UI/tests/docs: /root/compatibility; independent QA/security: /root/security.
+- Scope: bounded icon acquisition/persistence alongside covers in online.rs/state.rs; screenshot
+  modal keyboard controls, footer structure/retry and sign-in status lifecycle in src/ui/.
+  Preserve unrelated edits, details laziness, hero retry and existing account/session guards.
+- Acceptance: more than50 sidebar icons arrive before details open; image failures are independent;
+  physical pointer Retry starts network retry without navigation; distinct Downloads works;
+  real key events navigate modal with existing bounds; completed sign-in text clears.
+- Dependencies: owners agree event contract; independent GUI exercises final candidate. No schema,
+  dependency, package or broader authentication redesign. README only if behavior needs updating.
+- Authorization: scoped edits, isolated local HTTP/private D-Bus/Xvfb fixtures, required fmt/Clippy/
+  tests/debug build. Every test must explicitly use private HOME/XDG/runtime roots. No real profile,
+  credentials, account traffic, game execution, package build/install or external mutation.
+- Evidence: changed-control inventory, targeted failures and keyboard/pointer GUI checks, required
+  checks, source/security review and reports; record remaining live-account limitations honestly.
+- Result: sidebar icons interleave with covers in four workers, modal keys share wraparound buttons,
+  footer controls are independent, sign-in status settles and failure text is sanitized. Final fmt,
+  Clippy,313 unit/six integration tests/debug/diff checks pass; separate GTK regression passes.
+  Independent physical pointer/key,120-game cold icons/covers and synthetic real exchange lifecycle
+  pass with no scoped blocker. Reports: /tmp/ludomere-p87-{backend,ui}-report.md and
+  /tmp/ludomere-p87-review.md. Live GOG/desktop/game acceptance remains with P70.
+
+## P86 — Complete image loading and visible synchronization state
+
+- Requirements: R19, R13–R17. Status: complete. Backend owner: /root/acquisition; UI/grid/docs
+  owner: /root/compatibility; independent QA/security: /root/security.
+- Scope: diagnose fresh-login cover pipeline across batches; narrowly fix queue/event/cache defects;
+  meaningful stage/progress and loading/error presentation in grid, details and synchronization.
+  Preserve batch size 50, lazy metadata, available Play/Download, profile reset and existing edits.
+- Acceptance: fixture with more than 50 games completes all cover attempts; delayed/missing/failed
+  images are visibly distinguished; game-list/grid/actual metadata work has truthful stage feedback;
+  detail loading appears immediately and settles/retries; sync failures notify without navigation or
+  exposing credentials/URLs. Cancellation/stale-account responses cannot corrupt current state.
+- Ownership: backend online.rs and necessary gog/state code/tests; UI owner src/ui and README plus
+  focused GUI tests. Agree event contracts before editing shared boundaries. No schema/dependency
+  changes, packaging, real account/profile access or unrelated auth redesign.
+- Authorization: scoped source/tests/docs, disposable local HTTP fixtures/private GUI sessions,
+  fmt/Clippy/full tests/debug build. No real credential reads, live game/helper execution or reset.
+- Evidence: concrete cause, multi-batch/delayed/failure regressions, control inventory and independent
+  fresh-profile GUI review. Report live-account timing as unverified unless user supplies evidence.
+- Result: silent per-cover errors, whole-stage persistence abort, poisoned image cache, stale decoder
+  results and misleading status corrected. Cold-library presentation and authenticated Refresh panic
+  also fixed in the exercised synchronization path. Exact-final fmt/Clippy/312 unit/six integration/
+  debug checks pass; separate120-image GTK regression and19 independent online tests pass.
+  Independent120-game HTTP→GUI fixture covers fatal batch failure, partial images, repair/retry,
+  detail loaders/actions and page preservation, with a final zero-result Collections proof.
+  No scoped blocker remains. Reports: /tmp/ludomere-p86-backend-report.md,
+  /tmp/ludomere-p86-ui-report.md and /tmp/ludomere-cover-sync-review.md. Live cause remains unverified.
+
+## P84 — Empty-profile startup crash regression
+
+- Requirements: R13, R17; user report of cargo run failure after clearing profile, with backtrace.
+- Status: complete. Owner: /root/compatibility; independent verification /root/security.
+- Cause: rebuild_library changes the GTK stack while holding Ref<AppModel>; synchronous stack
+  notify attempts borrow_mut in window.rs:94 and aborts. Compilation succeeds.
+- Scope: minimal src/ui/library.rs/window.rs borrow ordering fix and focused empty-profile GUI
+  regression coverage. No unrelated warnings, renderer, dependency or account changes.
+- Acceptance: actual fresh-profile startup stays open; the exact failing signal path is covered;
+  existing cached startup/navigation intact; fmt/clippy/test/debug build pass; independent review.
+- Authorization: scoped source/test edits and isolated Xvfb/disposable XDG verification. No real
+  credentials/profile access or deletion, game execution, dependency changes, package installation.
+- Evidence: failing-before/passing-after reproduction, changed paths, checks and review disposition.
+- Result: exact fresh-profile failure independently reproduced; minimal borrow-order correction
+  passes fresh and cached 501-game GUI checks. New GUI regression fails before/passes after;
+  300 unit/six integration tests, fmt/Clippy/debug/diff checks pass. Reports:
+  /tmp/ludomere-p84-report.md and /tmp/ludomere-empty-startup-review.md.
+
+## P85 — Settings logout/cache control
+
+- Requirement: R18. Status: complete. Backend owner: /root/acquisition. UI/config/docs owner:
+  /root/compatibility. Independent reviewer: /root/security; no blocking finding remains.
+- Scope: Settings/account control and narrow backend reset logic/tests/documentation. Preserve
+  payloads, external installations and unrelated work; no dependency or schema boundary changes.
+- Acceptance: off-by-default toggle persists; enabling alone does nothing. User sign-out with
+  toggle enabled clears keyring login and full profile (config/preferences/activity/queues,
+  replaceable metadata/images/logs), preserves all payloads, safely quiesces or rejects active work,
+  prevents stale tasks restoring data, closes app and next launch creates a clean signed-out profile.
+  Errors surface clearly; normal sign-out unchanged when toggle off. No symlink/path escape or
+  arbitrary recursive deletion; reset uses explicitly owned files/directories and isolated tests.
+- Dependencies: P84 startup fix; user answer on reset behavior/data scope; independent review.
+- Authorization: scoped backend/UI/config/docs/tests and isolated disposable reset fixtures,
+  local build/fmt/Clippy/tests and private GUI verification. No actual user-data reset, real keyring
+  credential access, game/helper execution, package rebuild or external mutation by agents.
+- Implementation boundary: a fixed private reset manifest, profile lifetime lock and self re-exec
+  cleanup are necessary to stop detached writers before keyring/database deletion. Refuse active
+  payload operations or protected-path overlap before deletion; pending failures expose Retry/Close
+  without starting ordinary profile workers. No generic cleanup CLI or external helper dependency.
+  The pre-existing ordinary-sign-out token refresh race is recorded separately; this change must
+  prevent credential resurrection on the enabled full-reset path without broad auth redesign.
+- Evidence: 308 unit/six integration tests, fmt, warnings-denied Clippy, debug build and separate
+  empty-profile GTK regression pass. Seven independent backend regressions and disposable GUI
+  default-off, enabled-reset, payload preservation, overlap refusal and recovery Close/relaunch/Retry
+  pass. Reports: /tmp/ludomere-p85-backend-report.md, /tmp/ludomere-p85-ui-report.md and
+  /tmp/ludomere-profile-reset-review.md. Real account/active payload acceptance stays with P70.
+
+## P80 — Progressive library backend and safe partial persistence
+
+- Requirements: R13–R17. Status: complete. Owner: /root/acquisition.
+- Scope: src/online.rs, src/gog/, src/state.rs and backend model definitions as coordinated;
+  focused backend tests. Exclude UI, documentation and manager records.
+- Acceptance: core batches of 50 without rich expansions; covers before enrichment; targeted,
+  independently completing details/filter/acquisition APIs, bounded deduplicated work and cache
+  freshness. Preserve ownership/DLC and sparse persistence; respect schema baseline policy.
+- Dependencies: agree event/request/cache contracts with P81/P82 immediately.
+- Authorization: scoped edits, public primary-source reads and anonymous bounded requests,
+  disposable fixture tests/builds; no private account/credentials, host installs or dependency edits.
+- Evidence: changed paths, regression tests, request ordering/count evidence, risks and limitations.
+- P81 support after backend tests: acquisition owns only install-dialog preparation functions in
+  src/ui/download_chooser.rs by explicit region agreement with compatibility; move marker/installer
+  inspection off GTK and separate build readiness. Compatibility retains Download chooser ownership.
+
+## P81 — Responsive sync and lazy detail/action presentation
+
+- Requirements: R13–R17. Status: complete. Owner: /root/compatibility.
+- Scope: src/ui/sync.rs, details.rs, download_chooser.rs, files.rs, mod.rs, window.rs and minimal
+  necessary adjacent detail UI; README behavior/test instructions. Exclude P82-owned library/media
+  files, backend and manager records unless ownership explicitly coordinated.
+- Acceptance: drain bounded event batches; in-place detail sections with loading/retry; stale result
+  guards and current action inputs; immediate usable Play/Download; no GTK blocking work.
+- Dependencies: P80 APIs and P82 model/filter integration. Preserve prior Proton/Comet edits.
+- Authorization: scoped edits/builds/tests and isolated GUI fixtures, no actual account or game use.
+- Evidence: changed-control inventory, tests/checks, cold/warm/failure behavior and remaining gates.
+
+## P82 — Incremental grid, cover workers and filter readiness
+
+- Requirements: R13, R16, R17. Status: complete. Owner: /root/grid.
+- Scope: src/ui/library.rs, src/ui/widgets/media.rs and filter controls/collections by agreement.
+  Exclude P81-owned sync/details/model files and backend except coordinated contracts.
+- Acceptance: incremental cards, bounded off-GTK cover decode with visible priority; affected filter
+  loading/error/retry and incomplete-results feedback, available local filters usable.
+- Dependencies: P80 metadata readiness and P81 shared model/wiring; coordinate before shared edits.
+- Authorization: scoped edits and isolated tests/builds; preserve user data and existing edits.
+- Evidence: large-library request/render behavior, interaction inventory, tests and limitations.
+
+## P83 — Independent performance-change assurance
+
+- Requirements: R13–R17. Status: complete (available independent review; live acceptance remains
+  with P70). Owner: /root/security (independent of implementation).
+- Scope: read-only QA/security review, isolated fixture and GUI checks; no quiet fixes.
+- Acceptance: fmt/clippy/test pass; review data preservation, request bounds, stale responses,
+  action availability, every changed control's loading/error/success behavior and large-library
+  evidence. No authenticated performance or real-game claim without user evidence.
+- Dependencies: P80–P82. Authorization: ordinary local checks/disposable fixtures; no credentials,
+  host installation, publication or live-account operations. Return findings with reproductions.
+- Final evidence: /tmp/ludomere-library-performance-review.md; /tmp/ludomere-p81-report.md;
+  target/p81-test.log. Final candidate passes 300 unit/six integration/five UMU tests, fmt, Clippy,
+  debug build and diff checks. Independent five section regressions and isolated 501-game GUI
+  checks passed; no unresolved blocker in reviewed scope. Authenticated timing/account switching,
+  deliberately delayed scroll/tab behavior and real game/DLC installation remain live acceptance.
+
+## P10 — Proton discovery, persistence, and launch integration
+
+- Requirements: R02, R03, R04, R06, R09; repository invariants.
+- Status: review (implementation and focused checks passed). Owner: /root/compatibility.
+- Scope: src/compatibility backend/types/UMU and new discovery/selection module;
+  minimal persistence and installation call sites needed to carry the selected Proton consistently.
+  Own src/compatibility/mod.rs exports. Exclude acquisition implementation, UI, packaging, records.
+- Acceptance: discover native/Flatpak Steam and libraryfolders plus Heroic/Lutris/managed versions;
+  validate/deduplicate, GE > UMU > Valve with newest stable within family; first choice saves global
+  default; per-game overrides survive uninstall; missing selection never falls back; selected Proton
+  applies to install, launch, patches, winetricks, and Comet registration; native games unaffected.
+  Missing runtime is a typed/preflight condition with no implicit download or background dialog.
+- Dependencies: coordinate public acquisition/preflight contracts with P20 and UI with P30.
+- Evidence: focused fixtures and command-construction/persistence regressions, changed-path report.
+- Authorization: scoped edits, primary-source research, local builds/tests, routine dependency reads.
+  Stop for schema-policy conflicts, incompatible UMU contracts, or unsafe external-directory writes.
+- Implementation decision: use a dedicated atomic proton.json preference file under the existing
+  config root, with serialized updates. Existing Config/UI snapshots otherwise overwrite background
+  first-default selection. This avoids unrelated settings rewrites and schema changes.
+
+## P20 — Explicit Proton and runtime acquisition
+
+- Requirements: R05, R06; R02 integration; no bundled Proton.
+- Status: review (manifest regression and actual GUI acquisitions passed; real-game gate pending).
+  Owner: /root/acquisition.
+- Scope: new src/compatibility acquisition module(s), focused tests, a minimal private helper adapter
+  under resources/helpers/ if needed to enforce consent, necessary Cargo.toml/Cargo.lock
+  dependencies. Exclude discovery/config/UMU launch module exports, UI, packaging, records.
+- Acceptance: stable historical/current GE and UMU releases from authoritative upstream; explicit
+  download operations with progress, cancellation, bounded streaming, provenance/integrity checks,
+  safe extraction and atomic publication; no deletion of external versions. Runtime acquisition is
+  separate and explicit; normal launch cannot silently download or update missing components.
+- Dependencies: agree APIs with P10 and P30 before implementation; no UI blocking or dialog work.
+- Evidence: primary source/version contracts, local failure/security tests, acquisition report.
+- Authorization: authoritative upstream metadata/download research, scoped reversible fetches,
+  necessary constrained libraries after provenance/license review, tests in disposable directories.
+  No unreviewed helper execution with broad access. Stop for unsupported upstream contracts or
+  supply-chain/security tradeoffs; notify manager of new native dependencies.
+
+## P30 — Proton settings and user-action prerequisite flow
+
+- Requirements: R03, R04, R05, R06, R09.
+- Status: review (implementation/check/clippy passed). Owner: /root/ui.
+- Scope: src/ui/ including new compatibility settings module. Exclude backend/packaging/records.
+- Acceptance: global selector with persisted first/default choice, per-game override and inherit
+  action, refresh and folder choice, stable release catalog and explicit acquisition progress/errors/
+  cancellation. Missing chosen version asks for replacement. Missing Proton/runtime offers happen
+  on user action, with no background focus theft; all blocking work is off GTK. Native unaffected.
+- Dependencies: P10/P20 APIs. Initial work may inspect UI and agree interfaces; integrate once ready.
+- Evidence: full inventory of changed controls and states, compile/static checks, testable preflight
+  behavior, manual verification instructions for reviewer/user.
+- Authorization: scoped UI edits, local compilation/testing, established GTK/libadwaita patterns.
+  Stop for extra features, backend ownership conflicts, credential access, or unsafe UX behavior.
+
+## P40 — Arch packaging, bundled helpers, docs, local/CI checks
+
+- Requirements: R01, R02, R07, R08, R09.
+- Status: complete (final package/checks and independent exact-byte/source audit passed).
+  Owner: /root/compatibility.
+- Scope: PKGBUILD, helper preparation/build/check scripts, container definition, GitHub Actions,
+  README, THIRD_PARTY_NOTICES, minimal bundled-helper lookup in Comet/UMU as coordinated.
+- Acceptance: reproducible documented Arch environment; fmt/clippy/test; build pacman artifact with
+  bundled UMU and Comet/helper, licenses, no Proton/runtime payload; no host UMU dependency; verify
+  package contents and helper resolution. CI uploads package artifacts, does not publish releases.
+- Dependencies: P10–P30 implementation checkpoint.
+- Evidence: clean/container checks where available, release/package build, payload/license audit,
+  exact commands and limitations. No privileged host installs.
+- Authorization: build-time downloads explicitly allowed; pinned trustworthy sources, isolated
+  package build/test. Escalate system changes or resource/security constraints.
+
+## P45 — Determine GOG peer redistribution terms
+
+- Requirements: R07 and 2026-09-29 user clarification preferring bundled peers.
+- Status: complete (manager reviewed current terms and all eight artifact inventories). Owners: /root/security (official terms), /root/compatibility (artifact notices).
+- Scope: authoritative GOG SDK/developer/user terms, public peer metadata/artifact license evidence,
+  relevant upstream integration context. Research only; no product or project-record edits by workers.
+- Acceptance: identify an applicable redistribution grant and conditions, or exact missing grant/
+  restriction with primary-source evidence and a concrete path to resolve it. Distinguish use,
+  public download, game-developer redistribution, and third-party launcher redistribution.
+- Authorization: public primary-source reads and bounded official artifact downloads/inspection
+  in disposable paths; no binaries executed, credentials, terms accepted, accounts, or messages sent.
+- Stop for gated terms, account/credential requirements, or authority outside the documented scope.
+- Evidence: URLs, short relevant clauses/sections, applicability/uncertainty, artifact provenance,
+  report with findings and unresolved questions. Preserve other working-tree changes.
+
+## P46 — Component availability checks using upstream metadata
+
+- Requirements: R11, R12; R07 integration.
+- Status: complete (metadata tests and independent startup/manual GUI checks passed).
+  Owner: /root/acquisition.
+- Scope: GTK-free component metadata checks and compatibility exports; remove superseded custom
+  peer downloader/storage/tests and unused ZIP dependencies. Exclude Comet launch/package/records.
+- Acceptance: official HTTPS bounded metadata checks; compare available Comet/peer versions with
+  local version evidence without triggering payload downloads. Read upstream peer metadata from the
+  agreed Comet data location. No claim of Ludomere-managed peer verification, rollback or consent.
+  Coordinate status APIs with P47/P48; preserve Proton/runtime acquisition.
+- Authorization: scoped source/tests, vetted dependencies after reporting provenance, official
+  fetches and isolated tests. No peer execution, credentials, global install or publishing.
+- Evidence: metadata/version/error tests and authoritative upstream format validation.
+
+## P47 — Unmodified Comet packaging and confirmed official-binary updates
+
+- Requirements: R07, R11, R12; closes SEC-02.
+- Status: complete (official updater GUI, package checks and independent audit passed).
+  Owner: /root/compatibility.
+- Scope: official pinned helper preparation, comet.rs/comet_update.rs, package/build/check scripts,
+  README/notices; remove local Comet patch/source-build/custom-feed tools and superseded artifacts.
+  Exclude peer metadata implementation/UI/records. Coordinate data-root/status APIs with P46.
+- Acceptance: package official unmodified Comet/service; do not modify/recompile dependency code.
+  Allow upstream automatic peer acquisition, remove custom peer-readiness guards, retain credential
+  suppression. Confirmed updates use official release assets with publisher integrity metadata,
+  bounded transfer, atomic private selection, retry and working-version preservation; a newer package
+  supersedes an older private helper. No proprietary peers/Proton/runtime in package. Rebuild/check
+  Arch artifact and update docs, preserving system package ownership. No custom update feed needed.
+- Authorization: vetted pinned source/build dependencies, scoped builds and disposable smoke tests.
+  No real credentials/game or peer execution, host install, publishing. Report new supply-chain
+  dependencies/risks and incompatible upstream assumptions promptly.
+
+## P48 — Upstream behavior explanation and component update controls
+
+- Requirements: R11, R12, R09 UI invariants.
+- Status: complete (compile/static/focused and final packaged GUI checks passed).
+  Owner: /root/acquisition; UI thread unavailable.
+- Scope: src/ui/ only, minimal app-start wiring if necessary by agreement; no backend/package/records.
+- Acceptance: explain upstream automatic peer downloads/updates; remove custom peer consent gates,
+  payload controls and launch interception while preserving Proton behavior. Startup checks run off
+  GTK, render status in place, never present/navigate; manual check button reports loading/current/
+  newer/failure states. Newer Comet binary updates require confirmation, progress/cancel/retry and
+  app-owned storage. Peer updates remain Comet-managed with accurate UI copy.
+- Authorization: scoped UI edits, isolated compile/UI checks; no host desktop/credentials/game use.
+- Evidence: complete changed-control inventory, testable flows, worker-thread and no-focus review.
+
+## P50 — Independent QA
+
+- Requirements: all R01–R12 and skill QA gate.
+- Status: review (automated/package/credential-free GUI checks passed; real-game/desktop gates pending).
+  Owner: /root/qa for prior report; /root/security for independent P46–P48 extension because the QA
+  thread is unavailable. The extension reviewer implemented none of the reviewed product code.
+- Scope: read-only review plus disposable test artifacts; all changed behavior and relevant existing
+  interactions. Inventory every user-visible control/interaction and record exercised/unverified states.
+- Acceptance: reconcile requirements, run repository checks, assess package from representative clean
+  environment, exercise automatic/missing/download/native paths and supported graphical behavior.
+- Dependencies: P10–P40; R10 user participation for authenticated real-game testing.
+- Evidence: reproducible findings, commands, coverage/control inventory, explicit blockers.
+- Authorization: safe local testing only; no product fixes or real credentials without authorization.
+
+## P60 — Independent security review
+
+- Requirements: all applicable R01–R12 and skill security gate.
+- Status: complete (no unresolved blocker in reviewed official-binary delivery).
+  Owner: /root/security; evidence /tmp/ludomere-final-assurance-report.md.
+- Scope: read-only review of archive/network/process/path/persistence/bundled dependency/CI trust.
+- Acceptance: no unresolved material finding; inspect provenance, downloads, host/external path
+  boundaries, subprocess environments, credentials, progress/error redaction, and CI permissions.
+- Dependencies: P10–P40. Confirmed fixes go back to workers and return for re-review.
+- Evidence: severity/impact/reproduction/remediation report; no quiet fixes.
+- Authorization: primary-source research, safe local probes, no external active attack or secrets.
+
+## P70 — Guided user acceptance and readiness gate
+
+- Requirements: R10 and all skill readiness gates.
+- Status: ready (final package and README checklist available; awaiting user-assisted results).
+  Owner: manager coordinates user and independent QA.
+- Acceptance: user verifies real GOG install/launch, chosen/default/override Proton, Comet behavior
+  for a suitable game, package desktop operation, and no regressions in native Linux behavior.
+- Dependencies: P50/P60 results and reviewable artifacts/checklist.
+- Evidence: actual user results reconciled by QA; unexercised gates never count as passes.
+- No Prototype ready declaration until all required gates have evidence.

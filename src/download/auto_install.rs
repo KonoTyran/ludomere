@@ -1,0 +1,763 @@
+use super::{AutoInstallRequest, DownloadRequest};
+use crate::{
+    config::{GameLibrary, PreferredInstallationSource},
+    domain::{ArtifactKind, InstallationState, InstalledGame},
+    state::{DownloadInstallIntent, DownloadJobRecord, DownloadState, StateStore},
+};
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SelectedInstaller {
+    job_id: String,
+    product_id: i64,
+    title: String,
+    operating_system: String,
+    language: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InstallPlan {
+    product_id: i64,
+    slug: String,
+    title: String,
+    library: GameLibrary,
+    libraries: Vec<GameLibrary>,
+    base: SelectedInstaller,
+    dlcs: Vec<SelectedInstaller>,
+    interactive_prompts: bool,
+}
+
+pub(super) fn intent(
+    store: &StateStore,
+    requests: &[DownloadRequest],
+    choice: &AutoInstallRequest,
+) -> Result<Option<DownloadInstallIntent>> {
+    let groups = requests
+        .iter()
+        .filter_map(|request| {
+            let first = request.artifacts.first()?;
+            if first.kind != ArtifactKind::Installer
+                || !request.artifacts.iter().all(|artifact| {
+                    artifact.kind == ArtifactKind::Installer
+                        && artifact.product_id == first.product_id
+                })
+            {
+                return None;
+            }
+            let os = first.operating_system.as_deref()?.to_ascii_lowercase();
+            if !matches!(os.as_str(), "linux" | "windows") {
+                return None;
+            }
+            Some(SelectedInstaller {
+                job_id: super::job_id(&request.artifacts.iter().collect::<Vec<_>>()),
+                product_id: first.product_id,
+                title: request.title.clone(),
+                operating_system: os,
+                language: first.language.clone(),
+                version: first.version.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut bases = groups
+        .iter()
+        .filter(|group| group.product_id == choice.product_id)
+        .collect::<Vec<_>>();
+    bases.sort_by_key(|group| {
+        let source = if group.operating_system == "linux" {
+            PreferredInstallationSource::LinuxOffline
+        } else {
+            PreferredInstallationSource::WindowsOffline
+        };
+        let language = group.language.as_deref().unwrap_or("");
+        (
+            choice
+                .config
+                .installation_source_order
+                .iter()
+                .position(|preferred| *preferred == source)
+                .unwrap_or(usize::MAX),
+            if choice
+                .config
+                .installer_language
+                .as_deref()
+                .is_some_and(|preferred| preferred.eq_ignore_ascii_case(language))
+            {
+                0
+            } else if language.eq_ignore_ascii_case("english")
+                || language.eq_ignore_ascii_case("en")
+            {
+                1
+            } else {
+                2
+            },
+            group.job_id.clone(),
+        )
+    });
+    let Some(base) = bases.first() else {
+        return Ok(None);
+    };
+    ensure!(
+        !choice.slug.is_empty()
+            && !choice.slug.contains(['/', '\\'])
+            && !matches!(choice.slug.as_str(), "." | ".."),
+        "Invalid installation directory name"
+    );
+    let library = choice
+        .config
+        .installer_library()
+        .context("Choose a default game library before installing automatically")?
+        .clone();
+    ensure!(
+        library.path.is_absolute(),
+        "The default game library must be an absolute path"
+    );
+    let mut dlcs = Vec::new();
+    let mut ids = groups
+        .iter()
+        .filter(|group| group.product_id != choice.product_id)
+        .map(|group| group.product_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        ensure!(
+            store
+                .cached_product_game(choice.product_id)?
+                .is_some_and(|game| game.dlcs.iter().any(|dlc| dlc.product_id == id)),
+            "A selected installer is not a known DLC of this game; download it separately or disable automatic installation"
+        );
+        let selected=groups.iter().filter(|group|group.product_id==id && group.operating_system==base.operating_system && compatible(group.language.as_deref(),base.language.as_deref()) && compatible(group.version.as_deref(),base.version.as_deref())).min_by_key(|group|&group.job_id).context("Selected DLC installers do not match the base installer's platform, language or version; adjust the selection or disable automatic installation")?;
+        dlcs.push(selected.clone());
+    }
+    let plan = InstallPlan {
+        product_id: choice.product_id,
+        slug: choice.slug.clone(),
+        title: choice.title.clone(),
+        library,
+        libraries: choice.config.game_libraries.clone(),
+        base: (*base).clone(),
+        dlcs,
+        interactive_prompts: choice.config.interactive_installer_prompts,
+    };
+    let job_ids = std::iter::once(plan.base.job_id.clone())
+        .chain(plan.dlcs.iter().map(|dlc| dlc.job_id.clone()))
+        .collect();
+    for selected in std::iter::once(&plan.base).chain(&plan.dlcs) {
+        let request = requests
+            .iter()
+            .find(|request| {
+                super::job_id(&request.artifacts.iter().collect::<Vec<_>>()) == selected.job_id
+            })
+            .unwrap();
+        ensure!(
+            request.artifacts.iter().all(|artifact| artifact
+                .operating_system
+                .as_deref()
+                .is_some_and(|os| os.eq_ignore_ascii_case(&selected.operating_system))
+                && compatible(artifact.language.as_deref(), selected.language.as_deref())
+                && compatible(artifact.version.as_deref(), selected.version.as_deref())
+                && artifact
+                    .part_count
+                    .is_none_or(|count| count as usize == request.artifacts.len())),
+            "Select every matching installer part before installing automatically"
+        );
+        let parts = request
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.part_number)
+            .collect::<std::collections::HashSet<_>>();
+        ensure!(
+            parts.is_empty() || parts.len() == request.artifacts.len(),
+            "Selected installer parts are duplicated or incomplete"
+        );
+    }
+    Ok(Some(DownloadInstallIntent {
+        product_id: choice.product_id,
+        intent_id: format!(
+            "{}-{}",
+            choice.product_id,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ),
+        job_ids,
+        plan_json: serde_json::to_string(&plan)?,
+        state: "waiting".into(),
+        error: None,
+    }))
+}
+
+fn compatible(left: Option<&str>, right: Option<&str>) -> bool {
+    left.is_none_or(|left| right.is_none_or(|right| left.eq_ignore_ascii_case(right)))
+}
+
+fn completed_job(
+    store: &StateStore,
+    selected: &SelectedInstaller,
+) -> Result<Option<DownloadJobRecord>> {
+    let job = store.download_job(&selected.job_id)?.context(
+        "A selected installer download was removed; add it again to install automatically",
+    )?;
+    if job.state != DownloadState::Complete {
+        return Ok(None);
+    }
+    ensure!(
+        job.product_id == selected.product_id
+            && !job.artifacts.is_empty()
+            && job.completed_files.len() == job.artifacts.len(),
+        "The completed installer is missing required parts; retry the download"
+    );
+    ensure!(
+        job.completed_files.iter().all(|path| path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)),
+        "Downloaded installer files are missing; retry the download"
+    );
+    Ok(Some(job))
+}
+
+fn prepare(
+    store: &StateStore,
+    plan: &InstallPlan,
+) -> Result<Option<(InstalledGame, Vec<crate::installation::AdditionalInstaller>)>> {
+    let Some(base) = completed_job(store, &plan.base)? else {
+        return Ok(None);
+    };
+    let mut additional = Vec::new();
+    for selected in &plan.dlcs {
+        let Some(job) = completed_job(store, selected)? else {
+            return Ok(None);
+        };
+        additional.push(crate::installation::AdditionalInstaller {
+            product_id: selected.product_id,
+            revision_id: None,
+            version: selected.version.clone(),
+            title: selected.title.clone(),
+            files: job.completed_files,
+        });
+    }
+    let directory = plan.library.path.join(&plan.slug);
+    ensure_target_available(store, plan, &directory)?;
+    ensure!(
+        !plan.interactive_prompts,
+        "Automatic installation cannot display installer prompts. Disable interactive installer prompts or install this game manually"
+    );
+    let expected_extension = if plan.base.operating_system == "windows" {
+        "exe"
+    } else {
+        "sh"
+    };
+    ensure!(
+        base.completed_files.iter().any(|path| path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(expected_extension))),
+        "The installer has no supported launcher; install it manually"
+    );
+    let preferences = store.game_preferences(plan.product_id)?;
+    let now = chrono::Utc::now().timestamp();
+    let (last_played_at, playtime_seconds) = store.product_activity(plan.product_id)?;
+    Ok(Some((
+        InstalledGame {
+            product_id: plan.product_id,
+            library_id: plan.library.id.clone(),
+            installed_version: plan.base.version.clone(),
+            installation_directory: directory,
+            installer_revision_id: None,
+            installer_job_id: Some(base.job_id),
+            installer_files: base.completed_files,
+            installer_complete: true,
+            installer_operating_system: Some(plan.base.operating_system.clone()),
+            installer_language: plan.base.language.clone(),
+            compatibility: preferences
+                .as_ref()
+                .and_then(|preferences| preferences.compatibility.clone()),
+            primary_executable: None,
+            launch_arguments: preferences
+                .map_or_else(Vec::new, |preferences| preferences.launch_arguments),
+            state: InstallationState::Pending,
+            error: None,
+            installed_at: None,
+            verified_at: None,
+            last_played_at,
+            playtime_seconds,
+            created_at: now,
+            updated_at: now,
+        },
+        additional,
+    )))
+}
+
+fn ensure_target_available(
+    store: &StateStore,
+    plan: &InstallPlan,
+    directory: &std::path::Path,
+) -> Result<()> {
+    for library in &plan.libraries {
+        let entries = match std::fs::read_dir(&library.path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir()
+                && crate::installation::load_installation_marker(&path)?
+                    .is_some_and(|marker| marker.product_id == plan.product_id)
+                && crate::installation::directory_has_installed_payload(&path)
+            {
+                anyhow::bail!(
+                    "This game is already installed. Its payload was preserved; use its Install or Update action instead"
+                );
+            }
+        }
+    }
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_dir() && !metadata.is_symlink(),
+        "The installation target is not a regular directory; its contents were preserved"
+    );
+    let files = store
+        .download_jobs()?
+        .into_iter()
+        .flat_map(|job| job.completed_files)
+        .filter(|path| path.starts_with(directory))
+        .collect::<std::collections::HashSet<_>>();
+    let mut pending = vec![(directory.to_path_buf(), 0)];
+    let mut visited = 0;
+    while let Some((parent, depth)) = pending.pop() {
+        ensure!(
+            depth < 32,
+            "The existing installation directory needs manual inspection"
+        );
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            visited += 1;
+            ensure!(
+                visited <= 10000,
+                "The existing installation directory needs manual inspection"
+            );
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            ensure!(
+                !kind.is_symlink(),
+                "The installation directory contains a link; its contents were preserved"
+            );
+            if kind.is_dir() {
+                pending.push((path, depth + 1));
+            } else {
+                ensure!(
+                    kind.is_file() && files.contains(&path),
+                    "The installation directory contains existing payload or untracked files. Its contents were preserved; install manually"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Called serially by the download manager, never by a GTK callback.
+pub(super) fn process(store: &StateStore) -> Result<()> {
+    process_with(
+        store,
+        |game| {
+            if game.installer_operating_system.as_deref() == Some("windows") {
+                crate::compatibility::preflight_windows(Some(game.product_id))?;
+            }
+            Ok(())
+        },
+        |intent, game, additional| {
+            crate::installation::enqueue_downloaded_installation(
+                store,
+                &intent.intent_id,
+                game,
+                additional,
+            )
+        },
+    )
+}
+
+fn process_with(
+    store: &StateStore,
+    preflight: impl Fn(&InstalledGame) -> Result<()>,
+    dispatch: impl Fn(
+        &DownloadInstallIntent,
+        InstalledGame,
+        Vec<crate::installation::AdditionalInstaller>,
+    ) -> Result<()>,
+) -> Result<()> {
+    for intent in store
+        .download_install_intents()?
+        .into_iter()
+        .filter(|intent| intent.state == "waiting")
+    {
+        let result = (|| -> Result<bool> {
+            let plan: InstallPlan = serde_json::from_str(&intent.plan_json)?;
+            let Some((game, additional)) = prepare(store, &plan)? else {
+                return Ok(false);
+            };
+            let _activity =
+                crate::profile_reset::begin_activity("automatic installation preparation")?;
+            preflight(&game)?;
+            dispatch(&intent, game, additional)?;
+            Ok(true)
+        })();
+        let message = match result {
+            Ok(false) => continue,
+            Ok(true) => {
+                store.set_download_install_state(&intent.intent_id, "handed_off", None)?;
+                "Queued for automatic installation".to_owned()
+            }
+            Err(error) => {
+                let message = format!(
+                    "Automatic installation needs attention: {error}. Retry installation after resolving this, or install manually."
+                );
+                store.set_download_install_state(&intent.intent_id, "blocked", Some(&message))?;
+                message
+            }
+        };
+        if let Some(base) = intent.job_ids.first() {
+            store.set_download_job_status(base, Some(&message))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn clear_for_requests(store: &StateStore, requests: &[DownloadRequest]) -> Result<()> {
+    for request in requests {
+        if let Some(artifact) = request.artifacts.first() {
+            store.clear_download_install_intent(artifact.product_id)?;
+        }
+        if !request.artifacts.is_empty() {
+            store.clear_download_install_intent_for_job(&super::job_id(
+                &request.artifacts.iter().collect::<Vec<_>>(),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn block_replaced_job(
+    store: &StateStore,
+    previous: &str,
+    replacement: &str,
+) -> Result<()> {
+    for mut intent in store
+        .download_install_intents()?
+        .into_iter()
+        .filter(|intent| {
+            intent.job_ids.iter().any(|id| id == previous) && intent.state != "handed_off"
+        })
+    {
+        // Keep the old installer plan invalid; only transfer the visible queue association.
+        for id in &mut intent.job_ids {
+            if id == previous {
+                *id = replacement.to_owned();
+            }
+        }
+        intent.state = "blocked".into();
+        intent.error = Some("The installer revision changed. Select Download again with Install after downloading to confirm the new installer.".into());
+        store.save_download_install_intent(&intent)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::{Dlc, Game, RemoteArtifact},
+        state::DownloadJobUpdate,
+    };
+    use std::{cell::Cell, path::Path, sync::mpsc};
+
+    fn request(root: &Path, id: i64, os: &str) -> DownloadRequest {
+        DownloadRequest {
+            artifacts: vec![RemoteArtifact {
+                product_id: id,
+                kind: ArtifactKind::Installer,
+                name: format!("setup-{id}"),
+                language: Some("English".into()),
+                operating_system: Some(os.into()),
+                version: Some("1".into()),
+                release_date: None,
+                size_label: None,
+                size_bytes: Some(4),
+                part_number: Some(1),
+                part_count: Some(1),
+                download_path: format!("/installer/{id}/{os}"),
+                provider_group_id: None,
+                provider_file_id: None,
+                provider_category: None,
+            }],
+            title: format!("Game {id}"),
+            access_token: String::new(),
+            destination: root.join("game/installer").join(os).join(id.to_string()),
+            events: mpsc::channel().0,
+        }
+    }
+
+    fn choice(root: &Path) -> AutoInstallRequest {
+        let library = GameLibrary {
+            id: "test".into(),
+            name: "Test".into(),
+            path: root.into(),
+            default: true,
+        };
+        AutoInstallRequest {
+            product_id: 7,
+            slug: "game".into(),
+            title: "Game".into(),
+            config: crate::config::Config {
+                game_libraries: vec![library],
+                installer_library_id: Some("test".into()),
+                installation_source_order: vec![
+                    PreferredInstallationSource::LinuxOffline,
+                    PreferredInstallationSource::WindowsOffline,
+                ],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn save_job(store: &StateStore, request: &DownloadRequest, complete: bool) {
+        std::fs::create_dir_all(&request.destination).unwrap();
+        let files = request
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let path = request.destination.join(format!("setup-{index}.sh"));
+                std::fs::write(&path, b"data").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        store
+            .save_download_job(&DownloadJobUpdate {
+                job_id: &super::super::job_id(&request.artifacts.iter().collect::<Vec<_>>()),
+                product_id: request.artifacts[0].product_id,
+                title: &request.title,
+                artifacts: &request.artifacts,
+                destination: &request.destination,
+                state: if complete {
+                    DownloadState::Complete
+                } else {
+                    DownloadState::Queued
+                },
+                bytes_downloaded: if complete { 4 } else { 0 },
+                total_bytes: Some(4),
+                completed_files: if complete { &files } else { &[] },
+                error: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn selection_uses_defaults_and_requires_complete_matching_base_and_dlc() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let choice = choice(&root.path().join("library"));
+        store
+            .upsert_normalized_library(&[Game {
+                product_id: 7,
+                dlcs: vec![Dlc {
+                    product_id: 8,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }])
+            .unwrap();
+        let requests = vec![
+            request(&choice.config.game_libraries[0].path, 7, "windows"),
+            request(&choice.config.game_libraries[0].path, 7, "linux"),
+            request(&choice.config.game_libraries[0].path, 8, "linux"),
+        ];
+        let record = intent(&store, &requests, &choice).unwrap().unwrap();
+        let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
+        assert_eq!(plan.base.operating_system, "linux");
+        assert_eq!(plan.dlcs.len(), 1);
+        assert_eq!(record.job_ids.len(), 2);
+        assert!(intent(&store, &requests[2..], &choice).unwrap().is_none());
+        let mut partial = request(root.path(), 7, "linux");
+        partial.artifacts[0].part_count = Some(2);
+        assert!(intent(&store, &[partial], &choice).is_err());
+        let mut extra = request(root.path(), 7, "linux");
+        extra.artifacts[0].kind = ArtifactKind::Extra;
+        assert!(intent(&store, &[extra], &choice).unwrap().is_none());
+        assert!(
+            intent(&store, &[request(root.path(), 7, "mac")], &choice)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            intent(
+                &store,
+                &[
+                    request(root.path(), 7, "linux"),
+                    request(root.path(), 99, "linux")
+                ],
+                &choice
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn completion_waits_for_all_parts_and_dlc_then_dispatches_once_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let store = StateStore::open_at(&database).unwrap();
+        let choice = choice(&root.path().join("library"));
+        store
+            .upsert_normalized_library(&[Game {
+                product_id: 7,
+                dlcs: vec![Dlc {
+                    product_id: 8,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }])
+            .unwrap();
+        let requests = vec![
+            request(&choice.config.game_libraries[0].path, 7, "linux"),
+            request(&choice.config.game_libraries[0].path, 8, "linux"),
+        ];
+        let record = intent(&store, &requests, &choice).unwrap().unwrap();
+        store.save_download_install_intent(&record).unwrap();
+        save_job(&store, &requests[0], true);
+        save_job(&store, &requests[1], false);
+        let count = Cell::new(0);
+        process_with(
+            &store,
+            |_| Ok(()),
+            |_, _, _| {
+                count.set(count.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count.get(), 0);
+        save_job(&store, &requests[1], true);
+        process_with(
+            &store,
+            |_| Ok(()),
+            |_, game, dlc| {
+                assert_eq!(game.product_id, 7);
+                assert_eq!(dlc.len(), 1);
+                count.set(count.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count.get(), 1);
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "handed_off"
+        );
+        drop(store);
+        let store = StateStore::open_at(&database).unwrap();
+        process_with(
+            &store,
+            |_| Ok(()),
+            |_, _, _| panic!("replayed completed intent"),
+        )
+        .unwrap();
+        assert!(requests[0].destination.join("setup-0.sh").is_file());
+    }
+
+    #[test]
+    fn blocked_prerequisite_retries_explicitly_and_unchecked_or_removed_clears_consent() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let choice = choice(&root.path().join("library"));
+        let requests = vec![request(&choice.config.game_libraries[0].path, 7, "linux")];
+        save_job(&store, &requests[0], true);
+        process_with(
+            &store,
+            |_| Ok(()),
+            |_, _, _| panic!("historical completed download installed"),
+        )
+        .unwrap();
+        let record = intent(&store, &requests, &choice).unwrap().unwrap();
+        store.save_download_install_intent(&record).unwrap();
+        process_with(
+            &store,
+            |_| anyhow::bail!("Set up the runtime"),
+            |_, _, _| panic!("missing prerequisite dispatched"),
+        )
+        .unwrap();
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "blocked"
+        );
+        process_with(
+            &store,
+            |_| Ok(()),
+            |_, _, _| panic!("blocked intent retried without user action"),
+        )
+        .unwrap();
+        store
+            .set_download_install_state(&record.intent_id, "waiting", None)
+            .unwrap();
+        process_with(&store, |_| Ok(()), |_, _, _| Ok(())).unwrap();
+        clear_for_requests(&store, &requests).unwrap();
+        assert!(store.download_install_intents().unwrap().is_empty());
+        store.save_download_install_intent(&record).unwrap();
+        block_replaced_job(&store, &record.job_ids[0], "replacement-job").unwrap();
+        let blocked = &store.download_install_intents().unwrap()[0];
+        assert_eq!(blocked.state, "blocked");
+        assert_eq!(blocked.job_ids, ["replacement-job"]);
+        assert_eq!(blocked.plan_json, record.plan_json);
+        store
+            .clear_download_install_intent_for_job("replacement-job")
+            .unwrap();
+        assert!(store.download_install_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn existing_payload_elsewhere_and_untracked_target_files_are_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let mut choice = choice(&root.path().join("library"));
+        let requests = vec![request(&choice.config.game_libraries[0].path, 7, "linux")];
+        save_job(&store, &requests[0], true);
+        let record = intent(&store, &requests, &choice).unwrap().unwrap();
+        let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
+        let (mut game, _) = prepare(&store, &plan).unwrap().unwrap();
+        let sentinel = plan.library.path.join("game/keep.dat");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        assert!(prepare(&store, &plan).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+        std::fs::remove_file(sentinel).unwrap();
+        let other = root.path().join("other");
+        let target = other.join("renamed-game");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("start.sh"), b"never execute").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            target.join("start.sh"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        game.installation_directory = target.clone();
+        crate::installation::write_installation_marker(
+            &crate::installation::installation_marker_from_game(&game, vec![]),
+            &target,
+        )
+        .unwrap();
+        choice.config.game_libraries.push(GameLibrary {
+            id: "other".into(),
+            name: "Other".into(),
+            path: other,
+            default: false,
+        });
+        let record = intent(&store, &requests, &choice).unwrap().unwrap();
+        let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
+        assert!(prepare(&store, &plan).is_err());
+        assert!(target.join("start.sh").is_file());
+    }
+}

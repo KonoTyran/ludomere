@@ -377,6 +377,7 @@ pub fn delete_abandoned_depot_staging(
     slug: &str,
     operation_id: &str,
 ) -> Result<bool> {
+    let _activity = crate::profile_reset::begin_activity("staging deletion")?;
     let path = operation_staging_path(library, destination, slug, operation_id)?;
     if !path.exists() {
         return Ok(false);

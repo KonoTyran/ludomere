@@ -138,6 +138,7 @@ pub(super) fn show_game_settings(
         ));
     }
     compatibility_page.add(&compatibility_group);
+    compatibility_page.add(&proton_selection_group(&window, Some(game.product_id)).0);
 
     let fixes_group = adw::PreferencesGroup::new();
     fixes_group.set_title("Compatibility fixes");
@@ -1269,8 +1270,30 @@ fn present_source_migration(
     let installed = installed.clone();
     let choice_parent = parent.clone();
     let choice_dialog = dialog.clone();
-    proceed.connect_clicked(move |_| {
-        let Some(choice) = choices.get(selector.selected() as usize).copied() else { return };
+    let windows_product = {
+        let selector = selector.clone();
+        let choices = choices.clone();
+        let candidates = candidates.usable.clone();
+        let product_id = game.product_id;
+        move || {
+            (current == Some(crate::config::PreferredInstallationSource::WindowsOffline)
+                || choices
+                    .get(selector.selected() as usize)
+                    .is_some_and(|choice| match choice {
+                        crate::installation::FreshInstallSource::GalaxyWindows => true,
+                        crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+                            candidates.get(*index).is_some_and(|candidate| {
+                                candidate.operating_system.as_deref() != Some("linux")
+                            })
+                        }
+                    }))
+            .then_some(product_id)
+        }
+    };
+    connect_windows_action(&proceed, parent, false, windows_product, move |_| {
+        let Some(choice) = choices.get(selector.selected() as usize).copied() else {
+            return;
+        };
         let mut locations = store
             .cloud_save_record(game.product_id)
             .map(|record| record.locations)
@@ -1296,7 +1319,10 @@ fn present_source_migration(
                 .heading("Saved-game locations are unknown")
                 .body("Ludomere cannot back up this game's saves automatically. Continuing will remove the current payload and UMU prefix and may permanently delete saved games. Back them up manually before continuing.")
                 .build();
-            warning.add_responses(&[("cancel", "Cancel"), ("continue", "Continue Without Save Backup")]);
+            warning.add_responses(&[
+                ("cancel", "Cancel"),
+                ("continue", "Continue Without Save Backup"),
+            ]);
             warning.set_response_appearance("continue", adw::ResponseAppearance::Destructive);
             warning.set_default_response(Some("cancel"));
             warning.set_close_response("cancel");
@@ -1306,13 +1332,35 @@ fn present_source_migration(
             let candidates = candidates.usable.clone();
             let game = game.clone();
             let installed = installed.clone();
-            warning.choose(Some(&choice_parent), gio::Cancellable::NONE, move |response| {
-                if response == "continue" {
-                    launch_source_migration(&dialog, &status, &config, &game, &installed, &candidates, choice, Vec::new());
-                }
-            });
+            warning.choose(
+                Some(&choice_parent),
+                gio::Cancellable::NONE,
+                move |response| {
+                    if response == "continue" {
+                        launch_source_migration(
+                            &dialog,
+                            &status,
+                            &config,
+                            &game,
+                            &installed,
+                            &candidates,
+                            choice,
+                            Vec::new(),
+                        );
+                    }
+                },
+            );
         } else {
-            launch_source_migration(&choice_dialog, &status, &config, &game, &installed, &candidates.usable, choice, locations);
+            launch_source_migration(
+                &choice_dialog,
+                &status,
+                &config,
+                &game,
+                &installed,
+                &candidates.usable,
+                choice,
+                locations,
+            );
         }
     });
     dialog.present(Some(parent));

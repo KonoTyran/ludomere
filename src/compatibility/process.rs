@@ -12,9 +12,12 @@ use std::{
 pub struct CompatibilityProcess {
     child: Child,
     group: u32,
+    activity: Option<crate::profile_reset::ActivityGuard>,
 }
 impl CompatibilityProcess {
     pub(crate) fn spawn(mut command: Command, log_path: &std::path::Path) -> Result<Self> {
+        let activity = crate::profile_reset::begin_activity("compatibility process")
+            .map_err(std::io::Error::other)?;
         append_command_log(log_path, &command)?;
         let out = OpenOptions::new()
             .create(true)
@@ -28,7 +31,11 @@ impl CompatibilityProcess {
             .spawn()
             .map_err(|_| CompatibilityFailure::InstallerLaunchRejected)?;
         let group = child.id();
-        Ok(Self { child, group })
+        Ok(Self {
+            child,
+            group,
+            activity: Some(activity),
+        })
     }
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
@@ -56,6 +63,17 @@ impl CompatibilityProcess {
             self.child
                 .kill()
                 .map_err(|_| CompatibilityFailure::StopFailed)
+        }
+    }
+}
+
+impl Drop for CompatibilityProcess {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_)))
+            && let Some(activity) = self.activity.take()
+        {
+            // A dropped handle does not terminate its child. Refuse reset until the next app start.
+            std::mem::forget(activity);
         }
     }
 }

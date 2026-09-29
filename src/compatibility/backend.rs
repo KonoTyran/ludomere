@@ -84,6 +84,9 @@ pub trait CompatibilityBackend: Send + Sync {
 
 #[derive(Debug)]
 pub enum CompatibilityFailure {
+    ProtonMissing,
+    ProtonSelectionMissing(PathBuf),
+    RuntimeMissing(String),
     UmuUnavailable,
     UmuVersionIncompatible(String),
     UmuUnhealthy,
@@ -114,7 +117,26 @@ pub enum CompatibilityFailure {
 }
 impl fmt::Display for CompatibilityFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::ProtonMissing => write!(
+                f,
+                "No compatible Proton version was found. Choose a folder or download a version in Proton settings."
+            ),
+            Self::ProtonSelectionMissing(path) => write!(
+                f,
+                "The selected Proton version at {} is missing or incomplete. Choose a replacement in Proton settings.",
+                path.display()
+            ),
+            Self::RuntimeMissing(name) => write!(
+                f,
+                "The {name} Steam Linux Runtime is missing. Download it in Proton settings before continuing."
+            ),
+            Self::UmuUnavailable => write!(
+                f,
+                "Ludomere's bundled UMU helper is missing. Reinstall the Ludomere package or configure LUDOMERE_UMU_RUN for development."
+            ),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 impl std::error::Error for CompatibilityFailure {}

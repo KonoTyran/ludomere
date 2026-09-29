@@ -4,31 +4,39 @@ pkgrel=1
 pkgdesc='A native GOG library, download, and game manager for Linux.'
 arch=('x86_64')
 license=('GPL-3.0-or-later')
-options=('!lto' '!debug')
-depends=('gtk4' 'libadwaita' 'gdk-pixbuf2' 'webkitgtk-6.0' 'libsecret')
-optdepends=('umu-launcher: install and run Windows games')
-makedepends=('rust')
+# Rust release binaries are already stripped; preserve official helper bytes.
+options=('!lto' '!debug' '!strip')
+depends=('gtk4>=4.14' 'libadwaita>=1.5' 'gdk-pixbuf2' 'webkitgtk-6.0>=2.50' 'libsecret' 'dbus' 'xz' 'python' 'python-xlib' 'python-urllib3')
+optdepends=('gnome-keyring: Secret Service provider for login (or another provider)' 'vulkan-driver: Windows game graphics' 'lib32-vulkan-driver: 32-bit Windows game graphics')
+makedepends=('rust>=1.92' 'pkgconf')
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('SKIP')
+# tools/build-package.py inserts the current source snapshot checksum.
+sha256sums=('@SOURCE_SHA256@')
 
 prepare() {
   cd "$pkgname-$pkgver"
   cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+  python3 tools/prepare-helpers.py --destination target/helpers --cache "${LUDOMERE_HELPER_CACHE:-$srcdir/helper-downloads}"
 }
 
 build() {
   cd "$pkgname-$pkgver"
-  CARGO_TARGET_DIR=target cargo build --frozen --release
+  cargo build --frozen --release
 }
 
 check() {
   cd "$pkgname-$pkgver"
-  CARGO_TARGET_DIR=target cargo test --frozen
+  bash tools/check.sh
 }
 
 package() {
   cd "$pkgname-$pkgver"
-  install -Dm755 target/release/ludomere "$pkgdir/usr/bin/ludomere"
+  install -Dm755 "${CARGO_TARGET_DIR:-target}/release/ludomere" "$pkgdir/usr/bin/ludomere"
+  install -d "$pkgdir/usr/lib/ludomere" "$pkgdir/usr/share/licenses/$pkgname" "$pkgdir/usr/share/doc/$pkgname"
+  cp -a target/helpers/umu target/helpers/comet "$pkgdir/usr/lib/ludomere/"
+  cp -a target/helpers/licenses/. "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 resources/licenses/VDF-LICENSE.txt "$pkgdir/usr/share/licenses/$pkgname/VDF-LICENSE"
+  cp -a target/helpers/sources "$pkgdir/usr/share/doc/$pkgname/"
   install -Dm644 resources/io.github.KonoTyran.Ludomere.desktop \
     "$pkgdir/usr/share/applications/io.github.KonoTyran.Ludomere.desktop"
   install -Dm644 resources/io.github.KonoTyran.Ludomere.metainfo.xml \

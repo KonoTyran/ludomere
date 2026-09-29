@@ -96,6 +96,16 @@ pub struct DownloadJobUpdate<'a> {
     pub error: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DownloadInstallIntent {
+    pub product_id: i64,
+    pub intent_id: String,
+    pub job_ids: Vec<String>,
+    pub plan_json: String,
+    pub state: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallationOperationRecord {
     pub product_id: i64,
@@ -227,7 +237,8 @@ pub struct CloudSaveRecord {
 
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 5;
+// Development revision 6 adds durable, explicitly requested install-after-download intent.
+const CURRENT_DEVELOPMENT_REVISION: i64 = 6;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -301,6 +312,11 @@ impl StateStore {
                 updated_at INTEGER NOT NULL DEFAULT (unixepoch()), status_message TEXT,
                 queue_position INTEGER, retry_started_at INTEGER, next_retry_at INTEGER,
                 created_at INTEGER NOT NULL DEFAULT 0, completed_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS download_install_intents (
+                product_id INTEGER PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE,
+                job_ids_json TEXT NOT NULL, plan_json TEXT NOT NULL,
+                state TEXT NOT NULL, error TEXT
              );
              CREATE TABLE IF NOT EXISTS managed_files (
                 path TEXT PRIMARY KEY, product_id INTEGER NOT NULL, product_slug TEXT NOT NULL,
@@ -1529,6 +1545,22 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn clear_enrichment_observation(&self, product_id: i64, source: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM enrichment_observations WHERE product_id = ?1 AND source = ?2",
+            params![product_id, source],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_enrichment_source(&self, source: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM enrichment_observations WHERE source = ?1",
+            [source],
+        )?;
+        Ok(())
+    }
+
     pub fn cached_product_metadata(&self, product_id: i64) -> Result<Option<ProductMetadata>> {
         let result = self.connection.query_row(
             "SELECT metadata_json FROM products WHERE product_id = ?1",
@@ -1543,11 +1575,31 @@ impl StateStore {
     }
 
     pub fn normalized_games(&self) -> Result<Vec<Game>> {
+        self.normalized_games_for(None)
+    }
+
+    pub fn cached_product_game(&self, product_id: i64) -> Result<Option<Game>> {
+        for game in self.normalized_games_for(Some(product_id))? {
+            if game.product_id == product_id {
+                return Ok(Some(game));
+            }
+            if let Some(dlc) = game
+                .dlcs
+                .into_iter()
+                .find(|dlc| dlc.product_id == product_id)
+            {
+                return Ok(Some(dlc.into()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn normalized_games_for(&self, product_id: Option<i64>) -> Result<Vec<Game>> {
         let mut statement = self.connection.prepare(
             "SELECT product_id, parent_product_id, product_type, slug, title, release_date,
                     description, changelog, metadata_json, links_json, media_json, currently_owned
              FROM products
-             WHERE (product_type = 'game' AND currently_owned = 1)
+             WHERE ((product_type = 'game' AND currently_owned = 1)
                 OR (product_type = 'dlc' AND EXISTS (
                     SELECT 1 FROM product_relationships relationship
                     JOIN products parent
@@ -1556,10 +1608,13 @@ impl StateStore {
                       AND relationship.relationship = 'dlc'
                       AND parent.product_type = 'game'
                       AND parent.currently_owned = 1
-                ))
+                )))
+             AND (?1 IS NULL OR product_id = ?1 OR parent_product_id = ?1
+                  OR product_id IN (SELECT parent_product_id FROM product_relationships WHERE child_product_id = ?1 AND relationship = 'dlc')
+                  OR parent_product_id IN (SELECT parent_product_id FROM product_relationships WHERE child_product_id = ?1 AND relationship = 'dlc'))
              ORDER BY title COLLATE NOCASE",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([product_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Option<i64>>(1)?,
@@ -1592,7 +1647,8 @@ impl StateStore {
                 media_json,
                 currently_owned,
             ) = row?;
-            let metadata: crate::domain::ProductMetadata = serde_json::from_str(&metadata_json)?;
+            let mut metadata: crate::domain::ProductMetadata =
+                serde_json::from_str(&metadata_json)?;
             let description = if description.trim().is_empty() {
                 metadata.store_description.clone().unwrap_or_default()
             } else {
@@ -1600,9 +1656,31 @@ impl StateStore {
             };
             let links = serde_json::from_str(&links_json)?;
             let media: serde_json::Value = serde_json::from_str(&media_json)?;
+            if metadata.localizations.is_empty() {
+                metadata.localizations = media
+                    .get("core_localizations")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+            }
             let revisions = self.load_current_download_revisions(id)?;
             let artifacts = revisions_to_artifacts(&revisions);
-            let platforms = platforms_from_artifacts(&artifacts);
+            let platforms = media
+                .get("platforms")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| platforms_from_artifacts(&artifacts));
+            let languages: Vec<String> = media
+                .get("languages")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| {
+                    metadata
+                        .localizations
+                        .iter()
+                        .map(|value| value.name.clone())
+                        .collect()
+                });
             let release_date = release_date
                 .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
                 .map(|value| value.fixed_offset());
@@ -1628,11 +1706,7 @@ impl StateStore {
                         description,
                         changelog,
                         platforms,
-                        languages: metadata
-                            .localizations
-                            .iter()
-                            .map(|value| value.name.clone())
-                            .collect(),
+                        languages,
                         metadata,
                         galaxy_builds: builds,
                         location: PathBuf::new(),
@@ -1662,11 +1736,7 @@ impl StateStore {
                         .iter()
                         .map(|value| value.name.clone())
                         .collect(),
-                    languages: metadata
-                        .localizations
-                        .iter()
-                        .map(|value| value.name.clone())
-                        .collect(),
+                    languages,
                     metadata,
                     galaxy_builds: builds,
                     location: PathBuf::new(),
@@ -1732,6 +1802,181 @@ impl StateStore {
             }
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commit a complete entitlement snapshot without replacing rich product caches.
+    pub fn cache_core_library(
+        &self,
+        games: &[Game],
+        owned: &[i64],
+        entitled: &[i64],
+        packs: &[(i64, Vec<i64>)],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM owned_products", [])?;
+        for id in owned {
+            transaction.execute("INSERT INTO owned_products VALUES (?1, unixepoch())", [id])?;
+        }
+        for game in games {
+            upsert_core_product(&transaction, game, None)?;
+            for dlc in &game.dlcs {
+                upsert_core_dlc(&transaction, dlc, game.product_id)?;
+            }
+        }
+        transaction.execute("UPDATE products SET currently_owned = 0", [])?;
+        for id in entitled {
+            transaction.execute(
+                "UPDATE products SET currently_owned = 1 WHERE product_id = ?1",
+                [id],
+            )?;
+        }
+        for (pack, children) in packs {
+            transaction.execute("DELETE FROM product_relationships WHERE parent_product_id = ?1 AND relationship = 'pack_entitlement'", [pack])?;
+            for child in children {
+                transaction.execute("INSERT INTO product_relationships VALUES (?1, ?2, 'pack_entitlement', 'product_api')", params![pack, child])?;
+            }
+        }
+        transaction.execute("INSERT INTO online_sync_state(sync_key, completed_at) VALUES ('owned_library', unixepoch()) ON CONFLICT(sync_key) DO UPDATE SET completed_at = excluded.completed_at", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cached_pack_entitlements(&self, packs: &[i64]) -> Result<Vec<i64>> {
+        let mut statement = self.connection.prepare("SELECT parent_product_id, child_product_id FROM product_relationships WHERE relationship = 'pack_entitlement'")?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(pack, child)| packs.contains(&pack).then_some(child))
+            .collect())
+    }
+
+    /// Scoped writes never change entitlement or replace another product's relationships.
+    pub fn cache_product_section(
+        &self,
+        game: &Game,
+        section: crate::online::DetailSection,
+    ) -> Result<()> {
+        use crate::online::DetailSection;
+        let transaction = self.connection.unchecked_transaction()?;
+        if !transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM products WHERE product_id = ?1)",
+            [game.product_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            upsert_core_product(&transaction, game, None)?;
+        }
+        match section {
+            DetailSection::Product => {
+                transaction.execute("UPDATE products SET description = ?2, changelog = ?3, media_json = json_patch(media_json, ?4), updated_at = unixepoch() WHERE product_id = ?1", params![game.product_id, game.description, game.changelog, serde_json::json!({"screenshots": game.screenshots}).to_string()])?;
+                for dlc in &game.dlcs {
+                    upsert_core_dlc(&transaction, dlc, game.product_id)?;
+                    transaction.execute("UPDATE products SET description = ?2, changelog = ?3, media_json = json_patch(media_json, ?4) WHERE product_id = ?1", params![dlc.product_id, dlc.description, dlc.changelog, serde_json::json!({"screenshots":dlc.screenshots}).to_string()])?;
+                }
+            }
+            DetailSection::Metadata => {
+                transaction.execute("UPDATE products SET metadata_json = ?2, updated_at = unixepoch() WHERE product_id = ?1", params![game.product_id, serde_json::to_string(&game.metadata)?])?;
+                insert_edition_relationships(
+                    &transaction,
+                    game.product_id,
+                    &game.metadata.editions,
+                )?;
+            }
+            DetailSection::Artwork => {
+                let mut media = serde_json::Map::new();
+                for (key, path) in [
+                    ("detail_artwork", &game.detail_artwork),
+                    ("hero_logo", &game.hero_logo),
+                    ("icon", &game.icon),
+                ] {
+                    if let Some(path) = path {
+                        media.insert(key.into(), serde_json::to_value(path)?);
+                    }
+                }
+                transaction.execute("UPDATE products SET media_json = json_patch(media_json, ?2), updated_at = unixepoch() WHERE product_id = ?1", params![game.product_id, serde_json::to_string(&media)?])?;
+            }
+            DetailSection::Acquisition | DetailSection::Builds => {}
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cache_product_cover(&self, product_id: i64, path: &std::path::Path) -> Result<()> {
+        self.connection.execute(
+            "UPDATE products SET media_json = json_patch(media_json, ?2) WHERE product_id = ?1",
+            params![product_id, serde_json::json!({"artwork":path}).to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn cache_product_icon(&self, product_id: i64, path: &std::path::Path) -> Result<()> {
+        self.connection.execute(
+            "UPDATE products SET media_json = json_patch(media_json, ?2) WHERE product_id = ?1",
+            params![product_id, serde_json::json!({"icon":path}).to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_download_install_intent(&self, intent: &DownloadInstallIntent) -> Result<()> {
+        self.connection.execute("INSERT INTO download_install_intents(product_id,intent_id,job_ids_json,plan_json,state,error) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(product_id) DO UPDATE SET intent_id=excluded.intent_id,job_ids_json=excluded.job_ids_json,plan_json=excluded.plan_json,state=excluded.state,error=excluded.error",params![intent.product_id,intent.intent_id,serde_json::to_string(&intent.job_ids)?,intent.plan_json,intent.state,intent.error])?;
+        Ok(())
+    }
+
+    pub fn download_install_intents(&self) -> Result<Vec<DownloadInstallIntent>> {
+        let mut query=self.connection.prepare("SELECT product_id,intent_id,job_ids_json,plan_json,state,error FROM download_install_intents ORDER BY product_id")?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (product_id, intent_id, job_ids, plan_json, state, error) = row?;
+            Ok(DownloadInstallIntent {
+                product_id,
+                intent_id,
+                job_ids: serde_json::from_str(&job_ids)?,
+                plan_json,
+                state,
+                error,
+            })
+        })
+        .collect()
+    }
+
+    pub fn set_download_install_state(
+        &self,
+        intent_id: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE download_install_intents SET state=?2,error=?3 WHERE intent_id=?1",
+            params![intent_id, state, error],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "The automatic installation request was removed or replaced"
+        );
+        Ok(())
+    }
+
+    pub fn clear_download_install_intent(&self, product_id: i64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM download_install_intents WHERE product_id=?1",
+            [product_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_download_install_intent_for_job(&self, job_id: &str) -> Result<()> {
+        self.connection.execute("DELETE FROM download_install_intents WHERE EXISTS (SELECT 1 FROM json_each(download_install_intents.job_ids_json) WHERE value=?1)",[job_id])?;
         Ok(())
     }
 
@@ -2877,6 +3122,52 @@ fn media_path(media: &serde_json::Value, field: &str) -> Option<PathBuf> {
         .flatten()
 }
 
+fn upsert_core_dlc(
+    transaction: &rusqlite::Transaction<'_>,
+    dlc: &crate::domain::Dlc,
+    parent: i64,
+) -> Result<()> {
+    upsert_core_product(
+        transaction,
+        &Game {
+            product_id: dlc.product_id,
+            title: dlc.title.clone(),
+            slug: dlc.slug.clone(),
+            release_date: dlc.release_date,
+            platforms: dlc.platforms.clone(),
+            languages: dlc.languages.clone(),
+            links: dlc.links.clone(),
+            ..Game::default()
+        },
+        Some(parent),
+    )
+}
+
+fn upsert_core_product(
+    transaction: &rusqlite::Transaction<'_>,
+    game: &Game,
+    parent: Option<i64>,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO products(product_id, parent_product_id, product_type, slug, title, release_date,
+         description, changelog, metadata_json, links_json, media_json, currently_owned, first_seen_at, last_seen_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', '', ?9, ?7, ?8,
+         EXISTS(SELECT 1 FROM owned_products WHERE product_id = ?1), unixepoch(), unixepoch(), unixepoch())
+         ON CONFLICT(product_id) DO UPDATE SET slug = excluded.slug, title = excluded.title,
+         release_date = COALESCE(excluded.release_date, products.release_date),
+         links_json = excluded.links_json, media_json = json_patch(products.media_json, excluded.media_json),
+         last_seen_at = unixepoch(), updated_at = unixepoch()",
+        params![game.product_id, parent, if parent.is_some() { "dlc" } else { "game" }, game.slug, game.title,
+            game.release_date.as_ref().map(chrono::DateTime::timestamp), serde_json::to_string(&game.links)?,
+            serde_json::json!({"platforms":game.platforms,"languages":game.languages,"core_localizations":game.metadata.localizations}).to_string(),
+            serde_json::to_string(&crate::domain::ProductMetadata::default())?],
+    )?;
+    if let Some(parent) = parent {
+        transaction.execute("INSERT INTO product_relationships(parent_product_id, child_product_id, relationship, source) VALUES (?1, ?2, 'dlc', 'product_api') ON CONFLICT DO NOTHING", params![parent, game.product_id])?;
+    }
+    Ok(())
+}
+
 fn upsert_product_row(
     transaction: &rusqlite::Transaction<'_>,
     game: &Game,
@@ -3015,6 +3306,137 @@ fn manifest_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progressive_core_preserves_omitted_owned_products_rich_cache_and_pack_entitlement() {
+        let path = temp_database_path("progressive-core");
+        let store = StateStore::open_at(&path).unwrap();
+        let mut original = (1..=501)
+            .map(|id| Game {
+                product_id: id,
+                title: format!("Game {id}"),
+                slug: format!("game-{id}"),
+                description: format!("Rich {id}"),
+                ..Game::default()
+            })
+            .collect::<Vec<_>>();
+        original[0].detail_artwork = Some(PathBuf::from("cached-hero.png"));
+        original[0].dlcs.push(crate::domain::Dlc {
+            product_id: 9000,
+            title: "Pack DLC".into(),
+            owned: true,
+            description: "Cached DLC details".into(),
+            ..Default::default()
+        });
+        store.upsert_normalized_library(&original).unwrap();
+        let mut core = original[0].clone();
+        core.description.clear();
+        core.metadata = Default::default();
+        core.detail_artwork = None;
+        core.platforms.linux = true;
+        core.languages = vec!["French".into()];
+        store
+            .cache_core_library(&[core], &[1, 2, 9999], &[1, 2, 9000], &[(9999, vec![9000])])
+            .unwrap();
+        let games = store.normalized_games().unwrap();
+        assert_eq!(games.len(), 2);
+        let game = games.iter().find(|game| game.product_id == 1).unwrap();
+        assert_eq!(game.description, "Rich 1");
+        assert_eq!(
+            game.detail_artwork.as_deref(),
+            Some(std::path::Path::new("cached-hero.png"))
+        );
+        assert!(game.platforms.linux);
+        assert_eq!(game.languages, ["French"]);
+        assert!(game.dlcs[0].owned);
+        assert_eq!(game.dlcs[0].description, "Cached DLC details");
+        assert_eq!(store.cached_pack_entitlements(&[9999]).unwrap(), [9000]);
+        assert!(store.cached_pack_entitlements(&[]).unwrap().is_empty());
+        assert_eq!(
+            store
+                .cached_product_game(9000)
+                .unwrap()
+                .unwrap()
+                .description,
+            "Cached DLC details"
+        );
+        drop(store);
+        let reopened = StateStore::open_at(&path).unwrap();
+        assert!(
+            reopened
+                .cached_product_game(1)
+                .unwrap()
+                .unwrap()
+                .platforms
+                .linux
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn section_and_cover_writes_never_replace_other_fields_or_grant_entitlement() {
+        let path = temp_database_path("section-persistence");
+        let store = StateStore::open_at(&path).unwrap();
+        let original = Game {
+            product_id: 1,
+            title: "One".into(),
+            description: "Before".into(),
+            ..Default::default()
+        };
+        store
+            .cache_core_library(
+                &[
+                    original.clone(),
+                    Game {
+                        product_id: 2,
+                        title: "Two".into(),
+                        ..Default::default()
+                    },
+                ],
+                &[1, 2],
+                &[1, 2],
+                &[],
+            )
+            .unwrap();
+        let mut fetched = original.clone();
+        fetched.description = "After".into();
+        fetched.dlcs.push(crate::domain::Dlc {
+            product_id: 3,
+            title: "Not owned".into(),
+            owned: true,
+            ..Default::default()
+        });
+        store
+            .cache_product_section(&fetched, crate::online::DetailSection::Product)
+            .unwrap();
+        fetched.hero_logo = Some(PathBuf::from("new-logo.png"));
+        store
+            .cache_product_section(&fetched, crate::online::DetailSection::Artwork)
+            .unwrap();
+        store
+            .cache_product_cover(1, std::path::Path::new("tile.png"))
+            .unwrap();
+        store
+            .cache_product_icon(1, std::path::Path::new("sidebar.png"))
+            .unwrap();
+        let games = store.normalized_games().unwrap();
+        assert_eq!(games.len(), 2);
+        let game = games.iter().find(|game| game.product_id == 1).unwrap();
+        assert_eq!(game.description, "After");
+        assert_eq!(
+            game.hero_logo.as_deref(),
+            Some(std::path::Path::new("new-logo.png"))
+        );
+        assert_eq!(
+            game.artwork.as_deref(),
+            Some(std::path::Path::new("tile.png"))
+        );
+        assert!(!game.dlcs[0].owned);
+        assert_eq!(
+            game.icon.as_deref(),
+            Some(std::path::Path::new("sidebar.png"))
+        );
+        std::fs::remove_file(path).unwrap();
+    }
     use crate::domain::InstallationState;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3089,7 +3511,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(6));
         assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         drop(store);
         fs::remove_file(path).unwrap();
@@ -3397,7 +3819,7 @@ mod tests {
         drop(store);
 
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(6));
         assert_eq!(store.favorites().unwrap(), HashSet::from([42]));
         assert_eq!(
             store.galaxy_branch_credential("user", 42, "beta").unwrap(),
@@ -3416,10 +3838,11 @@ mod tests {
     }
 
     #[test]
-    fn retained_development_revisions_one_through_three_advance() {
-        for revision in 1..=3 {
+    fn retained_development_revisions_one_through_five_advance() {
+        for revision in [1, 2, 3, 5] {
             let path = temp_database_path(&format!("depot-revision-{revision}"));
             let store = StateStore::open_at(&path).unwrap();
+            store.connection.execute_batch("DROP TABLE download_install_intents; INSERT INTO user_game_state(product_id, favorite) VALUES(71, 1)").unwrap();
             store
                 .connection
                 .execute(
@@ -3429,7 +3852,9 @@ mod tests {
                 .unwrap();
             drop(store);
             let store = StateStore::open_at(&path).unwrap();
-            assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+            assert_eq!(development_revision(&store.connection).unwrap(), Some(6));
+            assert!(store.download_install_intents().unwrap().is_empty());
+            assert!(store.favorites().unwrap().contains(&71));
             assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
             drop(store);
             fs::remove_file(path).unwrap();
@@ -3481,13 +3906,14 @@ mod tests {
                  INSERT INTO galaxy_depot_chunks VALUES (
                     'operation-1', 'compressed', 'manifest', 10, 20, 'uncompressed',
                     'verified', '/stage/chunk', 10, 2);
+                 DROP TABLE download_install_intents;
                  UPDATE schema_state SET development_revision = 4;",
             )
             .unwrap();
         drop(store);
 
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(6));
         assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         assert_eq!(
             store.depot_operation("operation-1").unwrap(),

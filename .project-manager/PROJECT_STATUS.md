@@ -2,6 +2,47 @@
 
 Last meaningful update: 2026-09-30.
 
+## Current build investigation
+
+- Final local R64 disposition: reproduced and fixed source-archive omission; complete local package
+  pipeline passes. Manager reviewed before/after logs, exact one-line diff, archive fixture hashes/
+  exclusions and P177 package audit (official helpers/source hashes, adapter and licenses preserved).
+  Package dist/ludomere-0.1.0-1-x86_64.pkg.tar.zst, 14,424,020 bytes, SHA256
+  13d7023cc12155c0e59b016e08da660a1cec6bfff13966aa527b1f5150d56eff; built, not installed.
+- Four-path commit/message and narrow PR correction approved; records frozen for normal publication.
+  Outcome/new CI status belongs to /tmp/ludomere-p176-report.md, /tmp/ludomere-p177-review.md and
+  final handoff. Local full-build success is not a remote-CI success claim.
+
+- Corrected full package pipeline passes: one-line .zlib inclusion; release, fmt/all-target Clippy,
+  467 unit (12 ignored), six main integration cases and five Python tests, then pacman creation.
+  Evidence /tmp/ludomere-p176-package-after.log. Source archive includes exact hashes for all three
+  fixtures with private/source exclusions preserved. P177 final artifact review pending.
+- Publication will complete the existing authorized branch/PR delivery for the corrected build;
+  four source/record paths only, no package artifacts or manual CI rerun. Current remote CI still
+  tests pre-fix a7408a4, so it is not evidence for this correction.
+
+- Exact package failure reproduced in /tmp/ludomere-p176-package-before.log: release build passes,
+  makepkg check() fails all-target Clippy compilation at five include_bytes! sites for omitted XNA,
+  ISI and DOSBox074 fixtures. P176 corrects the source suffix allowlist and reruns full makepkg/check.
+  Container unavailable, so reproduction uses existing host Arch dependencies with private HOME/XDG
+  and session bus; no host/package installation. P177 audits final archive and package independently.
+
+- P177 found source-package omission: tools/build-package.py's suffix allowlist excludes three
+  tests/fixtures/gog-dependencies/*.zlib files referenced by include_bytes! in dependency/setup
+  tests. Checkout checks can therefore differ from extracted-source all-target checks. Root reviewed
+  references/allowlist; P176 verifies archive/compile reproduction and owns narrow inclusion fix.
+
+- User confirms local pacman package and Actions/PR checks. P176 now authorized complete documented
+  check/package reproduction (no installation). Prior 3dcaf6e CI failed fmt, fixed in a7408a4; latest
+  CI36783276226 in progress at read. Actual current package failure still being established.
+
+- R64/P176/P177 in progress after a7408a4. User reports build failing; build type pending answer.
+  Acquisition inspects fresh CI/logs and reproduces; security independently checks configuration
+  and reviews eventual minimal fix. Starting tree clean; prior local scoped checks passed but do
+  not prove the package/CI path. No cause assumed, no tests weakened, no new publication requested.
+- Previous P175/P171 publication is complete: a7408a46a3876735eb49568fa9b217f268ed5233 pushed,
+  clean tree verified; PR6 exact updated body/head/base read back successfully.
+
 ## Current publication
 
 - Final R62/R63 disposition: complete for scoped local assurance, independent P173 PASS with no

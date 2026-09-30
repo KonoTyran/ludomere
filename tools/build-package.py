@@ -28,7 +28,7 @@ for directory in ("src", "resources", "tests", "tools", ".github"):
         if path.is_symlink():
             raise RuntimeError(f"Source snapshot refuses symlink: {path.relative_to(root)}")
         if path.is_file() and "__pycache__" not in path.parts and (
-            path.suffix in {".rs", ".toml", ".json", ".py", ".sh", ".yml", ".yaml", ".svg", ".png", ".txt", ".desktop", ".xml", ".md"}
+            path.suffix in {".rs", ".toml", ".json", ".py", ".sh", ".yml", ".yaml", ".svg", ".png", ".txt", ".desktop", ".xml", ".md", ".zlib"}
             or path.name in {"umu-run", "Containerfile"}
         ):
             files.append(path)

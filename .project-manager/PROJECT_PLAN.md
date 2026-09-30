@@ -1,5 +1,33 @@
 # Project plan
 
+## P176–P177 — Build failure diagnosis and correction
+
+- Local fix/verification complete. Manager inspected exact before/after makepkg logs, one-line diff,
+  source hashes/exclusions and independent package/helper/license audit. No unresolved local finding.
+  Approved four-path commit/message, normal push, narrow PR update; records frozen before publication.
+  Remote CI remains a separate pending check, never inferred from local success.
+
+- Reproduction confirmed five missing-fixture compile errors after successful release build. Narrow
+  .zlib source inclusion corrected them; complete makepkg now passes fmt/Clippy, 467 unit tests,
+  six main integration cases, five Python boundary tests and package creation. Twelve unit tests
+  remain intentionally ignored by this general run. P177 independently verifies source/package.
+- Complete prior branch/PR delivery: after reviewed artifacts/frozen records, acquisition commits
+  the four changed paths and pushes normally; security updates PR packaging/verification mentions
+  and checks new CI state. No package artifacts committed, manual rerun, force push or merge.
+
+- User confirmed local pacman and CI failure. Package/full-check reproduction authorized in existing
+  pinned Arch environment; capture output, no host/package installation or remote rerun. Prior
+  3dcaf6e CI formatting failure is already fixed by a7408a4; latest run still in progress, so current
+  package issue remains unestablished. Owner checks existing logs before rebuilding.
+
+- R64 in progress. Acquisition owns fresh CI/build logs, reproduction and minimal evidenced fix;
+  security independently reviews clean-environment/configuration gaps and final correction. Root
+  owns records; no product edits. Report actual failing stage before fixing and preserve checks.
+- Authorize read-only GitHub runs/logs, cached local compile and relevant tests; broader build checks
+  only if needed to reproduce the failing build. No package build until established relevant scope,
+  host installation, credentials/profile/game/helper access, dependency patches, commit/push or CI
+  rerun. Reports /tmp/ludomere-p176-report.md and /tmp/ludomere-p177-review.md; logs retained safely.
+
 ## P172–P173 — Proton Settings parity with onboarding
 
 - Complete for scoped local assurance. Manager reviewed P172/P173 reports, final source diffs,

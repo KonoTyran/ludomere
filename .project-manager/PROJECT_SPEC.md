@@ -1,5 +1,16 @@
 # Project specification
 
+## Diagnose and fix failing build — 2026-09-30
+
+R64 user: "The build is failing. Figure out why and correct it." Reproduce from actual build
+output, correct the evidenced cause and verify the affected build path without weakening checks.
+Build type is being clarified while recent CI/logs are inspected. Preserve R60–R63; no unrelated
+cleanup, host installation, dependency modification or new publication requested.
+User confirms both local pacman package build and GitHub Actions/PR checks fail. Reproducing the
+documented package build and its full checks is now in scope; do not install the produced package.
+Continue the previously authorized branch/PR delivery with this packaging correction so remote
+checks receive the corrected source; no merge, host install or manual CI rerun.
+
 ## Simplify Proton Settings — 2026-09-30
 
 Follow-up R63: Rename the Settings tab to "GOG Online Services" and its update button to

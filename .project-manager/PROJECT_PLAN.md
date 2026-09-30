@@ -1,5 +1,55 @@
 # Project plan
 
+## P161–P163 — Publish prefix cleanup and concise complete PR
+
+- In_progress. P161 acquisition inventories/stages/commits/pushes R59 to fork main; P162
+  compatibility audits current PR/body and complete divergence, drafts concise feature/fix-complete
+  replacement and updates PR6 after push. P163 security independently reviews both publication
+  inventories/messages and feature coverage/claims. Root alone owns coordination records.
+- Acceptance: reviewed9-path R59 commit with useful message, normal fork push and matching refs;
+  existing KonoTyran/ludomere PR6 remains main-targeted, shorter clean Markdown retains all earlier
+  feature/fix mentions plus later implemented changes, and API readback matches reviewed body/head.
+- Authorize necessary local Git/read-only remote comparison and authenticated normal fork push/PR
+  description update, explicitly requested by user. No force/upstream branch write/merge/comments,
+  product edits/package/build/full-suite/secret output. Prior verified evidence remains applicable.
+  Stage and publish only after independent and manager review. Stop for divergence/new scope;
+  return exact inventories, drafts, coverage mapping, results, refs and URL. No stale PR assumptions.
+- P161 manager/independent content review clears exact9 paths and full R59 message; source hashes
+  match verified P160 candidate and fresh fork main matches be82a43. Stage/index check then normal
+  same-fork authenticated HTTPS commit/push authorized; no new test or build needed. P162/P163 PR
+  coverage review proceeds separately, and body publication follows the verified push.
+
+## P158–P160 — Remove managed prefixes during uninstall
+
+- R59; complete for scoped local assurance. P158 acquisition owns safe backend uninstall/recovery/prefix cleanup and
+  focused tests. P159 compatibility owns confirmation/partial-failure presentation, README and
+  applicable UI tests. P160 security independently reviews destructive boundaries and controls.
+  Root owns coordination records only. Agree APIs/file boundaries before shared edits.
+- Acceptance: healthy and incomplete Windows uninstall removes only the corresponding managed
+  prefix after affected writers stop; absent prefix succeeds; errors remain actionable/retryable;
+  symlink targets/other games/external saves/preferences remain untouched. Native behavior stays
+  independent, downloads stay opt-in. Confirmation accurately warns about prefix-contained saves.
+- Authorize scoped source/docs/tests and isolated HOME/allXDG/bus inert filesystem/GTK fixtures,
+  focused tests/fmt/Clippy/debug. No actual profiles/logs/credentials/user deletion, real game/helper
+  execution, dependency changes/schema/package/commit/push/full suite. Preserve prior work; stop
+  for broader destructive boundaries or uncertain ownership. Return source/evidence/limits.
+- Confirmed gaps: healthy Depot removes prefix after payload (losing retry evidence on failure),
+  Windows offline and incomplete recovery retain it. Reuse anchored nofollow cleanup and existing
+  recovery receipt with optional validated prefix identity; preserve prefix-only retry after payload
+  removal, reject replacement/conflicting ownership, never let a legacy receipt authorize a new root.
+  Preview exposes exact prefix targets/counts; normal paths validate before destructive work and
+  remove after writers drain. No new recovery store/schema or broader reset changes.
+- P160 identified vendor leader-exit/error can leave descendants; necessary offline-uninstall
+  protection reuses existing SetupProcessGuard in the same recovery receipt. Arm before spawn,
+  record known group, clear only proven drain; uncertain same-boot recovery stays blocked. No new
+  supervisor/store/schema. Cover failure/crash and markerless-native preservation in focused tests.
+- Manager reviewed P158/P159 reports, independent /tmp/ludomere-p160-review.md PASS, source,
+  final logs and actual confirmation/result screenshots.17 backend+2 UI focused tests, fmt,
+  all-target Clippy/debug/diff pass. Physical Cancel/unchecked cleanup/permission failure/prefix-only
+  retry/native preservation/missing-prefix checked recovery pass; exact source reconciled and
+  fixtures stopped. No scoped blocker. Real vendor/runtime execution remains untested; no full
+  suite/package/commit/push or global Prototype ready declaration.
+
 ## P157 — Commit and push state, logout, DLL and Depot corrections
 
 - User explicitly authorizes publication of current R53–R58 work. In_progress; acquisition owns

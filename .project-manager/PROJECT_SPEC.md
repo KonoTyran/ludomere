@@ -1,5 +1,23 @@
 # Project specification
 
+## Publish prefix cleanup and condense upstream PR — 2026-09-30
+
+User: "Commit and push, then update the PR with all the new features and fixes. The PR text is also
+very long, so try to be a bit more terse in your feature descriptions without omitting any feature
+or fix mentions." Publish R59 and update existing upstream-main PR6 to cover the full current fork
+diff, retaining every feature/fix mention in concise Markdown. No merge, new implementation, package
+build or redundant full-suite run requested.
+
+## Delete a game's prefix on uninstall — 2026-09-30
+
+User: "Uninstalling a game should also delete its prefix directory."
+- R59: Confirmed game uninstall, including incomplete-game removal/reset, removes that game's
+  managed compatibility prefix along with its game files. This supersedes earlier prefix retention
+  on uninstall. Explain removal of saves/settings stored inside that prefix in the confirmation.
+  Preserve external saves, other games' prefixes, Proton installations, durable Ludomere preferences/
+  activity and optional downloaded-file deletion. Profile reset behavior is unchanged. No actual
+  user-file deletion, game/helper execution, new package, commit or push requested in this task.
+
 ## Commit and push accumulated fixes — 2026-09-30
 
 User: "Commit what you have and push." Publish current R53–R58 source, tests, documentation and

@@ -96,17 +96,21 @@ pub enum UninstallPreparation {
 pub struct GameResetPlan {
     pub product_id: i64,
     pub directories: Vec<PathBuf>,
+    pub prefixes: Vec<PathBuf>,
     pub downloaded_files: usize,
     pub downloaded_bytes: u64,
     ids: Vec<i64>,
     config: crate::config::Config,
     slug: String,
     identities: Vec<Option<(u64, u64)>>,
+    prefix_identities: Vec<Option<(u64, u64)>>,
+    prefix_checks: Vec<bool>,
     session: u64,
 }
 #[derive(Default)]
 pub struct GameResetResult {
     pub removed_directories: usize,
+    pub removed_prefixes: usize,
     pub retained_downloads: usize,
     pub failures: Vec<String>,
 }
@@ -117,9 +121,13 @@ struct Receipt {
     product_id: i64,
     directory: PathBuf,
     identity: Option<(u64, u64)>,
+    #[serde(default)]
+    prefix_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    setup_process: Option<super::dependency_setup::SetupProcessGuard>,
 }
 
-fn receipt_path(directory: &Path) -> Result<PathBuf> {
+pub(super) fn receipt_path(directory: &Path) -> Result<PathBuf> {
     Ok(directory
         .parent()
         .context("Game has no library")?
@@ -191,18 +199,42 @@ fn valid_download_destination(
             .unwrap_or(false)
 }
 
-fn write_receipt(directory: &Path, product_id: i64, identity: Option<(u64, u64)>) -> Result<()> {
-    use std::{
-        io::Write,
-        os::{fd::AsRawFd, unix::ffi::OsStrExt},
-    };
+fn write_receipt(
+    directory: &Path,
+    product_id: i64,
+    identity: Option<(u64, u64)>,
+    prefix_identity: Option<(u64, u64)>,
+) -> Result<()> {
     if let Some(existing) = receipt(directory, product_id)? {
         ensure!(
             existing.identity == identity || identity.is_none(),
             "Recovery directory identity changed"
         );
+        ensure!(
+            prefix_identity.is_none() || existing.prefix_identity == prefix_identity,
+            "Recovery prefix identity changed; no prefix files were removed"
+        );
         return Ok(());
     }
+    persist_receipt(
+        &Receipt {
+            version: 1,
+            product_id,
+            directory: directory.to_owned(),
+            identity,
+            prefix_identity,
+            setup_process: None,
+        },
+        false,
+    )
+}
+
+fn persist_receipt(receipt: &Receipt, replace: bool) -> Result<()> {
+    use std::{
+        io::Write,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+    let directory = &receipt.directory;
     let path = receipt_path(directory)?;
     let mut parent = open_directory(directory.parent().context("Missing library")?)?;
     for name in [".ludomere", "staging"] {
@@ -217,18 +249,291 @@ fn write_receipt(directory: &Path, product_id: i64, identity: Option<(u64, u64)>
     }
     let anchored = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
     let mut temporary = tempfile::NamedTempFile::new_in(&anchored)?;
-    temporary.write_all(&serde_json::to_vec(&Receipt {
-        version: 1,
-        product_id,
-        directory: directory.to_owned(),
-        identity,
-    })?)?;
+    temporary.write_all(&serde_json::to_vec(receipt)?)?;
     temporary.as_file().sync_all()?;
     let name = path.file_name().context("Missing recovery filename")?;
     ensure!(!name.as_bytes().is_empty(), "Missing recovery filename");
-    temporary.persist_noclobber(anchored.join(name))?;
+    if replace {
+        temporary.persist(anchored.join(name))?;
+    } else {
+        temporary.persist_noclobber(anchored.join(name))?;
+    }
     parent.sync_all()?;
     Ok(())
+}
+
+pub(super) fn run_prefix_uninstaller(
+    directory: &Path,
+    product_id: i64,
+    cancelled: &AtomicBool,
+    log: &Path,
+    spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
+) -> Result<()> {
+    let mut record =
+        receipt(directory, product_id)?.context("Uninstall recovery record is missing")?;
+    if let Some(guard) = &record.setup_process {
+        super::dependency_setup::ensure_process_quiescent(guard)?;
+    }
+    ensure!(
+        !cancelled.load(Ordering::Acquire),
+        "Uninstallation cancelled before starting"
+    );
+    record.setup_process = Some(super::dependency_setup::SetupProcessGuard {
+        boot: super::dependency_setup::boot_identity()?,
+        group: None,
+    });
+    persist_receipt(&record, true)?;
+    let mut process = match spawn() {
+        Ok(process) => process,
+        Err(error) => {
+            record.setup_process = None;
+            persist_receipt(&record, true)?;
+            return Err(error);
+        }
+    };
+    record.setup_process.as_mut().unwrap().group = Some(process.group_id());
+    if let Err(error) = persist_receipt(&record, true) {
+        process.stop().context(
+            "Uninstaller identity could not be saved or drained; reboot before recovery",
+        )?;
+        record.setup_process = None;
+        persist_receipt(&record, true)?;
+        return Err(error);
+    }
+    let result = super::dependency_setup::wait_process(
+        &mut process,
+        &|| cancelled.load(Ordering::Acquire),
+        "Windows game uninstaller",
+        log,
+    );
+    if !matches!(process.group_running(), Ok(false)) {
+        process
+            .stop()
+            .context("The uninstaller could not be drained; recovery remains blocked")?;
+    }
+    record.setup_process = None;
+    persist_receipt(&record, true)?;
+    result
+}
+
+fn managed_prefix_path(directory: &Path) -> Result<PathBuf> {
+    let slug = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Invalid game folder")?;
+    crate::compatibility::validate_slug(slug)?;
+    ensure!(slug != ".ludomere", "Invalid game folder");
+    Ok(crate::compatibility::prefix_path(
+        directory.parent().context("Missing game library")?,
+        slug,
+    ))
+}
+
+fn read_config() -> Result<crate::config::Config> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let path = crate::config::Config::path();
+    let opened = (|| -> std::io::Result<std::fs::File> {
+        let parent = open_directory(path.parent().unwrap())?;
+        open_child(&parent, path.file_name().unwrap(), false, false)
+    })();
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(crate::config::Config::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.nlink() == 1,
+        "Unsafe configuration file"
+    );
+    let mut text = String::new();
+    file.by_ref()
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_string(&mut text)?;
+    ensure!(
+        text.len() <= 4 * 1024 * 1024,
+        "Configuration exceeds its safety limit"
+    );
+    Ok(toml::from_str(&text)?)
+}
+
+fn validate_prefix_locations(prefix: &Path) -> Result<()> {
+    let config = read_config()?;
+    let preferences = crate::compatibility::proton_preferences()?;
+    let store = crate::state::StateStore::open()?;
+    let mut protected = vec![
+        crate::identity::config_root(),
+        crate::identity::data_root(),
+        crate::identity::cache_root(),
+        config.download_directory,
+    ];
+    protected.extend(
+        config
+            .game_libraries
+            .into_iter()
+            .map(|library| library.path),
+    );
+    protected.extend(preferences.default);
+    protected.extend(preferences.overrides.into_values());
+    protected.extend(
+        store
+            .managed_files()?
+            .into_iter()
+            .filter(|file| file.present)
+            .map(|file| file.path),
+    );
+    protected.extend(
+        store
+            .download_jobs()?
+            .into_iter()
+            .map(|job| job.destination),
+    );
+    ensure!(
+        !protected.iter().any(|path| path.starts_with(prefix)
+            || std::fs::canonicalize(path).is_ok_and(|path| path.starts_with(prefix))),
+        "The managed prefix contains a protected profile, library, Proton or download location. Move that location before uninstalling; no prefix files were removed"
+    );
+    Ok(())
+}
+
+fn prefix_identity(
+    directory: &Path,
+    product_id: i64,
+    windows_proof: bool,
+    native: bool,
+) -> Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    if native {
+        return Ok(None);
+    }
+    let prefix = managed_prefix_path(directory)?;
+    let opened = match open_directory(&prefix) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("Cannot safely inspect this game's managed prefix");
+        }
+    };
+    let metadata = opened.metadata()?;
+    validate_prefix_locations(&prefix)?;
+    let identity = (metadata.dev(), metadata.ino());
+    let prior = receipt(directory, product_id)?;
+    if let Some(prior) = &prior {
+        ensure!(
+            prior.prefix_identity == Some(identity),
+            "The managed prefix changed or was not part of the previous removal; no prefix files were removed"
+        );
+    }
+    let owner = read_json(&prefix.join(".ludomere-managed.json"))?;
+    if let Some(owner) = &owner {
+        ensure!(
+            owner
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && owner
+                    .get("managed_by_ludomere")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                && owner.get("slug").and_then(serde_json::Value::as_str)
+                    == directory.file_name().and_then(|name| name.to_str()),
+            "Managed prefix ownership does not match this game; no prefix files were removed"
+        );
+    }
+    ensure!(
+        owner.is_some() || windows_proof || prior.is_some(),
+        "Cannot verify this game's managed prefix; no prefix files were removed"
+    );
+    Ok(Some(identity))
+}
+
+fn marker_prefix_identity(
+    directory: &Path,
+    product_id: i64,
+    marker: &super::marker::InstallationMarker,
+) -> Result<Option<(u64, u64)>> {
+    ensure!(
+        marker.product_id == product_id
+            && directory.file_name().and_then(|name| name.to_str()) == Some(marker.slug.as_str()),
+        "Installation identity changed; reopen Uninstall"
+    );
+    let Some(compatibility) = &marker.compatibility else {
+        return Ok(None);
+    };
+    ensure!(
+        compatibility.managed_by_ludomere && compatibility.prefix_slug == marker.slug,
+        "The prefix is not owned exclusively by this game; no prefix files were removed"
+    );
+    prefix_identity(directory, product_id, true, false)
+}
+
+/// Worker-only preview: use the same marker and prefix ownership checks as execution.
+pub fn uninstall_prefix(game: &crate::domain::InstalledGame) -> Result<Option<PathBuf>> {
+    let marker = super::marker::load(&game.installation_directory)?
+        .context("Installation marker is missing; reopen Uninstall for recovery")?;
+    marker_prefix_identity(&game.installation_directory, game.product_id, &marker)?
+        .map(|_| managed_prefix_path(&game.installation_directory))
+        .transpose()
+}
+
+pub(super) fn begin_uninstall_prefix(
+    directory: &Path,
+    product_id: i64,
+    marker: &super::marker::InstallationMarker,
+) -> Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    let prefix = marker_prefix_identity(directory, product_id, marker)?;
+    if marker.compatibility.is_some() {
+        if let Some(guard) = receipt(directory, product_id)?.and_then(|record| record.setup_process)
+        {
+            super::dependency_setup::ensure_process_quiescent(&guard)?;
+        }
+        let metadata = open_directory(directory)?.metadata()?;
+        write_receipt(
+            directory,
+            product_id,
+            Some((metadata.dev(), metadata.ino())),
+            prefix,
+        )?;
+    }
+    Ok(prefix)
+}
+
+pub(super) fn remove_prefix(
+    directory: &Path,
+    expected: Option<(u64, u64)>,
+    cancelled: &AtomicBool,
+    session: u64,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    ensure!(
+        !cancelled.load(Ordering::Relaxed) && crate::online::account_session() == session,
+        "Prefix removal cancelled; review and retry Uninstall"
+    );
+    let prefix = managed_prefix_path(directory)?;
+    validate_prefix_locations(&prefix)?;
+    let parent = match open_directory(prefix.parent().unwrap()) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let opened = match open_child(&parent, prefix.file_name().unwrap(), true, true) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = opened.metadata()?;
+    ensure!(
+        expected == (metadata.dev(), metadata.ino()),
+        "The managed prefix was replaced; no prefix files were removed"
+    );
+    clear_directory(&opened, &prefix, &[], cancelled, session)?;
+    unlink(&parent, prefix.file_name().unwrap(), true)?;
+    Ok(true)
 }
 
 pub fn prepare_uninstall(
@@ -260,6 +565,9 @@ pub fn prepare_uninstall(
         });
     let mut directories = Vec::new();
     let mut identities = Vec::new();
+    let mut prefixes = Vec::new();
+    let mut prefix_identities = Vec::new();
+    let mut prefix_checks = Vec::new();
     let mut installed = None;
     for library in &config.game_libraries {
         let directory = library.path.join(slug);
@@ -394,12 +702,73 @@ pub fn prepare_uninstall(
             "Cannot verify ownership of {}; no files were removed",
             directory.display()
         );
+        let operation_plan = operation
+            .as_ref()
+            .map(|operation| match operation {
+                super::operation_journal::OperationJournal::Offline { record, .. } => {
+                    serde_json::from_str::<serde_json::Value>(&record.plan_json)
+                }
+                super::operation_journal::OperationJournal::Depot { record, .. } => {
+                    serde_json::from_str::<serde_json::Value>(&record.plan_json)
+                }
+            })
+            .transpose()?;
+        let compatibility = marker
+            .as_ref()
+            .and_then(|marker| marker.get("compatibility"))
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                operation_plan
+                    .as_ref()
+                    .and_then(|plan| {
+                        plan.pointer("/target_marker/compatibility")
+                            .or_else(|| plan.pointer("/game/compatibility"))
+                    })
+                    .filter(|value| !value.is_null())
+            });
+        if let Some(compatibility) = compatibility {
+            ensure!(
+                compatibility
+                    .get("prefix_slug")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(slug)
+                    && compatibility
+                        .get("managed_by_ludomere")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false),
+                "The prefix is not owned exclusively by this game; no prefix files were removed"
+            );
+        }
+        let platform = operation_plan
+            .as_ref()
+            .and_then(|plan| {
+                plan.pointer("/target_marker/base/operating_system")
+                    .or_else(|| plan.pointer("/game/installer_operating_system"))
+            })
+            .or_else(|| {
+                marker
+                    .as_ref()
+                    .and_then(|marker| marker.pointer("/base/operating_system"))
+            });
+        let native = compatibility.is_none()
+            && platform
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|os| os != "windows");
+        let prefix = prefix_identity(&directory, product_id, compatibility.is_some(), native)?;
+        if prefix.is_some() {
+            prefixes.push(managed_prefix_path(&directory)?);
+        }
         if !active
             && operation.is_none()
             && prior.is_none()
             && marker.is_some()
             && marker.as_ref().is_some_and(|value| {
-                serde_json::from_value::<super::marker::InstallationMarker>(value.clone()).is_ok()
+                serde_json::from_value::<super::marker::InstallationMarker>(value.clone())
+                    .is_ok_and(|marker| {
+                        marker.compatibility.is_none()
+                            || marker.source == crate::domain::InstallationSource::GalaxyDepot
+                            || prefix.is_some()
+                    })
             })
         {
             let games = super::reconcile_installed_products(
@@ -414,6 +783,8 @@ pub fn prepare_uninstall(
         }
         directories.push(directory);
         identities.push(metadata.map(|metadata| (metadata.dev(), metadata.ino())));
+        prefix_identities.push(prefix);
+        prefix_checks.push(!native);
     }
     if !active
         && directories.len() == 1
@@ -429,12 +800,15 @@ pub fn prepare_uninstall(
     Ok(UninstallPreparation::Recovery(GameResetPlan {
         product_id,
         directories,
+        prefixes,
         downloaded_files: downloads.count(),
         downloaded_bytes: downloads.bytes(),
         ids,
         config: config.clone(),
         slug: slug.to_owned(),
         identities,
+        prefix_identities,
+        prefix_checks,
         session: crate::online::account_session(),
     }))
 }
@@ -617,34 +991,16 @@ pub fn reset_game(
     );
     let permit = crate::operation_gate::try_acquire()
         .context("Another game's operation is using files. Pause it, then retry this recovery")?;
-    let config_path = crate::config::Config::path();
-    {
-        let parent = open_directory(
-            config_path
-                .parent()
-                .context("Configuration has no parent")?,
-        )?;
-        use std::io::Read;
-        let mut file = open_child(&parent, config_path.file_name().unwrap(), false, false)?;
-        ensure!(
-            file.metadata()?.is_file() && file.metadata()?.nlink() == 1,
-            "Unsafe configuration file"
-        );
-        let mut text = String::new();
-        file.by_ref()
-            .take(4 * 1024 * 1024 + 1)
-            .read_to_string(&mut text)?;
-        ensure!(
-            text.len() <= 4 * 1024 * 1024,
-            "Configuration exceeds its safety limit"
-        );
-        let current: crate::config::Config = toml::from_str(&text)?;
-        ensure!(
-            current.game_libraries == plan.config.game_libraries
-                && current.download_directory == plan.config.download_directory,
-            "Library or download locations changed; reopen Uninstall"
-        );
-    }
+    ensure!(
+        crate::config::Config::path().try_exists()?,
+        "Configuration changed; reopen Uninstall"
+    );
+    let current = read_config()?;
+    ensure!(
+        current.game_libraries == plan.config.game_libraries
+            && current.download_directory == plan.config.download_directory,
+        "Library or download locations changed; reopen Uninstall"
+    );
     let mut protected = Vec::new();
     // Download paths stay indexed and in place, even with a shared game/download root.
     for file in store.managed_files()? {
@@ -672,7 +1028,17 @@ pub fn reset_game(
     let mut result = GameResetResult::default();
     // Revalidate every preview identity before the first destructive operation. A worker may
     // have created a previously absent root while stopping; that needs a new confirmation.
-    for (path, identity) in plan.directories.iter().zip(&plan.identities) {
+    for (((path, identity), prefix), check_prefix) in plan
+        .directories
+        .iter()
+        .zip(&plan.identities)
+        .zip(&plan.prefix_identities)
+        .zip(&plan.prefix_checks)
+    {
+        if let Some(guard) = receipt(path, plan.product_id)?.and_then(|record| record.setup_process)
+        {
+            super::dependency_setup::ensure_process_quiescent(&guard)?;
+        }
         let actual = match open_directory(path) {
             Ok(directory) => {
                 let metadata = directory.metadata()?;
@@ -685,7 +1051,13 @@ pub fn reset_game(
             actual.is_none() || actual == *identity,
             "The game directory changed; reopen Uninstall to review it"
         );
-        write_receipt(path, plan.product_id, *identity)?;
+        let actual_prefix =
+            prefix_identity(path, plan.product_id, prefix.is_some(), !check_prefix)?;
+        ensure!(
+            actual_prefix.is_none() || actual_prefix == *prefix,
+            "The managed prefix changed; reopen Uninstall to review it"
+        );
+        write_receipt(path, plan.product_id, *identity, *prefix)?;
     }
     // Once the receipt is durable, remove runnable operation journals before payload deletion.
     // A crash must leave an explicit recovery offer, never an automatic installation replay.
@@ -716,6 +1088,21 @@ pub fn reset_game(
             completed_files: &job.completed_files,
             error: Some("Game recovery interrupted this download; remove or explicitly requeue it"),
         })?;
+    }
+    progress("Removing this game's managed prefix and its contained saves/settings…");
+    for (path, prefix) in plan.directories.iter().zip(&plan.prefix_identities) {
+        match remove_prefix(path, *prefix, cancelled, plan.session) {
+            Ok(true) => result.removed_prefixes += 1,
+            Ok(false) => {}
+            Err(error) => result.failures.push(format!(
+                "Managed prefix {} could not be removed: {error}. Review and retry Uninstall",
+                managed_prefix_path(path)?.display()
+            )),
+        }
+    }
+    if !result.failures.is_empty() {
+        result.retained_downloads = crate::download::managed_downloads(plan.product_id)?.count();
+        return Ok(result);
     }
     progress("Removing this game's installation files…");
     for (path, identity) in plan.directories.iter().zip(&plan.identities) {
@@ -805,7 +1192,7 @@ pub fn reset_game(
     Ok(result)
 }
 
-fn remove_control_file(path: &Path) -> Result<()> {
+pub(super) fn remove_control_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let parent = match open_directory(path.parent().context("Missing control parent")?) {
         Ok(parent) => parent,
@@ -864,6 +1251,281 @@ mod tests {
         }
     }
 
+    fn windows_marker(id: i64) -> super::super::marker::InstallationMarker {
+        serde_json::from_value(serde_json::json!({
+            "schema_version":2,"product_id":id,"slug":format!("recovery-{id}"),
+            "base":{"operating_system":"windows","installed_at":1},
+            "compatibility":{"backend":"umu","managed_by_ludomere":true,
+                "prefix_slug":format!("recovery-{id}"),"profile":crate::compatibility::UmuProfile::fallback()}
+        })).unwrap()
+    }
+
+    #[test]
+    fn native_marker_and_native_pending_journal_leave_old_prefix_untouched() {
+        for id in [910023, 910024] {
+            let (_temporary, config, directory) = fixture(id);
+            let prefix = managed_prefix_path(&directory).unwrap();
+            std::fs::create_dir_all(&prefix).unwrap();
+            crate::compatibility::write_ownership(&prefix, &format!("recovery-{id}")).unwrap();
+            std::fs::write(prefix.join("native-sentinel"), b"keep").unwrap();
+            if id == 910023 {
+                let mut marker = windows_marker(id);
+                marker.schema_version = 1;
+                marker.compatibility = None;
+                marker.base.operating_system = Some("linux".into());
+                super::super::marker::write(&marker, &directory).unwrap();
+                assert!(
+                    marker_prefix_identity(&directory, id, &marker)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                let journal = super::super::operation_journal::path(
+                    &config.game_libraries[0].path,
+                    &format!("recovery-{id}"),
+                )
+                .unwrap();
+                super::super::operation_journal::write_offline(&journal, &crate::state::InstallationOperationRecord {
+                    product_id: id, operation:"install".into(), state:"failed".into(),
+                    plan_json: serde_json::json!({"game":{"installation_directory":directory,"installer_operating_system":"linux","compatibility":null}}).to_string(),
+                    message:None, percentage:None, queue_position:None, created_at:1, updated_at:1, completed_at:None,
+                }).unwrap();
+            }
+            let snapshot = plan(&config, id);
+            assert!(snapshot.prefixes.is_empty());
+            let result = reset_game(snapshot, false, &AtomicBool::new(false), |_| {}).unwrap();
+            assert!(result.failures.is_empty(), "{:?}", result.failures);
+            assert_eq!(result.removed_prefixes, 0);
+            assert_eq!(
+                std::fs::read(prefix.join("native-sentinel")).unwrap(),
+                b"keep"
+            );
+        }
+    }
+
+    #[test]
+    fn vendor_guard_is_durable_before_spawn_and_blocks_uncertain_prefix_cleanup() {
+        let (_temporary, config, directory) = fixture(910025);
+        let prefix = managed_prefix_path(&directory).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(prefix.join("save"), b"keep until drained").unwrap();
+        begin_uninstall_prefix(&directory, 910025, &windows_marker(910025)).unwrap();
+        let error = run_prefix_uninstaller(
+            &directory,
+            910025,
+            &AtomicBool::new(false),
+            &directory.join("inert.log"),
+            || {
+                let record = receipt(&directory, 910025).unwrap().unwrap();
+                let guard = record.setup_process.as_ref().expect("armed before spawn");
+                assert!(guard.group.is_none());
+                assert!(super::super::dependency_setup::ensure_process_quiescent(guard).is_err());
+                anyhow::bail!("inert spawn failure")
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inert spawn failure"));
+        let mut record = receipt(&directory, 910025).unwrap().unwrap();
+        assert!(record.setup_process.is_none());
+        let current_boot = super::super::dependency_setup::boot_identity().unwrap();
+        for (boot, group) in [
+            (current_boot.clone(), None),
+            (current_boot.clone(), Some(0)),
+            ("invalid".into(), Some(2)),
+        ] {
+            record.setup_process =
+                Some(super::super::dependency_setup::SetupProcessGuard { boot, group });
+            persist_receipt(&record, true).unwrap();
+            assert!(
+                reset_game(
+                    plan(&config, 910025),
+                    false,
+                    &AtomicBool::new(false),
+                    |_| {}
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(prefix.join("save")).unwrap(),
+                b"keep until drained"
+            );
+        }
+        let other_boot = if current_boot.starts_with('0') {
+            "10000000-0000-0000-0000-000000000000"
+        } else {
+            "00000000-0000-0000-0000-000000000000"
+        };
+        record.setup_process = Some(super::super::dependency_setup::SetupProcessGuard {
+            boot: other_boot.into(),
+            group: None,
+        });
+        persist_receipt(&record, true).unwrap();
+        let result = reset_game(
+            plan(&config, 910025),
+            false,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert!(result.failures.is_empty());
+        assert!(!prefix.exists());
+    }
+
+    #[test]
+    fn prefix_receipt_survives_vendor_payload_removal_and_partial_cleanup() {
+        let (temporary, config, directory) = fixture(910020);
+        let prefix = managed_prefix_path(&directory).unwrap();
+        std::fs::create_dir_all(prefix.join("drive_c/users/player")).unwrap();
+        crate::compatibility::write_ownership(&prefix, "recovery-910020").unwrap();
+        let external = temporary.path().join("external-save");
+        std::fs::write(&external, b"keep").unwrap();
+        symlink(&external, prefix.join("drive_c/users/player/Documents")).unwrap();
+        symlink(&config.game_libraries[0].path, prefix.join("l:")).unwrap();
+        let other = prefix.with_file_name("other-game");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("keep"), b"other").unwrap();
+        let expected = begin_uninstall_prefix(&directory, 910020, &windows_marker(910020)).unwrap();
+        assert!(
+            receipt(&directory, 910020)
+                .unwrap()
+                .unwrap()
+                .prefix_identity
+                .is_some()
+        );
+        // Simulate a completed vendor removing the payload, followed by cancellation
+        // during cleanup. Neither vendor nor helper executables run in this fixture.
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            remove_prefix(
+                &directory,
+                expected,
+                &AtomicBool::new(true),
+                crate::online::account_session()
+            )
+            .is_err()
+        );
+        // A partial deletion may already have removed the ownership file.
+        std::fs::remove_file(prefix.join(".ludomere-managed.json")).unwrap();
+        let snapshot = plan(&config, 910020);
+        assert_eq!(snapshot.prefixes, vec![prefix.clone()]);
+        let result = reset_game(snapshot, false, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.removed_directories, 0);
+        assert_eq!(result.removed_prefixes, 1);
+        assert!(!prefix.exists());
+        assert!(!receipt_path(&directory).unwrap().exists());
+        assert_eq!(std::fs::read(external).unwrap(), b"keep");
+        assert_eq!(std::fs::read(other.join("keep")).unwrap(), b"other");
+        assert!(config.game_libraries[0].path.is_dir());
+    }
+
+    #[test]
+    fn prefix_identity_refuses_replacement_foreign_ownership_and_links() {
+        let (temporary, config, directory) = fixture(910021);
+        let prefix = managed_prefix_path(&directory).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        crate::compatibility::write_ownership(&prefix, "other-game").unwrap();
+        assert!(begin_uninstall_prefix(&directory, 910021, &windows_marker(910021)).is_err());
+        assert!(!receipt_path(&directory).unwrap().exists());
+        crate::compatibility::write_ownership(&prefix, "recovery-910021").unwrap();
+        let snapshot = plan(&config, 910021);
+        let old = prefix.with_file_name("saved-prefix");
+        std::fs::rename(&prefix, &old).unwrap();
+        std::fs::create_dir(&prefix).unwrap();
+        std::fs::write(prefix.join("foreign"), b"keep").unwrap();
+        assert!(reset_game(snapshot, false, &AtomicBool::new(false), |_| {}).is_err());
+        assert_eq!(std::fs::read(prefix.join("foreign")).unwrap(), b"keep");
+        std::fs::remove_dir_all(&prefix).unwrap();
+        symlink(temporary.path(), &prefix).unwrap();
+        assert!(prefix_identity(&directory, 910021, true, false).is_err());
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn absent_prefix_and_legacy_receipts_do_not_authorize_new_prefixes() {
+        let (_temporary, config, directory) = fixture(910022);
+        let snapshot = plan(&config, 910022);
+        assert!(snapshot.prefixes.is_empty());
+        let metadata = directory.metadata().unwrap();
+        write_receipt(
+            &directory,
+            910022,
+            Some((metadata.dev(), metadata.ino())),
+            None,
+        )
+        .unwrap();
+        let prefix = managed_prefix_path(&directory).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        crate::compatibility::write_ownership(&prefix, "recovery-910022").unwrap();
+        assert!(prepare_uninstall(&config, 910022, "recovery-910022").is_err());
+        assert!(reset_game(snapshot, false, &AtomicBool::new(false), |_| {}).is_err());
+        assert!(prefix.exists());
+        std::fs::remove_dir_all(&prefix).unwrap();
+        let result = reset_game(
+            plan(&config, 910022),
+            false,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert!(result.failures.is_empty());
+        assert_eq!(result.removed_prefixes, 0);
+    }
+
+    #[test]
+    fn offline_windows_without_prefix_offers_recovery_instead_of_vendor_execution() {
+        let (_temporary, config, directory) = fixture(910026);
+        super::super::marker::write(&windows_marker(910026), &directory).unwrap();
+        std::fs::write(directory.join("game.exe"), b"inert payload").unwrap();
+        std::fs::write(directory.join("unins000.exe"), b"never execute").unwrap();
+        let snapshot = plan(&config, 910026);
+        assert!(snapshot.prefixes.is_empty());
+        let result = reset_game(snapshot, false, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(result.failures.is_empty());
+        assert_eq!(result.removed_prefixes, 0);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn prefix_overlap_refuses_protected_downloads_libraries_profiles_and_proton() {
+        let (_temporary, mut config, directory) = fixture(910027);
+        let prefix = managed_prefix_path(&directory).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        crate::compatibility::write_ownership(&prefix, "recovery-910027").unwrap();
+        let sentinel = prefix.join("preserve");
+        std::fs::write(&sentinel, b"protected").unwrap();
+        let original = config.clone();
+        config.download_directory = prefix.join("downloads");
+        config.save().unwrap();
+        assert!(begin_uninstall_prefix(&directory, 910027, &windows_marker(910027)).is_err());
+        config = original.clone();
+        config.game_libraries.push(crate::config::GameLibrary {
+            id: "nested".into(),
+            name: "Nested".into(),
+            path: prefix.join("library"),
+            default: false,
+        });
+        config.save().unwrap();
+        assert!(prepare_uninstall(&config, 910027, "recovery-910027").is_err());
+        original.save().unwrap();
+        let preference_path = crate::identity::config_root().join("proton.json");
+        let saved = std::fs::read(&preference_path).ok();
+        std::fs::write(
+            &preference_path,
+            serde_json::json!({"default":prefix.join("Proton")}).to_string(),
+        )
+        .unwrap();
+        assert!(begin_uninstall_prefix(&directory, 910027, &windows_marker(910027)).is_err());
+        match saved {
+            Some(bytes) => std::fs::write(&preference_path, bytes).unwrap(),
+            None => std::fs::remove_file(&preference_path).unwrap(),
+        }
+        assert!(validate_prefix_locations(&crate::identity::config_root()).is_err());
+        assert!(validate_prefix_locations(&crate::identity::data_root()).is_err());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"protected");
+        assert!(!receipt_path(&directory).unwrap().exists());
+    }
+
     #[test]
     fn recovery_deletes_confirmed_residuals_without_following_links_or_erasing_profile() {
         let (temporary, config, directory) = fixture(910001);
@@ -872,6 +1534,7 @@ mod tests {
             .path
             .join(".ludomere/compatibility/recovery-910001");
         std::fs::create_dir_all(&prefix).unwrap();
+        crate::compatibility::write_ownership(&prefix, "recovery-910001").unwrap();
         std::fs::write(prefix.join("sentinel"), b"prefix").unwrap();
         std::fs::write(&outside, b"external save").unwrap();
         symlink(&outside, directory.join("linked-save")).unwrap();
@@ -891,7 +1554,8 @@ mod tests {
         assert_eq!(result.removed_directories, 1);
         assert!(!directory.exists());
         assert_eq!(std::fs::read(&outside).unwrap(), b"external save");
-        assert_eq!(std::fs::read(prefix.join("sentinel")).unwrap(), b"prefix");
+        assert!(!prefix.exists());
+        assert_eq!(result.removed_prefixes, 1);
         assert_eq!(
             std::fs::read(crate::config::Config::path()).unwrap(),
             config_before
@@ -903,7 +1567,13 @@ mod tests {
     fn recovery_receipt_preserves_explicit_retry_and_rejects_replaced_roots() {
         let (_temporary, config, directory) = fixture(910002);
         let metadata = directory.metadata().unwrap();
-        write_receipt(&directory, 910002, Some((metadata.dev(), metadata.ino()))).unwrap();
+        write_receipt(
+            &directory,
+            910002,
+            Some((metadata.dev(), metadata.ino())),
+            None,
+        )
+        .unwrap();
         std::fs::remove_file(directory.join("goggame-910002.info")).unwrap();
         let snapshot = plan(&config, 910002);
         assert!(reset_game(snapshot.clone(), false, &AtomicBool::new(true), |_| {}).is_err());
@@ -930,7 +1600,7 @@ mod tests {
         let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert!(read_json(&fifo).is_err());
-        write_receipt(&directory, 910003, None).unwrap();
+        write_receipt(&directory, 910003, None, None).unwrap();
         assert!(receipt(&directory, 910004).is_err());
     }
 

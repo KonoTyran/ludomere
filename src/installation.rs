@@ -24,6 +24,7 @@ mod patch;
 pub mod recovery;
 pub use recovery::{
     GameResetPlan, GameResetResult, UninstallPreparation, prepare_uninstall, reset_game,
+    uninstall_prefix,
 };
 pub mod runtime_logs;
 pub mod source_migration;

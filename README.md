@@ -131,9 +131,12 @@ DLC downloads while preserving installed payloads, saves and preferences. It app
 downloads are present. Uninstall remains available for partial, failed and active operations. Healthy
 idle installations keep their normal uninstall flow, with downloaded-file cleanup unchecked and
 performed only after successful uninstall. Recovery removal first stops affected work, then removes
-the exact game directories shown in its confirmation and resets operation state. This deletes
-untracked files and saves inside those directories; external saves, prefixes, playtime and
-preferences are kept. Downloaded installers and extras remain unless the unchecked cleanup option
+the exact game directories shown in its confirmation and resets operation state. Windows uninstall,
+including recovery removal, also deletes the game's verified managed prefix. The confirmation lists
+affected paths: saves and settings inside that prefix, and untracked files and saves inside removed
+game directories, are deleted. External saves, other games' prefixes, Proton/runtime files, playtime
+and Ludomere preferences are kept. Full profile reset continues to preserve installed games and their
+prefixes. Downloaded installers and extras remain unless the unchecked cleanup option
 is selected. Recovery can be cancelled, and unsafe paths or partial failures remain visible with a
 fresh review/retry action.
 

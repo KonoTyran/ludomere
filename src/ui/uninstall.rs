@@ -14,6 +14,7 @@ struct Preview {
     dialog: glib::WeakRef<adw::AlertDialog>,
     choice: RefCell<Option<UninstallPreparation>>,
     downloads: RefCell<Option<download::ManagedDownloads>>,
+    prefix: RefCell<Option<std::path::PathBuf>>,
     cleanup: gtk::CheckButton,
     description: gtk::Label,
     status: gtk::Label,
@@ -35,6 +36,7 @@ impl Preview {
         }
         self.choice.borrow_mut().take();
         self.downloads.borrow_mut().take();
+        self.prefix.borrow_mut().take();
         self.cleanup.set_active(false);
         self.cleanup.set_sensitive(false);
         self.retry.set_sensitive(false);
@@ -49,11 +51,17 @@ impl Preview {
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let result = crate::installation::prepare_uninstall(&config, id, &slug)
-                .map(|choice| {
+                .and_then(|choice| {
+                    let prefix = match &choice {
+                        UninstallPreparation::Normal(installed) => {
+                            crate::installation::uninstall_prefix(installed)?
+                        }
+                        UninstallPreparation::Recovery(_) => None,
+                    };
                     let downloads = matches!(&choice, UninstallPreparation::Normal(_)).then(|| {
                         download::managed_downloads(id).map_err(|error| format!("{error:#}"))
                     });
-                    (choice, downloads)
+                    Ok((choice, downloads, prefix))
                 })
                 .map_err(|error| format!("{error:#}"));
             let _ = sender.send(result);
@@ -75,11 +83,14 @@ impl Preview {
                     preview.busy.set(false);
                     preview.retry.set_sensitive(true);
                     match result {
-                        Ok((choice, downloads)) => {
+                        Ok((choice, downloads, prefix)) => {
                             match &choice {
                                 UninstallPreparation::Normal(installed) => {
                                     dialog.set_response_label("uninstall", "Uninstall");
-                                    preview.description.set_label(&format!("Remove the installed game from {}? Downloaded files are kept unless selected below.", installed.installation_directory.display()));
+                                    preview.description.set_label(&normal_description(
+                                        &installed.installation_directory,
+                                        prefix.as_deref(),
+                                    ));
                                     match downloads {
                                         Some(Ok(files)) => {
                                             preview.cleanup.set_sensitive(files.count() > 0);
@@ -91,15 +102,17 @@ impl Preview {
                                     }
                                 }
                                 UninstallPreparation::Recovery(plan) => {
-                                    preview
-                                        .description
-                                        .set_label(&recovery_description(&plan.directories));
+                                    preview.description.set_label(&recovery_description(
+                                        &plan.directories,
+                                        &plan.prefixes,
+                                    ));
                                     preview.cleanup.set_sensitive(true);
-                                    preview.status.set_label(&format!("{} recorded downloaded files ({}). If selected, files finishing while work stops are included. Prefixes, external saves, playtime and preferences are kept.", plan.downloaded_files, human_size(plan.downloaded_bytes)));
+                                    preview.status.set_label(&format!("{} recorded downloaded files ({}). If selected, files finishing while work stops are included. External saves, other games' prefixes, Proton/runtime files, playtime and Ludomere preferences are kept.", plan.downloaded_files, human_size(plan.downloaded_bytes)));
                                     dialog
                                         .set_response_label("uninstall", "Remove files and reset");
                                 }
                             }
+                            *preview.prefix.borrow_mut() = prefix;
                             *preview.choice.borrow_mut() = Some(choice);
                             dialog.set_response_enabled("uninstall", true);
                         }
@@ -137,19 +150,42 @@ impl Preview {
     }
 }
 
-fn recovery_description(paths: &[std::path::PathBuf]) -> String {
-    if paths.is_empty() {
+fn normal_description(directory: &std::path::Path, prefix: Option<&std::path::Path>) -> String {
+    let mut description = format!(
+        "Remove the installed game from {}? Downloaded files are kept unless selected below.",
+        directory.display()
+    );
+    if let Some(prefix) = prefix {
+        description.push_str(&format!(
+            "\n\nAlso permanently delete this managed Windows prefix, including all saves and settings INSIDE it:\n{}\n\nExternal saves, other games' prefixes, Proton/runtime files, playtime and Ludomere preferences are kept.",
+            prefix.display()
+        ));
+    }
+    description
+}
+
+fn recovery_description(paths: &[std::path::PathBuf], prefixes: &[std::path::PathBuf]) -> String {
+    let mut description = if paths.is_empty() {
         "Stop this game's downloads/install operations and reset their state? There is no verified game directory to remove. Downloaded installers and extras are kept unless selected below.".into()
     } else {
         format!(
-            "Stop this game's downloads/install operations, delete all remaining files in the following game directories, and reset operation state? This includes untracked files and saves stored INSIDE these directories. Prefixes and saves OUTSIDE them are kept. Downloaded installers and extras are kept unless selected below.\n\n{}",
+            "Stop this game's downloads/install operations, delete all remaining files in the following game directories, and reset operation state? This includes untracked files and saves stored INSIDE these directories. Downloaded installers and extras are kept unless selected below.\n\nGame directories:\n{}",
             paths
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join("\n")
         )
+    };
+    if !prefixes.is_empty() {
+        description.push_str(&format!(
+            "\n\nAlso permanently delete the following managed Windows prefixes, including all saves and settings INSIDE them. Saves OUTSIDE the listed game directories and prefixes are kept.\n\nWindows prefixes:\n{}",
+            prefixes.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("\n")
+        ));
+    } else {
+        description.push_str("\n\nSaves OUTSIDE the listed game directories are kept.");
     }
+    description
 }
 
 pub(super) fn show_uninstall_dialog(
@@ -205,6 +241,7 @@ pub(super) fn show_uninstall_dialog(
         dialog: dialog.downgrade(),
         choice: RefCell::new(None),
         downloads: RefCell::new(None),
+        prefix: RefCell::new(None),
         cleanup,
         description,
         status,
@@ -273,6 +310,7 @@ fn queue_normal(preview: Rc<Preview>, installed: crate::domain::InstalledGame) {
             None
         };
         let config = preview.model.borrow().config.clone();
+        let reviewed_prefix = preview.prefix.borrow().clone();
         let slug = preview.game.slug.clone();
         let session = online::account_session();
         let (sender, receiver) = mpsc::channel();
@@ -291,6 +329,10 @@ fn queue_normal(preview: Rc<Preview>, installed: crate::domain::InstalledGame) {
                 anyhow::ensure!(
                     fresh.installation_directory == installed.installation_directory,
                     "Installation location changed; review removal again"
+                );
+                anyhow::ensure!(
+                    crate::installation::uninstall_prefix(&fresh)? == reviewed_prefix,
+                    "Windows prefix location changed; review removal again"
                 );
                 anyhow::ensure!(
                     online::account_session() == session,
@@ -470,11 +512,13 @@ fn run_recovery(preview: Rc<Preview>, plan: crate::installation::GameResetPlan) 
                     let failed = !matches!(&result, Ok(result) if result.failures.is_empty());
                     let message = match result {
                         Ok(result) if result.failures.is_empty() => format!(
-                            "Removal finished. {} game directories removed; {} downloaded files kept.",
-                            result.removed_directories, result.retained_downloads
+                            "Removal finished. {} game directories and {} Windows prefixes removed; {} downloaded files kept.",
+                            result.removed_directories,
+                            result.removed_prefixes,
+                            result.retained_downloads
                         ),
                         Ok(result) => notifications::failure_message(
-                            "Removal was only partially completed. Review the remaining state before retrying.",
+                            "Removal was only partially completed. Some game or prefix files may remain. Review the remaining state before retrying.",
                             &result.failures.join("\n"),
                         ),
                         Err(error) => notifications::failure_message(
@@ -511,18 +555,41 @@ fn run_recovery(preview: Rc<Preview>, plan: crate::installation::GameResetPlan) 
 mod tests {
     use super::*;
     #[test]
+    fn normal_warning_only_names_authoritative_windows_prefix() {
+        let directory = std::path::Path::new("/games/Game");
+        let prefix = std::path::Path::new("/games/.ludomere/compatibility/Game");
+        let message = normal_description(directory, Some(prefix));
+        assert!(message.contains(&prefix.display().to_string()));
+        assert!(message.contains("all saves and settings INSIDE"));
+        assert!(message.contains("External saves"));
+        assert!(message.contains("kept unless selected"));
+        assert!(!normal_description(directory, None).contains("prefix"));
+    }
+    #[test]
     fn recovery_warning_identifies_exact_scope_and_in_directory_save_loss() {
-        let message = recovery_description(&["/games/Gungeon".into(), "/other/Game".into()]);
+        let message = recovery_description(
+            &["/games/Gungeon".into(), "/other/Game".into()],
+            &["/games/.ludomere/compatibility/Gungeon".into()],
+        );
         for required in [
             "/games/Gungeon",
             "/other/Game",
             "untracked",
             "INSIDE",
             "OUTSIDE",
+            "Windows prefixes:",
+            "/games/.ludomere/compatibility/Gungeon",
+            "all saves and settings INSIDE",
             "kept unless selected",
         ] {
             assert!(message.contains(required), "{required}");
         }
-        assert!(recovery_description(&[]).contains("no verified game directory"));
+        assert!(!message.contains("Prefixes and saves OUTSIDE"));
+        let prefix_only =
+            recovery_description(&[], &["/games/.ludomere/compatibility/Gungeon".into()]);
+        assert!(prefix_only.contains("no verified game directory"));
+        assert!(prefix_only.contains("permanently delete"));
+        assert!(prefix_only.contains("/games/.ludomere/compatibility/Gungeon"));
+        assert!(!recovery_description(&[], &[]).contains("Windows prefixes:"));
     }
 }

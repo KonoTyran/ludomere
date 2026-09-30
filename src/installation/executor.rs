@@ -323,27 +323,22 @@ fn run_depot_uninstallation(
     }
     reject_symlink_path(directory)?;
     let journal = super::depot::operation_staging_path(library, directory, &marker.slug, "")?;
-    let prefix = marker
-        .compatibility
-        .filter(|compatibility| compatibility.managed_by_ludomere)
-        .map(|compatibility| {
-            crate::compatibility::prefix_path(library, &compatibility.prefix_slug)
-        });
-    if let Some(prefix) = prefix.as_deref() {
-        reject_symlink_path(prefix)?;
-    }
     if cancellation.load(Ordering::Acquire) {
         bail!("uninstallation cancelled");
     }
+    let session = crate::online::account_session();
+    let prefix = super::recovery::begin_uninstall_prefix(directory, product_id, &marker)?;
+    super::recovery::remove_prefix(directory, prefix, cancellation, session)
+        .context("Managed prefix removal failed; review and retry Uninstall")?;
     if directory.exists() {
         fs::remove_dir_all(directory)?;
-    }
-    if let Some(prefix) = prefix.filter(|path| path.exists()) {
-        fs::remove_dir_all(prefix)?;
     }
     super::depot_actions::remove_support_staging(&journal)?;
     if journal.exists() {
         fs::remove_file(journal)?;
+    }
+    if marker.compatibility.is_some() {
+        super::recovery::remove_control_file(&super::recovery::receipt_path(directory)?)?;
     }
     Ok(())
 }
@@ -373,34 +368,53 @@ fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -
         .parent()
         .context("installation has no library root")?;
     let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
+    let marker = super::marker::load(&game.installation_directory)?
+        .context("Windows installation marker is missing; reopen Uninstall for recovery")?;
+    anyhow::ensure!(
+        compatibility.prefix_slug == marker.slug,
+        "Windows prefix identity changed; reopen Uninstall"
+    );
+    let session = crate::online::account_session();
+    let prefix_identity = super::recovery::begin_uninstall_prefix(
+        &game.installation_directory,
+        game.product_id,
+        &marker,
+    )?;
     crate::compatibility::configure_library_drive(&prefix, library)
         .map_err(|e| anyhow::anyhow!(e))?;
     let log_path = uninstallation_log_path(game.product_id)?;
     let profile = crate::compatibility::profile_for_use(game.product_id, &compatibility.profile);
-    let mut process = backend.run_executable(CompatibilityRunRequest {
-        prefix,
-        profile,
-        executable: uninstaller.clone(),
-        arguments: Vec::new(),
-        working_directory: uninstaller.parent().map(PathBuf::from),
-        log_path,
-        background: false,
-    })?;
-    loop {
-        if cancellation.load(Ordering::Acquire) {
-            backend.stop(&mut process)?;
-            bail!("uninstallation cancelled")
-        }
-        if let Some(status) = process.try_wait()? {
-            if !status.success() {
-                bail!("Windows uninstaller exited unsuccessfully: {status}")
-            }
-            break;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
+    super::recovery::run_prefix_uninstaller(
+        &game.installation_directory,
+        game.product_id,
+        cancellation,
+        &log_path,
+        || {
+            Ok(backend.run_executable(CompatibilityRunRequest {
+                prefix,
+                profile,
+                executable: uninstaller.clone(),
+                arguments: Vec::new(),
+                working_directory: uninstaller.parent().map(PathBuf::from),
+                log_path: log_path.clone(),
+                background: false,
+            })?)
+        },
+    )?;
+    super::recovery::remove_prefix(
+        &game.installation_directory,
+        prefix_identity,
+        cancellation,
+        session,
+    )
+    .context(
+        "The game uninstaller finished, but its managed prefix remains. Review and retry Uninstall",
+    )?;
     super::marker::remove(&game.installation_directory)?;
     remove_empty_installation_directories(&game.installation_directory);
+    super::recovery::remove_control_file(&super::recovery::receipt_path(
+        &game.installation_directory,
+    )?)?;
     Ok(())
 }
 

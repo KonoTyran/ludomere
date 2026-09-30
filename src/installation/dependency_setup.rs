@@ -16,12 +16,12 @@ use std::{
 };
 
 #[derive(Serialize, Deserialize)]
-struct SetupProcessGuard {
-    boot: String,
-    group: Option<u32>,
+pub(super) struct SetupProcessGuard {
+    pub boot: String,
+    pub group: Option<u32>,
 }
 
-fn boot_identity() -> Result<String> {
+pub(super) fn boot_identity() -> Result<String> {
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     ensure!(
         valid_boot(boot.trim()),
@@ -48,6 +48,10 @@ pub(crate) fn ensure_setup_quiescent(record: &crate::state::DepotOperationRecord
     };
     let guard: SetupProcessGuard = serde_json::from_value(value.clone())
         .context("Invalid setup process guard; recovery must not delete files")?;
+    ensure_process_quiescent(&guard)
+}
+
+pub(super) fn ensure_process_quiescent(guard: &SetupProcessGuard) -> Result<()> {
     ensure!(
         valid_boot(&guard.boot)
             && guard

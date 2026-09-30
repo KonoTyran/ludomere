@@ -2,6 +2,66 @@
 
 Last meaningful update: 2026-09-30.
 
+## Current commit and PR update
+
+- P161 content checkpoint cleared by manager/P163: exact9 intended paths, unchanged verified
+  source, no untracked/generated/private artifacts, accurate complete R59 message. Fresh fork main
+  matches be82a43; staging/index check and normal authenticated fork push authorized. P162/P163
+  concise complete PR review remains pending. Final outcomes verified by remote refs/API readback.
+
+- User authorizes R59 commit/push then a shorter complete PR description covering every feature
+  and fix. P161 acquisition publication, P162 compatibility PR audit/draft/update, P163 security
+  independent content/coverage review. Verify live PR6/base/head before mutation; no new code,
+  package or repeated tests. Existing R59 exact-final evidence remains valid.
+
+## Prefix removal on uninstall
+
+- Final disposition: R59/P158–P160 complete for scoped local assurance, independent PASS. Healthy
+  and incomplete Windows uninstall remove exact managed prefixes with contained saves/settings;
+  confirmation lists scope and optional downloads remain separate. Partial failure/payload-gone
+  retry retains identity, unsafe ownership/overlap refuses, vendor process guard prevents deletion
+  while writers may survive. Native behavior, durable preferences and profile reset are unchanged.
+  Manager reviewed all reports/source/logs and actual screenshots:19 focused tests and final
+  fmt/Clippy/debug/diff pass. Physical missing-prefix checked recovery also passes with no prefix
+  creation/execution; exact source-copy hashes match. Private GUI/bus stopped, display lock absent.
+  No actual user data/vendor/game/runtime operation, full suite, package or publication. Changes
+  ready for cargo run; real vendor execution and broader original gates remain unverified.
+
+- Frozen candidate passes17 focused backend and2 UI tests, final fmt/all-target Clippy/debug/diff;
+  manager inspected owner report and exact logs. Final debug18:38:47UTC. Existing guard regression
+  uses only its owned harmless sleep process. No real game/helper or actual user-file operation.
+  P160 has closed source process/ownership concerns; final missing-prefix physical check and scoped
+  review disposition remain outstanding. No full suite/package/publication for this change.
+
+- Manager inspected13 recovery and1 healthy-Depot passing regressions and actual confirmation
+  screenshot. Offline Windows without a prefix now uses existing confirmed Recovery rather than
+  attempting impossible vendor execution. P160 physically verifies unchecked removal, protected
+  sentinels and permission failure→prefix-only retry after synthetic payload loss. Remaining
+  protected-root overlap refusal is necessary to retain configured downloads/libraries/profile/
+  runtime boundaries; owner implementing minimal pre-deletion checks before final verification.
+
+- P159 two focused confirmation tests and debug build pass; backend integration underway.
+  P160 found offline vendor failure/monitor errors could leave descendants after leader exit.
+  Approved narrow existing SetupProcessGuard reuse in recovery receipt, with proven drain before
+  deletion/recovery and conservative uncertain-process handling. Independent verification pending.
+
+- Manager reviewed P159 draft confirmation/README: exact prefix paths and contained-save/settings
+  loss are explicit, downloads remain opt-in, worker preview rechecks prefix before enqueue.
+  P160 prepared private GUI sentinel fixtures with execution traps. Backend integration and
+  destructive/payload-gone retry regressions remain in progress; no actual user data touched.
+
+- Backend inspection confirms inconsistent paths: normal Depot already attempts prefix removal,
+  Windows offline and recovery retain it. Approved minimal anchored cleanup plus existing-receipt
+  prefix identity to preserve safe partial-failure/payload-gone retry; no new store/schema. P159
+  updates exact-target confirmation/counts and README, P160 independently checks destructive bounds.
+
+- R59 supersedes prefix retention specifically for confirmed uninstall/incomplete-game removal.
+  P158 acquisition backend, P159 compatibility UI/docs, P160 security independent review. User's
+  explicit direction settles deletion choice; confirmation must explain prefix-contained saves.
+  Other game/runtime/external-save/preferences and profile-reset behavior remain unchanged.
+- Prior P157 complete: be82a43 pushed normally to fork main; local/remote refs matched and tree
+  was clean. No publication requested for this new change; only disposable fixtures may be deleted.
+
 ## Current publication
 
 - Final content checkpoint: manager and independent P157 review clear exactly35 intended paths,

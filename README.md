@@ -25,6 +25,10 @@ Completion refreshes the affected game's actions and library state without reope
 Transfer progress does not rescan downloaded files. If local-state inspection fails, Ludomere
 keeps the previous state and reports the error; use **Manage → Refresh local state** to retry. Uninstall checks the
 current downloaded files before offering optional cleanup, with a separate retry control.
+Displayed sizes and rates use decimal byte units (1 MB = 1,000,000 bytes).
+Installation and launch failures retain their full diagnostic text in Notifications, with sensitive
+URLs/credential fields redacted. **View error** expands the current game's failure, including a
+recovered installation failure, without switching to Downloads; Resume remains a separate action.
 
 For eligible Windows games, Download opens the source chooser with generation-two Depot builds
 first and confirms **Download and install**. Source metadata loads independently; a failed check

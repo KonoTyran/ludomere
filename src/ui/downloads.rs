@@ -227,9 +227,15 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
                     .any(|old| old.job_id == job.job_id && old.state != job.state)
                 {
                     let result = match job.state {
-                        DownloadState::Complete => Some("Download completed"),
-                        DownloadState::Failed => Some("Download failed; open Downloads to retry"),
-                        DownloadState::Paused => Some("Download paused"),
+                        DownloadState::Complete => Some("Download completed".to_owned()),
+                        DownloadState::Failed => Some(notifications::failure_message(
+                            "Download failed",
+                            job.error
+                                .as_deref()
+                                .or(job.status_message.as_deref())
+                                .unwrap_or("The download failed without further details."),
+                        )),
+                        DownloadState::Paused => Some("Download paused".to_owned()),
                         _ => None,
                     };
                     if let Some(result) = result {

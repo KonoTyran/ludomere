@@ -273,7 +273,7 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     changed_products.insert(snapshot.product_id);
                 }
                 crate::installation::InstallationManagerEvent::OperationCancelled(snapshot) => {
-                    outcomes.insert(snapshot.product_id, "Operation cancelled");
+                    outcomes.insert(snapshot.product_id, "Operation cancelled".to_owned());
                     changed_products.insert(snapshot.product_id);
                     terminal_products.insert(snapshot.product_id);
                 }
@@ -284,13 +284,16 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     changed_products.insert(product_id);
                     match &event {
                         crate::installation::InstallationEvent::Complete { .. } => {
-                            outcomes.insert(product_id, "Installed");
+                            outcomes.insert(product_id, "Installed".to_owned());
                         }
                         crate::installation::InstallationEvent::Cancelled => {
-                            outcomes.insert(product_id, "Installation cancelled");
+                            outcomes.insert(product_id, "Installation cancelled".to_owned());
                         }
-                        crate::installation::InstallationEvent::Failed(_) => {
-                            outcomes.insert(product_id, "Installation failed; see game details");
+                        crate::installation::InstallationEvent::Failed(error) => {
+                            outcomes.insert(
+                                product_id,
+                                notifications::failure_message("Installation failed", error),
+                            );
                         }
                         _ => {}
                     }
@@ -331,15 +334,18 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     changed_products.insert(product_id);
                     match &event {
                         crate::installation::UninstallationEvent::Complete => {
-                            outcomes.insert(product_id, "Uninstalled");
+                            outcomes.insert(product_id, "Uninstalled".to_owned());
                         }
                         crate::installation::UninstallationEvent::Cancelled => {
-                            outcomes.insert(product_id, "Uninstall cancelled");
+                            outcomes.insert(product_id, "Uninstall cancelled".to_owned());
                         }
-                        crate::installation::UninstallationEvent::Failed(_) => {
+                        crate::installation::UninstallationEvent::Failed(error) => {
                             outcomes.insert(
                                 product_id,
-                                "Uninstall or cleanup failed; see game details",
+                                notifications::failure_message(
+                                    "Uninstall or cleanup failed",
+                                    error,
+                                ),
                             );
                         }
                         _ => {}
@@ -374,9 +380,15 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     outcomes.insert(
                         snapshot.product_id,
                         match snapshot.state.as_str() {
-                            "complete" => "Depot operation completed",
-                            "cancelled" | "abandoned" => "Depot operation cancelled",
-                            _ => "Depot operation failed; see Downloads",
+                            "complete" => "Depot operation completed".to_owned(),
+                            "cancelled" | "abandoned" => "Depot operation cancelled".to_owned(),
+                            _ => notifications::failure_message(
+                                "Depot operation failed",
+                                snapshot
+                                    .error
+                                    .as_deref()
+                                    .unwrap_or("The operation failed without further details."),
+                            ),
                         },
                     );
                 }

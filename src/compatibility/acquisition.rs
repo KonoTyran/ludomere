@@ -396,7 +396,8 @@ fn receive_archive(
 ) -> Result<()> {
     ensure!(
         total.is_none_or(|size| size <= MAX_DOWNLOAD),
-        "Component archive exceeds 4 GiB"
+        "Component archive exceeds {}",
+        crate::domain::human_size(MAX_DOWNLOAD)
     );
     let mut target = OpenOptions::new()
         .write(true)
@@ -772,7 +773,11 @@ fn extract(
         expanded = expanded
             .checked_add(size)
             .context("Archive size overflow")?;
-        ensure!(expanded <= MAX_EXTRACTED, "Expanded archive exceeds 16 GiB");
+        ensure!(
+            expanded <= MAX_EXTRACTED,
+            "Expanded archive exceeds {}",
+            crate::domain::human_size(MAX_EXTRACTED)
+        );
         if kind.is_gnu_longname() || kind.is_gnu_longlink() || kind.is_pax_local_extensions() {
             ensure!(size <= 64 * 1024, "Archive extension metadata is too large");
             let mut body = String::new();
@@ -1018,6 +1023,20 @@ mod tests {
     fn archive_receiver_verifies_digest_size_and_cancellation() {
         let temp = tempfile::tempdir().unwrap();
         let expected = format!("{:x}", Sha256::digest(b"payload"));
+        assert_eq!(
+            receive_archive(
+                Cursor::new(b""),
+                Some(MAX_DOWNLOAD + 1),
+                &expected,
+                &temp.path().join("oversized"),
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err()
+            .to_string(),
+            "Component archive exceeds 4.3 GB"
+        );
+        assert!(!temp.path().join("oversized").exists());
         receive_archive(
             Cursor::new(b"payload"),
             Some(7),

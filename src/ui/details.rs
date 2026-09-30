@@ -320,6 +320,10 @@ pub(super) fn render_detail_page(
                         return;
                     }
                 }
+                if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                    status.hide();
+                }
+                let session = online::account_session();
                 let receiver = launch_with_components(&widgets.window, installed);
                 let button = primary_button.clone();
                 let action_group = action_group.clone();
@@ -331,6 +335,9 @@ pub(super) fn render_detail_page(
                 let activity_widgets = activity_widgets.clone();
                 let cloud_launch_status = cloud_launch_status.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
+                    if online::account_session() != session {
+                        return glib::ControlFlow::Break;
+                    }
                     match receiver.try_recv() {
                         Ok(
                             event @ (crate::installation::LaunchEvent::EnablementRequired {
@@ -418,7 +425,11 @@ pub(super) fn render_detail_page(
                         }
                         Ok(crate::installation::LaunchEvent::Failed(error)) => {
                             if let Some(status) = cloud_launch_status.borrow().as_ref() {
-                                status.hide();
+                                *status.failure.borrow_mut() = Some(
+                                    notifications::failure_message("", &error)
+                                        .trim_start()
+                                        .to_owned(),
+                                );
                             }
                             button.set_sensitive(true);
                             button.remove_css_class("operational-action");
@@ -428,12 +439,13 @@ pub(super) fn render_detail_page(
                                 primary_action.icon(),
                                 primary_action.label(),
                             );
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("Could not run game")
-                                .body(error)
-                                .build();
-                            dialog.add_response("close", "Close");
-                            dialog.present(Some(&window));
+                            show_status(
+                                &activity_widgets,
+                                &notifications::failure_message(
+                                    &format!("{}: Could not run game", detail.title),
+                                    &error,
+                                ),
+                            );
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -497,11 +509,12 @@ pub(super) fn render_detail_page(
             let play_current = gtk::Button::with_label("Play");
             play_current.add_css_class("flat");
             play_current.set_halign(gtk::Align::Fill);
-            let window = w.window.clone();
+            let widgets = w.clone_refs();
+            let title = game.title.clone();
             let action_popover = popover.clone();
             play_current.connect_clicked(move |_| {
                 action_popover.popdown();
-                launch_installed_game(&window, installed_game.clone());
+                launch_installed_game(&widgets, installed_game.clone(), &title);
             });
             actions.append(&play_current);
         }
@@ -560,7 +573,7 @@ pub(super) fn render_detail_page(
     };
     action_bar.append(&installation_status_panel(
         game.product_id,
-        &w.window,
+        w,
         (&download_button, &primary_actions, &cloud_launch_status),
         primary_action,
         installation_was_running,
@@ -1228,10 +1241,16 @@ fn set_primary_button_content(button: &gtk::Button, icon: &str, label: &str) {
     button.set_child(Some(&content));
 }
 
-fn launch_installed_game(window: &adw::ApplicationWindow, installed: crate::domain::InstalledGame) {
-    let receiver = launch_with_components(window, installed);
-    let window = window.clone();
+fn launch_installed_game(widgets: &Widgets, installed: crate::domain::InstalledGame, title: &str) {
+    let title = title.to_owned();
+    let session = online::account_session();
+    let receiver = launch_with_components(&widgets.window, installed);
+    let widgets = widgets.clone_refs();
+    let window = widgets.window.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if online::account_session() != session {
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(
                 event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
@@ -1250,12 +1269,13 @@ fn launch_installed_game(window: &adw::ApplicationWindow, installed: crate::doma
             }
             Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
             Ok(crate::installation::LaunchEvent::Failed(error)) => {
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Could not run game")
-                    .body(error)
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&window));
+                show_status(
+                    &widgets,
+                    &notifications::failure_message(
+                        &format!("{title}: Could not run game"),
+                        &error,
+                    ),
+                );
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1270,10 +1290,12 @@ struct CloudLaunchStatus {
     heading: gtk::Label,
     detail: gtk::Label,
     progress: gtk::ProgressBar,
+    failure: Rc<RefCell<Option<String>>>,
 }
 
 impl CloudLaunchStatus {
     fn show(&self, phase: crate::installation::CloudSyncPhase) {
+        self.failure.borrow_mut().take();
         self.heading.set_label(match phase {
             crate::installation::CloudSyncPhase::BeforeLaunch => "SYNCING CLOUD SAVES",
             crate::installation::CloudSyncPhase::AfterExit => "UPLOADING CLOUD SAVES",
@@ -1292,6 +1314,7 @@ impl CloudLaunchStatus {
     }
 
     fn hide(&self) {
+        self.failure.borrow_mut().take();
         self.panel.set_visible(false);
         self.progress.set_visible(false);
     }
@@ -1299,7 +1322,7 @@ impl CloudLaunchStatus {
 
 fn installation_status_panel(
     product_id: i64,
-    window: &adw::ApplicationWindow,
+    widgets: &Widgets,
     action_widgets: (
         &gtk::Button,
         &gtk::Box,
@@ -1310,6 +1333,7 @@ fn installation_status_panel(
     model: &Rc<RefCell<AppModel>>,
     refresh_after_install: Rc<dyn Fn()>,
 ) -> gtk::Box {
+    let window = &widgets.window;
     let (primary_action, action_group, cloud_launch_status) = action_widgets;
     let panel = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     panel.add_css_class("hero-install-status");
@@ -1317,10 +1341,13 @@ fn installation_status_panel(
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let heading = gtk::Label::new(None);
     heading.set_xalign(0.0);
+    heading.set_single_line_mode(true);
+    heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
     heading.add_css_class("hero-transfer-heading");
     text.append(&heading);
     let detail = gtk::Label::new(None);
     detail.set_xalign(0.0);
+    detail.set_single_line_mode(true);
     detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
     detail.set_max_width_chars(42);
     detail.add_css_class("hero-transfer-detail");
@@ -1330,11 +1357,47 @@ fn installation_status_panel(
     progress.add_css_class("hero-transfer-progress");
     text.append(&progress);
     panel.append(&text);
+    let view_error = gtk::Button::with_label("View error");
+    view_error.set_widget_name("installation-error-details");
+    view_error.set_visible(false);
+    view_error.set_valign(gtk::Align::Center);
+    panel.append(&view_error);
+    let failure = Rc::new(RefCell::new(None::<String>));
+    let account_epoch = model.borrow().account_epoch;
+    view_error.connect_clicked({
+        let window = window.clone();
+        let notifications = widgets.notifications.clone();
+        let heading = heading.clone();
+        let detail = detail.clone();
+        let model = model.clone();
+        move |_| {
+            let title = {
+                let state = model.borrow();
+                if state.account_epoch != account_epoch || state.logout_pending {
+                    return;
+                }
+                state
+                    .games
+                    .iter()
+                    .find(|game| game.product_id == product_id)
+                    .map(|game| game.title.clone())
+                    .unwrap_or_else(|| "Game".into())
+            };
+            notifications.show_message(
+                &window,
+                &notifications::failure_message(
+                    &format!("{title}: {}", heading.label()),
+                    &detail.label(),
+                ),
+            );
+        }
+    });
     *cloud_launch_status.borrow_mut() = Some(CloudLaunchStatus {
         panel: panel.clone(),
         heading: heading.clone(),
         detail: detail.clone(),
         progress: progress.clone(),
+        failure: failure.clone(),
     });
     let cancel = gtk::Button::from_icon_name("process-stop-symbolic");
     cancel.add_css_class("flat");
@@ -1469,6 +1532,10 @@ fn installation_status_panel(
     let action_visual = Rc::new(std::cell::Cell::new(0_u8));
     let depot_rate = Rc::new(RefCell::new(SmoothedTransferRate::default()));
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if model.borrow().account_epoch != account_epoch || model.borrow().logout_pending {
+            panel_for_poll.set_visible(false);
+            return glib::ControlFlow::Break;
+        }
         let normal_action = {
             let state = model.borrow();
             let parent = state
@@ -1480,6 +1547,15 @@ fn installation_status_panel(
         if panel_for_poll.root().is_none() {
             return glib::ControlFlow::Break;
         }
+        if let Some(error) = failure.borrow().as_ref() {
+            heading.set_label("LAUNCH FAILED");
+            detail.set_label(error);
+            panel_for_poll.set_visible(true);
+            progress.set_visible(false);
+            view_error.set_visible(true);
+            return glib::ControlFlow::Continue;
+        }
+        view_error.set_visible(false);
         if progress.is_visible() && !determinate.get() {
             progress.pulse();
         }
@@ -1529,11 +1605,16 @@ fn installation_status_panel(
                 "INSTALLATION PAUSED"
             });
             detail.set_label(
-                snapshot
-                    .error
-                    .as_deref()
-                    .unwrap_or("Resume this installation or cancel it to start over"),
+                notifications::failure_message(
+                    "",
+                    snapshot
+                        .error
+                        .as_deref()
+                        .unwrap_or("Resume this installation or cancel it to start over"),
+                )
+                .trim_start(),
             );
+            view_error.set_visible(snapshot.error.is_some());
             progress.set_visible(snapshot.download_total_bytes.is_some());
             if let Some(total) = snapshot.download_total_bytes {
                 progress.set_fraction(if total == 0 {
@@ -1718,8 +1799,9 @@ fn installation_status_panel(
                     .as_deref()
                     .or(failed.status_message.as_deref())
                     .unwrap_or("The download could not be completed");
-                detail.set_label(message);
-                detail.set_tooltip_text(Some(message));
+                let message = notifications::failure_message("", message);
+                detail.set_label(message.trim_start());
+                view_error.set_visible(true);
                 progress.set_visible(false);
                 determinate.set(false);
                 primary_action.set_sensitive(true);
@@ -1883,10 +1965,15 @@ fn installation_status_panel(
                 panel_for_poll.set_visible(true);
                 heading.set_label("INSTALLATION FAILED");
                 detail.set_label(
-                    error
-                        .as_deref()
-                        .unwrap_or("The installer exited with an error"),
+                    notifications::failure_message(
+                        "",
+                        error
+                            .as_deref()
+                            .unwrap_or("The installer exited with an error"),
+                    )
+                    .trim_start(),
                 );
+                view_error.set_visible(true);
                 progress.set_visible(false);
                 determinate.set(false);
                 primary_action.set_sensitive(true);
@@ -1908,10 +1995,15 @@ fn installation_status_panel(
                 panel_for_poll.set_visible(true);
                 heading.set_label("UNINSTALL FAILED");
                 detail.set_label(
-                    error
-                        .as_deref()
-                        .unwrap_or("The uninstaller exited with an error"),
+                    notifications::failure_message(
+                        "",
+                        error
+                            .as_deref()
+                            .unwrap_or("The uninstaller exited with an error"),
+                    )
+                    .trim_start(),
                 );
+                view_error.set_visible(true);
                 progress.set_visible(false);
                 determinate.set(false);
                 primary_action.set_sensitive(true);
@@ -2022,13 +2114,7 @@ fn parse_installation_progress(output: &str) -> Option<u8> {
 }
 
 fn format_transfer_rate(bytes_per_second: f64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    if bytes_per_second >= MIB {
-        format!("{:.1} MiB/s", bytes_per_second / MIB)
-    } else {
-        format!("{:.0} KiB/s", bytes_per_second / KIB)
-    }
+    format!("{}/s", human_size(bytes_per_second.max(0.0) as u64))
 }
 
 #[derive(Default)]
@@ -2711,8 +2797,12 @@ mod installation_progress_tests {
 
     #[test]
     fn formats_download_rates_for_the_install_status() {
-        assert_eq!(format_transfer_rate(512.0 * 1024.0), "512 KiB/s");
-        assert_eq!(format_transfer_rate(12.5 * 1024.0 * 1024.0), "12.5 MiB/s");
+        assert_eq!(format_transfer_rate(999.0), "999 B/s");
+        assert_eq!(format_transfer_rate(1000.0), "1.0 kB/s");
+        assert_eq!(format_transfer_rate(512.0 * 1024.0), "524.3 kB/s");
+        assert_eq!(format_transfer_rate(12_500_000.0), "12.5 MB/s");
+        assert_eq!(format_transfer_rate(1_000_000_000.0), "1.0 GB/s");
+        assert_eq!(format_transfer_rate(-1.0), "0 B/s");
     }
 
     #[test]

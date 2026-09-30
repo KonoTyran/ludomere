@@ -318,7 +318,10 @@ fn add_network_chunk<'a>(
 pub fn parse(bytes: &[u8]) -> Result<DepotManifest> {
     let json = if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
         if bytes.len() as u64 > MAX_EXPANDED {
-            bail!("depot manifest exceeds 64 MiB");
+            bail!(
+                "depot manifest exceeds {}",
+                crate::domain::human_size(MAX_EXPANDED)
+            );
         }
         bytes.to_vec()
     } else {
@@ -328,7 +331,10 @@ pub fn parse(bytes: &[u8]) -> Result<DepotManifest> {
             .read_to_end(&mut out)
             .context("decompress depot manifest")?;
         if out.len() as u64 > MAX_EXPANDED {
-            bail!("expanded depot manifest exceeds 64 MiB");
+            bail!(
+                "expanded depot manifest exceeds {}",
+                crate::domain::human_size(MAX_EXPANDED)
+            );
         }
         out
     };

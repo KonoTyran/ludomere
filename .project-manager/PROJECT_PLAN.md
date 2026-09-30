@@ -1,5 +1,67 @@
 # Project plan
 
+## P123 — Commit error presentation, decimal units and runtime fixes
+
+- User authorizes local commit with a useful message. Compatibility owns exact15-file inventory,
+  message and commit; security independently reviews staged scope/message. Status complete.
+- Include R39–R41 source/README/project records; preserve earlier committed history and exclude
+  generated artifacts/private logs. No new code, package operation, push or PR mutation. Existing
+  final390 unit/six integration/fmt/Clippy/debug and scoped GUI evidence remains applicable.
+- Acceptance: complete accurate message, reviewed explicit inventory, diff checks and clean local
+  commit result. Record user-confirmed Witcher launch without generalizing live acceptance.
+- Independent content/message review cleared exactly15 intended files. Local commit succeeded with
+  clean status; these closure records are included in that same commit. No push or new product edits.
+
+## P122 — Confirmed MSVC2019_x64 variant
+
+- R41 follow-up. Acquisition implements exact x64 mapping to existing vcrun2019 and extends
+  focused mixed-variant/coalescing regressions in manager.rs; security independently reviews.
+  Status complete for scoped local assurance. Same P120 isolation/authorization boundaries, no extra runtime families,
+  dependency changes or new UI. Required fmt/Clippy/test/debug; actual game remains user acceptance.
+- Exact x64 alias/deduplication/coalescing verified; final390 unit/six integration/fmt/Clippy/debug
+  pass. Manager reviewed source/reports/logs; independent /tmp/ludomere-p122-review.md PASS.
+
+## P120–P121 — Identified MSVC2019 Depot failure
+
+- R41/R39/R26. P120 acquisition owns narrow dependency mapping and meaningful regressions in
+  src/installation/manager.rs, minimal necessary compatibility validation and README if affected.
+  Verify primary Winetricks/UMU semantics first; no guessed aliases or unrelated runtime expansion.
+  P121 security independently reviews correctness, required-dependency enforcement and resume safety.
+  Status complete for scoped local assurance. Prior uncommitted P117–P119 changes preserved.
+- Acceptance: MSVC2019 requests supported runtime setup, keeps unknown requirements failing and
+  does not mark dependencies installed before success; regression and required fmt/Clippy/test pass.
+  Source/fixture assurance only; no real Witcher installation success claim.
+- Authorize scoped edits by P120, public primary-source reads, private HOME/allXDG/bus fixtures,
+  required checks/debug. No real profile/credentials/game/helper execution, package build/install,
+  commit/push/PR mutation or dependency edits. Stop for broader scope or unsafe runtime assumptions.
+  Return source references, changed paths, evidence and limits; root owns records.
+- Final mapping and tests confined to installation/manager.rs. Manager and P121 reviewed pinned
+  Winetricks semantics and source; exact final fmt/Clippy390 unit/six integration/debug checks pass.
+  Independent /tmp/ludomere-p121-review.md reports no scoped blocker. Actual runtime/game execution
+  remains user acceptance; prior-prefix/partial-runtime retry limitations were not expanded here.
+
+## P117–P119 — Readable installation failures and decimal units
+
+- R39/R40. P117 compatibility owns UI error ingress/no-navigation/readable notifications and
+  decimal formatting (domain.rs shared formatter plus UI), focused regressions/README. P118
+  acquisition traces backend error detail/sanitization/dependency mapping; investigate the Witcher
+  case, fix confirmed narrow propagation defects, propose necessary dependency-support changes
+  before implementation if identity/semantics cannot be established. P119 security independently
+  reviews and exercises real input/error paths. Status complete for scoped local assurance.
+- Acceptance: full sanitized native/Depot/launch failure visible/copyable without page change;
+  error-control clicks don't merely redirect to Downloads. Correct decimal boundary/rate displays;
+  existing background focus/account invariants retained. Do not suppress unsupported requirements.
+- Authorize scoped source/docs/tests, public primary-source investigation, private HOME/allXDG/
+  bus/Xvfb/local inert fixtures, required fmt/Clippy/test/debug. No real profile/account/credentials,
+  game/helper execution, dependency downloads/installations, package build, commit/push/PR mutation.
+  Owners coordinate APIs and return paths/evidence/limits; manager owns records, no product edits.
+- Final evidence: /tmp/ludomere-p117-report.md, /tmp/ludomere-p118-report.md and independent
+  /tmp/ludomere-p119-review.md. Manager inspected source, final checks and actual GUI screenshots.
+  Fmt/Clippy388 unit/six integration/debug and dedicated GTK regression pass. Physical full-copy,
+  persisted Depot recovery, no-navigation, account guard and corrected compact/control layout pass;
+  two scoped layout findings closed. Exact Witcher dependency remains unknown; mapping unchanged.
+  No real game/account/helper execution or new package/commit. Live acceptance remains P70.
+
 ## P116 — Upstream pull request
 
 - User explicitly requests a PR against upstream main with a clean Markdown inventory of all

@@ -51,6 +51,7 @@ impl Notifications {
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         root.set_valign(gtk::Align::Center);
         root.set_halign(gtk::Align::End);
+        compact.set_single_line_mode(true);
         compact.set_visible(false);
         root.append(compact);
         let button = gtk::Button::from_icon_name("notifications-symbolic");
@@ -133,37 +134,7 @@ impl Notifications {
                     return;
                 };
                 hover.popdown();
-                let dialog = adw::Dialog::builder()
-                    .title("Notifications")
-                    .content_width(640)
-                    .content_height(480)
-                    .build();
-                let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-                let header = adw::HeaderBar::new();
-                content.append(&header);
-                let hint = gtk::Label::new(Some(
-                    "Latest 200 notifications from this session. Live progress is not saved.",
-                ));
-                hint.set_wrap(true);
-                hint.set_margin_start(16);
-                hint.set_margin_end(16);
-                content.append(&hint);
-                let list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-                list.set_widget_name("notification-history");
-                list.set_margin_top(8);
-                list.set_margin_bottom(16);
-                list.set_margin_start(16);
-                list.set_margin_end(16);
-                render_history(&list, &history.borrow());
-                *modal_list.borrow_mut() = Some(list.downgrade());
-                let scroll = gtk::ScrolledWindow::builder()
-                    .hscrollbar_policy(gtk::PolicyType::Never)
-                    .vexpand(true)
-                    .child(&list)
-                    .build();
-                content.append(&scroll);
-                dialog.set_child(Some(&content));
-                dialog.present(Some(&window));
+                present_history(&window, &history, &modal_list);
             }
         });
         compact.connect_label_notify({
@@ -217,6 +188,90 @@ impl Notifications {
             render_history(&list, &self.history.borrow());
         }
     }
+
+    // Called only by a direct user action; background failures just update history.
+    pub fn show_message(&self, window: &adw::ApplicationWindow, message: &str) {
+        self.compact.set_label(message);
+        self.hover.popdown();
+        present_history(window, &self.history, &self.modal_list);
+    }
+}
+
+fn present_history(
+    window: &adw::ApplicationWindow,
+    history: &Rc<RefCell<History>>,
+    modal_list: &Rc<RefCell<Option<glib::WeakRef<gtk::Box>>>>,
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Notifications")
+        .content_width(640)
+        .content_height(480)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.append(&adw::HeaderBar::new());
+    let hint = gtk::Label::new(Some(
+        "Latest 200 notifications from this session. Live progress is not saved.",
+    ));
+    hint.set_wrap(true);
+    hint.set_margin_start(16);
+    hint.set_margin_end(16);
+    content.append(&hint);
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    list.set_widget_name("notification-history");
+    list.set_margin_top(8);
+    list.set_margin_bottom(16);
+    list.set_margin_start(16);
+    list.set_margin_end(16);
+    render_history(&list, &history.borrow());
+    *modal_list.borrow_mut() = Some(list.downgrade());
+    content.append(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&list)
+            .build(),
+    );
+    dialog.set_child(Some(&content));
+    dialog.present(Some(window));
+}
+
+pub(super) fn failure_message(context: &str, error: &str) -> String {
+    let mut redact_next = false;
+    let mut safe = String::new();
+    for part in error.split_inclusive(char::is_whitespace) {
+        let word = part.trim_end_matches(char::is_whitespace);
+        let whitespace = &part[word.len()..];
+        let lower = word.to_ascii_lowercase();
+        let key = lower.trim_start_matches(['\'', '"', '(', '{', '[']);
+        let credential = [
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "authorization",
+            "password",
+            "token",
+        ]
+        .iter()
+        .find_map(|key_name| {
+            key.strip_prefix(key_name)
+                .filter(|rest| rest.is_empty() || rest.starts_with(['=', ':', '\'', '"']))
+        });
+        if lower.contains("https://") || lower.contains("http://") {
+            safe.push_str("[URL redacted]");
+            redact_next = false;
+        } else if let Some(rest) = credential {
+            safe.push_str("[credential redacted]");
+            let value = rest.trim_matches(['=', ':', '\'', '"', ',', '}']);
+            redact_next = value.is_empty() || value == "bearer";
+        } else if redact_next {
+            safe.push_str("[redacted]");
+            redact_next = matches!(lower.as_str(), "=" | ":" | "bearer");
+        } else {
+            safe.push_str(word);
+        }
+        safe.push_str(whitespace);
+    }
+    format!("{context}\n{safe}")
 }
 
 fn render_history(list: &gtk::Box, history: &History) {
@@ -258,6 +313,82 @@ fn prepend_notification(list: &gtk::Box, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_details_keep_cause_chain_and_dependency_id_without_credentials() {
+        let reason = "Finalizing installation\nunsupported required GOG dependency: ExampleDependency2019_x64\npath /games/the_witcher_3/redist\nrequest=(https://example.invalid/redist?signed=URL_CANARY) access_token= TOKEN_CANARY\nAuthorization: Bearer AUTH_CANARY\nclient_secret=SECRET_CANARY\nCaused by: installer exit status 42";
+        for context in [
+            "The Witcher 3: Installation failed",
+            "The Witcher 3: Depot operation failed",
+            "The Witcher 3: Could not run game",
+        ] {
+            let result = failure_message(context, reason);
+            assert!(result.starts_with(context));
+            assert!(result.contains("ExampleDependency2019_x64"));
+            assert!(result.contains("/games/the_witcher_3/redist"));
+            assert!(result.contains("\nCaused by: installer exit status 42"));
+            assert!(!result.contains("CANARY"));
+        }
+        assert!(
+            !failure_message("Failed", "authorization=\"Bearer BEARER_CANARY\"").contains("CANARY")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, Xvfb and private D-Bus"]
+    fn full_failure_opens_only_on_user_action_and_keeps_current_page() {
+        adw::init().expect("private display required");
+        let app = adw::Application::builder()
+            .application_id("io.github.legendarylinux.Ludomere.ErrorTest")
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let page = gtk::Stack::new();
+        page.add_named(&gtk::Label::new(Some("Game details")), Some("details"));
+        page.add_named(&gtk::Label::new(Some("Downloads")), Some("downloads"));
+        page.set_visible_child_name("details");
+        content.append(&page);
+        let compact = gtk::Label::new(None);
+        let notifications = Notifications::new(&window, &compact);
+        content.append(&notifications.root);
+        window.set_content(Some(&content));
+        window.present();
+        let message = failure_message(
+            "The Witcher 3: Depot operation failed",
+            &format!(
+                "{}\nunsupported required GOG dependency: TerminalDependencyIdentifier",
+                "Diagnostic context. ".repeat(120)
+            ),
+        );
+        compact.set_label(&message);
+        assert_eq!(compact.label(), message);
+        assert_eq!(compact.layout().line_count(), 1);
+        assert_eq!(notifications.latest.label(), message);
+        assert!(window.visible_dialog().is_none());
+        assert_eq!(page.visible_child_name().as_deref(), Some("details"));
+        notifications.show_message(&window, &message);
+        assert!(window.visible_dialog().is_some());
+        assert_eq!(page.visible_child_name().as_deref(), Some("details"));
+        let list = notifications
+            .modal_list
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        let row = list.first_child().unwrap().downcast::<gtk::Box>().unwrap();
+        let text = row.first_child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert_eq!(text.label(), message);
+        assert!(text.is_selectable());
+        notifications.clear();
+        assert!(notifications.history.borrow().entries.is_empty());
+        assert_eq!(
+            list.first_child().unwrap().widget_name(),
+            "empty-notifications"
+        );
+        window.close();
+    }
 
     #[test]
     fn history_bounds_deduplicates_and_does_not_extend_repeated_status() {

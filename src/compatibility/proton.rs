@@ -158,7 +158,10 @@ fn read_bounded(path: &Path) -> std::io::Result<String> {
     let mut text = String::new();
     file.take(1024 * 1024 + 1).read_to_string(&mut text)?;
     if text.len() > 1024 * 1024 {
-        return Err(std::io::Error::other("Proton metadata exceeds 1 MiB"));
+        return Err(std::io::Error::other(format!(
+            "Proton metadata exceeds {}",
+            crate::domain::human_size(1024 * 1024)
+        )));
     }
     Ok(text)
 }

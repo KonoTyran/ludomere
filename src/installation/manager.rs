@@ -1755,8 +1755,15 @@ fn dependency_verbs(dependencies: &[String]) -> anyhow::Result<Vec<String>> {
             "MSVC2015" | "MSVC2015_x64" => {
                 verbs.insert("vcrun2015".into());
             }
+            "MSVC2019" | "MSVC2019_x64" => {
+                verbs.insert("vcrun2019".into());
+            }
             unknown => anyhow::bail!("unsupported required GOG dependency {unknown}"),
         }
+    }
+    // Winetricks' 2019 runtime covers 2015 too; installing both verbs conflicts.
+    if verbs.contains("vcrun2019") {
+        verbs.remove("vcrun2015");
     }
     Ok(verbs.into_iter().collect())
 }
@@ -3498,6 +3505,85 @@ mod tests {
             ]
         );
         assert!(dependency_verbs(&["FutureRuntime".into()]).is_err());
+    }
+
+    #[test]
+    fn msvc2019_satisfies_requested_2015_without_conflicting_verbs() {
+        assert_eq!(
+            dependency_verbs(&["MSVC2019".into()]).unwrap(),
+            ["vcrun2019"]
+        );
+        for dependencies in [
+            vec!["MSVC2019_x64"],
+            vec!["MSVC2019", "MSVC2019_x64"],
+            vec!["MSVC2015", "MSVC2019", "MSVC2015_x64", "MSVC2019"],
+            vec!["MSVC2019", "MSVC2015_x64", "MSVC2015"],
+            vec!["MSVC2015", "MSVC2015_x64", "MSVC2019_x64"],
+            vec!["MSVC2019_x64", "MSVC2015_x64", "MSVC2015"],
+        ] {
+            assert_eq!(
+                dependency_verbs(
+                    &dependencies
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
+                ["vcrun2019"]
+            );
+        }
+        assert_eq!(
+            dependency_verbs(&[
+                "MSVC2010".into(),
+                "MSVC2012".into(),
+                "MSVC2013".into(),
+                "MSVC2015".into(),
+                "MSVC2019".into(),
+                "DirectX".into()
+            ])
+            .unwrap(),
+            [
+                "d3dcompiler_43",
+                "d3dx9",
+                "vcrun2010",
+                "vcrun2012",
+                "vcrun2013",
+                "vcrun2019",
+                "xact",
+                "xinput"
+            ]
+        );
+        for unknown in ["FutureRuntime", "MSVC2019_unknown"] {
+            assert_eq!(
+                dependency_verbs(&["MSVC2019".into(), unknown.into()])
+                    .unwrap_err()
+                    .to_string(),
+                format!("unsupported required GOG dependency {unknown}")
+            );
+        }
+    }
+
+    #[test]
+    fn uncommitted_msvc2019_is_retried_after_first_install_failure() {
+        let mut target = marker(false);
+        target.dependencies = vec!["MSVC2019".into()];
+        let committed = dependency_commit_marker(&target, None);
+        assert!(committed.dependencies.is_empty());
+        assert_eq!(
+            changed_dependency_verbs(&committed.dependencies, &target.dependencies).unwrap(),
+            ["vcrun2019"]
+        );
+        // Resume preserves the old committed set until dependency setup succeeds.
+        let resumed = dependency_commit_marker(&target, Some(&committed));
+        assert_eq!(
+            changed_dependency_verbs(&resumed.dependencies, &target.dependencies).unwrap(),
+            ["vcrun2019"]
+        );
+        assert!(
+            changed_dependency_verbs(&target.dependencies, &target.dependencies)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

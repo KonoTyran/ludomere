@@ -2,6 +2,102 @@
 
 Last meaningful update: 2026-09-29.
 
+## Current commit and user acceptance
+
+- User confirms Witcher 3 now launches after MSVC2019/base+x64 mapping fixes, then authorizes a
+  local commit with useful message. P123 compatibility prepares the15-file source/README/records
+  inventory; security reviews. No new implementation, package, push or PR update requested.
+- Manager reviewed complete commit draft and explicit15-file inventory; independent source-content
+  review confirms intended source/README/records only. Prior exact-final checks remain applicable.
+  Final independent message clearance passed; exact15-file local commit succeeded with clean status.
+  These closure records are included in that same commit. No push, package or new product changes.
+- Live launch is confirmed for this game only. Other game/service/desktop gates remain P70;
+  no global Prototype ready declaration. Current final automated and independent evidence retained.
+
+## Identified MSVC2019 failure
+
+- P122 complete: MSVC2019_x64 shares vcrun2019, base/x64 deduplicate and2015 coalescing remains.
+  Manager reviewed final source, /tmp/ludomere-p122-report.md and390 unit/six integration/fmt/Clippy/
+  debug logs; independent /tmp/ludomere-p122-review.md PASS. Actual game execution remains untested.
+- User now confirms MSVC2019_x64 as the next rejected requirement. Reopen narrow follow-up P122
+  for exact architecture alias, already verified vcrun2019 x64 support and mixed-request deduplication.
+  Acquisition implements, security reviews. Preserve earlier uncommitted work and unknown refusal.
+- Complete: exact MSVC2019 maps to vcrun2019, coalescing any requested2015 runtime into2019.
+  Unknown identifiers still fail; no dependency source changes or forced replacement. Manager
+  reviewed diff and final fmt/all-target Clippy/390 unit/six integration/debug evidence; independent
+  P121 PASS (/tmp/ludomere-p121-review.md). Prior UI work unchanged. No real runtime/game execution,
+  package build, commit or PR mutation. User can retry Resume; actual installation remains P70.
+- User supplied exact dependency MSVC2019 for The Witcher 3: Wild Hunt — Remastered. P120
+  acquisition will verify runtime mapping and implement narrow correction; P121 security provides
+  independent review. Existing mapping stops at MSVC2015, explaining this specific rejection.
+  Prior error/decimal changes preserved; no actual user profile/game/dependency execution authorized.
+- P120 verifies upstream vcrun2019 supports2015–2019 and conflicts with vcrun2015; UMU forwards
+  selected verbs without an additional local allowlist. Narrow exact MSVC2019 mapping plus same-
+  request2015/2019 coalescing authorized. No speculative aliases, forced prefix replacement or
+  dependency patches. Independent review and final checks pending.
+- Narrow mapping implemented in installation/manager.rs; manager inspected exact diff. Regression
+  covers order/duplicates,2015 coalescing, unrelated dependencies, unknown refusal and uncommitted
+  dependency retry. P121 confirms current refusal precedes any dependency invocation. Pre-existing
+  UMU already-installed-verb and Winetricks prior-prefix conflicts remain possible after partial
+  setup; no forced replacement or broad recovery redesign authorized. Required checks underway.
+
+## Current installation error and units request
+
+- Final disposition: R39/R40/P117–P119 complete with no unresolved scoped QA/security finding.
+  Full sanitized errors retained in session notifications; View error exposes current/recovered
+  failures without navigation, compact previews stay one line and existing controls remain usable.
+  Sizes/rates use decimal1000 units with unchanged byte accounting/limits. README updated.
+- Manager reviewed owner/independent reports, exact-final logs and screenshots. Fmt, all-target
+  Clippy with warnings denied,388 unit/six integration tests/debug and dedicated GTK regression pass.
+  Physical native/Depot/launch errors, saved Depot recovery, full copy, plain text/redaction,
+  sign-out stale-result rejection and two corrected layout regressions pass. Independent report
+  /tmp/ludomere-p119-review.md; private processes stopped and inert execution traps untouched.
+  Exact Witcher dependency and actual game installation remain unverified; no mapping bypass/fix
+  claimed. No package rebuild, commit or PR mutation. No Prototype ready declaration; P70 remains.
+- R39/R40: user reports truncated unsupported-required-GOG-dependency failure for Witcher3 and
+  error navigation to uninformative Downloads, requests full alerts and decimal MB/etc. P117 UI/
+  format compatibility, P118 backend diagnosis acquisition, P119 independent security review.
+- Source already shows native failure monitor discards event detail for "see game details" and
+  shared human_size/rate formatters use binary units. Backend unsupported dependency path exists;
+  exact required identifier is not inferable from truncated screenshot. No real profile read.
+- CurrentHEAD57574b3 includes user's post-PR record commit; preserve it. No package rebuild or
+  upstream PR update requested for this task.
+- P118 traced failure to Windows Depot finalization dependency mapping; full unknown identifier
+  already persists in backend snapshot/journal. Native UI discards full reason; detailed/recovered
+  Depot presentation must expose saved text rather than redirect. No dependency bypass/addition
+  without exact ID/evidence. Backend byte-limit error copy coordinated for decimal presentation.
+- User clarified first Depot installation, edition unknown but no DLC listed. This does not reliably
+  identify required dependency/build. Existing saved failure must be inspectable after the UI fix.
+- P119 may inject synthetic native/Depot/launch failures in disposable source at pre-execution event
+  boundaries, with exact diff retained; no game/helper/dependency execution or real account access.
+- P118 complete checkpoint: full backend chain/log/journal error retained; no exact-ID Witcher
+  diagnosis or mapping change. Four backend size-limit messages use shared decimal formatting with
+  unchangedcaps; three meaningful archive/repository/dependency regressions pass. Manager read
+  /tmp/ludomere-p118-report.md; P117 UI is source of lost/hidden reason and owns fullerror ingress.
+- P117 retains detailed native/Depot errors in notification history and adds direct View error for
+  current/recovered hero failures, keeping Resume separate and avoiding automatic navigation/dialogs.
+  Shared sizes/rates use1000. Touched full-error ingress must sanitize credentials/URL queries while
+  preserving actionable causes; P119 reviews adversarial synthetic messages and actual controls.
+- P117 frozen checkpoint passes fmt, all-target Clippy with warnings denied,388 unit/six integration
+  tests and debug build; one new display-dependent error/history regression passes separately in
+  private Xvfb. Manager inspected source, /tmp/ludomere-p117-report.md and check logs. History now
+  retains full sanitized reasons; direct View error opens readable history for saved/current errors.
+  Decimal sizes/rates use1000 without changing backend limits. P119 physical-controls review pending.
+- P119 actual native failure retains full dependency/cause and removes synthetic credentials without
+  leaving Home. It exposed multiline errors expanding the compact footer vertically; P117 reopened
+  for a single-line preview while retaining full history/hover/modal. Independent recheck required.
+- P119 physical native/Depot/recovered-native View error and primary launch failure paths pass:
+  full1,883-character copy retains terminal cause/identifier and excludes synthetic secret/URL
+  canaries; no background modal/navigation. Root viewed full-modal and initial layout screenshots.
+  Two single-line preview corrections landed; final checks, saved Depot/stale-account and corrected
+  physical layout verification remain pending. No actual game/helper execution.
+- Corrected candidate passes exact required checks388 unit/six integrations/debug and GTK regression.
+  One existing shutdown-recovery test failed transiently, then passed isolated and full reruns;
+  evidence retained at /tmp/ludomere-p117-test-shutdown-failure.log, no speculative change.
+- P119 verifies persisted Depot journal recovery/full1,892-character copy and late launch failure
+  suppression after actual sign-out. Root final screenshot review identified possible right-edge
+  control crowding from View error; owners are checking baseline and narrow status-width correction.
+
 ## Current upstream PR request
 
 - Complete: https://github.com/KonoTyran/ludomere/pull/6 published open/non-draft against main,

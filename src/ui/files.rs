@@ -821,7 +821,12 @@ pub(super) fn activate_context_primary_action(
             }
             let receiver = launch_with_components(&widgets.window, installed);
             let window = widgets.window.clone();
+            let widgets = widgets.clone();
+            let session = online::account_session();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                if online::account_session() != session {
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(
                         event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
@@ -842,12 +847,13 @@ pub(super) fn activate_context_primary_action(
                     }
                     Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
                     Ok(crate::installation::LaunchEvent::Failed(error)) => {
-                        let dialog = adw::AlertDialog::builder()
-                            .heading("Could not run game")
-                            .body(error)
-                            .build();
-                        dialog.add_response("close", "Close");
-                        dialog.present(Some(&window));
+                        show_status(
+                            &widgets,
+                            &notifications::failure_message(
+                                &format!("{}: Could not run game", game.title),
+                                &error,
+                            ),
+                        );
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

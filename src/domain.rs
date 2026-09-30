@@ -600,16 +600,36 @@ fn platform_label(platforms: &Platforms) -> String {
 }
 
 pub fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn displays_decimal_bytes_without_changing_the_input() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (999, "999 B"),
+            (1000, "1.0 kB"),
+            (1024, "1.0 kB"),
+            (1_000_000, "1.0 MB"),
+            (1_048_576, "1.0 MB"),
+            (1_500_000, "1.5 MB"),
+            (1_000_000_000, "1.0 GB"),
+            (1_000_000_000_000, "1.0 TB"),
+        ] {
+            assert_eq!(super::human_size(bytes), expected);
+        }
     }
 }

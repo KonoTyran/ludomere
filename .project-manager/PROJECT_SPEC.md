@@ -1,5 +1,31 @@
 # Project specification
 
+## Identified Witcher 3 Depot dependency — 2026-09-29
+
+User supplied the complete error after R39:
+> The Witcher 3: Wild Hunt — Remastered: Depot operation failed
+> unsupported required GOG dependency MSVC2019
+
+- R41: Resolve the identified MSVC2019 dependency mapping in the existing Depot Windows setup
+  flow, using verified upstream runtime semantics. Preserve required-dependency refusal for unknown
+  identifiers and existing prefix/resume/commit behavior. No dependency source modification.
+- Follow-up confirmed by user: the next required identifier is MSVC2019_x64. Include this exact
+  architecture variant in R41, using the existing runtime's x64 support and deduplicated setup.
+- User subsequently reports: "The game does launch now." This is live Witcher 3 launch acceptance
+  after the dependency fixes, not acceptance of unrelated games or every service feature.
+
+## Installation errors and decimal download units — 2026-09-29
+
+> When a game installation fails, include full details in the alerts, don't redirect to downloads. Downloads didn't have any further information. When attempting to launch Witcher 3, I got a truncated error, which reads: "Installation Failed unsupported required GOG depe..." [Image #1]. Also, change the download units from MiB to MB, etc. Nobody wants to see Mibibytes or Mibibits.
+
+- R39: Preserve full actionable installation/launch failure details in readable alerts/notification
+  history; never redirect to Downloads on failure. Trace the reported unsupported-required-GOG-
+  dependency failure without guessing or bypassing necessary dependency checks. Use existing
+  notifications, readable/copyable text and session/privacy guards. Screenshot supplied in chat.
+- R40: Show download sizes and transfer rates using decimal byte units (kB/MB/GB/TB and per-second
+  equivalents), converting with1000 rather than relabeling binary magnitudes. Preserve byte-based
+  storage/accounting; no transfer/protocol changes.
+
 ## Package failure and Comet availability — 2026-09-29
 
 > The build failed. Also, based on the settings view, I think the Comet integration isn't functional. It may need to be compiled from source if there is no release available to download.

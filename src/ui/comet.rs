@@ -76,7 +76,7 @@ fn component_view(
             ), None),
             Err(_) => ("No downloadable release was offered. Reinstall Ludomere, or prepare development helpers for a source build.".into(), None),
         },
-        Some(Err(error)) => (format!("Could not check downloadable releases: {error}. Use Check for updates to retry."), None),
+        Some(Err(error)) => (format!("Could not check downloadable releases: {error}. Use Check for Updates to retry."), None),
     };
     let local_peers = match peer {
         Ok(Some(version)) => format!("Comet last reported version {version}."),
@@ -86,7 +86,7 @@ fn component_view(
     let peer_update = match releases.map(|updates| &updates.peers) {
         None => "Checking the published version…".into(),
         Some(Err(_)) => {
-            "Published version check unavailable; use Check for updates to retry.".into()
+            "Published version check unavailable; use Check for Updates to retry.".into()
         }
         Some(Ok(release)) => match peer.as_ref().ok().and_then(|version| version.as_deref()) {
             Some(installed)
@@ -127,7 +127,7 @@ fn version_message(available: &str, installed: Option<&str>) -> String {
 
 pub(super) fn comet_page(window: &adw::ApplicationWindow) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
-    page.set_title("GOG online services");
+    page.set_title("GOG Online Services");
     let group = adw::PreferencesGroup::new();
     group.set_title("Comet");
     group.set_description(Some("Comet provides GOG authentication, achievements and statistics for supported games. Unmodified Comet automatically downloads and updates its GOG peer libraries when used, according to its own update checks. Ludomere's startup and manual checks read version information only. Installing or updating Comet itself requires your confirmation."));
@@ -145,10 +145,11 @@ pub(super) fn comet_page(window: &adw::ApplicationWindow) -> adw::PreferencesPag
     release.set_use_markup(false);
     group.add(&installation);
     group.add(&release);
-    let check = gtk::Button::with_label("Check for updates");
+    let check = gtk::Button::with_label("Check for Updates");
     let update = gtk::Button::with_label("Update Comet…");
     update.set_visible(false);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_margin_top(8);
     actions.append(&check);
     actions.append(&update);
     group.add(&actions);

@@ -1,8 +1,36 @@
 # Project plan
 
+## P172–P173 — Proton Settings parity with onboarding
+
+- Complete for scoped local assurance. Manager reviewed P172/P173 reports, final source diffs,
+  five focused-test/check logs and actual Settings/GOG/wizard screenshots. Independent review reports
+  no open material finding; fixture stopped. Exact-final active-Cancel guard passed fmt/Clippy/debug.
+  P174 copy/spacing complete. P175 commit message/eight-path inventory and updated P171 PR body
+  approved; records frozen for normal push and verified PR readback. No broader readiness claim.
+
+- Owner implementation/checks complete; independent review closing. Five focused cases pass (Settings
+  GTK, wizard GTK, runtime metadata, two folder cases), fmt/all-target Clippy/debug/diff checks pass.
+  Final publication P175 acquisition follows reviewed report/frozen records; normal origin-main push
+  and PR6 update by security. No full suite/package. See /tmp/ludomere-p172-*.log.
+
+- P174/R63 acquisition owns exact GOG Online Services/Check for Updates copy and small top margin
+  in online-settings presentation only. No adjacent redesign; source review and combined formatting/
+  build suffice for copy/spacing. Coordinate distinct paths with compatibility; publish together.
+
+- R62 in progress. Compatibility owns Proton Settings/shared essential setup glue, scoped tests
+  and README; security independently reviews source and isolated controls, then updates the retained
+  PR draft. Root records only. Acceptance: automatic explicit saves, Custom-only chooser/last option,
+  always-visible Proton downloads, bottom runtime state with automatic checking and explicit missing
+  download; preserve saved choices, wizard, per-game semantics, cancellation and stale-result guards.
+- Authorize focused selector/runtime/setup tests, fmt/Clippy and debug build for isolated GTK review.
+  Private HOME/all XDG/bus/Xvfb and inert files only; coordinate fixture processes. No full suite,
+  package, live account/profile, real game/helper or real runtime payload. Minimal reuse, no schema/
+  backend changes. Publish only after owner/reviewer evidence is reviewed; P171 draft waits final push.
+
+
 ## P170–P171 — Publish onboarding wizard and update PR
 
-- In progress; user-authorized R60/R61 publication. P170 acquisition reviews and commits the six
+- P170 complete, P171 held for R62; user-authorized R60/R61 publication. P170 acquisition reviews and commits the six
   changed paths, pushes normally to verified origin main, and verifies remote HEAD. P171 security
   prepares a concise PR6 body retaining existing coverage, adds wizard/refinements, and publishes
   after push verification and manager review. Root owns records and release decision.

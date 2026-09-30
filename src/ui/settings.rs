@@ -311,7 +311,7 @@ pub(super) fn show_settings_page(
         ),
         (
             "comet",
-            "GOG online services",
+            "GOG Online Services",
             "network-server-symbolic",
             comet::comet_page(&settings_window).upcast::<gtk::Widget>(),
         ),

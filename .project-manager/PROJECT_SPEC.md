@@ -1,5 +1,22 @@
 # Project specification
 
+## Simplify Proton Settings — 2026-09-30
+
+Follow-up R63: Rename the Settings tab to "GOG Online Services" and its update button to
+"Check for Updates"; add a small margin above that button to separate it from Official Release.
+Include in the same current publication; no other Comet behavior change requested.
+
+User: "The Proton settings should get the same treatment as the onboarding. When the user changes
+the proton version there, set it as selected automatically. Only show the folder choice if custom
+is selected. Proton downloads should always be shown there. Include a section at the bottom for
+the Steam Runtime. Do this and run tests, then push and update the PR."
+- R62: Apply automatic explicit selection and conditional Custom picker to Proton Settings, retain
+  detected/saved choice and Custom-last behavior, keep Proton acquisition visible, and put Steam
+  Linux Runtime readiness/acquisition below it. Reuse the wizard's automatic checks and explicit
+  downloads, with errors and retry. Preserve per-game choices, onboarding, and prior preferences.
+- Focused tests and relevant validation now expressly authorized for this change, followed by
+  commit/push and PR6 update. No full suite, package, real account or game execution requested.
+
 ## Publish onboarding wizard — 2026-09-30
 
 User: "Commit and push, then update the PR to reflect the new additions." Publish the current

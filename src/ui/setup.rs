@@ -9,25 +9,6 @@ const STEPS: [&str; 5] = [
     "Verify Steam Linux Runtime",
 ];
 
-fn saved_proton(
-    product_id: Option<i64>,
-) -> anyhow::Result<crate::compatibility::ProtonInstallation> {
-    let preferences = crate::compatibility::proton_preferences()?;
-    let path = product_id
-        .and_then(|id| preferences.overrides.get(&id.to_string()))
-        .or(preferences.default.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("Select a Proton version before continuing."))?;
-    Ok(crate::compatibility::validate_proton(path)?)
-}
-
-fn runtime_readiness(product_id: Option<i64>) -> anyhow::Result<Option<bool>> {
-    let proton = saved_proton(product_id)?;
-    Ok(
-        crate::compatibility::acquisition::runtime_requirement(&proton.path)?
-            .map(|runtime| crate::compatibility::acquisition::runtime_ready(&runtime)),
-    )
-}
-
 fn validate_folder(path: &std::path::Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         path.is_absolute(),
@@ -143,6 +124,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         product_id,
         Some(active.clone()),
         Some(acquisition_busy.clone()),
+        false,
     );
     selection.set_title("Select Proton Version");
     selection.set_description(Some(if product_id.is_some() {
@@ -170,12 +152,6 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         .set_title("Verify Steam Linux Runtime");
     runtime_download.group.set_description(Some("Proton also needs a Steam Linux Runtime. If it has not been detected on your system, click the button below to download it."));
     runtime_page.add(&runtime_download.group);
-    let requirements = adw::PreferencesGroup::new();
-    let retry = gtk::Button::with_label("Retry runtime detection");
-    retry.set_widget_name("setup-runtime-retry");
-    retry.set_visible(false);
-    requirements.add(&retry);
-    runtime_page.add(&requirements);
     let status = gtk::Label::new(None);
     status.set_widget_name("setup-status");
     status.set_wrap(true);
@@ -285,75 +261,15 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         }
     });
     render();
-    let checking_runtime = Rc::new(Cell::new(false));
-    let runtime_generation = Rc::new(Cell::new(0u64));
-    let check_runtime: Rc<dyn Fn()> = Rc::new({
-        let active = active.clone();
-        let step = step.clone();
-        let checking = checking_runtime.clone();
-        let generation = runtime_generation.clone();
-        let button = runtime_download.runtime_button.clone();
-        let status = runtime_download.status.clone();
-        let retry = retry.clone();
-        move || {
-            if !active() || step.get() != 4 {
-                return;
-            }
-            let request = generation.get().wrapping_add(1);
-            generation.set(request);
-            checking.set(true);
-            button.set_sensitive(false);
-            retry.set_visible(false);
-            status.set_label("Looking for the required Steam Linux Runtime…");
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = sender.send(runtime_readiness(product_id));
-            });
+    let (check_runtime, checking_runtime) = proton::runtime_check(
+        product_id,
+        &runtime_download,
+        Rc::new({
             let active = active.clone();
             let step = step.clone();
-            let checking = checking.clone();
-            let generation = generation.clone();
-            let button = button.clone();
-            let status = status.clone();
-            let retry = retry.clone();
-            glib::timeout_add_local(Duration::from_millis(50), move || {
-                if !active() || step.get() != 4 || generation.get() != request {
-                    if generation.get() == request {
-                        checking.set(false);
-                    }
-                    return glib::ControlFlow::Break;
-                }
-                let result = match receiver.try_recv() {
-                    Ok(result) => result,
-                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(_) => Err(anyhow::anyhow!("Runtime detection stopped. Try again.")),
-                };
-                checking.set(false);
-                match result {
-                    Ok(Some(true)) => {
-                        status.set_label("Steam Linux Runtime found! You're all set!")
-                    }
-                    Ok(Some(false)) => {
-                        status.set_label("Click the button below to download the missing runtime.");
-                        button.set_sensitive(true);
-                    }
-                    Ok(None) => status
-                        .set_label("This Proton version does not require a Steam Linux Runtime."),
-                    Err(error) => {
-                        status.set_label(&format!(
-                            "Could not check the selected Proton runtime: {error}"
-                        ));
-                        retry.set_visible(true);
-                    }
-                }
-                glib::ControlFlow::Break
-            });
-        }
-    });
-    retry.connect_clicked({
-        let check = check_runtime.clone();
-        move |_| check()
-    });
+            move || active() && step.get() == 4
+        }),
+    );
     let components_busy: Rc<dyn Fn() -> bool> = Rc::new({
         let proton_busy = proton_download.busy.clone();
         let runtime_busy = runtime_download.busy.clone();
@@ -474,7 +390,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                                     }
                                 }
                             }
-                            saved_proton(product_id).map(|_| ())
+                            proton::saved_proton(product_id).map(|_| ())
                         })()
                     };
                     let _ = sender.send(result);
@@ -664,14 +580,14 @@ mod tests {
         }
         let manifest = proton.join("toolmanifest.vdf");
         std::fs::write(&manifest, "manifest {}").unwrap();
-        assert!(runtime_readiness(None).is_err());
+        assert!(proton::runtime_readiness(None).is_err());
         crate::compatibility::set_default_proton(&proton).unwrap();
         let preferences = crate::identity::config_root().join("proton.json");
         let original = std::fs::read(&preferences).unwrap();
         let modified = std::fs::metadata(&preferences).unwrap().modified().unwrap();
-        assert_eq!(runtime_readiness(None).unwrap(), None);
+        assert_eq!(proton::runtime_readiness(None).unwrap(), None);
         std::fs::write(&manifest, "manifest { require_tool_appid 4183110 }").unwrap();
-        assert_eq!(runtime_readiness(None).unwrap(), Some(false));
+        assert_eq!(proton::runtime_readiness(None).unwrap(), Some(false));
         let runtime = crate::compatibility::acquisition::runtime_requirement(&proton)
             .unwrap()
             .unwrap();
@@ -687,11 +603,11 @@ mod tests {
             std::fs::write(path, "inert metadata fixture").unwrap();
         }
         std::fs::create_dir_all(runtime.path.join("steamrt4_platform_fixture/files")).unwrap();
-        assert_eq!(runtime_readiness(None).unwrap(), Some(true));
+        assert_eq!(proton::runtime_readiness(None).unwrap(), Some(true));
         std::fs::remove_file(runtime.path.join(".installed.ok")).unwrap();
-        assert_eq!(runtime_readiness(None).unwrap(), Some(false));
+        assert_eq!(proton::runtime_readiness(None).unwrap(), Some(false));
         std::fs::write(&manifest, "manifest { require_tool_appid 999 }").unwrap();
-        assert!(runtime_readiness(None).is_err());
+        assert!(proton::runtime_readiness(None).is_err());
         assert_eq!(std::fs::read(&preferences).unwrap(), original);
         assert_eq!(
             std::fs::metadata(&preferences).unwrap().modified().unwrap(),

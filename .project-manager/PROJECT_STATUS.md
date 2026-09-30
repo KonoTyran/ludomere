@@ -4,6 +4,39 @@ Last meaningful update: 2026-09-30.
 
 ## Current publication
 
+- Final R62/R63 disposition: complete for scoped local assurance, independent P173 PASS with no
+  open material finding. Manager reviewed /tmp/ludomere-p172-report.md, /tmp/ludomere-p173-review.md,
+  final source/diff, focused test/check logs and Settings/GOG/wizard screenshots. Five focused cases,
+  fmt/all-target Clippy/debug/diff pass; final debug 18:00:47-0400 includes active-Cancel guard. Settings
+  autosave/custom/no-default, readiness/error/retry/cancel, preference preservation and wizard
+  suggested-first Next physically pass; private fixtures stopped. P168's prior uncompiled limitation
+  is superseded by this combined validation. No live payload/account/helper, full suite or package.
+- P175 eight-path commit and normal origin-main push authorized; P171 reviewed concise PR update
+  includes wizard, Settings parity, GOG copy/spacing and current verification while retaining previous
+  coverage. Records now frozen. Final SHA/remote/readback evidence will be in /tmp/ludomere-p175-report.md,
+  /tmp/ludomere-p171-report.md and user handoff, avoiding an extra records-only commit.
+
+- P172 owner checks pass: five focused cases including actual Settings/wizard GTK and runtime/folder
+  regressions, fmt, warnings-denied all-target Clippy, debug and diff check. P174 labels included.
+  P173 Settings control matrix passes; final wizard smoke/report pending. No full suite/package or
+  real downloads/helpers/account access. Logs: /tmp/ludomere-p172-{settings,wizard-selection,wizard-runtime,tests,fmt,clippy,build}.log.
+
+- P174/R63 source changes complete: Settings tab/page and update button capitalization, matching
+  retry text and 8px top margin on the action row. Manager reviewed the two-file diff; combined
+  validation/visual review follows with R62. Comet behavior unchanged. Report: /tmp/ludomere-p174-report.md.
+
+- P170 complete: wizard commit 3dcaf6edf4bb04c87571339c996bd06845b293e4 pushed to origin main;
+  local/remote refs matched and tree was clean. P171 concise PR draft reviewed but publication held
+  for the user's additional R62 Settings request. No tests/builds were run for this publication.
+- P172/P173 R62 in progress: compatibility implements automatic Settings Proton saves, Custom-only
+  chooser, always-visible Proton downloads and bottom Steam Linux Runtime; security independently
+  reviews relevant source/controls. User now requests focused tests, then push and PR update. Prior
+  no-test restriction remains historical for P168, not a prohibition on testing the new integration.
+- P173 initial isolated GUI checkpoint: saved default/full path appears without Apply or chooser;
+  Proton downloads remain visible with detected versions; runtime is the final section and shows
+  missing state. Opening Settings preserved preference bytes. Manager inspected both screenshots
+  under /tmp/ludomere-p86-qa-g_gu_cm4. Remaining transition/failure checks and owner tests pending.
+
 - P170/P171 in progress: user requests commit, push and PR6 update for R60/R61. Six modified paths
   reviewed; acquisition owns git publication, security owns concise PR additions, root owns records.
   No new checks requested or run; latest selector correction remains source-reviewed only. Earlier

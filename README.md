@@ -195,6 +195,12 @@ Heroic and Lutris Proton folders, and versions downloaded by Ludomere. This incl
 versions placed there by ProtonPlus. Choose folder supports other locations. External versions
 are used in place and are never installed, updated, or deleted by Ludomere's download manager.
 
+Selecting a version in Settings saves it automatically. Custom Proton Directory stays last and
+reveals the folder picker only when selected; discovery alone never changes the saved default.
+Proton downloads remain available below the selector. The bottom Steam Linux Runtime section
+checks the saved Proton on opening or changing it and after successful downloads, with an explicit
+download action only for a missing runtime. Detection and download errors remain retryable.
+
 Automatic selection prefers the newest stable GE-Proton, then UMU-Proton, then Valve Proton.
 The first automatically or manually chosen version becomes the saved application default;
 installing a newer version elsewhere does not change it. Game settings can override that default

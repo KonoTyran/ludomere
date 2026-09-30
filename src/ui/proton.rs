@@ -8,12 +8,190 @@ use std::{
     },
 };
 
+pub(super) fn saved_proton(
+    product_id: Option<i64>,
+) -> anyhow::Result<crate::compatibility::ProtonInstallation> {
+    let preferences = crate::compatibility::proton_preferences()?;
+    let path = product_id
+        .and_then(|id| preferences.overrides.get(&id.to_string()))
+        .or(preferences.default.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Select a Proton version before continuing."))?;
+    Ok(crate::compatibility::validate_proton(path)?)
+}
+
+pub(super) fn runtime_readiness(product_id: Option<i64>) -> anyhow::Result<Option<bool>> {
+    let proton = saved_proton(product_id)?;
+    Ok(
+        crate::compatibility::acquisition::runtime_requirement(&proton.path)?
+            .map(|runtime| crate::compatibility::acquisition::runtime_ready(&runtime)),
+    )
+}
+
+pub(super) fn runtime_check(
+    product_id: Option<i64>,
+    component: &ComponentGroup,
+    active: Rc<dyn Fn() -> bool>,
+) -> (Rc<dyn Fn()>, Rc<std::cell::Cell<bool>>) {
+    let retry = gtk::Button::with_label("Retry runtime detection");
+    retry.set_widget_name("runtime-retry");
+    retry.set_visible(false);
+    component.group.add(&retry);
+    let checking_runtime = Rc::new(std::cell::Cell::new(false));
+    let runtime_generation = Rc::new(std::cell::Cell::new(0u64));
+    let check_runtime: Rc<dyn Fn()> = Rc::new({
+        let active = active.clone();
+        let checking = checking_runtime.clone();
+        let generation = runtime_generation.clone();
+        let button = component.runtime_button.clone();
+        let status = component.status.clone();
+        let retry = retry.clone();
+        move || {
+            if !active() {
+                return;
+            }
+            let request = generation.get().wrapping_add(1);
+            generation.set(request);
+            checking.set(true);
+            button.set_sensitive(false);
+            retry.set_visible(false);
+            status.set_label("Looking for the required Steam Linux Runtime…");
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(runtime_readiness(product_id));
+            });
+            let active = active.clone();
+            let checking = checking.clone();
+            let generation = generation.clone();
+            let button = button.clone();
+            let status = status.clone();
+            let retry = retry.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if !active() || generation.get() != request {
+                    if generation.get() == request {
+                        checking.set(false);
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!("Runtime detection stopped. Try again.")),
+                };
+                checking.set(false);
+                match result {
+                    Ok(Some(true)) => {
+                        status.set_label("Steam Linux Runtime found! You're all set!")
+                    }
+                    Ok(Some(false)) => {
+                        status.set_label("Click the button below to download the missing runtime.");
+                        button.set_sensitive(true);
+                    }
+                    Ok(None) => status
+                        .set_label("This Proton version does not require a Steam Linux Runtime."),
+                    Err(error) => {
+                        status.set_label(&format!(
+                            "Could not check the selected Proton runtime: {error}"
+                        ));
+                        retry.set_visible(true);
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    retry.connect_clicked({
+        let check = check_runtime.clone();
+        move |_| check()
+    });
+    (check_runtime, checking_runtime)
+}
+
 pub(super) fn proton_page(window: &adw::ApplicationWindow) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Proton");
-    let (selection, refresh) = proton_selection_group(window, None);
-    page.add(&selection);
-    page.add(&acquisition_group(None, refresh, ComponentScope::All).group);
+    let closed = Rc::new(std::cell::Cell::new(false));
+    let active: Rc<dyn Fn() -> bool> = Rc::new({
+        let closed = closed.clone();
+        move || !closed.get()
+    });
+    let acquisition_busy = Rc::new(std::cell::Cell::new(false));
+    let selection = proton_selection_group_guarded(
+        window,
+        None,
+        Some(active.clone()),
+        Some(acquisition_busy.clone()),
+        true,
+    );
+    selection.group.set_description(Some("Choose the default Proton version for Windows games. Changes are saved automatically; individual games can use their own overrides."));
+    page.add(&selection.group);
+    let download = acquisition_group_guarded(
+        None,
+        selection.refresh.clone(),
+        ComponentScope::Proton,
+        acquisition_busy.clone(),
+        Some(selection.busy.clone()),
+    );
+    download.group.set_title("Download Proton");
+    download.group.set_description(Some("Browse and download Proton versions. A completed download becomes your saved default; existing installations are kept."));
+    page.add(&download.group);
+    let runtime = acquisition_group_guarded(
+        None,
+        selection.refresh.clone(),
+        ComponentScope::Runtime,
+        acquisition_busy.clone(),
+        Some(selection.busy.clone()),
+    );
+    runtime.group.set_title("Steam Linux Runtime");
+    runtime.group.set_description(Some("Check the runtime required by your saved Proton version. Missing runtimes are downloaded only when you request them."));
+    runtime.runtime_button.set_sensitive(false);
+    page.add(&runtime.group);
+    let (check_runtime, checking) = runtime_check(
+        None,
+        &runtime,
+        Rc::new({
+            let active = active.clone();
+            let selecting = selection.busy.clone();
+            move || active() && !selecting.get()
+        }),
+    );
+    page.connect_map({
+        let refresh = selection.refresh.clone();
+        let busy = selection.busy.clone();
+        let acquisition_busy = acquisition_busy.clone();
+        move |_| {
+            if !busy.get() && !acquisition_busy.get() {
+                refresh();
+            }
+        }
+    });
+    window.connect_close_request({
+        let closed = closed.clone();
+        let proton_cancel = download.cancelled.clone();
+        let runtime_cancel = runtime.cancelled.clone();
+        move |_| {
+            closed.set(true);
+            proton_cancel.store(true, Ordering::Release);
+            runtime_cancel.store(true, Ordering::Release);
+            glib::Propagation::Proceed
+        }
+    });
+    let weak_page = page.downgrade();
+    let mut was_selecting = true;
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if !active() || weak_page.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        selection.group.set_sensitive(!acquisition_busy.get());
+        download
+            .group
+            .set_sensitive(!selection.busy.get() && (!checking.get() || acquisition_busy.get()));
+        runtime.group.set_sensitive(!selection.busy.get());
+        if was_selecting && !selection.busy.get() && !acquisition_busy.get() {
+            check_runtime();
+        }
+        was_selecting = selection.busy.get();
+        glib::ControlFlow::Continue
+    });
     page
 }
 
@@ -21,7 +199,7 @@ pub(super) fn proton_selection_group(
     window: &adw::ApplicationWindow,
     product_id: Option<i64>,
 ) -> (adw::PreferencesGroup, Rc<dyn Fn()>) {
-    let selection = proton_selection_group_guarded(window, product_id, None, None);
+    let selection = proton_selection_group_guarded(window, product_id, None, None, false);
     (selection.group, selection.refresh)
 }
 
@@ -38,6 +216,7 @@ pub(super) fn proton_selection_group_guarded(
     product_id: Option<i64>,
     active: Option<Rc<dyn Fn() -> bool>>,
     acquisition_busy: Option<Rc<std::cell::Cell<bool>>>,
+    prompt_without_saved: bool,
 ) -> ProtonSelection {
     let automatic = active.is_some();
     let group = adw::PreferencesGroup::new();
@@ -180,6 +359,14 @@ pub(super) fn proton_selection_group_guarded(
                             .or(preferences.default.as_ref());
                         let mut entries = Vec::new();
                         let mut labels = Vec::new();
+                        if automatic
+                            && prompt_without_saved
+                            && saved.is_none()
+                            && product_id.is_none()
+                        {
+                            entries.push(None);
+                            labels.push("Select a Proton version".to_string());
+                        }
                         if product_id.is_some() {
                             entries.push(None);
                             labels.push("Use application default".to_string());
@@ -205,9 +392,13 @@ pub(super) fn proton_selection_group_guarded(
                             entries.push(None);
                             labels.push("Select a Proton version".into());
                         }
-                        let index = if product_id
-                            .is_some_and(|id| !preferences.overrides.contains_key(&id.to_string()))
-                            && (!automatic || saved.is_some())
+                        let index = if (automatic
+                            && prompt_without_saved
+                            && saved.is_none()
+                            && product_id.is_none())
+                            || (product_id.is_some_and(|id| {
+                                !preferences.overrides.contains_key(&id.to_string())
+                            }) && (!automatic || saved.is_some()))
                         {
                             0
                         } else {
@@ -346,8 +537,9 @@ pub(super) fn proton_selection_group_guarded(
                 browse.set_visible(custom);
                 if custom {
                     status.set_label("Choose a Proton directory. Your saved selection stays unchanged until a valid folder is selected.");
-                } else if let Some(path) = paths.borrow().get(selected.selected() as usize).cloned() {
-                    if path.is_some() || product_id.is_some() { save(path); }
+                } else if let Some(path) = paths.borrow().get(selected.selected() as usize).cloned()
+                    && (path.is_some() || product_id.is_some()) {
+                    save(path);
                 }
             }
         });
@@ -403,7 +595,9 @@ pub(super) fn proton_selection_group_guarded(
         match path {
             Some(Some(path)) => Ok(Some(path)),
             Some(None) if product_id.is_some() => Ok(None),
-            _ => anyhow::bail!("Select a Proton version or choose a valid custom directory before continuing."),
+            _ => anyhow::bail!(
+                "Select a Proton version or choose a valid custom directory before continuing."
+            ),
         }
     });
     ProtonSelection {
@@ -416,7 +610,6 @@ pub(super) fn proton_selection_group_guarded(
 }
 
 pub(super) enum ComponentScope {
-    All,
     Proton,
     Runtime,
 }
@@ -496,6 +689,7 @@ pub(super) fn acquisition_group_guarded(
     cancel.set_visible(false);
     group.add(&cancel);
     let cancelled = Arc::new(AtomicBool::new(false));
+    let alive = Rc::new(std::cell::Cell::new(true));
     let succeeded = Rc::new(std::cell::Cell::new(false));
     let component = ComponentGroup {
         group: group.clone(),
@@ -507,7 +701,11 @@ pub(super) fn acquisition_group_guarded(
     };
     group.connect_unrealize({
         let cancelled = cancelled.clone();
-        move |_| cancelled.store(true, Ordering::Release)
+        let alive = alive.clone();
+        move |_| {
+            alive.set(false);
+            cancelled.store(true, Ordering::Release);
+        }
     });
     cancel.connect_clicked({
         let cancelled = cancelled.clone();
@@ -540,8 +738,9 @@ pub(super) fn acquisition_group_guarded(
         let version = version.clone();
         let busy = busy.clone();
         let blocked = blocked.clone();
+        let alive = alive.clone();
         move |_| {
-            if busy.get() || blocked.as_ref().is_some_and(|busy| busy.get()) {
+            if !alive.get() || busy.get() || blocked.as_ref().is_some_and(|busy| busy.get()) {
                 return;
             }
             busy.set(true);
@@ -572,7 +771,12 @@ pub(super) fn acquisition_group_guarded(
             let cancel = cancel.clone();
             let version = version.clone();
             let busy = busy.clone();
+            let alive = alive.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                if !alive.get() {
+                    busy.set(false);
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(result) => {
                         busy.set(false);
@@ -618,7 +822,7 @@ pub(super) fn acquisition_group_guarded(
         }
     });
     let transfer: Rc<dyn Fn(Option<acquisition::Release>)> = Rc::new(move |release| {
-        if busy.get() || blocked.as_ref().is_some_and(|busy| busy.get()) {
+        if !alive.get() || busy.get() || blocked.as_ref().is_some_and(|busy| busy.get()) {
             return;
         }
         succeeded.set(false);
@@ -666,7 +870,12 @@ pub(super) fn acquisition_group_guarded(
         let refresh = refresh.clone();
         let busy = busy.clone();
         let succeeded = succeeded.clone();
+        let alive = alive.clone();
         glib::timeout_add_local(Duration::from_millis(100), move || {
+            if !alive.get() {
+                busy.set(false);
+                return glib::ControlFlow::Break;
+            }
             for update in progress_receiver.try_iter().take(32) {
                 let update: acquisition::DownloadProgress = update;
                 status.set_label(&format!(
@@ -896,6 +1105,142 @@ mod tests {
 
     #[test]
     #[ignore = "requires private HOME/all XDG, private D-Bus and Xvfb"]
+    fn settings_autosaves_explicit_choice_and_checks_saved_runtime_without_discovery_writes() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p172-")
+        );
+        let root =
+            PathBuf::from(std::env::var("HOME").unwrap()).join(".steam/root/compatibilitytools.d");
+        let versions = [root.join("GE-Proton-first"), root.join("GE-Proton-second")];
+        for path in &versions {
+            std::fs::create_dir_all(path.join("files/bin")).unwrap();
+            for name in ["proton", "files/bin/wine"] {
+                std::fs::write(path.join(name), "inert; never execute\n").unwrap();
+                std::fs::set_permissions(path.join(name), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            std::fs::write(path.join("toolmanifest.vdf"), "manifest {}").unwrap();
+        }
+        std::fs::write(
+            versions[0].join("toolmanifest.vdf"),
+            "manifest { require_tool_appid 4183110 }",
+        )
+        .unwrap();
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.legendarylinux.ludomere.ProtonSettingsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let page = proton_page(&window);
+        window.set_content(Some(&page));
+        window.present();
+        fn children(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                result.extend(children(&widget));
+                child = widget.next_sibling();
+            }
+            result
+        }
+        fn wait_until(condition: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(condition());
+        }
+        let widgets = children(page.upcast_ref());
+        let row = widgets
+            .iter()
+            .filter_map(|w| w.clone().downcast::<adw::ComboRow>().ok())
+            .find(|row| row.title() == "Proton version")
+            .unwrap();
+        let button = |title: &str| {
+            widgets
+                .iter()
+                .filter_map(|w| w.clone().downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(title))
+                .unwrap()
+        };
+        let runtime_button = widgets
+            .iter()
+            .filter_map(|widget| widget.clone().downcast::<gtk::Button>().ok())
+            .find(|button| {
+                button.is_visible() && button.label().as_deref() == Some("Download missing runtime")
+            })
+            .unwrap();
+        let has_text = |text: &str| {
+            widgets
+                .iter()
+                .filter_map(|w| w.clone().downcast::<gtk::Label>().ok())
+                .any(|label| label.label().contains(text))
+        };
+        wait_until(|| has_text("Select a Proton version before continuing"));
+        assert!(!crate::identity::config_root().join("proton.json").exists());
+        assert_eq!(row.selected(), 0);
+        assert!(!button("Choose folder…").is_visible());
+        assert!(!button("Use selected version").is_visible());
+        let choices = row.model().unwrap().downcast::<gtk::StringList>().unwrap();
+        assert_eq!(
+            choices.string(choices.n_items() - 1).unwrap(),
+            "Custom Proton Directory"
+        );
+        row.set_selected(1);
+        wait_until(|| has_text("Click the button below to download the missing runtime."));
+        assert_eq!(
+            compatibility::proton_preferences().unwrap().default,
+            Some(versions[0].clone())
+        );
+        assert!(runtime_button.is_sensitive());
+        assert!(
+            widgets
+                .iter()
+                .filter_map(|w| w.clone().downcast::<adw::PreferencesGroup>().ok())
+                .any(|group| group.title() == "Download Proton" && group.is_visible())
+        );
+        let groups: Vec<_> = widgets
+            .iter()
+            .filter_map(|w| w.clone().downcast::<adw::PreferencesGroup>().ok())
+            .collect();
+        assert_eq!(groups.last().unwrap().title(), "Steam Linux Runtime");
+        let second = (0..choices.n_items())
+            .find(|index| choices.string(*index).unwrap().contains("GE-Proton-second"))
+            .unwrap();
+        row.set_selected(second);
+        wait_until(|| has_text("does not require a Steam Linux Runtime"));
+        assert!(!runtime_button.is_sensitive());
+        row.set_selected(choices.n_items() - 1);
+        assert!(button("Choose folder…").is_visible());
+        assert_eq!(
+            compatibility::proton_preferences().unwrap().default,
+            Some(versions[1].clone())
+        );
+        std::fs::write(
+            versions[1].join("toolmanifest.vdf"),
+            "manifest { require_tool_appid 999 }",
+        )
+        .unwrap();
+        page.set_visible(false);
+        page.set_visible(true);
+        wait_until(|| has_text("unsupported Steam Linux Runtime"));
+        assert!(button("Retry runtime detection").is_visible());
+        assert!(!runtime_button.is_sensitive());
+        std::fs::write(versions[1].join("toolmanifest.vdf"), "manifest {}").unwrap();
+        button("Retry runtime detection").emit_clicked();
+        wait_until(|| has_text("does not require a Steam Linux Runtime"));
+        button("Refresh").emit_clicked();
+        window.close();
+        wait_until(|| app.windows().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, private D-Bus and Xvfb"]
     fn wizard_selection_only_saves_user_choices_and_restores_failed_choices() {
         assert!(
             std::env::var("HOME")
@@ -939,6 +1284,7 @@ mod tests {
                 move || active.get()
             })),
             None,
+            false,
         );
         window.set_content(Some(&selection.group));
         window.present();

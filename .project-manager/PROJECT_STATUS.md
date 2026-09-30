@@ -2,6 +2,25 @@
 
 Last meaningful update: 2026-09-29.
 
+## Current upstream PR request
+
+- Complete: https://github.com/KonoTyran/ludomere/pull/6 published open/non-draft against main,
+  head LegendaryLinux:main637c2b1. Manager/independent review verified complete Markdown coverage,
+  privacy and test/limit claims. API readback matches exact reviewed title/body and expected head.
+  No push, merge, extra comments or new commit. Local PLAN/STATUS coordination edits remain local.
+- User authorizes an upstream-main PR containing all implemented features and fixes in clean
+  Markdown. P116 compatibility drafts/creates, acquisition audits feature coverage, security
+  reviews claims/content. Current committed head637c2b1, fork LegendaryLinux/ludomere and upstream
+  KonoTyran/ludomere; fresh remote comparison and existing-PR check pending. No code changes planned.
+- Fresh HTTPS remote verification: upstream/main c9447f3, fork/main and localHEAD637c2b1;
+  zero upstream-only/three fork commits, no existing matching PR. Configured SSH unavailable,
+  remote configuration unchanged. Fork is already current; no push needed. Local coordination
+  edits remain outside the committed PR diff. Draft inventory/review underway.
+- P116 feature audit /tmp/ludomere-p116-feature-inventory.md complete; manager reviewed comprehensive
+  /tmp/ludomere-p116-pr-body.md and title. Includes all three commits, distinguishes existing Depot/
+  cloud engines, official Comet versus UMU adapter, cloud concurrency risk and honest validation
+  limits. Independent final description review pending before authorized publication.
+
 ## Current R38 commit request
 
 - User authorized local commit of build/Comet fixes with a helpful message. P115 compatibility

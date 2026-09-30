@@ -1,5 +1,20 @@
 # Project plan
 
+## P116 — Upstream pull request
+
+- User explicitly requests a PR against upstream main with a clean Markdown inventory of all
+  implemented features/fixes. Compatibility owns fresh remote comparison, PR draft and creation;
+  acquisition audits earlier feature inventory; security independently checks completeness/claims.
+  Status complete. Root manages review and local records only.
+- Target KonoTyran/ludomere main from LegendaryLinux/ludomere current committed branch. Verify
+  remotes and existing PRs, do not duplicate or push upstream. Fork push only if required for the
+  authorized PR; no force push, merge, code edits, package rebuild or new implementation commit.
+- Acceptance: accurate complete user-facing Markdown, validation and honest limits, reviewed
+  base/head and published PR URL. Current verified tests remain valid; no unnecessary reruns.
+- Published https://github.com/KonoTyran/ludomere/pull/6, open non-draft; main from
+  LegendaryLinux:main637c2b1. API readback matches reviewed title/body and branch scope. No push,
+  merge, additional comments or new commit; local coordination updates remain outside PR source.
+
 ## P115 — Commit package and Comet corrections
 
 - User authorized a local commit with a helpful message. Compatibility owns explicit seven-file

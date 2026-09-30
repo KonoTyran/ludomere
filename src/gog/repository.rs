@@ -28,9 +28,10 @@ pub fn parse(bytes: &[u8]) -> Result<GenerationTwoRepository> {
         );
     }
 
-    let repository: GenerationTwoRepository =
+    let mut repository: GenerationTwoRepository =
         serde_json::from_slice(&expanded).context("parsing generation-2 repository JSON")?;
     validate(&repository)?;
+    repository.setup_metadata_version = 1;
     Ok(repository)
 }
 
@@ -96,6 +97,15 @@ mod tests {
     #[test]
     fn parses_raw_repository_metadata() {
         let repository = parse(FIXTURE.as_bytes()).unwrap();
+        assert_eq!(repository.setup_metadata_version, 1);
+        assert_eq!(
+            repository.products[0].temp_executable.as_deref(),
+            Some("setup.exe")
+        );
+        assert_eq!(repository.products[0].temp_arguments.as_deref(), Some(""));
+        let cached: GenerationTwoRepository =
+            serde_json::from_str(&serde_json::to_string(&repository).unwrap()).unwrap();
+        assert_eq!(cached, repository);
         assert_eq!(repository.products.len(), 2);
         assert_eq!(repository.depots[1].product_id, "200");
         assert_eq!(repository.depots[0].languages, ["en-US"]);

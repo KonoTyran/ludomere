@@ -1,5 +1,141 @@
 # Project specification
 
+## Game verification and publication — 2026-09-30
+
+User confirms the existing Witcher 3 installation runs, BIT.TRIP Runner successfully runs, and
+Coffee Talk was downloaded and runs. This accepts those reported game paths, including the
+BIT.TRIP certificate/dependency retry; it does not establish every game/service/platform gate.
+User explicitly requests committing current changes and pushing them to the configured fork.
+
+## Persistent DirectX certificate failure — 2026-09-30
+
+User retries R52 and again receives curl77 naming `/etc/ssl/cert.pem`; successful dependency
+receipts skip OpenAL/MSVC execution. Reopen the integration diagnosis: establish why the intended
+CA configuration did not reach/effect the failing downloader before another correction. Preserve
+TLS and user trust, no prefix reset/dependency source modifications. Relevant tests only.
+User confirms cargo run after closing Ludomere and all three certificate variables absent in the
+launch terminal. Subsequent instrumented retry reports inherited SSL_CERT_FILE/SSL_CERT_DIR and
+skips the managed default. Diagnose launcher/library additions rather than treating presence alone
+as proof of user customization.
+User additionally requires the solution to work on generic Arch installations, not just their
+machine. Discover and translate system trust paths without user-specific paths or certificate
+contents; retain explicit trust selection and secure verification.
+
+## DirectX certificate failure — 2026-09-30
+
+User supplies BIT.TRIP Runner log: OpenAL and MSVC2010 proceed successfully; DirectX Winetricks
+download fails with curl77, unable to set certificate file `/etc/ssl/cert.pem` under UMU/GE-Proton.
+- R52: Diagnose and correct the demonstrated certificate/download integration failure without
+  disabling TLS verification, modifying dependency source or resetting the user's prefix. Preserve
+  successful setup receipts/Resume and distinguish unrelated prefix warnings from the fatal cause.
+  Use focused tests only; actual runtime/game execution is not authorized by this pasted log.
+
+## Verification policy — 2026-09-30
+
+User: "don't run the full test suite if you only change a small amount of code. Run relevant tests
+only. The full suite should be reserved for the build process."
+- Small changes require relevant tests and proportionate checks; reserve the full suite for the
+  build process. This supersedes earlier routine full-suite requirements for narrow edits.
+
+## Dependency endpoint failure — 2026-09-30
+
+User reports BIT.TRIP Runner installation fails with `No supported official dependency download endpoint`.
+- R51: Diagnose and correct the dependency endpoint selection against actual official GOG response
+  shape; preserve validated origins, hashes, cancellation and existing Resume. Regress the real
+  response-to-transfer path rather than only synthetic direct chunk requests. No real installer/
+  game execution, account access, package or commit requested.
+
+## GOG dependency resolution implementation — 2026-09-30
+
+User authorizes the P135 proposal: "Implement proper GOG dependency resolution."
+- R49: Resolve the complete required GOG dependency set from its official catalog before game
+  transfer, with actionable aggregate unsupported/unavailable failures and explicit offline choice.
+  Acquire verified reusable dependency artifacts, support catalog-declared executable/MSI and
+  game-local content using typed plans, and retain narrowly evidenced Wine compatibility exceptions.
+- R50: Apply required setup through unchanged UMU and selected Proton/prefix, with visible progress,
+  cancellation and full sanitized errors; track success per prefix identity and dependency revision,
+  retry unfinished setup without re-downloading intact game files, and never silently skip requirements.
+  Existing Resume records must resolve missing plans safely. Preserve recovery generation/account
+  guards, native independence, successful-only installed markers and existing working installations.
+- Required dependency acquisition is part of the explicitly selected game installation/update;
+  present required components in the plan and preserve existing Proton/runtime consent. Offline
+  installers remain an explicit alternative, never an automatic second payload download.
+- Verify representative real catalog metadata plus inert/local HTTP failure, retry, cache, unsafe
+  path and recreated-prefix fixtures, independent QA/security and repository required checks.
+  No host package/commit, real account or real installer/game execution is requested.
+
+## Recurring Depot dependency failures — 2026-09-30
+
+User reports BIT.TRIP Runner fails with `unsupported required GOG dependency openAL` and asks
+whether recurring installation failures can be avoided, comparing Steam and Lutris.
+- R48: Diagnose this exact failure and assess a systematic dependency-handling solution using
+  primary evidence. Distinguish Ludomere mapping refusals from runtime installer failures; explain
+  feasible prevention and limitations. Broader replacement/runtime execution policy needs a concrete
+  proposal before implementation. Preserve prior fixes and unmodified dependency policy.
+
+## Incomplete-game removal and visible running logs — 2026-09-30
+
+User reports:
+> Enter the Gungeon now launches. Show the uninstall button even for games mid-download or in an error state. The user should be able to delete files and reset the game state even if a problem occurs with the files. I also do not see where to view the log window when a game is running.
+
+- R46: Make confirmed uninstall/reset available for active-download, incomplete and failed games.
+  Safely quiesce affected work before removing managed game files and transient operation state;
+  preserve durable activity/preferences and protected payload boundaries. Do not require a healthy
+  installation marker or working vendor uninstaller to recover from a failed installation.
+- R47: Make running-game log access visible from game controls. Existing Logs tab is currently the
+  only entry; clarify separate live window versus direct tab navigation before dependent UI work.
+- User confirms real Enter the Gungeon launch after R45, settling that game's immediate acceptance.
+  This does not establish every runtime/game/service gate. Optional downloaded-file cleanup choice
+  and log-window presentation are being interviewed. No actual user-file deletion by agents.
+- Interview settled: keep downloaded-file deletion optional, retaining its existing unchecked
+  default. User found the Logs tab and explicitly withdrew R47: "Disregard this feature request."
+  No log UI changes belong to this task. R46 remains active.
+- Residual-file interview explicitly warned that untracked files may include saves; user answered
+  "Delete them too." R46 recovery may delete all remaining files, including untracked files and
+  in-directory saves, in the exact confirmed game directory. Explain this in confirmation. Prefixes,
+  external saves, unrelated directories and durable preferences/activity remain protected; managed
+  downloaded installers/extras retain their separate optional unchecked deletion choice. No recovery
+  folder is requested. Existing healthy idle normal uninstall behavior remains unchanged.
+
+## Gungeon setup crash and inactive View Error — 2026-09-29
+
+User reports:
+> Enter the Gungeon opens an installer, and when I select OK on the language, it crashes and Ludomere reports the following error: Enter the Gungeon: Depot operation failed / GOG setup action failed. Also, the View Error button does nothing. There is a real problem with dependency handling here.
+
+- R45: Investigate and correct the demonstrated Depot setup invocation failure and restore usable
+  View Error details. Audit the full required setup invocation contract rather than assuming another
+  missing runtime. Preserve required actions and unmodified dependencies; no success claim without
+  evidence. Existing relevant operation-log authority persists; no real installer execution authorized.
+
+## Gungeon resumed Depot setup executable — 2026-09-29
+
+User reports deleting local files manually and downloading again through Resume, followed by:
+> Enter the Gungeon: Depot operation failed
+> ExecutableMissing("/home/chris/GameFiles/ludomere/enter_the_gungeon/galaxy_enter_the_gungeon_2.11.0.13.exe")
+
+- R44: Diagnose and correct the resumed Depot installation's missing executable failure, preserving
+  required setup, safe path resolution and resumability. Distinguish reproduced source defects from
+  assumptions about manually removed files. Preserve R42/R43 changes; no package/commit requested.
+
+## Enter the Gungeon diagnostics and game logs — 2026-09-29
+
+User reports:
+> I installed Enter the Gungeon and got this error: Enter the Gungeon: Depot operation failed; see Downloads //// That's not a very helpful error. It looks like Ludomere has real problems installing required dependencies. Are you able to run Ludomere and inspect operations yourself? I also want a log for running games, similar to what Lutris has.
+
+- R42: Investigate the uninformative Enter the Gungeon Depot failure and improve diagnosed error/
+  dependency problems. Distinguish actual failure evidence from assumptions; isolated app execution
+  is permitted. Access to the user's relevant operation logs is pending explicit answer; no credential
+  access or real game/helper execution authorized by the current investigation.
+- R43: Provide usable game-run logs. Inspect existing capture/view behavior before redesigning;
+  live view plus saved per-launch logs versus saved-only preference is pending clarification.
+- Interview settled: user permits inspection of relevant local Enter the Gungeon operation logs,
+  excluding credentials and with sensitive values redacted from reports. User selects live,
+  scrollable game log view plus saved per-launch logs, Copy and Open log folder actions.
+  No authorization to execute actual user games/installers or inspect credential stores.
+- User explicitly authorizes the isolated capture test after automatic approval rejection: "Yes,
+  run that isolated logging test." Only the temporary synthetic stdout/stderr script with a one-
+  second wait and exit may run through Ludomere; no real game or compatibility helper is authorized.
+
 ## Identified Witcher 3 Depot dependency — 2026-09-29
 
 User supplied the complete error after R39:

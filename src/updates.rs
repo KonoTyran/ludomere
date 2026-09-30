@@ -196,6 +196,7 @@ fn queue_galaxy(
         .galaxy_depot
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Installed Galaxy provenance is missing"))?;
+    let recovery_generation = crate::installation::recovery::generation(game.product_id);
     let platform = marker.base.operating_system.as_deref().unwrap_or("windows");
     ensure!(
         platform.eq_ignore_ascii_case("windows") || platform.eq_ignore_ascii_case("linux"),
@@ -313,6 +314,8 @@ fn queue_galaxy(
     crate::online::with_account_session(session, || Ok(()))?;
     let request = crate::installation::depot_planner::prepare(
         crate::installation::depot_planner::PrepareDepotRequest {
+            account_session: session,
+            recovery_generation,
             store,
             acquisition: &acquisition,
             build,

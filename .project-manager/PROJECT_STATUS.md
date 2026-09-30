@@ -1,6 +1,459 @@
 # Project status
 
-Last meaningful update: 2026-09-29.
+Last meaningful update: 2026-09-30.
+
+## Current commit and push
+
+- User confirms Witcher 3 (previous installation), BIT.TRIP Runner, and newly downloaded Coffee
+  Talk run successfully. BIT.TRIP's reported dependency/certificate issue now has user acceptance.
+  Broader game/service/desktop gates are not implied. User authorizes current commit and push.
+- P145 compatibility inventories/drafts/commits/pushes, security independently reviews scope and
+  message. Target origin main in LegendaryLinux/ludomere; no force/upstream push or package build.
+  Prior test/review evidence remains valid; no unnecessary suite rerun. Publication pending review.
+- Final content checkpoint: manager reviewed40 paths and comprehensive message; independent
+  review cleared metadata-only fixtures, privacy and claims. Stage verification then authorized
+  commit/push remain delivery actions, with final result recorded by Git refs and user handoff.
+  Fresh forkmain57574b3 permits fast-forward from local a99f277 plus new commit; HTTPS authentication
+  replaces unavailable SSH for this operation only. No product changes or repeated tests made.
+
+## Current repeated DirectX certificate failure
+
+- Final P143/P144 disposition: complete for scoped local assurance, independent PASS. Cargo's
+  injected SSL settings bypassed the previous default-only mapping. Winetricks child now resolves
+  inherited readable host paths dynamically into runtime host mounts, preserving selected trust
+  and directory-list semantics. No user-specific production paths or upstream code changes.
+  Manager inspected final source, /tmp/ludomere-p143-report.md and -p144-review.md, nine focused
+  tests/fmt/Clippy/debug/diff logs and actual runtime HTTPS200/TLS verification0. Debug06:51:21UTC.
+  Private probes left zero task-root processes. No full suite/package/commit or real Proton/game/
+  installer execution; user should restart cargo run and Resume. Actual DirectX success remains
+  unverified and broader readiness remains undeclared. Earlier checkpoints follow.
+- Inert private Cargo/direct comparison reproduces SSL_CERT_FILE/DIR added by cargo run, absent
+  when running the same binary directly (/tmp/ludomere-p143-cargo-ca-probe.log). P143 correction
+  approved: translate inherited host CA paths to the same objects under runtime host mounts, only
+  for Winetricks child; no provenance guessing or trust replacement. User explicitly requires a
+  generic Arch solution. P144 reviews dynamic paths, custom trust and focused regressions.
+- New user retry confirms the own-code policy skipped mapping because SSL_CERT_FILE and
+  SSL_CERT_DIR were present inside Ludomere, although both were absent in the launch terminal.
+  P143/P144 reopened to trace library initialization and distinguish automatic defaults from user
+  trust. Runtime-only probe already confirmed mapped bundle readable and override preserved,
+  original cert.pem unreadable, with zero surviving probe processes; it did not exercise Proton's
+  altered library environment. No actual installer success or second certificate fix claimed yet.
+- User retry still names original `/etc/ssl/cert.pem`; R52 reopened as P143 compatibility/P144
+  independent review. Previous command-construction tests and source mapping did not prove actual
+  downloader received the override. Trace full propagation/explicit overrides before new edit;
+  existing receipts worked for OpenAL/MSVC. No prefix reset/TLS bypass. Focused tests only.
+- Exact pinned UMU→Proton→Protonfixes→Winetricks source preserves CA environment; curl has no
+  explicit --cacert but reads its configuration. Live Ludomere process not visible. User confirms
+  cargo run after closing app, excluding installed-app selection. Await safe same-terminal CA-var
+  presence booleans; no private environment/curlrc accessed. P143 authorized minimal controlled
+  policy-decision installer log (variable names only), no second speculative certificate change.
+- User reports all three CA variables absent in launch terminal. Exact pinned Winetricks/Protonfixes
+  sources do not strip CA settings. Prepared runtime-only probe uses empty inherited environment,
+  private HOME/allXDG/private bus and pressure-vessel variable/home roots, no shared home, no network,
+  Proton or prefix access; prints presence/readability/fixed mapping/curl version only. Manager
+  reconciles earlier self-imposed execution exclusion with developer's authorization for ordinary
+  reversible/read-only debugging: this exact independently reviewed probe may run subject to platform
+  review. No general runtime/game execution permission or trust relaxation follows.
+
+## Current DirectX certificate failure
+
+- Final disposition: P141/P142 R52 complete for scoped local assurance. Winetricks now receives
+  canonical host CA through runtime /run/host mapping only absent explicit certificate variables.
+  TLS/custom trust preserved; no host CA copy/change or dependency modification. Manager inspected
+  source, final logs and /tmp/ludomere-p141-report.md plus independent -p142-review.md (PASS).
+  Six focused tests/fmt/Clippy/debug/diff pass; debug06:26:33UTC. No fullsuite or runtime execution.
+  Fatal curl77 is confirmed by supplied log; container default-path explanation is primary-source
+  supported, not an observed exact-runtime reproduction. User cargo run/Resume remains acceptance;
+  successful OpenAL/MSVC receipts and prefix retained. Broader readiness remains undeclared.
+- User log confirms progressed through OpenAL/MSVC2010 then DirectX download curl77 certificate
+  file setup failure. P141 compatibility diagnoses own UMU environment/runtime certificate mapping;
+  P142 independent review. Do not conflate prefix warnings with established fatal curl error.
+  No prefix deletion, TLS bypass or dependency patch authorized; focused tests only. Existing
+  source work and successful receipts preserved; actual installer/game execution remains excluded.
+- Host CA file is readable; own UMU environment has no certificate override. P141 verified primary
+  pressure-vessel host /etc read-only mapping under /run/host/etc while runtime replaces /etc.
+  Narrow Winetricks-only default selects canonical host bundle under mapped host path, preserving
+  every explicit CURL_CA_BUNDLE/SSL_CERT_FILE/SSL_CERT_DIR override. P142 verifies mapping/trust;
+  no downloaded CA, insecure flag, global environment change or dependency patch proposed.
+
+## Current dependency endpoint correction
+
+- Final disposition: R51/P139–P140 complete, independent PASS. Dependency-only plain-base URL
+  handling corrects the confirmed parameters.path mismatch; trusted hosts/HTTPS/redirect policy
+  unchanged. Manager inspected source, reports and final logs. Nine relevant tests, fmt/Clippy/debug/
+  diff pass; actual production official OpenAL transfer/hash/cache reuse passes. AGENTS.md records
+  revised test policy. No full-suite run, package, account access or downloaded executable execution.
+  Reports /tmp/ludomere-p139-report.md and /tmp/ludomere-p140-review.md. User can restart cargo run
+  and Resume existing BIT.TRIP installation; installer/game runtime acceptance remains unverified.
+- User changes routine verification: relevant tests for small edits, full suite only during build
+  process. P139/P140 notified; no full-suite run for this narrow correction.
+- Actual official response has complete dependency base URLs with empty parameters, unlike game
+  templated endpoints requiring parameters.path. Shared chunk_url rejects these before origin
+  validation. P139 implements dedicated verified plain-base handling without broadening trusted
+  origins, then checks actual OpenAL acquisition in disposable storage without execution.
+- Production API verification now passes resolve(openAL)→official endpoint selection→streamed
+  acquisition→cache reuse:809496 bytes with expected SHA256, /tmp/ludomere-p139-acquire.log.
+  No executable ran and disposable profile removed. Nine focused dependency tests pass; final
+  focused checks and independent disposition pending. AGENTS.md Verification now reflects user's
+  relevant-tests-only small-change policy; full suite not run.
+- R51/P139 acquisition investigates and corrects reported BIT.TRIP Runner endpoint refusal;
+  P140 security independently reviews actual official response and safety. Prior R49 implementation
+  tests did not establish successful real endpoint selection/acquisition. All existing work preserved;
+  no actual vendor execution/account/package/commit authorized. Final checks and reproduction pending.
+
+## Current GOG dependency implementation
+
+- Final disposition: R49/R50 P136–P138 complete for scoped local assurance. Catalog-based full-set
+  preparation, verified reusable artifacts, typed EXE/MSI/game-local/ISI setup, retained evidenced
+  Wine recipes, per-prefix/revision receipts, legacy Resume and explicit offline choice implemented.
+  Required setup success precedes Windows installed markers. Tracked process drain and durable
+  journal guards protect recovery across interruption; affected corrupt journals fail closed.
+- Manager reviewed all three handoff/review reports, exact-final logs/source and actual UI images.
+  Fmt/Clippy430unit/sixintegration/debug/diff pass,112 focused installation regressions pass;
+  independent eight catalog/cache and six setup/journal tests pass. Physical review/Cancel/offline/
+  enqueue-failure retry/long-list/error/Resume/closed-result controls pass. Both GUI findings and
+  lifecycle/targeted-journal regression are closed. Seven unit/one integration GTK cases remain
+  excluded from the headless suite; changed controls were independently exercised separately.
+- Final debug timestamp2026-09-30 06:01:20UTC; reports /tmp/ludomere-p136-report.md,
+  /tmp/ludomere-p137-report.md and /tmp/ludomere-p138-review.md. All private GUI processes stopped.
+  No real vendor/UMU/game execution or account access, package build/install, commit or dependency
+  modification. BIT.TRIP Runner/OpenAL runtime success remains user-assisted cargo run/Resume
+  acceptance; nonzero unclassified vendor statuses remain failures. No global Prototype ready
+  declaration; broader P70 gates remain open. Milestone history follows.
+- User authorizes proper catalog-based resolution following P135. R49/R50 P136 acquisition owns
+  catalog/verified payloads, P137 compatibility setup/checkpoints/UI/docs integration, P138 security
+  independent assurance. Agreed scope includes early whole-set preflight, exact supported methods,
+  per-prefix/revision completion and explicit offline choice. Prior working-tree edits preserved.
+- No additional permission round needed for the accepted design; no real installer/game execution
+  or new package/commit. Owners must agree typed APIs and file boundaries before shared edits.
+- Integration checkpoint: serializable plan uses existing Depot operation journal, avoiding schema
+  changes. Initial and legacy Resume resolve before payload transfer. Existing DirectX/supported
+  MSVC Winetricks methods remain explicit compatibility exceptions to preserve user-confirmed
+  Gungeon/Witcher paths; all IDs still require catalog resolution/revision and prefix-bound evidence.
+  Other ordinary EXE/MSI entries use catalog commands. No new guessed aliases/families authorized.
+- P138 confirms existing CompatibilityProcess::stop may return after only leader exit or immediately
+  after SIGKILL, leaving descendants. P137 authorized narrow owned-process-group drain correction
+  and isolated synthetic subprocess regression, necessary for dependency cancellation and R46 reset.
+  No real/downloaded game/installer/helper execution or broad process refactor; tool approvals apply.
+- API agreed: P136 gog/dependencies metadata-only resolve→serializable Plan, acquisition→verified
+  roots, cached verification/manifest access/safe game-local publication; typed EXE/MSI/GameFiles/
+  ScriptInterpreter and literal argv. Official compressed manifest MD5 contract verified; freeze
+  bounded original metadata for Resume checks. Existing chunk/materializer reused with dedicated
+  dependency namespace. P137 owns journal, setup/checkpoints/UI integration; no schema change.
+- Draft review tracks cancellation writer Interrupted retry loops, stale prefix receipts after missing
+  registry files, per-prefix ISI receipts incorrectly suppressing reinstall setup, and MSI Windows
+  argument paths. Owners must correct and regress these before closure. P137 also defers streamed
+  Windows installed-marker publication until successful setup and coordinates managed provenance
+  for game-local dependency files. These are R49/R50 necessities, not new prefix-repair scope.
+- Primary catalog check confirms all19 current game-local records have empty executable/arguments;
+  resolver now accepts only that evidenced shape, refusing nonempty unexpected executable paths
+  instead of silently skipping setup. Exact openAL remains GOG oalinst.exe with /S. Final fixture
+  checks and independent review remain pending.
+- First integrated all-target compilation passes apart from the temporarily unused UI-description
+  function. Candidate now validates frozen plans against required repository IDs, rejects missing
+  prefix registries, binds ISI setup to an operation, passes an explicit Windows MSI path and defers
+  Windows markers. Review still requires path mapping, descendant drain on failure, game-local
+  manifest persistence, actual preflight/offline controls and exact-final checks; no completion claim.
+- Manager inspected six passing P136 focused tests, including actual OpenAL metadata, typed plans,
+  local HTTP verified cache/repair/failure and game-local SFC publication. P136 also owns narrowly
+  scoped README updates by coordination; P137 remains final-check owner. P138 may use a disposable
+  exact-diff UI fixture substituting only preparation results/enqueue capture, with all runtime
+  execution trapped, to exercise real review/Cancel/offline/confirm/error controls. Backend and
+  presentation evidence must remain distinguished; no live-game pass is implied.
+- P136 handed off frozen catalog/cache/docs candidate; manager reviewed report and eight-test log.
+  Eight dependency plus10 existing transfer regressions and all-target Clippy pass in isolated
+  profiles. Metadata-only official XNA/ISI/DOSBox fixtures supplement embedded OpenAL fixture.
+  Report /tmp/ludomere-p136-report.md documents HTTPS/hash trust, bounded timeout cancellation and
+  no vendor execution. P136 in review; P137 final integration and P138 independent gates remain.
+- P138 independently reproduced eight dependency-test passes. P137 reports shared asynchronous
+  component review for install/update/repair and explicit Resume; actual GUI checks remain ongoing.
+  P136 reactivated solely for coordinated process.rs synthetic drain regressions to reduce P137
+  test workload. Only owned harmless test processes are authorized, never real helpers; P137 still
+  owns exact-final combined checks after all test edits freeze.
+- Manager reviewed107 installation-test passes and three process tests (including synthetic
+  surviving descendants, TERM escalation and no late writes). P138 actual review/Cancel/offline/
+  failed-enqueue retry/single enqueue and50-entry scrolling pass; manager inspected review/error
+  screenshots. Long aggregate failure geometry, latest Resume/closed-account guards and final
+  combined checks remain outstanding. No real vendor execution or successful BIT.TRIP claim.
+- P138 confirmed new aggregate-error geometry blocker:128 required-ID failures expand source
+  chooser beyond the screen, hiding controls/final cause. P137 owns bounded scrollable failure
+  area with stable actions; P138 must physically recheck corrected geometry before closure.
+- P138 physically reproduced a late preparation result reopening review after the user closed the
+  chooser. Retained AdwDialog is_visible was insufficient. P137 must track explicit close lifetime
+  for initial and Resume flows, preserving no unsolicited background dialogs; independent delayed
+  Close recheck required. No payload was enqueued in this fixture.
+- Updated110 installation regressions pass, including legacy plan conversion, missing required
+  entries, real inert ISI operation/reinstall invocation, deferred markers and combined managed
+  files. Both UI corrections are under physical recheck. P138 identified StopFailed retaining only
+  global reset activity while releasing product admission; P137 must keep game recovery fail-closed
+  while owned writers might survive. Prefer existing guards/minimal retained reservation, no broad
+  supervisor scope. Final checks wait for this necessary R46/R50 correction and narrow ISI preflight
+  argument rejection to match executor capability.
+- Both UI blockers physically closed; manager inspected bounded-error screenshot. Saved Resume
+  review, delayed Escape/Sign out and no late modal also pass. P137 authorized a minimal existing-
+  journal boot/process-group guard for undrained setup: pre-execution arming, known-group recheck,
+  uncertain same-boot refusal and changed-boot clearance, avoiding unsafe loss of in-memory-only
+  protection on restart. No schema/supervisor/general launch redesign. P138 reviews necessary R46
+  recovery safety and normal drained-outcome preservation; exact-final checks remain pending.
+- Guard wiring now compiles across setup/prefix initialization, Resume, enqueue, abandon and
+  recovery; boot/group values validate and writes sync file/directory. P136 reactivated for additive
+  actual-journal regression under P137-coordinated ownership; P138 rechecks all mutation guards.
+  Existing journal shape avoids schema changes, UMU source remains unmodified. UI source has not
+  changed since independent accepted snapshot. Full final checks follow test freeze.
+- Six dependency-setup module tests pass, including actual persisted journal unknown/live/malformed
+  refusal, drained/changed-boot retry and pre-spawn arming. Manager inspected guard test log;
+  P136 test edits frozen. Exact-final fmt/Clippy/full serial cargo test/debug running under private
+  runner, logs /tmp/ludomere-p137-{fmt,clippy,test,build}.log. P138 final LIFE-01 disposition pending.
+- P138 independently passes six setup tests and closes LIFE-01 source/focused review. First full
+  run catches two guard integration regressions (428pass/2fail/7ignored): broad journal scan reloads/
+  normalizes Config and rejects unrelated malformed journals. P137 must use the supplied snapshot
+  and affected slug only, preserving preferences/unrelated games. Damaged affected journal may hide
+  setup identity and now conservatively refuses deletion; manager authorizes narrow test update
+  asserting preservation, then restoring known inert fixture to retain retry coverage. README/report
+  must disclose limitation; no automatic journal deletion. P138 review and final full rerun required.
+
+## Current recurring dependency failures
+
+- R48/P135 investigation complete. Manager reviewed three reports and source/primary evidence.
+  openAL is an exact official catalog entry absent from Ludomere's small mapper; failure precedes
+  runtime invocation but follows payload/prefix work. Existing ID-list marker also cannot establish
+  prerequisite readiness in a recreated prefix. No claim of a failed OpenAL runtime or UMU defect.
+- Proposal: typed GOG catalog-backed dependency plan before transfer, explicit compatibility
+  exceptions, verified artifact cache, successful per-prefix/revision checkpoints/resume, clear
+  aggregate unsupported-method errors and explicit offline fallback. Steam maintained common
+  redistributables and Lutris recipes/vendor setup explain alternative approaches; universal game
+  reliability is not established. Exact openAL→openal is a bounded immediate option only.
+- Evidence: /tmp/ludomere-p135-backend.md, /tmp/ludomere-p135-comparison.md and independent
+  /tmp/ludomere-p135-security-review.md. No product changes, tests/builds, executable downloads,
+  actual profiles or credentials accessed. Broader implementation awaits user direction.
+- User reports BIT.TRIP Runner `unsupported required GOG dependency openAL`, asks for systematic
+  prevention compared with Steam/Lutris. R48/P135 read-only investigation activated; source points
+  to own hardcoded dependency mapping. Acquisition audits backend/GOG, compatibility primary
+  comparative sources, security independent proposal review. No new implementation authorized yet.
+
+## Current recovery and running-log request
+
+- Final disposition: R46/P132–P134 complete for scoped local assurance; R47 withdrawn. Uninstall
+  remains available across incomplete/error/active states, confirmed recovery stops affected work,
+  deletes authorized in-directory leftovers/saves, preserves optional downloads/prefixes/external
+  saves/preferences, clears transient state and supports explicit retry after partial failure.
+  Healthy idle normal uninstall remains unchanged. No automatic destructive recovery.
+- Manager reviewed owner reports, independent /tmp/ludomere-p134-review.md, final logs/source and
+  actual confirmation/result/partial-error screenshots. Fmt/Clippy411 unit/six integration/debug/diff
+  and affected GTK regression pass. Independent physical checked/unchecked cleanup, long-root and
+  failure scrolling, symlink refusal, partial deletion/receipt retry and healthy Normal Cancel pass;
+  actual HTTP worker drain/unrelated-queue preservation passes. No scoped blocker remains.
+- All private test processes stopped. In-progress Cancel/account-switch UI limits are disclosed in
+  review and have source/backend evidence; actual vendor/game cancellation, user-file recovery and
+  host desktop integration remain user acceptance. No real user files changed, new package/commit
+  or global Prototype ready declaration. Broader P70 gates remain open. Milestone history follows.
+- User confirms Enter the Gungeon now launches after R45. Requests uninstall/reset even during
+  downloads or errors and a discoverable running-game log window. R46/R47 P132 backend, P133 UI,
+  P134 independent assurance activated. Preserve prior uncommitted work; no real-file operations.
+- Interview asks whether downloaded-file cleanup remains optional and whether visible View logs
+  opens a separate live window or existing tab. Safe backend/UI inventory proceeds independently.
+  Need explicit file/operation boundaries and quiescence before any destructive implementation.
+- User keeps optional download deletion unchanged and withdraws log UI request after finding Logs
+  tab. Owners notified; active scope is only R46 safe incomplete/error/active uninstall recovery.
+- User explicitly chooses deleting unknown leftovers despite the disclosed in-directory-save risk.
+  Confirmation must identify exact game roots and this consequence; prefix/external saves/durable
+  preferences stay intact and downloaded-file checkbox stays optional/off. Owners notified; no
+  recovery-folder feature. Normal healthy idle uninstall remains unchanged.
+- Agreed worker API prepares authoritative Normal(InstalledGame) or Recovery(GameResetPlan), then
+  cancellable recovery with progress. Necessary per-product admission reservation/generation prevents
+  late queued callbacks/auto-install from republishing files; drain includes final persistence/events.
+  Reviewer checks Depot active-removal ordering, native dequeue/start gap and protected nested downloads.
+- P134 early draft review identifies recursive admission/scheduling deadlock, shared-root download-only
+  ownership rejection and corrupt-marker refusal despite independent ownership evidence. P132 owns
+  narrow corrections and inert regressions; none is yet a verified final finding closure. UI owner
+  coordinates required final checks after backend freeze. No real files or helpers used.
+- Independent draft review also identifies dequeue-to-admission gap: a popped native task could
+  outlive the entire reset and restart afterward. Backend owner must close it atomically or reject
+  stale generations. Review includes account cancellation and readable long partial-failure dialogs.
+- Manager/reviewer additionally require revalidation of newly appeared game directories, truthful
+  retained-directory counts, protected-root handling and partial-download staging cleanup. Reviewer
+  identified in-memory downloads missing SQLite rows as a quiescence gap; worker identity/generation
+  must cover them without relying on successful prior persistence. Corrections remain P132 scope.
+- P132 backend API integrated but not frozen. Necessary minimal staging recovery identity receipt
+  authorized to retain explicit retry after deleting original metadata or partial failure/crash;
+  no automatic destructive recovery, schema change or new general queue. P134 reviews receipt paths,
+  bounded reads/publication, confirmation timing and success/partial cleanup. Final tests pending.
+- P133 UI compiles; checkpoint all-target Clippy and warning regression pass. P134 physical held
+  click opens markerless-game exact-root warning with unchecked downloads; Cancel preserves detail
+  page/files and execution traps stay untouched. Manager viewed actual confirmation screenshot.
+  Destructive synthetic checks await final backend, so this is not a recovery safety pass.
+- P132 adds focused residual/symlink/profile-preservation, receipt/replaced-root, unsafe metadata,
+  generation and cancellation/protected-download fixtures. P134 additionally requires stale
+  retention callbacks to honor the same recovery generation so retained downloads cannot be pruned
+  after reset. Final freeze/checks and confirmed synthetic deletion remain outstanding.
+- Five focused recovery tests pass; manager inspected output. Reviewer found blocking launch
+  admission reachable synchronously from GTK. P132 uses nonblocking admission with a retryable
+  busy result and held-lock regression, preserving atomic launch/reset exclusion without moving
+  game execution. P133 remains responsible for exact-final checks after the backend freezes.
+- P133 actual local-HTTP manager regression passes: reset waits for held transfer, then cancellation
+  drains before game/staging/job removal; unrelated queued download completes and retained download
+  sentinel survives with no late affected completion. Manager inspected captured passing log.
+  P132 closes delayed Depot-plan admission with a nonpersistent generation stamp; final checks and
+  independent destructive GUI still pending.
+- P132 frozen checkpoint: focused recovery filter15/15 and all-target Clippy pass; P133 starts final
+  combined checks. P134 actual unchecked removal deletes confirmed game/in-directory-save sentinels
+  across two roots, retaining nested installer bytes/index, prefixes/external save/favorite. Manager
+  viewed result screenshot; long-root confirmation remains readable. Checked cleanup and partial
+  failure/retry review are still pending; no actual user files or executable payloads used.
+- Exact-final fmt, all-target Clippy with warnings denied,411 unit/six integration tests and debug
+  build pass; affected real-GTK sidebar action regression separately passes. Manager inspected logs
+  /tmp/ludomere-p133-{fmt,clippy,test,build}.log. Seven display/fixture unit cases are ignored in
+  ordinary suite; changed sidebar case explicitly exercised. Source frozen; P134 final GUI pending.
+- Manager reviewed P132/P133 handoff reports and source. P132/P133 move to review; final independent
+  P134 disposition remains required. Conservative limits: folders lacking all ownership evidence
+  are refused; changed/new roots require a new confirmation; unrelated busy filesystem operations
+  may require pause/retry. Existing healthy idle uninstall remains unchanged. No package or commit.
+- P134 actual checked cleanup removes payload/in-directory save/installer and clears installer
+  presence while preserving prefix/external save/favorite. Preview Retry resets checkbox off;
+  symlink-root refusal and repaired-root Retry pass. Two-root permission failure removes only the
+  accessible payload and retains receipt/download with readable partial result; final Retry pending.
+  Account switch is physically inaccessible under the modal; its boundary uses source/test evidence,
+  not a claimed physical account-switch pass. No additional test-only injection is necessary.
+
+## Current Gungeon setup invocation and View Error
+
+- R45/P129–P131 complete for scoped local assurance. Corrected metadata aliases and cache parser
+  revision preserve Galaxy wrapper identity; existing Resume refreshes only its exact repository.
+  Matching legacy wrappers receive silent destination/language/product/build/version context and
+  game cwd. Generic Execute/uninstall semantics unchanged. Failures retain action/exit/log-tail
+  context, and View Error stays mapped instead of cancelling held clicks each100ms.
+- Manager inspected final source/reports/official safe metadata fields, exact checks and actual
+  readable error-modal screenshot. Fmt/all-target Clippy401 unit/six integration/debug/diff pass;
+ 95 installation+42GOG focused regressions pass. Independent P131 accepts with no scoped issue,
+  physically verifies current/recovered held clicks/copy/redaction/sign-out and stops private fixtures.
+  User must still verify real Gungeon setup with updated cargo run/Resume; the actual post-dialog
+  crash and prefix warning are not independently resolved by execution evidence. No package/commit,
+  dependency edit, real helper execution or global Prototype ready declaration.
+- R45/P129–P131: user gets interactive language installer then crash/generic setup failure; View
+  Error does nothing. Acquisition audits invocation and operation diagnostics, compatibility fixes
+  actual UI error control, security independently reviews. Earlier path lookup fixed only missing
+  executable discovery; actual setup remains failing. No runtime/helper modifications or execution
+  authorized. Preserve prior source work and inspect only relevant logs/public package metadata.
+- Exact bounded GOG script contains only executable/runAsAdmin, with no lost argument field.
+  Public selected-product metadata identifies the executable as its legacy temp_executable;
+  primary Heroic v2 setup source supplies Galaxy silent/destination/language/product/build/version
+  arguments and game working directory. Current invocation omits that context. P129 may implement
+  this metadata-identified contract while retaining arbitrary Execute semantics, not filename guesses.
+- RepositoryProduct currently ignores real snake_case temp_executable/temp_arguments under camelCase
+  deserialization, losing them in cache. Necessary aliases and exact-selected-repository refresh for
+  earlier cached Resume metadata authorized with identity/cache guards, no schema or build switch.
+  Diagnostics must retain action/exit/sanitized log detail. Prefix-version warning is not an
+  established crash cause; no prefix repair/deletion or dependency alteration authorized.
+- UI poll hides then re-shows View Error every100ms; P130 removes this transient unmap by deriving
+  visibility from final state. P131 preserves before fixture and tests a physical held click across
+  poll ticks before/after, alongside readable/copyable details and account guards.
+- P131 reproduced baseline350ms held click failing while fast click succeeds. Corrected current/
+  recovered Depot errors pass350/700/1000ms physical clicks; copied1217 characters retain terminal
+  cause and remove synthetic secret/URL canaries. Escape keeps details, sign-out hides stale action
+  and clears history. Private UI fixture stopped, no process traps fired. Backend/final checks pending.
+
+## Current resumed Gungeon installation
+
+- R44/P127–P128 complete for scoped local assurance. Exact support executable now resolves from
+  verified support staging when genuinely absent from the game root; explicit root semantics and
+  required-action failure remain intact. Only new product edit is installation/depot_actions.rs.
+- Manager reviewed final source, official manifest entry, owner and independent reports and logs.
+  Eight focused tests plus fmt/all-target Clippy397 unit/six integration/debug/diff pass. Regression
+  covers cleanup/retry and manual deletion while retaining journal; no game/helper was executed.
+  Independent P128 reports no scoped blocker. User should restart cargo run and Resume the existing
+  operation. Actual Gungeon completion remains unverified; no package rebuild/commit or new GUI scope.
+- User reports manual local-file removal followed by Resume and missing
+  galaxy_enter_the_gungeon_2.11.0.13.exe during Depot operation. R44/P127 acquisition investigates
+  setup executable resolution/support restoration; P128 security independently verifies. Exact
+  cause not established from filename alone. Preserve all uncommitted R42/R43 work; no real helper
+  execution, package rebuild or commit. Tests remain isolated.
+- P127 confirms official anonymous Gungeon support manifest4240955f901d3ab68193ad0f353d9ecb
+  contains the exact reported executable marked support/executable. Authorized installer log shows
+  bare Execute resolving only under the game root. Approve exact relative app-first lookup with
+  support fallback only on genuine absence; explicit paths and unsafe/read errors must not fallback.
+  P128 confirms existing resume rematerializes missing support; no journal redesign/setup bypass.
+  Inert support materialize/delete/rematerialize regressions and final checks pending.
+
+## Current Depot diagnostics and logging request
+
+- Final disposition: R42/R43 P124–P126 complete for scoped local assurance. Gungeon's actual log
+  showed UMU rejecting an already-installed verb; Ludomere now requests only missing exact verbs
+  and exposes pending setup/status/sanitized installer-tail diagnostics. Saved per-launch logs and
+  live Logs-tab controls implemented without dependency changes or automatic log pruning.
+- Manager reviewed owner reports, /tmp/ludomere-p126-review.md, final checks and actual native-log
+  screenshot. Fmt/all-target Clippy395 unit/six integration/debug/diff pass; new GTK regression
+  separately passes. Independent history/Copy/folder/read-error retry/Follow/inner+outer+grid wheel/
+  delayed-account-clear checks pass; three scoped findings closed. Two approved synthetic native
+  launches capture both streams/exit7 into distinct0600 files, preserving the first hash and legacy
+  history; displayed/copied canaries are redacted. Exact source snapshot matches final candidate.
+- Private fixtures stopped; no real game, UMU or Comet executed, package rebuilt or commit made.
+  User will close the installed app, use cargo run and Resume Gungeon. Actual Gungeon completion,
+  Windows runtime output and host file-manager/Wayland behavior remain user acceptance, not passes.
+  No global Prototype ready declaration. Earlier checkpoints below retain the evidence history.
+- User reports Enter the Gungeon generic "Depot operation failed; see Downloads" and requests
+  agent-driven inspection and game logging. R42/R43 P124–P126 start read-only investigation.
+- Exact old message is absent from current source after a99f277; running-binary version or another
+  persistence/path is not yet established. Runtime logs already exist in launcher/details sources.
+  Asked permission to inspect relevant user operation logs and live+saved versus saved-only view;
+  independent repository/isolated work proceeds without those answers.
+- User answers authorize relevant operation-log inspection with credential avoidance/redaction,
+  and live scrollable per-launch saved logs with Copy/Open folder. P124 owns diagnostics/backend,
+  P125 UI/docs, P126 independent assurance. Existing runtime file is overwritten per launch;
+  reuse existing Logs tab and safe backend patterns rather than introducing unrelated features.
+- Authorized bounded Enter the Gungeon installation-log inspection confirms UMU rejects the request
+  because d3dcompiler_43 is already installed; requested list also includes other DirectX and
+  vcrun2010/2012 verbs. This is the previously noted already-installed-verb guard, not a new unknown
+  dependency. P124 authorized narrow own-Ludomere missing-verb filtering against the selected prefix's
+  Winetricks record, matching verified upstream semantics, with safe reads and real errors preserved.
+  No UMU patch/force or actual user-prefix inspection authorized. Improve safe failure context too.
+- R43 API agreed: per-game saved-launch listing and bounded256KiB tail reads off GTK; legacy latest
+  log retained. Existing Logs tab gains saved-run selection, live following, Refresh, Copy and Open
+  folder; one in-flight worker, account guards and selection/scroll preservation. P126 reviews.
+- Backend checkpoint adds private create-new per-launch capture, lifecycle/error diagnostics,
+  bounded/redacted tail reads and legacy history. Dependency failure now includes pending verbs,
+  exit status and sanitized8KiB installer tail. Missing-verb filter has synthetic partial/all/invalid/
+  link/FIFO regressions; actual user's prefix untouched. Matching-log read errors now surface instead
+  of silently disappearing from history. Integrated compilation/final tests and physical GUI pending.
+- User identifies desktop launcher/installed pacman package for the Gungeon failure, consistent with
+  old "see Downloads" wording: prior package artifact predates P117 fixes. Asked whether to rebuild
+  package after verification (repository requires user request); no installation proposed. P124
+  report /tmp/ludomere-p124-report.md and89 focused tests pass; P125 combined suite/P126 GUI pending.
+- User chooses cargo run testing and declines package rebuild. No package build/install is part
+  of this task. Installed desktop package remains unchanged.
+- Combined source passes fmt/all-target Clippy with warnings denied,395 unit/six integration tests,
+  debug and dedicated GTK selection/live-buffer regression. Manager inspected final check logs;
+  P126 actual control/capture review remains pending. No source changes claimed final until review.
+- P126 physical first100-line log reproduces Follow auto-disabling during layout with no user
+  scroll, preventing live updates. P125 reopened for narrow user-vs-programmatic scrolling fix;
+  existing buffer-only GTK regression did not exercise actual geometry. Independent recheck and
+  refreshed final checks required; unaffected copy/history/error/native-capture review continues.
+- P126 actual Copy/past+legacy selection/folder failure-retry/permission failure-Refresh/new-run
+  arrival/empty controls pass. Copied1,797-character text excludes synthetic credentials; read
+  errors preserve known content/selection. Root viewed initial and permission-error screenshots.
+  P125 now pauses Follow through actual input controllers rather than layout changes; physical
+  corrected live/scroll and production inert-native capture verification remain pending.
+- Automatic approval rejected the private end-to-end native-capture fixture because invoking the
+  synthetic script was interpreted as outside the no-game/helper execution boundary. No such process
+  ran; earlier attempt stopped at a fixture guard. Reviewer disabled execution and continues safer
+  file-driven UI checks without bypass. User asked explicit authority for the concrete private script
+  (synthetic stdout/stderr, one-second wait, exit); capture-path test remains unverified pending answer.
+- User explicitly approved that exact isolated logging test. Reviewer may request fresh tool approval
+  with the new authority and exact single-script/native guard; all other execution traps remain.
+  No bypass, actual user-game execution or general helper permission granted.
+- Corrected initial Follow/live append and keyboard pause/resume pass physical review. Wheel
+  input still reaches the outer details-page capture controller before the log pane; P125 may move
+  that controller to bubble phase as necessary nested-view support. P126 must verify inner log
+  scrolling plus ordinary outer-page/grid behavior before final checks and closure.
+- P126 confirms corrected inner wheel moves the log without moving the page, disables Follow and
+  preserves paused output; outer-heading wheel scrolls details normally. Delayed read after sign-out
+  leaves text cleared and Copy/folder disabled. Fresh tool approval accepted the user's explicit
+  inert-native test authority; capture verification proceeds under exact-script-only guards.
+  P125 runs refreshed final fmt/Clippy/full serial tests/debug against frozen candidate.
+- Exact-final source passes fmt, all-target Clippy with warnings denied,395 unit/six integration
+  tests and debug build; manager inspected logs and source timestamps. P126 confirms the authorized
+  native script produces both streams and exit7 with private0600 per-launch lifecycle capture,
+  without helper/game execution. Root viewed the actual Logs-tab screenshot. Final preservation/
+  redaction/grid checks, reviewer disposition and private-fixture cleanup remain pending.
 
 ## Current commit and user acceptance
 

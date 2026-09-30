@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
 };
 
+pub(crate) mod dependency_setup;
 pub mod depot;
 pub mod depot_actions;
 pub mod depot_metadata;
@@ -18,6 +19,11 @@ mod manager;
 mod marker;
 mod operation_journal;
 mod patch;
+pub mod recovery;
+pub use recovery::{
+    GameResetPlan, GameResetResult, UninstallPreparation, prepare_uninstall, reset_game,
+};
+pub mod runtime_logs;
 pub mod source_migration;
 mod windows_executable;
 pub use depot::{delete_abandoned_depot_staging, inspect_abandoned_depot_staging};
@@ -36,9 +42,10 @@ pub use manager::{
     cancel_depot_operation, cancel_operation, depot_operation_snapshot,
     depot_operation_snapshot_for_product, depot_operation_snapshots, enqueue_depot_operation,
     enqueue_downloaded_installation, enqueue_installation, enqueue_uninstallation,
-    enqueue_uninstallation_with_cleanup, installation_operation_snapshot, recover_depot_operations,
-    recover_interrupted_operations, respond_to_installation, resume_depot_operation, shutdown,
-    start_recovered_operations, subscribe_depot_events, subscribe_installation_events,
+    enqueue_uninstallation_with_cleanup, installation_operation_snapshot, prepare_depot_resume,
+    recover_depot_operations, recover_interrupted_operations, respond_to_installation,
+    resume_depot_operation, shutdown, start_recovered_operations, subscribe_depot_events,
+    subscribe_installation_events,
 };
 pub use marker::{
     InstallationMarker, InstalledDlc, from_game as installation_marker_from_game,

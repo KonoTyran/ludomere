@@ -1191,6 +1191,25 @@ pub(super) fn connect_actions(
         }
     });
     w.window.add_action(&offline);
+    let resume = gio::SimpleAction::new("resume-depot", Some(&String::static_variant_type()));
+    resume.connect_activate({
+        let w = w.clone();
+        let model = model.clone();
+        move |_, value| {
+            let id = value.and_then(|value| value.get::<String>());
+            let token = model
+                .borrow()
+                .account_token
+                .as_ref()
+                .map(|token| token.access_token.clone());
+            if !model.borrow().logout_pending
+                && let (Some(id), Some(token)) = (id, token)
+            {
+                download_chooser::review_depot_resume(&w.window, &model, id, token);
+            }
+        }
+    });
+    w.window.add_action(&resume);
     {
         let w = w.clone();
         let model = model.clone();

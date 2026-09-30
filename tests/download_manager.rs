@@ -135,6 +135,7 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     exercise_transient_retry(&root);
     exercise_connectivity_change_resets_backoff(&root);
     exercise_manual_retry_resets_backoff(&root);
+    exercise_active_recovery(&root);
     download::shutdown();
     server.join().unwrap();
 
@@ -422,6 +423,153 @@ fn exercise_active_removal(root: &std::path::Path) {
     server.join().unwrap();
     wait_for_job_removal(&id);
     assert!(!staging.exists(), "removed job retained its staging data");
+}
+
+fn exercise_active_recovery(root: &std::path::Path) {
+    use ludomere::{
+        config::{Config, GameLibrary},
+        installation::{UninstallPreparation, prepare_uninstall, reset_game},
+    };
+    use std::sync::atomic::AtomicBool;
+
+    let library = root.join("recovery-library");
+    let directory = library.join("game-10");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("goggame-10010.info"),
+        r#"{"gameId":"10010"}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.join("partial-payload"),
+        b"remove only after worker stops",
+    )
+    .unwrap();
+    let config = Config {
+        game_libraries: vec![GameLibrary {
+            id: "recovery".into(),
+            name: "Recovery fixture".into(),
+            path: library,
+            default: true,
+        }],
+        download_directory: root.join("downloads"),
+        ..Default::default()
+    };
+    config.save().unwrap();
+    let retained = config
+        .download_directory
+        .join("previously-downloaded-extra.zip");
+    fs::write(&retained, b"keep without cleanup consent").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (started, start) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(read_request_id(&mut stream), 10);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 600000\r\nContent-Disposition: attachment; filename=\"setup_10.bin\"\r\nConnection: close\r\n\r\n").unwrap();
+        stream.write_all(&vec![17; 300_000]).unwrap();
+        stream.flush().unwrap();
+        started.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+        let _ = stream.write_all(&[17]);
+        drop(stream);
+        let (mut other, _) = listener.accept().unwrap();
+        assert_eq!(read_request_id(&mut other), 11);
+        send_download(&mut other, 11);
+    });
+    let mut affected = artifact(10, format!("http://{address}/10"));
+    affected.size_bytes = Some(600_000);
+    let id = download::job_id(&[&affected]);
+    let staging = root.join("downloads/.ludomere-staging").join(&id);
+    let (events, receiver) = mpsc::channel();
+    download::enqueue(DownloadRequest {
+        artifacts: vec![affected],
+        title: "Recovery active transfer".into(),
+        access_token: "inert-test-token".into(),
+        destination: root.join("downloads/game-10/installer/windows/english"),
+        events,
+    });
+    start.recv_timeout(Duration::from_secs(3)).unwrap();
+    wait_for_staging_bytes(&staging);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>()
+        < 300_000
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "held body was not staged"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Let the synchronous reader enter the server-held next read before requesting recovery.
+    thread::sleep(Duration::from_millis(50));
+    let (other_events, other_receiver) = mpsc::channel();
+    download::enqueue(DownloadRequest {
+        artifacts: vec![artifact(11, format!("http://{address}/11"))],
+        title: "Unaffected queued game".into(),
+        access_token: "inert-test-token".into(),
+        destination: root.join("downloads/game-11/installer/windows/english"),
+        events: other_events,
+    });
+    let UninstallPreparation::Recovery(plan) =
+        prepare_uninstall(&config, 10010, "game-10").unwrap()
+    else {
+        panic!("active partial game must use recovery");
+    };
+    let (finished, result) = mpsc::channel();
+    let (stopping, stopping_receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = reset_game(plan, false, &AtomicBool::new(false), |message| {
+            let _ = stopping.send(message.to_owned());
+        });
+        finished.send(result).unwrap();
+    });
+    stopping_receiver
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    // The server is holding the synchronous read: deletion must await its terminal event.
+    if result.recv_timeout(Duration::from_millis(100)).is_ok() {
+        panic!("recovery completed before the held transfer was released");
+    }
+    assert!(directory.join("partial-payload").exists());
+    release.send(()).unwrap();
+    wait_for_cancelled(&receiver);
+    let result = result
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(result.failures.is_empty(), "{:?}", result.failures);
+    assert_eq!(result.removed_directories, 1);
+    worker.join().unwrap();
+    wait_for_completion(other_receiver);
+    server.join().unwrap();
+    assert!(!directory.exists());
+    assert!(!staging.exists());
+    assert!(
+        StateStore::open()
+            .unwrap()
+            .download_job(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fs::read(retained).unwrap(), b"keep without cleanup consent");
+    assert_eq!(
+        fs::read(root.join("downloads/game-11/installer/windows/english/setup_11.bin")).unwrap(),
+        b"download-11"
+    );
+    assert!(
+        !receiver
+            .try_iter()
+            .any(|event| matches!(event, DownloadEvent::Complete { .. })),
+        "cancelled product emitted a late completion"
+    );
 }
 
 fn read_range_header(stream: &mut std::net::TcpStream) -> Option<String> {

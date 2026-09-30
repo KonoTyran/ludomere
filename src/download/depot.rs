@@ -1462,15 +1462,22 @@ fn validate_complete_file(path: &Path, file: &DepotFile) -> Result<()> {
     validate_complete_file_with_progress(path, file, |_| Ok(()))
 }
 
-fn validate_complete_file_with_progress<F>(
-    path: &Path,
+fn validate_complete_file_with_progress<F>(path: &Path, file: &DepotFile, checked: F) -> Result<()>
+where
+    F: FnMut(u64) -> Result<()>,
+{
+    let mut input = File::open(path)?;
+    validate_open_file_with_progress(&mut input, file, checked)
+}
+
+pub(crate) fn validate_open_file_with_progress<F>(
+    input: &mut File,
     file: &DepotFile,
     mut checked: F,
 ) -> Result<()>
 where
     F: FnMut(u64) -> Result<()>,
 {
-    let mut input = File::open(path)?;
     if input.metadata()?.len() != file.size {
         bail!("staged file size does not match manifest");
     }

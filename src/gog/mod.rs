@@ -1,6 +1,7 @@
 pub mod achievements;
 pub mod audit;
 pub mod builds;
+pub mod dependencies;
 pub mod depot_acquisition;
 pub mod depot_manifest;
 pub mod depot_service;

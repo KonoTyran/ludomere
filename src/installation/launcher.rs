@@ -4,8 +4,7 @@ use anyhow::{Context, Result};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self, File},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{Mutex, OnceLock, mpsc},
@@ -58,6 +57,13 @@ pub enum LaunchEvent {
 
 pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
     let (sender, receiver) = mpsc::channel();
+    let admission = match super::recovery::try_admit(game.product_id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = sender.send(LaunchEvent::Failed(error.to_string()));
+            return receiver;
+        }
+    };
     let activity = match crate::profile_reset::begin_activity("game or cloud sync") {
         Ok(activity) => activity,
         Err(error) => {
@@ -74,10 +80,41 @@ pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
         }
         games.insert(game.product_id, stop_sender);
     }
+    drop(admission);
     thread::spawn(move || {
         let _activity = activity;
         let product_id = game.product_id;
-        match run_game(&game, &sender, &stop_receiver) {
+        let capture = super::runtime_logs::create(product_id);
+        let result = match capture {
+            Ok((path, mut file)) => {
+                super::runtime_logs::diagnostic(
+                    &mut file,
+                    &format!(
+                        "Launch requested at {}: product {product_id}, mode {}",
+                        chrono::Utc::now().to_rfc3339(),
+                        if game.compatibility.is_some() {
+                            "Windows / Proton"
+                        } else {
+                            "native"
+                        }
+                    ),
+                );
+                let result = run_game(&game, &sender, &stop_receiver, &path, &mut file);
+                match &result {
+                    Ok((_, seconds, exit_code)) => super::runtime_logs::diagnostic(
+                        &mut file,
+                        &format!("Session finished after {seconds}s; exit code {exit_code:?}"),
+                    ),
+                    Err(error) => super::runtime_logs::diagnostic(
+                        &mut file,
+                        &format!("Launch failed: {error:#}"),
+                    ),
+                }
+                result
+            }
+            Err(error) => Err(error.context("could not create a private game runtime log")),
+        };
+        match result {
             Ok((started_at, seconds, exit_code)) => {
                 let _ = sender.send(LaunchEvent::Exited {
                     started_at,
@@ -141,6 +178,8 @@ fn run_game(
     game: &InstalledGame,
     events: &mpsc::Sender<LaunchEvent>,
     stop: &mpsc::Receiver<()>,
+    log_path: &std::path::Path,
+    log: &mut File,
 ) -> Result<(i64, u64, Option<i32>)> {
     let mut game = game.clone();
     let backend = game
@@ -166,9 +205,9 @@ fn run_game(
         .as_ref()
         .filter(|path| path.is_file())
         .context("the configured game executable is missing")?;
-    let log_path = runtime_log_path(game.product_id)?;
-    let stdout = File::create(&log_path)
-        .with_context(|| format!("could not create runtime log {}", log_path.display()))?;
+    let stdout = log
+        .try_clone()
+        .context("could not duplicate runtime log handle")?;
     let stderr = stdout
         .try_clone()
         .context("could not duplicate runtime log handle")?;
@@ -177,7 +216,7 @@ fn run_game(
         .and_then(|store| store.compatibility_fix_overrides(game.product_id))
         .unwrap_or_default();
     let fixes = crate::compatibility::effective_fixes(game.product_id, &fix_overrides);
-    let _comet = start_online_services_fix(&game, backend.as_ref(), &fixes, &log_path);
+    let _comet = start_online_services_fix(&game, backend.as_ref(), &fixes, log_path, log);
     let started_at = chrono::Utc::now().timestamp();
     let timer = Instant::now();
     let mut command = if let Some(compatibility) = &game.compatibility {
@@ -197,7 +236,7 @@ fn run_game(
                 executable: executable.clone(),
                 arguments: game.launch_arguments.clone(),
                 working_directory: None,
-                log_path: log_path.clone(),
+                log_path: log_path.to_owned(),
                 background: false,
             })?
     } else {
@@ -222,10 +261,12 @@ fn run_game(
         .spawn()
         .with_context(|| format!("could not launch {}", executable.display()))?;
     let process_group = child.id();
+    super::runtime_logs::diagnostic(log, &format!("Game process started: PID {process_group}"));
     events.send(LaunchEvent::Started).ok();
     let mut leader_status = None;
     let status = loop {
         if stop.try_recv().is_ok() {
+            super::runtime_logs::diagnostic(log, "Stop requested");
             stop_process_group(process_group, &mut child)?;
             break match leader_status {
                 Some(status) => status,
@@ -245,16 +286,9 @@ fn run_game(
         thread::sleep(Duration::from_millis(100));
     };
     let seconds = timer.elapsed().as_secs();
+    super::runtime_logs::diagnostic(log, &format!("Game process exited: {status}"));
     StateStore::open()?.record_game_session(game.product_id, started_at, seconds)?;
     finish_cloud_saves(&game, events);
-    if !status.success()
-        && let Ok(mut log) = OpenOptions::new().append(true).open(&log_path)
-    {
-        let _ = writeln!(
-            log,
-            "\n[Ludomere] Game process exited with status {status}."
-        );
-    }
     Ok((started_at, seconds, status.code()))
 }
 
@@ -456,6 +490,7 @@ fn start_online_services_fix(
     backend: Option<&crate::compatibility::UmuBackend>,
     fixes: &[crate::compatibility::LaunchFixDefinition],
     log_path: &std::path::Path,
+    log: &mut File,
 ) -> Option<crate::compatibility::comet::CometSession> {
     if !fixes.iter().any(|fix| {
         matches!(
@@ -475,9 +510,10 @@ fn start_online_services_fix(
     match result {
         Ok(session) => session,
         Err(error) => {
-            if let Ok(mut log) = OpenOptions::new().append(true).open(log_path) {
-                let _ = writeln!(log, "[Ludomere] GOG online services unavailable: {error:#}");
-            }
+            super::runtime_logs::diagnostic(
+                log,
+                &format!("GOG online services unavailable: {error:#}"),
+            );
             None
         }
     }
@@ -754,9 +790,13 @@ fn stop_process_group(_process_group: u32, child: &mut std::process::Child) -> R
 }
 
 pub fn runtime_log_path(product_id: i64) -> Result<PathBuf> {
-    let root = crate::identity::runtime_logs();
-    fs::create_dir_all(&root)?;
-    Ok(root.join(format!("{product_id}.log")))
+    Ok(super::runtime_logs::list_runtime_logs(product_id)?
+        .into_iter()
+        .next()
+        .map_or_else(
+            || crate::identity::runtime_logs().join(format!("{product_id}.log")),
+            |log| log.path,
+        ))
 }
 
 #[cfg(test)]

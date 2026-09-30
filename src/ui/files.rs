@@ -350,16 +350,10 @@ pub(super) fn detail_file_management(
         manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
         let uninstall = management_menu_button("Uninstall");
+        uninstall.set_widget_name("game-uninstall");
         uninstall.add_css_class("destructive-action");
-        let window = window.clone();
-        let title = game.title.clone();
-        let refresh_after_uninstall = refresh_after_change.clone();
-        let downloaded = downloaded.clone();
-        let model = model.clone();
-        let status = status.clone();
         let product_id = game.product_id;
-        let refresh_preview = refresh_preview.clone();
-        let installed_controls = [browse.clone(), repair.clone(), uninstall.clone()];
+        let installed_controls = [browse.clone(), repair.clone()];
         {
             let model = model.clone();
             let epoch = model.borrow().account_epoch;
@@ -386,158 +380,30 @@ pub(super) fn detail_file_management(
                 }
             });
         }
-        uninstall.connect_clicked(move |button| {
-                let Some(installed) = model.borrow().installed_games.get(&product_id).cloned() else { return; };
-                refresh_preview();
-                let epoch = model.borrow().account_epoch;
-                let confirmation = adw::AlertDialog::builder()
-                .heading(format!("Uninstall {title}?"))
-                .body(format!(
-                    "Remove the installed game from {}? Downloaded files are kept unless you explicitly select cleanup below.",
-                    installed.installation_directory.display()
-                ))
-                .build();
-                let cleanup = gtk::CheckButton::with_label("Also delete downloaded installers, patches, extras and DLC backups");
-                cleanup.set_active(false);
-                cleanup.set_sensitive(false);
-                let cleanup_status = gtk::Label::new(Some("Checking downloaded files…"));
-                cleanup_status.set_wrap(true);
-                let extra = gtk::Box::new(gtk::Orientation::Vertical, 6);
-                extra.append(&cleanup);
-                extra.append(&cleanup_status);
-                let retry_preview = gtk::Button::with_label("Retry downloaded-file check");
-                extra.append(&retry_preview);
-                {
-                    let refresh = refresh_preview.clone();
-                    let cleanup = cleanup.clone();
-                    let busy = preview_busy.clone();
-                    retry_preview.connect_clicked(move |_| {
-                        if busy.get() { return; }
-                        cleanup.set_active(false);
-                        refresh();
-                    });
+        {
+            let window = window.clone();
+            let model = model.clone();
+            let game = game.clone();
+            let refresh = refresh_after_change.clone();
+            uninstall.connect_clicked(move |button| {
+                if model.borrow().logout_pending {
+                    return;
                 }
-                confirmation.set_extra_child(Some(&extra));
-                {
-                    let downloaded = downloaded.clone();
-                    let cleanup = cleanup.downgrade();
-                    let cleanup_status = cleanup_status.clone();
-                    let retry_preview = retry_preview.clone();
-                    let busy = preview_busy.clone();
-                    glib::timeout_add_local(Duration::from_millis(50), move || {
-                        let Some(cleanup) = cleanup.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        retry_preview.set_sensitive(!busy.get());
-                        match downloaded.borrow().as_ref() {
-                            Some(Ok(files)) => {
-                                cleanup.set_sensitive(files.count() > 0);
-                                cleanup_status.set_label(&format!("{} managed files ({})", files.count(), human_size(files.bytes())));
-                                glib::ControlFlow::Continue
-                            }
-                            Some(Err(error)) => {
-                                cleanup.set_active(false);
-                                cleanup.set_sensitive(false);
-                                cleanup_status.set_label(error);
-                                glib::ControlFlow::Continue
-                            }
-                            None => {
-                                cleanup.set_sensitive(false);
-                                cleanup_status.set_label("Checking downloaded files…");
-                                glib::ControlFlow::Continue
-                            },
-                        }
-                    });
-                }
-                confirmation.add_responses(&[("cancel", "Cancel"), ("uninstall", "Uninstall")]);
-                confirmation.set_default_response(Some("cancel"));
-                confirmation.set_close_response("cancel");
-                confirmation
-                    .set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
-                let installed = installed.clone();
-                let button = button.clone();
-                let response_window = window.clone();
-                let refresh_after_change = refresh_after_uninstall.clone();
-                let downloaded = downloaded.clone();
-                let model = model.clone();
-                let status = status.clone();
-                let cleanup_notice = cleanup_notice.clone();
-                confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                    if response != "uninstall" || model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-                        return;
-                    }
-                    let cleanup = if cleanup.is_active() {
-                        downloaded.borrow().as_ref().and_then(|result| result.as_ref().ok()).cloned()
-                    } else {
-                        None
-                    };
-                    let product_id = installed.product_id;
-                    let windows = installed.installer_operating_system.as_deref() != Some("linux");
-                    let directory = installed.installation_directory.clone();
-                    let parent = response_window.clone();
-                    let action = move || {
-                    button.set_sensitive(false);
-                    let receiver = crate::installation::subscribe_installation_events();
-                    let product_id = installed.product_id;
-                    if !crate::installation::enqueue_uninstallation_with_cleanup(installed, cleanup) {
+                button.set_sensitive(false);
+                let dialog = super::uninstall::show_uninstall_dialog(
+                    &window,
+                    &model,
+                    &game,
+                    refresh.clone(),
+                );
+                let button = button.downgrade();
+                dialog.connect_closed(move |_| {
+                    if let Some(button) = button.upgrade() {
                         button.set_sensitive(true);
-                        return;
-                    }
-                    let button = button.clone();
-                    let refresh_after_change = refresh_after_change.clone();
-                    glib::timeout_add_local(Duration::from_millis(100), move || {
-                        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-                            return glib::ControlFlow::Break;
-                        }
-                        match receiver.try_recv() {
-                            Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                                product_id: event_product_id,
-                                event: crate::installation::UninstallationEvent::Started,
-                            }) if event_product_id == product_id => {
-                                refresh_after_change();
-                                glib::ControlFlow::Continue
-                            }
-                            Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                                product_id: event_product_id,
-                                event: crate::installation::UninstallationEvent::Complete,
-                            }) if event_product_id == product_id => {
-                                refresh_after_change();
-                                glib::ControlFlow::Break
-                            }
-                            Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                                product_id: event_product_id,
-                                event: crate::installation::UninstallationEvent::Cancelled,
-                            }) if event_product_id == product_id => {
-                                button.set_sensitive(true);
-                                refresh_after_change();
-                                glib::ControlFlow::Break
-                            }
-                            Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                                product_id: event_product_id,
-                                event: crate::installation::UninstallationEvent::Failed(error),
-                            }) if event_product_id == product_id => {
-                                button.set_sensitive(true);
-                                status.set_label(&error);
-                                status.set_visible(true);
-                                hold_status_notice(cleanup_notice.as_ref(), &error);
-                                refresh_after_change();
-                                glib::ControlFlow::Break
-                            }
-                            Ok(_) | Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                button.set_sensitive(true);
-                                glib::ControlFlow::Break
-                            }
-                        }
-                    });
-                    };
-                    if windows {
-                        with_windows_components(&parent, product_id, true, Some(directory), action);
-                    } else {
-                        action();
                     }
                 });
             });
+        }
         manage_actions.append(&uninstall);
         manage_submenu_actions.push(uninstall);
     }

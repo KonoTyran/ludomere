@@ -108,7 +108,7 @@ pub(in crate::ui) fn install_smooth_wheel_scroll(scrolled: &gtk::ScrolledWindow)
     let controller = gtk::EventControllerScroll::new(
         gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
     );
-    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_propagation_phase(gtk::PropagationPhase::Bubble);
     {
         let scrolled = scrolled.clone();
         let adjustment = adjustment.clone();

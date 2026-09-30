@@ -14,6 +14,8 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 pub struct PrepareDepotRequest<'a> {
+    pub account_session: u64,
+    pub recovery_generation: u64,
     pub store: &'a StateStore,
     pub acquisition: &'a Acquisition,
     pub build: &'a GalaxyBuild,
@@ -27,7 +29,37 @@ pub struct PrepareDepotRequest<'a> {
 }
 
 pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest> {
+    anyhow::ensure!(
+        super::recovery::current(request.build.product_id, request.recovery_generation),
+        "Game recovery invalidated this preparation; start it again explicitly"
+    );
     validate(&request)?;
+    let session = request.account_session;
+    anyhow::ensure!(
+        crate::online::account_session() == session,
+        "Account changed before dependency preparation"
+    );
+    let dependency_plan = if request
+        .build
+        .operating_system
+        .eq_ignore_ascii_case("windows")
+    {
+        let mut ids = request.acquisition.repository.dependencies.clone();
+        if request.acquisition.repository.script_interpreter && !ids.iter().any(|id| id == "ISI") {
+            ids.push("ISI".into());
+        }
+        Some(crate::gog::dependencies::resolve(&ids, || {
+            crate::online::account_session() != session
+                || !super::recovery::current(request.build.product_id, request.recovery_generation)
+        })?)
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        crate::online::account_session() == session
+            && super::recovery::current(request.build.product_id, request.recovery_generation),
+        "Account or recovery changed during dependency preparation"
+    );
     cache_acquisition(request.store, request.acquisition, request.build)?;
     let now = chrono::Utc::now().timestamp();
     let destination = request.library_root.join(&request.slug);
@@ -161,6 +193,8 @@ pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest
         &request.operation_id,
     )?;
     let mut operation = DepotOperationRequest {
+        account_session: session,
+        recovery_generation: request.recovery_generation,
         operation_id: request.operation_id,
         product_id: base_product,
         build_id: request.build.build_id.clone(),
@@ -172,6 +206,7 @@ pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest
         library_id: request.library_id,
         dependencies: request.acquisition.repository.dependencies.clone(),
         entitlement_dlc,
+        dependency_plan,
         library_root: request.library_root,
         slug: request.slug,
         destination,
@@ -448,6 +483,8 @@ mod tests {
             small_files_containers: Vec::new(),
         };
         let repository = GenerationTwoRepository {
+            setup_metadata_version: 1,
+            script_interpreter: false,
             generation: 2,
             root_product_id: "7".into(),
             build_id: Some("build".into()),
@@ -511,6 +548,8 @@ mod tests {
             selected_dlc: Default::default(),
         };
         let operation = prepare(PrepareDepotRequest {
+            account_session: crate::online::account_session(),
+            recovery_generation: crate::installation::recovery::generation(build.product_id),
             store: &store,
             acquisition: &acquisition,
             build: &build,
@@ -573,6 +612,8 @@ mod tests {
             is_gog_depot: false,
         };
         let repository = GenerationTwoRepository {
+            setup_metadata_version: 1,
+            script_interpreter: false,
             generation: 2,
             root_product_id: "7".into(),
             build_id: Some("installed".into()),

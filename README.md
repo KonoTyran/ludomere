@@ -29,6 +29,14 @@ Displayed sizes and rates use decimal byte units (1 MB = 1,000,000 bytes).
 Installation and launch failures retain their full diagnostic text in Notifications, with sensitive
 URLs/credential fields redacted. **View error** expands the current game's failure, including a
 recovered installation failure, without switching to Downloads; Resume remains a separate action.
+The **Logs** tab shows saved native/Windows launch output with a live scrollable view, a saved-run
+selector, **Copy**, **Refresh**, and **Open log folder**. Scrolling away or selecting text pauses
+display updates; enable **Follow live output** to resume, or **Refresh** for a one-time update.
+The viewer reads at most the latest 262.1 kB and lists the newest 100 runs, including legacy logs
+among those runs. Complete logs
+remain on disk without automatic pruning. Recognized URLs and credential fields are redacted in the
+viewer and copied text; raw private log files may still contain sensitive game-generated output, so
+review them before sharing. Existing installer/uninstaller log links remain available below.
 
 For eligible Windows games, Download opens the source chooser with generation-two Depot builds
 first and confirms **Download and install**. Source metadata loads independently; a failed check
@@ -36,6 +44,30 @@ offers Retry rather than silently choosing another source. **Offline installers 
 opens the archive chooser. Customized source ordering is preserved; the former default order is
 migrated once to Depot first. Installed Depot games compare their installed build with Depot
 metadata, independently of any offline installer backups.
+
+Before transferring a Windows Depot game, Ludomere resolves its complete required dependency list
+against GOG's official catalog. Missing or unsupported requirements stop preparation with details;
+**Offline installers and extras…** remains an explicit alternative. Supported catalog components
+include executable and MSI installers, game-local files, and the GOG setup interpreter. Downloaded
+components are checksum-verified and cached for reuse, then verified again before setup. Required
+components are part of the confirmed game installation; Proton and Steam Linux Runtime downloads
+retain their separate confirmation controls.
+
+The existing DirectX and supported Visual C++ compatibility recipes continue through Winetricks;
+other supported dependencies use GOG's declared installer and arguments through UMU. Successful
+setup is recorded for the selected prefix, dependency revision and installation method. Resume
+retries unfinished work and reuses intact cached files; recreating a prefix requires setup again.
+For Winetricks downloads, Ludomere preserves the trust selected by `CURL_CA_BUNDLE`, `SSL_CERT_FILE`
+and `SSL_CERT_DIR`, translating readable host paths under `/etc` or `/usr` to the runtime's read-only
+host mount. This also handles certificate variables added by `cargo run`. Other custom, relative or
+empty settings stay unchanged; when no setting exists, Ludomere uses an existing host CA bundle.
+TLS verification stays enabled. The installation log records the selected policy and variable names,
+without their values. Curl's own configuration can also affect certificate selection.
+A resolved dependency is not a guarantee that its installer or the game will work under Proton.
+Failures keep the operation retryable and do not mark the game successfully installed.
+If interrupted setup cannot be proven stopped, Resume and recovery refuse to change its files.
+An interrupted launch with no saved process identity requires a reboot, not just restarting Ludomere.
+An unreadable operation journal requires repair before recovery; it is not discarded to bypass this check.
 
 Settings → Downloads includes automatic Depot updates (on), offline installer backups (off),
 and superseded-installer cleanup (off). Checks run after library synchronization and every six
@@ -94,9 +126,14 @@ in effect and can still be changed in Settings.
 
 Manage → Delete Downloaded Files removes confirmed, recorded installer/patch/extra files and related
 DLC downloads while preserving installed payloads, saves and preferences. It appears when managed
-downloads are present. Uninstall also offers an unchecked cleanup checkbox; cleanup runs only after
-successful uninstall. Active work and unsafe/replaced files are protected, and partial failures stay
-visible so you can inspect or retry them.
+downloads are present. Uninstall remains available for partial, failed and active operations. Healthy
+idle installations keep their normal uninstall flow, with downloaded-file cleanup unchecked and
+performed only after successful uninstall. Recovery removal first stops affected work, then removes
+the exact game directories shown in its confirmation and resets operation state. This deletes
+untracked files and saves inside those directories; external saves, prefixes, playtime and
+preferences are kept. Downloaded installers and extras remain unless the unchecked cleanup option
+is selected. Recovery can be cancelled, and unsafe paths or partial failures remain visible with a
+fresh review/retry action.
 
 > [!IMPORTANT]
 > Ludomere was built entirely with AI assistance for the author's personal use. Its behavior and

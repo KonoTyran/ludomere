@@ -629,6 +629,8 @@ fn depot_active(state: &str) -> bool {
     matches!(
         state,
         "preparing"
+            | "dependencies"
+            | "setup"
             | "verifying"
             | "verifying_existing"
             | "calculating"
@@ -1107,10 +1109,7 @@ fn active_depot_header(
         let resume = gtk::Button::from_icon_name("media-playback-start-symbolic");
         resume.set_tooltip_text(Some("Resume"));
         resume.set_sensitive(model.account_token.is_some());
-        let token = model
-            .account_token
-            .as_ref()
-            .map(|token| token.access_token.clone());
+        let resume_window = window.clone();
         let resume_id = operation_id.clone();
         let product_id = operation.product_id;
         connect_windows_action(
@@ -1118,12 +1117,12 @@ fn active_depot_header(
             window,
             true,
             move || Some(product_id),
-            move |button| {
-                if let Some(token) = token.clone()
-                    && crate::installation::resume_depot_operation(resume_id.clone(), token)
-                {
-                    button.set_sensitive(false);
-                }
+            move |_| {
+                let _ = gtk::prelude::WidgetExt::activate_action(
+                    &resume_window,
+                    "win.resume-depot",
+                    Some(&resume_id.to_variant()),
+                );
             },
         );
         footer.append(&resume);
@@ -1151,6 +1150,8 @@ fn depot_stage_label(state: &str) -> &'static str {
         "materializing" => "DOWNLOADING",
         "committing" => "INSTALLING FILES",
         "finalizing" => "FINALIZING",
+        "dependencies" => "DOWNLOADING REQUIRED COMPONENTS",
+        "setup" => "SETTING UP REQUIRED COMPONENTS",
         "interrupted" => "PAUSED",
         "failed" => "FAILED",
         "complete" => "COMPLETE",
@@ -1240,22 +1241,19 @@ fn depot_operation_card(
         let resume = gtk::Button::from_icon_name("media-playback-start-symbolic");
         resume.set_tooltip_text(Some("Resume"));
         resume.set_sensitive(model.account_token.is_some());
-        let token = model
-            .account_token
-            .as_ref()
-            .map(|token| token.access_token.clone());
+        let resume_window = w.window.clone();
         let product_id = operation.product_id;
         connect_windows_action(
             &resume,
             &w.window,
             true,
             move || Some(product_id),
-            move |button| {
-                if let Some(token) = token.clone()
-                    && crate::installation::resume_depot_operation(operation_id.clone(), token)
-                {
-                    button.set_sensitive(false);
-                }
+            move |_| {
+                let _ = gtk::prelude::WidgetExt::activate_action(
+                    &resume_window,
+                    "win.resume-depot",
+                    Some(&operation_id.to_variant()),
+                );
             },
         );
         row.append(&resume);

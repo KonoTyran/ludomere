@@ -28,6 +28,8 @@ pub struct EntitlementDlc {
 
 #[derive(Clone)]
 pub struct DepotOperationRequest {
+    pub account_session: u64,
+    pub recovery_generation: u64,
     pub operation_id: String,
     pub product_id: i64,
     pub build_id: String,
@@ -38,6 +40,7 @@ pub struct DepotOperationRequest {
     pub current_manifest_json: Option<String>,
     pub library_id: String,
     pub dependencies: Vec<String>,
+    pub dependency_plan: Option<crate::gog::dependencies::Plan>,
     pub entitlement_dlc: Vec<EntitlementDlc>,
     pub library_root: PathBuf,
     pub slug: String,
@@ -102,6 +105,8 @@ struct PersistedDepotPlan {
     #[serde(default)]
     dependencies: Vec<String>,
     #[serde(default)]
+    dependency_plan: Option<crate::gog::dependencies::Plan>,
+    #[serde(default)]
     entitlement_dlc: Vec<EntitlementDlc>,
     library_root: PathBuf,
     slug: String,
@@ -122,6 +127,7 @@ impl From<&DepotOperationRequest> for PersistedDepotPlan {
             current_manifest_json: request.current_manifest_json.clone(),
             library_id: request.library_id.clone(),
             dependencies: request.dependencies.clone(),
+            dependency_plan: request.dependency_plan.clone(),
             entitlement_dlc: request.entitlement_dlc.clone(),
             library_root: request.library_root.clone(),
             slug: request.slug.clone(),
@@ -323,6 +329,8 @@ pub struct InstallationOperationSnapshot {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedInstallationPlan {
+    #[serde(skip)]
+    recovery_generation: u64,
     game: InstalledGame,
     additional_installers: Vec<AdditionalInstaller>,
     install_base: bool,
@@ -345,6 +353,8 @@ enum QueuedOperation {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedUninstallationPlan {
+    #[serde(skip)]
+    recovery_generation: u64,
     #[serde(flatten)]
     game: InstalledGame,
     #[serde(default)]
@@ -431,6 +441,8 @@ fn depot_state_is_active(state: &str) -> bool {
         state,
         "queued"
             | "preparing"
+            | "dependencies"
+            | "setup"
             | "verifying"
             | "verifying_existing"
             | "calculating"
@@ -502,6 +514,14 @@ pub fn recover_depot_operations() -> anyhow::Result<usize> {
 }
 
 pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
+    if super::recovery::pending(&request.destination, request.product_id).unwrap_or(true) {
+        return false;
+    }
+    let Ok(_admission) =
+        super::recovery::admit_generation(request.product_id, request.recovery_generation)
+    else {
+        return false;
+    };
     let Ok(staging) = super::depot::operation_staging_path(
         &request.library_root,
         &request.destination,
@@ -596,31 +616,7 @@ pub fn resume_depot_operation(operation_id: String, access_token: String) -> boo
     {
         return false;
     }
-    let resumed_operation_id = operation_id.clone();
-    let result = super::operation_journal::find_depot(&operation_id)
-        .map(|(_, record)| record)
-        .and_then(|record| {
-            let plan: PersistedDepotPlan = serde_json::from_str(&record.plan_json)?;
-            Ok(DepotOperationRequest {
-                operation_id: resumed_operation_id,
-                product_id: plan.product_id,
-                build_id: plan.build_id,
-                branch: plan.branch,
-                kind: plan.kind,
-                sources: plan.sources,
-                current_sources: plan.current_sources,
-                current_manifest_json: plan.current_manifest_json,
-                library_id: plan.library_id,
-                dependencies: plan.dependencies,
-                entitlement_dlc: plan.entitlement_dlc,
-                library_root: plan.library_root,
-                slug: plan.slug,
-                destination: plan.destination,
-                staging_path: plan.staging_path,
-                target_marker: plan.target_marker,
-                access_token,
-            })
-        });
+    let result = prepare_depot_resume(operation_id.clone(), access_token);
     match result {
         Ok(request) => enqueue_depot_operation(request),
         Err(error) => {
@@ -639,6 +635,42 @@ pub fn resume_depot_operation(operation_id: String, access_token: String) -> boo
             false
         }
     }
+}
+
+pub fn prepare_depot_resume(
+    operation_id: String,
+    access_token: String,
+) -> anyhow::Result<DepotOperationRequest> {
+    let mut request = super::operation_journal::find_depot(&operation_id)
+        .map(|(_, record)| record)
+        .and_then(|record| {
+            super::dependency_setup::ensure_setup_quiescent(&record)?;
+            let plan: PersistedDepotPlan = serde_json::from_str(&record.plan_json)?;
+            Ok(DepotOperationRequest {
+                account_session: crate::online::account_session(),
+                recovery_generation: super::recovery::generation(plan.product_id),
+                operation_id: operation_id.clone(),
+                product_id: plan.product_id,
+                build_id: plan.build_id,
+                branch: plan.branch,
+                kind: plan.kind,
+                sources: plan.sources,
+                current_sources: plan.current_sources,
+                current_manifest_json: plan.current_manifest_json,
+                library_id: plan.library_id,
+                dependencies: plan.dependencies,
+                dependency_plan: plan.dependency_plan,
+                entitlement_dlc: plan.entitlement_dlc,
+                library_root: plan.library_root,
+                slug: plan.slug,
+                destination: plan.destination,
+                staging_path: plan.staging_path,
+                target_marker: plan.target_marker,
+                access_token,
+            })
+        })?;
+    prepare_required_dependencies(&mut request, &std::sync::atomic::AtomicBool::new(false))?;
+    Ok(request)
 }
 
 fn publish_depot(snapshot: DepotOperationSnapshot) {
@@ -744,32 +776,28 @@ fn run_depot_operation(
             error: (!was_cancelled).then_some(message),
         });
     }
-    DEPOT_MANAGER
-        .lock()
-        .unwrap()
-        .active
-        .remove(&request.operation_id);
     let abandon = DEPOT_MANAGER
         .lock()
         .unwrap()
         .abandon_requested
-        .remove(&request.operation_id);
-    DEPOT_MANAGER
-        .lock()
-        .unwrap()
-        .reservations
         .remove(&request.operation_id);
     if abandon {
         let _ = abandon_saved_depot_operation(&request.operation_id);
     } else if let Some(snapshot) = failure_snapshot {
         publish_depot(snapshot);
     }
+    let mut manager = DEPOT_MANAGER.lock().unwrap();
+    manager.active.remove(&request.operation_id);
+    manager.reservations.remove(&request.operation_id);
 }
 
 fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
     let (journal_path, record) = super::operation_journal::find_depot(operation_id)?;
+    super::dependency_setup::ensure_setup_quiescent(&record)?;
     let plan: PersistedDepotPlan = serde_json::from_str(&record.plan_json)?;
     let request = DepotOperationRequest {
+        account_session: crate::online::account_session(),
+        recovery_generation: super::recovery::generation(plan.product_id),
         operation_id: operation_id.to_owned(),
         product_id: plan.product_id,
         build_id: plan.build_id,
@@ -780,6 +808,7 @@ fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
         current_manifest_json: plan.current_manifest_json,
         library_id: plan.library_id,
         dependencies: plan.dependencies,
+        dependency_plan: plan.dependency_plan,
         entitlement_dlc: plan.entitlement_dlc,
         library_root: plan.library_root,
         slug: plan.slug,
@@ -813,10 +842,107 @@ fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn prepare_required_dependencies(
+    request: &mut DepotOperationRequest,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<()> {
+    let session = request.account_session;
+    let stopped = || {
+        cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::online::account_session() != session
+            || !super::recovery::current(request.product_id, request.recovery_generation)
+    };
+    anyhow::ensure!(
+        !stopped(),
+        "Account or recovery changed before prerequisite preparation"
+    );
+    if request
+        .target_marker
+        .base
+        .operating_system
+        .as_deref()
+        .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+    {
+        let repository = setup_repository(&StateStore::open()?, request, cancelled, |identity| {
+            crate::gog::depot_acquisition::fetch_repository(
+                &reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(45))
+                    .build()?,
+                &request.access_token,
+                identity,
+            )
+        })?;
+        anyhow::ensure!(
+            repository.dependencies == request.dependencies,
+            "Saved dependency requirements do not match the selected build; prepare it again"
+        );
+        let mut ids = repository.dependencies.clone();
+        if repository.script_interpreter && !ids.iter().any(|id| id == "ISI") {
+            ids.push("ISI".into());
+        }
+        if let Some(plan) = &request.dependency_plan {
+            super::dependency_setup::validate_required(plan, &ids)?;
+        } else {
+            let plan = crate::gog::dependencies::resolve(&ids, stopped)?;
+            super::dependency_setup::validate_required(&plan, &ids)?;
+            anyhow::ensure!(!stopped(), "Dependency preparation cancelled");
+            request.dependency_plan = Some(plan);
+            request
+                .target_marker
+                .galaxy_depot
+                .as_mut()
+                .unwrap()
+                .manifest_fingerprint
+                .clear();
+            request
+                .target_marker
+                .galaxy_depot
+                .as_mut()
+                .unwrap()
+                .manifest_fingerprint = planned_manifest_identity(request)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_depot_operation_inner(
     request: &DepotOperationRequest,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
+    let mut request = request.clone();
+    let session = request.account_session;
+    anyhow::ensure!(
+        crate::online::account_session() == session,
+        "Account changed before dependency setup"
+    );
+    let windows = request
+        .target_marker
+        .base
+        .operating_system
+        .as_deref()
+        .is_some_and(|os| os.eq_ignore_ascii_case("windows"));
+    prepare_required_dependencies(&mut request, cancelled)?;
+    let (path, mut record) = super::operation_journal::find_depot(&request.operation_id)?;
+    super::dependency_setup::ensure_setup_quiescent(&record)?;
+    record.plan_json = serde_json::to_string(&PersistedDepotPlan::from(&request))?;
+    super::operation_journal::write_depot(&path, &record)?;
+    let request = &request;
+    let stopped = || {
+        cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::online::account_session() != session
+            || !super::recovery::current(request.product_id, request.recovery_generation)
+    };
+    let prepared = if let Some(plan) = &request.dependency_plan {
+        let mut acquisition = plan.clone();
+        acquisition.entries.retain(|entry| {
+            super::dependency_setup::override_verbs(&entry.id, &request.dependencies).is_none()
+        });
+        crate::gog::dependencies::acquire(&acquisition, stopped, |done, total| {
+            publish_depot_progress(request, "dependencies", done, done, 0, 0, total);
+        })?
+    } else {
+        Vec::new()
+    };
     anyhow::ensure!(
         !super::is_game_running(request.product_id),
         "Close the running game before resuming this Depot operation"
@@ -846,6 +972,20 @@ fn run_depot_operation_inner(
     let (support, support_sources) = merge_support_sources(request)?;
     let removed_actions = removed_dlc_actions(request)?;
     let current = current_manifest(request)?;
+    let combined =
+        super::dependency_setup::combined_manifest(&target, request.dependency_plan.as_ref())?;
+    let payload_paths = target
+        .entries
+        .iter()
+        .map(entry_path)
+        .collect::<std::collections::HashSet<_>>();
+    let dependency_paths = combined
+        .entries
+        .iter()
+        .map(entry_path)
+        .filter(|path| !payload_paths.contains(path))
+        .map(str::to_owned)
+        .collect();
     let target_totals = target.totals()?;
     let support_totals = support.totals()?;
     let total = target_totals
@@ -1029,7 +1169,13 @@ fn run_depot_operation_inner(
     let mut served = std::collections::HashSet::new();
     let operation_id = request.operation_id.clone();
     let installed_marker = super::marker::load(&request.destination)?;
-    let commit_marker = dependency_commit_marker(&request.target_marker, installed_marker.as_ref());
+    let mut commit_marker =
+        dependency_commit_marker(&request.target_marker, installed_marker.as_ref());
+    commit_marker
+        .galaxy_depot
+        .as_mut()
+        .unwrap()
+        .manifest_fingerprint = target.identity();
     let plan = super::depot::DepotInstallPlan {
         operation: match request.kind {
             DepotOperationKind::Install => super::depot::DepotOperationKind::Install,
@@ -1041,6 +1187,8 @@ fn run_depot_operation_inner(
         target_manifest: &target,
         current_manifest: current.as_ref(),
         target_marker: commit_marker,
+        publish_marker: !windows,
+        retained_paths: dependency_paths,
     };
     let forced_remove_paths = forced_dlc_removals(request)?;
     let mut retry_states = HashMap::<usize, SourceRetryState>::new();
@@ -1218,7 +1366,14 @@ fn run_depot_operation_inner(
             total,
         )?)
     };
-    let finalization = finalize_depot_metadata(request, support_root.as_deref(), &removed_actions);
+    let finalization = finalize_depot_metadata(
+        request,
+        support_root.as_deref(),
+        &removed_actions,
+        cancelled,
+        &prepared,
+        session,
+    );
     let cleanup = super::depot_actions::remove_support_staging(&request.staging_path);
     finalization?;
     cleanup?;
@@ -1389,6 +1544,22 @@ fn required_network_bytes(
 fn current_manifest(
     request: &DepotOperationRequest,
 ) -> anyhow::Result<Option<crate::gog::depot_manifest::DepotManifest>> {
+    if let Some(marker) = super::marker::load(&request.destination)?
+        && let Some(provenance) = marker.galaxy_depot.as_ref()
+        && let Some(record) = StateStore::open()?.depot_manifest(
+            &provenance.manifest_fingerprint,
+            request.product_id,
+            &provenance.build_id,
+            "ludomere:installed-with-dependencies",
+        )?
+    {
+        let manifest = crate::gog::depot_manifest::parse(record.manifest_json.as_bytes())?;
+        anyhow::ensure!(
+            manifest.identity() == provenance.manifest_fingerprint,
+            "Installed dependency ownership manifest is damaged"
+        );
+        return Ok(Some(manifest));
+    }
     if request.current_sources.is_empty() {
         return request
             .current_manifest_json
@@ -1546,6 +1717,9 @@ fn finalize_depot_metadata(
     request: &DepotOperationRequest,
     _support: Option<&std::path::Path>,
     removed_actions: &[(i64, Vec<super::depot_metadata::DepotScriptAction>)],
+    cancelled: &std::sync::atomic::AtomicBool,
+    prepared: &[crate::gog::dependencies::PreparedDependency],
+    session: u64,
 ) -> anyhow::Result<()> {
     let language = request
         .target_marker
@@ -1577,7 +1751,16 @@ fn finalize_depot_metadata(
         .as_deref()
         .is_some_and(|value| value.eq_ignore_ascii_case("windows"))
     {
-        use crate::compatibility::CompatibilityBackend;
+        let repository = setup_repository(&StateStore::open()?, request, cancelled, |identity| {
+            crate::gog::depot_acquisition::fetch_repository(
+                &reqwest::blocking::Client::builder()
+                    .connect_timeout(Duration::from_secs(15))
+                    .timeout(Duration::from_secs(45))
+                    .build()?,
+                &request.access_token,
+                identity,
+            )
+        })?;
         let compatibility = marker
             .compatibility
             .as_ref()
@@ -1598,36 +1781,40 @@ fn finalize_depot_metadata(
                 &format!("{name} path: {}", path.display()),
             )?;
         }
-        let prefix = backend.initialize_prefix(crate::compatibility::InitializePrefixRequest {
-            library_id: request.library_id.clone(),
-            library: request.library_root.clone(),
-            slug: request.slug.clone(),
-            profile: compatibility.profile.clone(),
-            log_path: log_path.clone(),
-        })?;
+        let stopped = || {
+            cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                || crate::online::account_session() != session
+                || !super::recovery::current(request.product_id, request.recovery_generation)
+        };
+        let prefix = backend.initialize_prefix_controlled(
+            crate::compatibility::InitializePrefixRequest {
+                library_id: request.library_id.clone(),
+                library: request.library_root.clone(),
+                slug: request.slug.clone(),
+                profile: compatibility.profile.clone(),
+                log_path: log_path.clone(),
+            },
+            |command, log| {
+                super::dependency_setup::run_tracked(
+                    Some(&request.operation_id),
+                    &stopped,
+                    "Prefix initialization",
+                    log,
+                    || {
+                        Ok(crate::compatibility::CompatibilityProcess::spawn(
+                            command, log,
+                        )?)
+                    },
+                )
+            },
+        )?;
         let prefix = request.library_root.join(prefix.relative_path);
         crate::compatibility::append_step_log(
             &log_path,
             &format!("prefix path: {}", prefix.display()),
         )?;
-        let installed_dependencies = super::marker::load(&request.destination)?
-            .map(|installed| installed.dependencies)
-            .unwrap_or_default();
-        let verbs = changed_dependency_verbs(&installed_dependencies, &request.dependencies)?;
-        if !verbs.is_empty() {
-            let mut process = backend.run_winetricks(
-                &prefix,
-                &compatibility.profile,
-                &verbs,
-                &request.destination,
-                &log_path,
-            )?;
-            if !process.wait()?.success() {
-                anyhow::bail!("installing required Windows dependencies failed");
-            }
-        }
-        marker.dependencies = request.dependencies.clone();
         let context = super::depot_actions::ActionContext {
+            operation_id: Some(request.operation_id.clone()),
             product_id: request.product_id,
             app: request.destination.clone(),
             support: super::depot_actions::support_staging(&request.staging_path)?,
@@ -1635,17 +1822,65 @@ fn finalize_depot_metadata(
             windows_app: crate::compatibility::windows_destination(&request.slug),
             profile: compatibility.profile.clone(),
             log_path,
+            galaxy_setup: None,
         };
+        let plan = request.dependency_plan.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Missing resolved dependency plan; retry preparation")
+        })?;
+        for dependency in prepared.iter().filter(|item| {
+            matches!(
+                item.dependency.method,
+                crate::gog::dependencies::Method::GameFiles
+            )
+        }) {
+            crate::gog::dependencies::publish_game_files(
+                dependency,
+                &request.destination,
+                stopped,
+            )?;
+        }
+        super::dependency_setup::apply(&backend, plan, prepared, &context, stopped, |name| {
+            let _ = crate::compatibility::append_step_log(
+                &context.log_path,
+                &format!("Applying required component: {name}"),
+            );
+            publish_depot_progress(request, "setup", 0, 0, 0, 0, 0);
+        })?;
+        marker.dependencies = request.dependencies.clone();
         for (product_id, actions) in removed_actions {
             let context = super::depot_actions::ActionContext {
                 product_id: *product_id,
                 ..context.clone()
             };
-            super::depot_actions::execute_actions(&backend, &context, actions, true)?;
+            super::depot_actions::execute_actions_controlled(
+                &backend, &context, actions, true, &stopped,
+            )?;
         }
         let mut products = vec![request.product_id];
         products.extend(marker.dlc.iter().map(|dlc| dlc.product_id));
         for product_id in products {
+            if repository.script_interpreter {
+                let context = super::depot_actions::ActionContext {
+                    product_id,
+                    ..context.clone()
+                };
+                super::dependency_setup::interpret(
+                    &backend,
+                    plan,
+                    prepared,
+                    &context,
+                    &super::depot_actions::GalaxySetup {
+                        executable: String::new(),
+                        arguments: String::new(),
+                        language: language.into(),
+                        build_id: request.build_id.clone(),
+                        version: marker.base.version.clone().unwrap_or_default(),
+                    },
+                    &request.operation_id,
+                    stopped,
+                )?;
+                continue;
+            }
             let script = request
                 .destination
                 .join(format!("goggame-{product_id}.script"));
@@ -1659,12 +1894,135 @@ fn finalize_depot_metadata(
             )?;
             let context = super::depot_actions::ActionContext {
                 product_id,
+                galaxy_setup: if repository.script_interpreter {
+                    None
+                } else {
+                    repository
+                        .products
+                        .iter()
+                        .find(|product| product.product_id == product_id.to_string())
+                        .and_then(|product| {
+                            product
+                                .temp_executable
+                                .as_ref()
+                                .filter(|name| !name.is_empty())
+                                .map(|executable| super::depot_actions::GalaxySetup {
+                                    executable: executable.clone(),
+                                    arguments: product.temp_arguments.clone().unwrap_or_default(),
+                                    language: language.to_owned(),
+                                    build_id: request.build_id.clone(),
+                                    version: marker.base.version.clone().unwrap_or_default(),
+                                })
+                        })
+                },
                 ..context.clone()
             };
-            super::depot_actions::execute_actions(&backend, &context, &actions, false)?;
+            super::depot_actions::execute_actions_controlled(
+                &backend, &context, &actions, false, &stopped,
+            )?;
         }
     }
-    super::marker::write(&marker, &request.destination)
+    anyhow::ensure!(
+        !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            && crate::online::account_session() == session
+            && super::recovery::current(request.product_id, request.recovery_generation),
+        "Account or operation changed before publishing installation success"
+    );
+    let (payload, _) = merge_depot_sources(request)?;
+    let combined =
+        super::dependency_setup::combined_manifest(&payload, request.dependency_plan.as_ref())?;
+    let now = chrono::Utc::now().timestamp();
+    StateStore::open()?.save_depot_manifest(&crate::state::DepotManifestRecord {
+        manifest_identity: combined.identity(),
+        product_id: request.product_id,
+        build_id: request.build_id.clone(),
+        depot_id: "ludomere:installed-with-dependencies".into(),
+        manifest_json: combined.canonical_json()?,
+        first_seen_at: now,
+        last_seen_at: now,
+    })?;
+    crate::online::with_account_session(session, || {
+        let _admission =
+            super::recovery::admit_generation(request.product_id, request.recovery_generation)?;
+        anyhow::ensure!(
+            !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            "Setup cancelled before publishing installation success"
+        );
+        super::marker::write(&marker, &request.destination)
+    })
+}
+
+fn setup_repository(
+    store: &StateStore,
+    request: &DepotOperationRequest,
+    cancelled: &std::sync::atomic::AtomicBool,
+    fetch: impl FnOnce(&str) -> anyhow::Result<crate::gog::types::GenerationTwoRepository>,
+) -> anyhow::Result<crate::gog::types::GenerationTwoRepository> {
+    use anyhow::{Context, ensure};
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::download::depot::DepotCancelled.into());
+    }
+    let identity = &request
+        .target_marker
+        .galaxy_depot
+        .as_ref()
+        .context("Depot setup has no selected repository identity")?
+        .repository_id;
+    let cached = store.depot_repository(request.product_id, "windows", &request.build_id)?;
+    if let Some(cached) = &cached {
+        ensure!(
+            cached.manifest_identity == *identity && cached.branch == request.branch,
+            "Cached setup repository does not match the selected build"
+        );
+    }
+    let parsed = cached
+        .as_ref()
+        .map(|record| {
+            serde_json::from_str::<crate::gog::types::GenerationTwoRepository>(
+                &record.repository_json,
+            )
+        })
+        .transpose()?;
+    let refresh = parsed
+        .as_ref()
+        .is_none_or(|repository| repository.setup_metadata_version == 0);
+    let repository = if refresh {
+        fetch(identity)
+            .context("Refreshing selected build setup metadata; retry Resume when online")?
+    } else {
+        parsed.unwrap()
+    };
+    ensure!(
+        repository.setup_metadata_version == 1
+            && repository.generation == 2
+            && repository.root_product_id == request.product_id.to_string()
+            && repository
+                .build_id
+                .as_deref()
+                .is_none_or(|id| id == request.build_id)
+            && repository
+                .platform
+                .as_deref()
+                .is_none_or(|platform| platform.eq_ignore_ascii_case("windows")),
+        "Setup repository identity does not match the selected Windows build"
+    );
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::download::depot::DepotCancelled.into());
+    }
+    if refresh {
+        let now = chrono::Utc::now().timestamp();
+        store.save_depot_repository(&crate::state::DepotRepositoryRecord {
+            product_id: request.product_id,
+            operating_system: "windows".into(),
+            build_id: request.build_id.clone(),
+            branch: request.branch.clone(),
+            manifest_identity: identity.clone(),
+            repository_json: serde_json::to_string(&repository)?,
+            first_seen_at: cached.as_ref().map_or(now, |record| record.first_seen_at),
+            last_seen_at: now,
+        })?;
+    }
+    Ok(repository)
 }
 
 fn write_entitlement_markers(
@@ -1732,6 +2090,7 @@ fn write_entitlement_markers(
     Ok(())
 }
 
+#[cfg(test)]
 fn dependency_verbs(dependencies: &[String]) -> anyhow::Result<Vec<String>> {
     let mut verbs = std::collections::BTreeSet::new();
     for dependency in dependencies {
@@ -1768,6 +2127,7 @@ fn dependency_verbs(dependencies: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(verbs.into_iter().collect())
 }
 
+#[cfg(test)]
 fn changed_dependency_verbs(
     installed: &[String],
     requested: &[String],
@@ -1777,6 +2137,69 @@ fn changed_dependency_verbs(
     } else {
         dependency_verbs(requested)
     }
+}
+
+pub(crate) fn pending_dependency_verbs(
+    prefix: &std::path::Path,
+    requested: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context;
+    use std::io::Read;
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    if requested.is_empty() {
+        return Ok(requested);
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(prefix)?;
+    // The selected prefix anchors this read; a log link cannot redirect it elsewhere.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"winetricks.log".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(requested);
+        }
+        return Err(anyhow::Error::from(error))
+            .context("could not inspect installed Windows dependencies");
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "Winetricks history must be a regular file with a single link"
+    );
+    let mut text = String::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .context("could not read installed Windows dependencies")?;
+    anyhow::ensure!(
+        text.len() <= 1024 * 1024,
+        "Winetricks history exceeds its size limit"
+    );
+    let installed = text
+        .lines()
+        .map(str::trim)
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        installed
+            .iter()
+            .all(|line| line.len() <= 1024 && !line.chars().any(char::is_control)),
+        "Winetricks history contains invalid entries"
+    );
+    Ok(requested
+        .into_iter()
+        .filter(|verb| !installed.contains(verb.as_str()))
+        .collect())
 }
 
 fn dependency_commit_marker(
@@ -1984,12 +2407,21 @@ fn persist_depot_request(request: &DepotOperationRequest) -> anyhow::Result<()> 
         .checked_add(support.totals()?.compressed)
         .ok_or_else(|| anyhow::anyhow!("depot operation size overflows"))?;
     let journal_path = super::operation_journal::depot_path(&request.staging_path);
-    let previous = super::operation_journal::read(&journal_path)
-        .ok()
-        .and_then(|journal| match journal {
-            super::operation_journal::OperationJournal::Depot { record, .. } => Some(record),
-            _ => None,
-        });
+    let previous = match super::operation_journal::read(&journal_path) {
+        Ok(super::operation_journal::OperationJournal::Depot { record, .. }) => Some(record),
+        Ok(_) => anyhow::bail!("A different operation already owns this game journal"),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(record) = &previous {
+        super::dependency_setup::ensure_setup_quiescent(record)?;
+    }
     let now = chrono::Utc::now().timestamp();
     let record = DepotOperationRecord {
         operation_id: request.operation_id.clone(),
@@ -2197,7 +2629,12 @@ fn merge_depot_sources(
         entries,
     };
     if !provenance.manifest_fingerprint.is_empty()
-        && provenance.manifest_fingerprint != manifest.identity()
+        && provenance.manifest_fingerprint
+            != super::dependency_setup::combined_manifest(
+                &manifest,
+                request.dependency_plan.as_ref(),
+            )?
+            .identity()
     {
         anyhow::bail!("combined depot manifest does not match target marker provenance");
     }
@@ -2213,7 +2650,11 @@ pub(crate) fn planned_manifest_identity(request: &DepotOperationRequest) -> anyh
     {
         anyhow::bail!("planned marker fingerprint must be empty");
     }
-    Ok(merge_depot_sources(request)?.0.identity())
+    Ok(super::dependency_setup::combined_manifest(
+        &merge_depot_sources(request)?.0,
+        request.dependency_plan.as_ref(),
+    )?
+    .identity())
 }
 
 fn merge_support_sources(
@@ -2275,7 +2716,15 @@ fn merge_support_sources(
     ))
 }
 
-fn entries_equivalent(
+fn entry_path(entry: &crate::gog::depot_manifest::DepotEntry) -> &str {
+    use crate::gog::depot_manifest::DepotEntry;
+    match entry {
+        DepotEntry::File(file) => &file.path,
+        DepotEntry::Directory { path } | DepotEntry::Link { path, .. } => path,
+    }
+}
+
+pub(crate) fn entries_equivalent(
     left: &crate::gog::depot_manifest::DepotEntry,
     right: &crate::gog::depot_manifest::DepotEntry,
 ) -> bool {
@@ -2356,7 +2805,15 @@ pub fn enqueue_installation(
     interactive_prompts: bool,
 ) -> bool {
     let product_id = plan.product_id;
+    if super::recovery::pending(&plan.installation_directory, product_id).unwrap_or(true) {
+        return false;
+    }
+    let generation = super::recovery::generation(product_id);
+    let Ok(admission) = super::recovery::admit_generation(product_id, generation) else {
+        return false;
+    };
     let persisted_plan = PersistedInstallationPlan {
+        recovery_generation: generation,
         game: plan.clone(),
         additional_installers: additional_installers.clone(),
         install_base,
@@ -2402,6 +2859,7 @@ pub fn enqueue_installation(
     if let Some(snapshot) = installation_operation_snapshot(product_id) {
         publish(InstallationManagerEvent::OperationQueued(snapshot));
     }
+    drop(admission);
     schedule_next();
     true
 }
@@ -2414,7 +2872,14 @@ pub fn enqueue_downloaded_installation(
     additional_installers: Vec<AdditionalInstaller>,
 ) -> anyhow::Result<()> {
     let product_id = game.product_id;
+    anyhow::ensure!(
+        !super::recovery::pending(&game.installation_directory, product_id)?,
+        "Finish this game's interrupted recovery before installing"
+    );
+    let generation = super::recovery::generation(product_id);
+    let admission = super::recovery::admit_generation(product_id, generation)?;
     let plan = PersistedInstallationPlan {
+        recovery_generation: generation,
         game,
         additional_installers,
         install_base: true,
@@ -2447,6 +2912,7 @@ pub fn enqueue_downloaded_installation(
     manager.snapshots.insert(product_id, snapshot.clone());
     drop(manager);
     publish(InstallationManagerEvent::OperationQueued(snapshot));
+    drop(admission);
     schedule_next();
     Ok(())
 }
@@ -2537,7 +3003,18 @@ pub fn enqueue_uninstallation_with_cleanup(
     cleanup: Option<crate::download::ManagedDownloads>,
 ) -> bool {
     let product_id = game.product_id;
-    let plan = PersistedUninstallationPlan { game, cleanup };
+    if super::recovery::pending(&game.installation_directory, product_id).unwrap_or(true) {
+        return false;
+    }
+    let generation = super::recovery::generation(product_id);
+    let Ok(admission) = super::recovery::admit_generation(product_id, generation) else {
+        return false;
+    };
+    let plan = PersistedUninstallationPlan {
+        game,
+        cleanup,
+        recovery_generation: generation,
+    };
     let queue_position = {
         let mut manager = MANAGER.lock().unwrap();
         if manager.active.contains_key(&product_id)
@@ -2577,6 +3054,7 @@ pub fn enqueue_uninstallation_with_cleanup(
     if let Some(snapshot) = installation_operation_snapshot(product_id) {
         publish(InstallationManagerEvent::OperationQueued(snapshot));
     }
+    drop(admission);
     schedule_next();
     true
 }
@@ -2597,6 +3075,13 @@ fn schedule_next() {
 }
 
 fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
+    let Ok(admission) = super::recovery::admit_generation(
+        persisted_plan.game.product_id,
+        persisted_plan.recovery_generation,
+    ) else {
+        schedule_next();
+        return;
+    };
     let authorization = if persisted_plan.download_intent_id.is_some() {
         StateStore::open().and_then(|store| download_intent_matches(&store, &persisted_plan))
     } else {
@@ -2623,6 +3108,7 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
             .unwrap()
             .snapshots
             .remove(&persisted_plan.game.product_id);
+        drop(admission);
         schedule_next();
         return;
     }
@@ -2650,6 +3136,7 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
             .active
             .insert(product_id, OperationControl::Installation(handle.control()));
     }
+    drop(admission);
     persist_existing_operation(product_id, "running", Some(running_message), None, None);
     {
         let mut manager = MANAGER.lock().unwrap();
@@ -2704,6 +3191,11 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
 
 fn start_queued_uninstallation(plan: PersistedUninstallationPlan) {
     let product_id = plan.game.product_id;
+    let Ok(admission) = super::recovery::admit_generation(product_id, plan.recovery_generation)
+    else {
+        schedule_next();
+        return;
+    };
     let handle = super::executor::start_uninstallation(plan.game);
     {
         let mut manager = MANAGER.lock().unwrap();
@@ -2712,6 +3204,7 @@ fn start_queued_uninstallation(plan: PersistedUninstallationPlan) {
             OperationControl::Uninstallation(handle.control()),
         );
     }
+    drop(admission);
     persist_existing_operation(
         product_id,
         "running",
@@ -2847,6 +3340,126 @@ pub fn cancel_operation(product_id: i64) -> bool {
     ));
     schedule_next();
     true
+}
+
+pub(super) fn recovery_busy(ids: &[i64]) -> bool {
+    let manager = MANAGER.lock().unwrap();
+    let busy = manager.active.keys().any(|id| ids.contains(id))
+        || manager
+            .queue
+            .iter()
+            .any(|operation| ids.contains(&operation.product_id()))
+        || manager.snapshots.iter().any(|(id, snapshot)| {
+            ids.contains(id)
+                && matches!(
+                    snapshot.state,
+                    crate::domain::InstallationState::Failed
+                        | crate::domain::InstallationState::UninstallFailed
+                )
+        });
+    drop(manager);
+    busy || DEPOT_MANAGER
+        .lock()
+        .unwrap()
+        .snapshots
+        .values()
+        .any(|snapshot| {
+            ids.contains(&snapshot.product_id)
+                && !matches!(snapshot.state.as_str(), "complete" | "abandoned")
+        })
+}
+
+pub(super) fn quiesce_recovery(
+    ids: &[i64],
+    cancelled: &std::sync::atomic::AtomicBool,
+    config: &crate::config::Config,
+    slug: &str,
+) -> anyhow::Result<()> {
+    {
+        let mut manager = MANAGER.lock().unwrap();
+        manager
+            .queue
+            .retain(|operation| !ids.contains(&operation.product_id()));
+        for (id, control) in &manager.active {
+            if ids.contains(id) {
+                match control {
+                    OperationControl::Installation(control) => control.cancel(),
+                    OperationControl::Uninstallation(control) => control.cancel(),
+                }
+            }
+        }
+    }
+    {
+        let manager = DEPOT_MANAGER.lock().unwrap();
+        for (operation, (id, _)) in &manager.reservations {
+            if ids.contains(id)
+                && let Some(cancel) = manager.active.get(operation)
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        anyhow::ensure!(
+            !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            "Recovery cancelled; stopped operations remain available for review"
+        );
+        let offline = MANAGER
+            .lock()
+            .unwrap()
+            .active
+            .keys()
+            .any(|id| ids.contains(id));
+        let depot = {
+            let manager = DEPOT_MANAGER.lock().unwrap();
+            manager.reservations.iter().any(|(operation, (id, _))| {
+                ids.contains(id) && manager.active.contains_key(operation)
+            })
+        };
+        if !offline && !depot {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "The installer is still stopping. No files were removed; retry recovery after it stops"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    for library in &config.game_libraries {
+        let path = super::operation_journal::path(&library.path, slug)?;
+        match super::operation_journal::read(&path) {
+            Ok(super::operation_journal::OperationJournal::Depot { record, .. }) => {
+                anyhow::ensure!(ids.contains(&record.product_id), "Another game's operation owns this recovery journal");
+                super::dependency_setup::ensure_setup_quiescent(&record)?;
+            }
+            Ok(_) => {}
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error.context("Cannot verify this game's setup process journal. No files were removed; restore a valid operation record before retrying recovery")),
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn finish_recovery(ids: &[i64]) {
+    {
+        let mut manager = MANAGER.lock().unwrap();
+        for id in ids {
+            manager.snapshots.remove(id);
+        }
+    }
+    {
+        let mut manager = DEPOT_MANAGER.lock().unwrap();
+        manager
+            .snapshots
+            .retain(|_, snapshot| !ids.contains(&snapshot.product_id));
+    }
+    for id in ids {
+        publish(InstallationManagerEvent::Uninstallation {
+            product_id: *id,
+            event: UninstallationEvent::Complete,
+        });
+    }
 }
 
 pub fn recover_interrupted_operations() -> anyhow::Result<usize> {
@@ -3211,6 +3824,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&game).unwrap()).unwrap();
         assert!(legacy.cleanup.is_none());
         let encoded = serde_json::to_vec(&PersistedUninstallationPlan {
+            recovery_generation: 0,
             game,
             cleanup: Some(cleanup.clone()),
         })
@@ -3253,6 +3867,7 @@ mod tests {
         let database = root.path().join("state.db");
         let store = StateStore::open_at(&database).unwrap();
         let plan = PersistedInstallationPlan {
+            recovery_generation: 0,
             game: super::super::marker::game_from_marker(
                 &marker(false),
                 "library".into(),
@@ -3326,6 +3941,49 @@ mod tests {
     }
 
     #[test]
+    fn popped_native_plan_cannot_start_after_recovery_and_play_never_waits_for_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let mut game = super::super::marker::game_from_marker(
+            &marker(false),
+            "fixture".into(),
+            root.path().join("game"),
+            None,
+        );
+        game.product_id = 910010;
+        let plan = PersistedInstallationPlan {
+            recovery_generation: super::super::recovery::generation(game.product_id),
+            game: game.clone(),
+            additional_installers: vec![],
+            install_base: true,
+            interactive_prompts: false,
+            download_intent_id: None,
+        };
+        // Model the real schedule_next gap: plan was removed from the queue before recovery.
+        let reservation = super::super::recovery::Reservation::reserve(&[game.product_id]).unwrap();
+        drop(reservation);
+        start_queued_installation(plan);
+        assert!(
+            !MANAGER
+                .lock()
+                .unwrap()
+                .active
+                .contains_key(&game.product_id)
+        );
+        assert!(!game.installation_directory.exists());
+        let _registration = super::super::recovery::admit_generation(
+            game.product_id,
+            super::super::recovery::generation(game.product_id),
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let events = super::super::launch_game(game);
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        assert!(
+            matches!(events.recv_timeout(std::time::Duration::from_millis(100)).unwrap(), super::super::LaunchEvent::Failed(message) if message.contains("busy"))
+        );
+    }
+
+    #[test]
     fn failed_download_handoff_keeps_intent_unconsumed() {
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
@@ -3333,6 +3991,7 @@ mod tests {
         std::fs::create_dir_all(&library).unwrap();
         std::fs::write(library.join(".ludomere"), b"preserve").unwrap();
         let plan = PersistedInstallationPlan {
+            recovery_generation: 0,
             game: super::super::marker::game_from_marker(
                 &marker(false),
                 "library".into(),
@@ -3408,6 +4067,7 @@ mod tests {
 
     fn request(target_dlc: bool) -> DepotOperationRequest {
         DepotOperationRequest {
+            recovery_generation: 0,
             operation_id: "op".into(),
             product_id: 7,
             build_id: "build".into(),
@@ -3442,8 +4102,185 @@ mod tests {
             destination: PathBuf::from("/library/game"),
             staging_path: PathBuf::from("/library/.ludomere/staging/game.json"),
             target_marker: marker(target_dlc),
+            account_session: crate::online::account_session(),
+            dependency_plan: None,
             access_token: "token-password-sentinel".into(),
         }
+    }
+
+    #[test]
+    fn setup_repository_refreshes_old_resume_cache_once_and_validates_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&directory.path().join("state.db")).unwrap();
+        let request = request(false);
+        let fixture = br#"{"version":2,"baseProductId":"7","buildId":"build","platform":"windows","installDirectory":"Game","products":[{"productId":"7","temp_executable":"setup.exe","temp_arguments":"/custom"}],"depots":[{"productId":"7","manifest":"abcd","size":1}]}"#;
+        let repository = crate::gog::repository::parse(fixture).unwrap();
+        let mut old = serde_json::to_value(&repository).unwrap();
+        old.as_object_mut().unwrap().remove("setupMetadataVersion");
+        old["products"][0]["tempExecutable"] = serde_json::Value::Null;
+        old["products"][0]["tempArguments"] = serde_json::Value::Null;
+        store
+            .save_depot_repository(&crate::state::DepotRepositoryRecord {
+                product_id: 7,
+                operating_system: "windows".into(),
+                build_id: "build".into(),
+                branch: None,
+                manifest_identity: "repo".into(),
+                repository_json: old.to_string(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        assert!(
+            setup_repository(&store, &request, &cancelled, |_| anyhow::bail!("offline")).is_err()
+        );
+        let restored = setup_repository(&store, &request, &cancelled, |identity| {
+            assert_eq!(identity, "repo");
+            crate::gog::repository::parse(fixture)
+        })
+        .unwrap();
+        assert_eq!(
+            restored.products[0].temp_executable.as_deref(),
+            Some("setup.exe")
+        );
+        assert_eq!(
+            setup_repository(&store, &request, &cancelled, |_| panic!(
+                "current cache must not refetch"
+            ))
+            .unwrap(),
+            restored
+        );
+        let mut cached = store
+            .depot_repository(7, "windows", "build")
+            .unwrap()
+            .unwrap();
+        for field in ["baseProductId", "buildId", "platform"] {
+            let mut wrong = serde_json::to_value(&restored).unwrap();
+            wrong[field] = serde_json::json!("wrong");
+            cached.repository_json = wrong.to_string();
+            store.save_depot_repository(&cached).unwrap();
+            assert!(
+                setup_repository(&store, &request, &cancelled, |_| panic!(
+                    "mismatch must fail"
+                ))
+                .is_err()
+            );
+        }
+        let mut no_build = serde_json::to_value(&restored).unwrap();
+        no_build.as_object_mut().unwrap().remove("buildId");
+        cached.repository_json = no_build.to_string();
+        store.save_depot_repository(&cached).unwrap();
+        assert!(
+            setup_repository(&store, &request, &cancelled, |_| panic!(
+                "identity-bound cache accepts omitted optional build ID"
+            ))
+            .is_ok()
+        );
+        cached.repository_json = old.to_string();
+        store.save_depot_repository(&cached).unwrap();
+        let error = setup_repository(&store, &request, &cancelled, |_| {
+            cancelled.store(true, Ordering::Relaxed);
+            crate::gog::repository::parse(fixture)
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::download::depot::DepotCancelled>()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .depot_repository(7, "windows", "build")
+                .unwrap()
+                .unwrap()
+                .repository_json,
+            old.to_string()
+        );
+    }
+
+    #[test]
+    fn legacy_resume_resolves_before_payload_and_incomplete_saved_plan_is_rejected() {
+        let store = StateStore::open().unwrap();
+        let mut request = request(false);
+        request.recovery_generation = super::super::recovery::generation(request.product_id);
+        request.target_marker.base.operating_system = Some("windows".into());
+        request.sources[0].manifest_json = Some(r#"{"version":2,"depot":{"items":[]}}"#.into());
+        request.sources[0].content_root = Some("7".into());
+        let mut repository=crate::gog::repository::parse(br#"{"version":2,"baseProductId":"7","buildId":"build","platform":"windows","installDirectory":"Game","products":[{"productId":"7"}],"depots":[{"productId":"7","manifest":"abcd","size":1}]}"#).unwrap();
+        let save = |repository: &crate::gog::types::GenerationTwoRepository| {
+            store
+                .save_depot_repository(&crate::state::DepotRepositoryRecord {
+                    product_id: 7,
+                    operating_system: "windows".into(),
+                    build_id: "build".into(),
+                    branch: None,
+                    manifest_identity: "repo".into(),
+                    repository_json: serde_json::to_string(repository).unwrap(),
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                })
+                .unwrap();
+        };
+        save(&repository);
+        let mut old = serde_json::to_value(PersistedDepotPlan::from(&request)).unwrap();
+        old.as_object_mut().unwrap().remove("dependency_plan");
+        let old: PersistedDepotPlan = serde_json::from_value(old).unwrap();
+        assert!(old.dependency_plan.is_none());
+        request.dependency_plan = old.dependency_plan;
+        prepare_required_dependencies(&mut request, &std::sync::atomic::AtomicBool::new(false))
+            .unwrap();
+        assert!(request.dependency_plan.as_ref().unwrap().entries.is_empty());
+        let frozen: PersistedDepotPlan = serde_json::from_str(
+            &serde_json::to_string(&PersistedDepotPlan::from(&request)).unwrap(),
+        )
+        .unwrap();
+        assert!(frozen.dependency_plan.is_some());
+        repository.dependencies = vec!["openAL".into()];
+        request.dependencies = repository.dependencies.clone();
+        save(&repository);
+        let error =
+            prepare_required_dependencies(&mut request, &std::sync::atomic::AtomicBool::new(false))
+                .unwrap_err();
+        assert!(error.to_string().contains("complete selected build"));
+    }
+
+    #[test]
+    fn installed_dependency_snapshot_is_loaded_by_exact_marker_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = include_bytes!("../../tests/fixtures/gog-dependencies/DOSBox074.zlib");
+        let manifest = crate::gog::depot_manifest::parse(bytes).unwrap();
+        let mut installed = marker(false);
+        let provenance = installed.galaxy_depot.as_mut().unwrap();
+        provenance.build_id = "dependency-snapshot-fixture".into();
+        provenance.manifest_fingerprint = manifest.identity();
+        super::super::marker::write(&installed, root.path()).unwrap();
+        let store = StateStore::open().unwrap();
+        let mut record = crate::state::DepotManifestRecord {
+            manifest_identity: manifest.identity(),
+            product_id: 7,
+            build_id: "dependency-snapshot-fixture".into(),
+            depot_id: "ludomere:installed-with-dependencies".into(),
+            manifest_json: manifest.canonical_json().unwrap(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        };
+        store.save_depot_manifest(&record).unwrap();
+        let mut request = request(false);
+        request.destination = root.path().to_owned();
+        assert_eq!(
+            current_manifest(&request).unwrap().unwrap().identity(),
+            manifest.identity()
+        );
+        record.manifest_json = r#"{"version":2,"depot":{"items":[]}}"#.into();
+        store.save_depot_manifest(&record).unwrap();
+        assert!(
+            current_manifest(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("ownership manifest is damaged")
+        );
     }
 
     #[test]
@@ -3505,6 +4342,77 @@ mod tests {
             ]
         );
         assert!(dependency_verbs(&["FutureRuntime".into()]).is_err());
+    }
+
+    #[test]
+    fn only_exact_completed_dependency_verbs_are_skipped_on_retry() {
+        let prefix = tempfile::tempdir().unwrap();
+        let requested =
+            dependency_verbs(&["DirectX".into(), "MSVC2010".into(), "MSVC2012".into()]).unwrap();
+        assert_eq!(
+            pending_dependency_verbs(prefix.path(), requested.clone()).unwrap(),
+            requested
+        );
+        std::fs::write(prefix.path().join("winetricks.log"), "").unwrap();
+        assert_eq!(
+            pending_dependency_verbs(prefix.path(), requested.clone()).unwrap(),
+            requested
+        );
+        std::fs::write(
+            prefix.path().join("winetricks.log"),
+            "  d3dcompiler_43  \nvcrun2010_extra\n",
+        )
+        .unwrap();
+        let pending = pending_dependency_verbs(prefix.path(), requested.clone()).unwrap();
+        assert!(!pending.iter().any(|verb| verb == "d3dcompiler_43"));
+        assert!(pending.iter().any(|verb| verb == "vcrun2010"));
+        // A failed remaining command leaves the same requirements pending on retry.
+        assert_eq!(
+            pending_dependency_verbs(prefix.path(), requested.clone()).unwrap(),
+            pending
+        );
+        std::fs::write(prefix.path().join("winetricks.log"), requested.join("\n")).unwrap();
+        assert!(
+            pending_dependency_verbs(prefix.path(), requested)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(prefix.path().join("winetricks.log"), "vcrun2015\n").unwrap();
+        assert_eq!(
+            pending_dependency_verbs(
+                prefix.path(),
+                dependency_verbs(&["MSVC2019".into()]).unwrap()
+            )
+            .unwrap(),
+            ["vcrun2019"]
+        );
+        assert!(dependency_verbs(&["UnknownRuntime".into()]).is_err());
+    }
+
+    #[test]
+    fn invalid_dependency_history_never_claims_setup_complete() {
+        let prefix = tempfile::tempdir().unwrap();
+        let path = prefix.path().join("winetricks.log");
+        for invalid in [
+            vec![0xff],
+            b"d3dcompiler_43\0\n".to_vec(),
+            vec![b'x'; 1024 * 1024 + 1],
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(
+                pending_dependency_verbs(prefix.path(), vec!["d3dcompiler_43".into()]).is_err()
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(prefix.path().join("absent"), &path).unwrap();
+        assert!(pending_dependency_verbs(prefix.path(), vec!["d3dcompiler_43".into()]).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(pending_dependency_verbs(prefix.path(), vec!["d3dcompiler_43".into()]).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(pending_dependency_verbs(prefix.path(), vec!["d3dcompiler_43".into()]).is_err());
     }
 
     #[test]

@@ -1,5 +1,234 @@
 # Project plan
 
+## P145 — Commit and push verified installation improvements
+
+- User authorizes current changes committed and pushed. In_progress; compatibility owns exact
+  inventory/message/staging/commit/push, security independently reviews content and claims. Root
+  records only. Include accumulated R42–R46/R49–R52 work, tests/docs and user game acceptance.
+- Acceptance: comprehensive accurate message, reviewed explicit paths without secrets/generated
+  payloads, diff checks, normal push to origin main (LegendaryLinux/ludomere), remote hash matches.
+  No new product edits/builds/package/full suite, force push or upstream mutation. Prior verified
+  evidence remains applicable. Stop on unexpected divergence or unrelated content.
+- Manager reviewed exact40-path inventory and complete message; independent review cleared prose,
+  public metadata fixtures and privacy. Final staged check precedes commit and normal fork push.
+  Fresh fork main57574b3 is an ancestor of local a99f277, so push also publishes that prior local
+  commit. SSH unavailable; authenticated HTTPS to the same fork is allowed without remote changes.
+  Publication outcome is verified by matching remote/local refs and reported with the final SHA.
+
+## P143–P144 — Persistent certificate failure
+
+- R52 follow-up; complete for scoped local assurance. P143 compatibility traces own command→UMU→Protonfixes→downloader
+  and confirms a narrow correction; P144 security independently reviews causal evidence and trust.
+  Prior source-only proposed fix did not establish runtime success; do not repeat that claim.
+- Read-only primary sources/repository/system helper code and scoped diagnosis allowed; preserve
+  prior edits/user state. Relevant private-profile inert tests and own-code fixes after cause
+  confirmation only. No fullsuite, real helper/game/installer execution, userprefix/privateenv/
+  credentials, dependency patches, host changes, package or commit. A concrete runtime-only probe
+  may run after independent isolation review as ordinary reversible/read-only debugging; platform
+  approvals remain binding. This excludes Proton, installers, games and user-prefix access. Root records only.
+- Acceptance: demonstrated propagation/override cause, focused secure regression or clearly stated
+  external blocker, no new guessed CA default. Reports include paths/evidence/remaining limits.
+- New actual retry identifies inherited SSL_CERT_FILE/SSL_CERT_DIR as the skip cause despite
+  absence in the shell. Owners trace Cargo/library initialization and propose a minimal path/trust
+  correction before implementation; no startup-only provenance assumption without evidence.
+- Isolated Cargo/direct comparison confirms Cargo adds both SSL keys. Approved minimal own-code
+  translation of inherited readable absolute CA file/directory paths through proven host mounts,
+  preserving selected trust, unmapped/invalid values and directory-list semantics. Generic Arch,
+  no user-specific locations; multi-layout/private fixtures and independent review required.
+- Manager inspected final source, P143 report and P144 independent PASS, nine focused tests,
+  fmt/Clippy/debug/diff checks and actual runtime HTTPS200/TLS verification0 with translated
+  SSL_CERT_FILE/DIR. No scoped blocker remains. Actual Proton/DirectX retry is user acceptance;
+  no full suite, dependency modification, package or commit. All probe processes stopped.
+
+## P141–P142 — Winetricks certificate handling
+
+- R52; complete for scoped local assurance. P141 compatibility owns source/primary diagnosis and minimal own-adapter/
+  command environment correction plus focused regression and necessary README. P142 security
+  independently verifies cause, TLS preservation, command boundaries and relevant evidence.
+- Authorize repository/helper-source reads, bounded public primary references, relevant system
+  certificate metadata checks (no environment dump/private credentials), disposable HOME/allXDG/
+  bus tests and proportionate fmt/Clippy/debug. No full suite, user prefix changes, real runtime/
+  installer/game execution, dependency patches, host package/system CA changes or commit/push.
+- Acceptance: establish cause versus hypothesis, preserve secure trust selection and explicit user
+  CA intent, reproduce corrected command/download behavior safely; report paths/evidence/limits.
+  Escalate any required external runtime execution/access or trust-policy tradeoff. Root records only.
+- Narrow final change: Winetricks-only mapped canonical host CA default and two inert regressions
+  in umu.rs plus README. Six relevant tests/fmt/Clippy/debug/diff pass; manager inspected source,
+  reports /tmp/ludomere-p141-report.md and independent -p142-review.md. TLS/custom trust preserved.
+  Source-supported runtime-path diagnosis, actual steamrt/DirectX retry unverified. No fullsuite,
+  dependency/host/prefix modification or package/commit. No unresolved scoped finding.
+
+## P139–P140 — Dependency endpoint selection
+
+- R51/R49; complete for scoped local assurance. P139 acquisition owns narrow dependencies.rs/shared endpoint fix and
+  relevant regression tests, proportionate fmt/Clippy/compile/debug checks. User now reserves the
+  full suite for build process; no full cargo test for this narrow correction. P140 independently reviews
+  real official endpoint shape and origin/redirect/credential integrity. Root owns records only.
+- Authorize bounded anonymous official metadata/primary-source reads, disposable inert payload
+  acquisition if necessary for transfer verification (never execution), private HOME/all XDG/bus
+  fixtures and source/test edits by owner. Preserve all prior work; no schema/UI redesign, account/
+  profile/credentials, host package, commit/push or dependency code modification.
+- Acceptance: reproduce exact refusal, verify official response→URL→verified acquisition, meaningful
+  regression, required checks and independent no-unresolved-finding report. Escalate new security/
+  scope boundaries; return cause/paths/commands/evidence/limits. No live game success claim.
+- Final change confined to dependencies.rs URL handling/test and AGENTS.md verification policy.
+  Manager reviewed /tmp/ludomere-p139-report.md and independent -p140-review.md, source and logs.
+  Nine relevant tests/fmt/Clippy/debug/diff pass; actual production OpenAL acquisition/checksum/
+  cache reuse passes. No full suite, package, execution or account access. All scoped findings closed.
+
+## P136–P138 — Catalog-backed GOG dependencies
+
+- R49/R50 following P135; complete for scoped local assurance. P136 acquisition owns catalog resolution, bounded official
+  metadata, verified artifact acquisition/cache and minimal depot transfer reuse plus focused tests.
+  P137 compatibility owns execution/checkpoints and installation/Resume integration, UI/preflight/
+  offline alternative, docs and final checks. P138 security independently reviews and exercises
+  changed boundaries/controls. Root records only; preserve all existing uncommitted work.
+- Manager reviewed /tmp/ludomere-p136-report.md, -p137-report.md and independent -p138-review.md,
+  final logs/source and actual UI screenshots. Exact fmt/Clippy430unit/sixintegration/debug/diff
+  checks pass;112 focused installation plus independent eight catalog/six setup cases pass.
+  All scoped findings closed; actual review/Cancel/offline/retry/Resume/long-error/closed-result
+  controls pass in inert fixtures. No real vendor/runtime/game success claim; P70 gates remain.
+  README documents conservative uncertain-process/corrupt-journal recovery limits. No schema,
+  dependency-source modification, package, commit or real-user-data operation. Fixtures stopped.
+- Agree exact typed plan and file/API ownership before edits. Prefer GTK-free dependency module(s)
+  and existing transfer/process/journal patterns; no new external downloader/dependency patches.
+  No invented numeric product IDs or unnecessary schema changes. If persistence schema is necessary,
+  retain target25 with canonical24→25/development revision policy and full migration verification.
+- Acceptance: exact openAL catalog resolves before game transfer; whole dependency list preflight;
+  supported EXE/MSI/local-content plans, safe verified cache reuse, success-only per-prefix/revision
+  checkpoints, partial Resume/prefix replacement, aggregate errors/explicit offline choice; preserve
+  account/generation reset and native behavior. Never claim real title success from inert tests.
+- Authorize scoped source/tests/docs edits, primary public metadata/reference reads, disposable
+  HOME/allXDG/bus/local HTTP/Xvfb tests and fmt/Clippy/full serial tests/debug. No user profile/logs/
+  credentials, real helper/installer/game execution, host changes, package/commit/push or dependency
+  code modification. Stop for new scope/security/access decisions. UI owner coordinates final checks;
+  reviewer sends findings to owners without fixes. Reports include paths/evidence/limits.
+
+## P135 — Systematic Depot dependency investigation
+
+- R48/R26/R42. Complete (investigation/proposal only). Acquisition audits own dependency/setup architecture and public GOG
+  contracts; compatibility researches primary Steam/Lutris/Winetricks/Heroic approaches; security
+  independently checks proposed bounds. Read-only product investigation, root records only.
+- Acceptance: exact openAL cause, source-backed broader gaps and implementable alternatives with
+  tradeoffs, testing and scope. No speculative dependency aliases or success guarantees. No code,
+  actual user logs/profile/credentials, runtime/game/helper execution, package, commit or publication.
+- Authorize scoped source reads and bounded anonymous primary-source web/metadata research and
+  inert /tmp reports. Never print full GOG metadata/client secrets. Escalate necessary new access
+  or behavior changes; return sources/findings/limits and proposed next work.
+- Manager reviewed /tmp/ludomere-p135-backend.md, -comparison.md and independent
+  -security-review.md plus own source/primary documentation. Exact official openAL is absent from
+  the mapper; full IDs available before late failure. Recommend typed GOG catalog planning,
+  aggregate early preflight, verified cached artifacts, per-prefix/version successful checkpoints
+  and explicit offline choice. No product/test/build/runtime work performed. Implementation pending
+  user direction; current lookup-table-only approach is not complete Depot prerequisite support.
+
+## P132–P134 — Incomplete-game recovery
+
+- R47 withdrawn by user after locating Logs tab. Only R46 remains; optional downloaded-file deletion
+  retains existing unchecked default. No running-log changes or further interview needed on that point.
+- Residual policy settled: delete unknown/modified leftovers including in-directory saves after
+  explicit path-labelled confirmation, per user answer. Preserve prefixes/external saves and optional
+  downloads unless selected; no recovery-folder feature. Healthy idle normal uninstall unchanged.
+- R46 (R47 withdrawn). P132–P134 complete for scoped local assurance. P132 acquisition owns cancellation/quiescence and safe managed-file/
+  transient-state cleanup backend; P133 compatibility owns discoverable actions, confirmation and
+  recovery presentation/docs. P134 security independently reviews destructive boundaries and real UI
+  controls. Root records only; preserve all prior uncommitted work.
+- First inventory existing reset/uninstall/cancel/cleanup APIs and propose minimal safe contract.
+  No deletion of actual user files, broad recursive cleanup, prefix/save reset or schema changes
+  without established necessity. Durable prefs/activity/native independence remain invariant.
+- Acceptance: available action across active/incomplete/error states, wait for affected writers,
+  preserve unrelated files/preferences and truthful partial errors/retry, prevent auto-resume from
+  recreating removed files, immediate in-place refresh and existing session/lifecycle safeguards.
+  Download-cleanup default remains unchecked; running-log request is withdrawn.
+- Authorize scoped source/test/docs and disposable HOME/allXDG/bus/Xvfb/synthetic file+queue
+  fixtures. No real profile/prefix/credential or game/helper execution, actual deletion, dependency
+  patch, package/commit/push. Stop for new destructive/access/scope ambiguity. Agree backend/UI API
+  before overlapping edits. UI owner coordinates final fmt/Clippy/fullserial/debug after source freeze.
+- Necessary R46 support approved: minimal bounded, atomic/no-follow recovery identity receipt under
+  existing staging retains safe explicit retry after metadata deletion/partial failure/crash. Created
+  only after confirmed quiescence/revalidation, no automatic deletion/resume or new schema/queue;
+  preserve until requested removal succeeds. P134 independently reviews boundaries and necessity.
+- Final evidence reviewed: /tmp/ludomere-p132-report.md, /tmp/ludomere-p133-report.md and independent
+  /tmp/ludomere-p134-review.md. Exact fmt/Clippy411 unit/six integration/debug/diff checks pass;
+  affected GTK case separately passes. Actual local HTTP drain/unrelated-job preservation and
+  physical checked/unchecked cleanup, exact warnings, unsafe-path refusal, partial deletion/receipt
+  retry and healthy normal preview/Cancel pass. No unresolved scoped finding. Physical in-progress
+  cancellation/account switching and actual vendor execution remain explicit limits. Fixtures stopped;
+  no real user files, package, commit or dependency changes. Broader P70 gates remain open.
+
+## P129–P131 — Setup invocation and View Error
+
+- R45/R39/R42/R44. Status complete for scoped local assurance. P129 acquisition owns backend invocation/diagnostics/tests;
+  P130 compatibility owns View Error UI and necessary regressions/docs; P131 security independently
+  reviews both. Preserve all existing uncommitted changes; root owns records only.
+- Acceptance: identify observed installer invocation error from relevant logs/metadata, correct
+  confirmed contract defects without skipping required setup, retain action/exit/log context;
+  physical View Error click opens readable full failure without unwanted navigation or stale-account
+  exposure. Meaningful inert regressions and final fmt/Clippy/full serial tests/debug required.
+- Authorize narrow source edits, primary public metadata/reference reads, bounded existing authorized
+  Gungeon log inspection and exact inert GOG setup-script metadata inspection if necessary. Private
+  HOME/allXDG/bus/Xvfb fixtures only; no real profile/prefix/credential access, installer/game/helper
+  execution, dependency patch, package/commit/push. Stop for unapproved execution/access or scope.
+  Owners agree file boundaries and report cause/evidence/limits; UI owner coordinates final suite.
+- Final corrected source supplies metadata-identified Galaxy wrapper context, repairs old cached
+  setup metadata by exact selected repository refresh, retains detailed action/exit/log failures,
+  and keeps View Error mapped across timer ticks. Reports /tmp/ludomere-p129-report.md,
+  /tmp/ludomere-p130-report.md and independent /tmp/ludomere-p131-review.md reviewed by manager.
+  Fmt/Clippy401 unit/six integration/debug/diff pass;95 installation+42GOG focused pass. Physical
+  current/recovered held-click/full-copy/account-clear regressions pass; private fixtures stopped.
+  No scoped finding remains. Actual Gungeon setup/crash resolution remains user acceptance;
+  no prefix manipulation, dependency modification, package or commit.
+
+## P127–P128 — Resumed Depot support executable
+
+- R44/R42/R26. Status complete for scoped local assurance. P127 acquisition owns narrow installation/Depot backend diagnosis,
+  confirmed correction and regressions; P128 security independently reviews safe path/setup/resume
+  behavior. Preserve current uncommitted logging changes. Root alone edits records.
+- Acceptance: trace exact ExecutableMissing origin; safely resolve required setup executable or
+  report actionable missing support data without claiming installation complete. Regress actual
+  affected flow, including resume after missing files, then fmt/Clippy/full serial tests/debug.
+- Authorize source/docs/tests and isolated HOME/allXDG/bus filesystem fixtures, existing relevant
+  operation-log authority and primary public references as necessary. No real profile/credentials,
+  prefix reads, real game/helper execution, destructive user-file operations, dependency patch,
+  package, commit or push. Escalate broader scope/access; return paths, cause, evidence and limits.
+- Confirmed exact executable is a support file in official metadata; bare Execute app-only lookup
+  corrected to safe exact app-first/support fallback. Manager reviewed source/manifest, owner
+  /tmp/ludomere-p127-report.md, independent /tmp/ludomere-p128-review.md and final check logs.
+  Eight focused tests, fmt/Clippy397 unit/six integration/debug/diff pass, including manual deletion
+  with retained journal then verified rematerialization. No scoped finding remains. Actual Gungeon
+  setup/launch remains user acceptance; no GUI/dependency/package changes or executable test needed.
+
+## P124–P126 — Depot diagnostics and game-run logs
+
+- R42/R43. P124 acquisition investigates generic failure source/runtime execution/persisted errors;
+  P125 compatibility inventories existing capture/log controls and proposes minimal logging change.
+  P126 security independently reviews diagnostics/privacy and eventual implementation. Status
+  complete for scoped local assurance. Interview settled: relevant user operation logs may be inspected; live+saved logging
+  implementation authorized. P124 owns runtime capture/storage/backend and operation diagnosis;
+  P125 owns log UI/README/tests; P126 independent QA/security. Coordinate minimal API before edits.
+- Authorize repository/source reads, reports and isolated HOME/allXDG/bus/local inert app fixtures.
+  No real profile/logs pending permission, credentials, game/helper execution, external mutation,
+  package operation or commits. Preserve clean a99f277 baseline; root alone edits records.
+- Return concrete causes vs hypotheses, affected controls, minimal scoped plan and necessary tests.
+  User asked whether agents can inspect operations; explain existing runtime capture and limits.
+- Updated authority: P124 may inspect only relevant user operation logs with bounded/redacted
+  output and safe running executable identity (no environment/credentials); other profile content
+  remains excluded. Implement R43 scoped source/tests/docs, isolated inert process fixtures,
+  fmt/Clippy/full tests/debug; no real game/helper execution or dependency patches. Preserve old
+  logs, account guards, off-GTK I/O and no background windows. No automatic log deletion proposed.
+- Confirmed R42 backend correction: skip already-installed requested Winetricks verbs before UMU
+  invocation, preserve all missing setup failures/unknown dependency refusal and commit-on-success.
+  Own-Ludomere code only; bounded exact-format read and synthetic retry/partial/all/readerror tests.
+  Actual user's prefix remains outside inspection authorization. Reviewer examines this boundary.
+- Final evidence: /tmp/ludomere-p124-report.md, /tmp/ludomere-p125-report.md and independent
+  /tmp/ludomere-p126-review.md. Manager reviewed source, reports, exact-final check logs and GUI
+  screenshot. Fmt/Clippy395 unit/six integration/debug/diff pass; new GTK regression separately passes.
+  Physical history/live/pause/scroll/Copy/folder-retry/read-retry/account clearing pass. Two explicitly
+  authorized inert native launches preserve distinct0600 logs and redact displayed synthetic secrets.
+  Three scoped findings corrected and independently verified; no unresolved scoped blocker.
+  Private fixtures stopped. Real Gungeon resume/Windows/desktop acceptance remains P70. No package,
+  commit or push; user will test with cargo run.
+
 ## P123 — Commit error presentation, decimal units and runtime fixes
 
 - User authorizes local commit with a useful message. Compatibility owns exact15-file inventory,

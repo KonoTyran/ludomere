@@ -11,6 +11,34 @@ pub mod depot;
 mod files;
 mod layout;
 mod manager;
+pub(crate) use manager::quiesce_recovery;
+
+pub(crate) fn recovery_staging(
+    job: &crate::state::DownloadJobRecord,
+    slug: &str,
+    child: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    anyhow::ensure!(
+        !job.artifacts.is_empty(),
+        "Download has no artifact identity"
+    );
+    let relative =
+        layout::destination(std::path::Path::new("/"), slug, child, &[&job.artifacts[0]]);
+    anyhow::ensure!(
+        job.destination.is_absolute()
+            && job.destination.components().all(|part| matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::RootDir
+            ))
+            && job.destination.ends_with(relative.strip_prefix("/")?),
+        "Download layout is ambiguous; its partial files were retained"
+    );
+    Ok(layout::staging_directory(
+        &job.destination,
+        &job.artifacts,
+        &job.job_id,
+    ))
+}
 mod protocol;
 mod transfer;
 mod trash;

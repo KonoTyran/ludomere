@@ -234,17 +234,20 @@ pub(super) fn render_detail_page(
                     widgets.reconnect.emit_clicked();
                     return;
                 };
-                let button = primary_button.clone();
+                let resume_window = widgets.window.clone();
+                let resume_model = model.clone();
                 with_windows_components(
                     &widgets.window,
                     detail.product_id,
                     true,
                     None,
                     move || {
-                        if crate::installation::resume_depot_operation(snapshot.operation_id, token)
-                        {
-                            button.set_sensitive(false);
-                        }
+                        download_chooser::review_depot_resume(
+                            &resume_window,
+                            &resume_model,
+                            snapshot.operation_id,
+                            token,
+                        );
                     },
                 );
                 return;
@@ -835,9 +838,16 @@ pub(super) fn render_detail_page(
 
     let logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
     logs.set_margin_top(12);
+    logs.append(&super::logs::runtime_log_view(
+        &w.window,
+        model,
+        game.product_id,
+    ));
+    let operation_logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    logs.append(&operation_logs);
     tabs.add_titled(&logs, Some("logs"), "Logs");
     tabs.connect_visible_child_name_notify({
-        let logs = logs.clone();
+        let logs = operation_logs;
         let window = w.window.clone();
         let product_id = game.product_id;
         move |tabs| {
@@ -1555,7 +1565,6 @@ fn installation_status_panel(
             view_error.set_visible(true);
             return glib::ControlFlow::Continue;
         }
-        view_error.set_visible(false);
         if progress.is_visible() && !determinate.get() {
             progress.pulse();
         }
@@ -1590,6 +1599,7 @@ fn installation_status_panel(
                     "complete" | "cancelled" | "abandoned"
                 )
             {
+                view_error.set_visible(false);
                 refresh_after_install();
                 return glib::ControlFlow::Break;
             }
@@ -1638,6 +1648,7 @@ fn installation_status_panel(
                 "complete" | "failed" | "cancelled" | "abandoned"
             )
         {
+            view_error.set_visible(false);
             panel_for_poll.set_visible(true);
             primary_action.set_sensitive(false);
             set_alternate_game_actions_sensitive(&action_group, false);
@@ -1651,6 +1662,8 @@ fn installation_status_panel(
                 "materializing" => "DOWNLOADING".to_owned(),
                 "committing" => "INSTALLING".to_owned(),
                 "finalizing" => "FINALIZING".to_owned(),
+                "dependencies" => "DOWNLOADING REQUIRED COMPONENTS".to_owned(),
+                "setup" => "SETTING UP REQUIRED COMPONENTS".to_owned(),
                 _ => snapshot.state.replace('_', " ").to_uppercase(),
             };
             heading.set_label(&display_state);
@@ -1716,6 +1729,7 @@ fn installation_status_panel(
                 })
                 .collect::<Vec<_>>();
             if !active.is_empty() {
+                view_error.set_visible(false);
                 if action_visual.replace(1) != 1 {
                     set_primary_button_content(
                         &primary_action,
@@ -1781,6 +1795,7 @@ fn installation_status_panel(
                 return glib::ControlFlow::Continue;
             }
             if was_downloading.replace(false) {
+                view_error.set_visible(false);
                 refresh_after_install();
                 return glib::ControlFlow::Break;
             }
@@ -1808,6 +1823,7 @@ fn installation_status_panel(
                 return glib::ControlFlow::Continue;
             }
             if jobs.iter().any(|job| job.state == DownloadState::Paused) {
+                view_error.set_visible(false);
                 action_visual.set(0);
                 action_group.remove_css_class("operational-state");
                 set_primary_button_content(
@@ -1824,6 +1840,7 @@ fn installation_status_panel(
                 return glib::ControlFlow::Continue;
             }
             if crate::installation::is_game_running(product_id) {
+                view_error.set_visible(false);
                 was_game_running.set(true);
                 let stopping = crate::installation::is_game_stopping(product_id);
                 let visual = if stopping { 4 } else { 3 };
@@ -1855,8 +1872,17 @@ fn installation_status_panel(
             }
         }
         if cloud_enable.is_visible() {
+            view_error.set_visible(false);
             return glib::ControlFlow::Continue;
         }
+        view_error.set_visible(installation_snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot.queued
+                && matches!(
+                    snapshot.state,
+                    crate::domain::InstallationState::Failed
+                        | crate::domain::InstallationState::UninstallFailed
+                )
+        }));
         match installation_snapshot {
             Some(crate::installation::InstallationOperationSnapshot {
                 queued: true,
@@ -2293,10 +2319,6 @@ fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::App
                 "Uninstaller log",
                 crate::installation::uninstallation_log_path(product_id).ok(),
             ),
-            (
-                "Runtime log",
-                crate::installation::runtime_log_path(product_id).ok(),
-            ),
         ]
         .into_iter()
         .filter_map(|(title, path)| path.filter(|path| path.is_file()).map(|path| (title, path)))
@@ -2351,10 +2373,8 @@ fn render_product_logs(
     }
     if logs.is_empty() && download_failures.is_empty() {
         let empty = adw::StatusPage::builder()
-            .title("No logs for this game")
-            .description(
-                "Installation, download, and runtime logs will appear here when available.",
-            )
+            .title("No operation logs for this game")
+            .description("Installation and download logs will appear here when available.")
             .icon_name("document-open-recent-symbolic")
             .build();
         container.append(&empty);

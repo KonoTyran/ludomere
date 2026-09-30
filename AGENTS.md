@@ -78,7 +78,11 @@ shims, and opportunistic refactors.
 
 ## Verification
 
-Run these before handing off code changes:
+For small changes, run the relevant tests and proportionate formatting, compilation, and lint checks
+before handing off. Do not run the full test suite for each small change; reserve it for the build
+process.
+
+The build process runs:
 
 ```bash
 cargo fmt --check

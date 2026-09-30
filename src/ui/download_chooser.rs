@@ -2,6 +2,244 @@ use super::*;
 
 pub(super) type ManagedArtifactIdentity = (i64, String, Option<String>);
 
+pub(super) fn review_depot_resume(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    operation_id: String,
+    token: String,
+) {
+    let epoch = model.borrow().account_epoch;
+    let session = crate::online::account_session();
+    let dialog = adw::Dialog::builder()
+        .title("Preparing Resume")
+        .content_width(560)
+        .content_height(320)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.append(&adw::HeaderBar::new());
+    let status = gtk::Label::builder()
+        .label("Checking the saved build and its complete prerequisite plan…")
+        .wrap(true)
+        .selectable(true)
+        .build();
+    body.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&status)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+    dialog.set_child(Some(&body));
+    let closed = Rc::new(std::cell::Cell::new(false));
+    dialog.connect_closed({
+        let closed = closed.clone();
+        move |_| closed.set(true)
+    });
+    dialog.present(Some(window));
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<_> {
+            anyhow::ensure!(
+                session == crate::online::account_session(),
+                "Account changed before Resume preparation"
+            );
+            crate::installation::prepare_depot_resume(operation_id, token)
+        })()
+        .and_then(|request| {
+            anyhow::ensure!(
+                session == crate::online::account_session(),
+                "Account changed during Resume preparation"
+            );
+            Ok(request)
+        });
+        let _ = sender.send(result);
+    });
+    let window = window.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if model.borrow().account_epoch != epoch || closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Ok(Ok(request)) => { dialog.close(); confirm_depot_plan(&window,&model,request); }
+            Ok(Err(error)) => status.set_label(&notifications::failure_message("Could not prepare Resume. Close and retry, or use Offline installers and extras from Manage game.",&format!("{error:#}"))),
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => status.set_label("Preparation stopped. Close and retry Resume."),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn confirm_depot_plan(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    request: crate::installation::DepotOperationRequest,
+) {
+    if model.borrow().logout_pending
+        || request.account_session != crate::online::account_session()
+        || !crate::installation::recovery::current(request.product_id, request.recovery_generation)
+    {
+        return;
+    }
+    let epoch = model.borrow().account_epoch;
+    let session = crate::online::account_session();
+    let product_id = request.product_id;
+    let needs_review = request
+        .dependency_plan
+        .as_ref()
+        .is_some_and(|plan| !plan.entries.is_empty());
+    let description = request
+        .dependency_plan
+        .as_ref()
+        .map(crate::installation::dependency_setup::describe)
+        .unwrap_or_else(|| "This native installation requires no Windows setup.".into());
+    let dialog = adw::Dialog::builder()
+        .title(if needs_review {
+            "Review required components"
+        } else {
+            "Starting Depot operation"
+        })
+        .content_width(600)
+        .content_height(440)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_start(18);
+    body.set_margin_end(18);
+    body.set_margin_bottom(18);
+    body.append(&adw::HeaderBar::new());
+    let introduction = gtk::Label::new(Some(
+        "Confirm to download verified components and apply required setup in this game's selected Proton prefix. Offline installers remain a separate choice.",
+    ));
+    introduction.set_wrap(true);
+    introduction.set_visible(needs_review);
+    body.append(&introduction);
+    let label = gtk::Label::builder()
+        .label(&description)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .build();
+    body.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&label)
+            .vexpand(true)
+            .min_content_height(100)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+    let status = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .build();
+    body.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&status)
+            .max_content_height(140)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let cancel = gtk::Button::with_label("Cancel");
+    let offline = gtk::Button::with_label("Offline installers…");
+    let confirm = gtk::Button::with_label("Confirm download and setup");
+    confirm.add_css_class("suggested-action");
+    if !needs_review {
+        confirm.set_label("Retry");
+    }
+    for button in [&cancel, &offline, &confirm] {
+        actions.append(button);
+    }
+    body.append(&actions);
+    actions.set_visible(needs_review);
+    dialog.set_child(Some(&body));
+    cancel.connect_clicked({
+        let dialog = dialog.clone();
+        move |_| {
+            dialog.close();
+        }
+    });
+    offline.connect_clicked({
+        let dialog = dialog.clone();
+        let window = window.clone();
+        let model = model.clone();
+        move |_| {
+            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                return;
+            }
+            dialog.close();
+            let _ = gtk::prelude::WidgetExt::activate_action(
+                &window,
+                "win.offline-download",
+                Some(&product_id.to_variant()),
+            );
+        }
+    });
+    dialog.present(Some(window));
+    let model = model.clone();
+    let pending = Rc::new(std::cell::Cell::new(false));
+    confirm.connect_clicked(move |button| {
+        if model.borrow().account_epoch != epoch || model.borrow().logout_pending || pending.replace(true) {
+            return;
+        }
+        button.set_sensitive(false);
+        offline.set_sensitive(false);
+        cancel.set_sensitive(false);
+        dialog.set_can_close(false);
+        status.set_label("Saving operation…");
+        let request = request.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                anyhow::ensure!(crate::online::account_session()==session,"Account changed before queuing setup");
+                anyhow::ensure!(crate::installation::enqueue_depot_operation(request),
+                    "Operation conflicts with active work or could not be saved. Reopen installation choices to retry.");
+                Ok(())
+            })();
+            let _ = sender.send(result);
+        });
+        let model = model.clone();
+        let dialog = dialog.clone();
+        let status = status.clone();
+        let button = button.clone();
+        let offline = offline.clone();
+        let cancel = cancel.clone();
+        let pending = pending.clone();
+        let actions = actions.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            if model.borrow().account_epoch != epoch {
+                dialog.set_can_close(true);
+                dialog.close();
+                return glib::ControlFlow::Break;
+            }
+            match receiver.try_recv() {
+                Ok(Err(error)) => {
+                    status.set_label(&super::notifications::failure_message("Could not start Depot setup", &format!("{error:#}")));
+                }
+                Ok(Ok(())) => {
+                    dialog.set_can_close(true);
+                    dialog.close();
+                    return glib::ControlFlow::Break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => status.set_label("Preparation worker stopped; retry or choose offline installers."),
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            }
+            pending.set(false);
+            actions.set_visible(true);
+            button.set_sensitive(true);
+            offline.set_sensitive(true);
+            cancel.set_sensitive(true);
+            dialog.set_can_close(true);
+            glib::ControlFlow::Break
+        });
+    });
+    if !needs_review {
+        confirm.emit_clicked();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum InstallerCoverage {
     #[default]
@@ -465,6 +703,7 @@ fn present_existing_depot_operation_dialog(
     let library_id = installed.library_id;
     let epoch = model.borrow().account_epoch;
     let model = model.clone();
+    let result_window = window.clone();
     dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
         if response != "start" || model.borrow().account_epoch != epoch {
             return;
@@ -472,8 +711,26 @@ fn present_existing_depot_operation_dialog(
         let Some(library_root) = library_root else {
             return;
         };
+        let pending = adw::Dialog::builder().title("Preparing required components").content_width(560).content_height(320).build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.append(&adw::HeaderBar::new());
+        let status = gtk::Label::builder().label("Resolving the complete selected build and its prerequisites…").wrap(true).selectable(true).build();
+        content.append(&gtk::ScrolledWindow::builder().child(&status).vexpand(true).hscrollbar_policy(gtk::PolicyType::Never).build());
+        let offline = gtk::Button::with_label("Offline installers…");
+        content.append(&offline);
+        offline.connect_clicked({ let pending=pending.clone(); let window=result_window.clone(); let model=model.clone(); move |_| {
+            if model.borrow().account_epoch != epoch { return; }
+            pending.close();
+            let _=gtk::prelude::WidgetExt::activate_action(&window,"win.offline-download",Some(&product_id.to_variant()));
+        }});
+        pending.set_child(Some(&content));
+        let closed=Rc::new(std::cell::Cell::new(false));
+        pending.connect_closed({let closed=closed.clone(); move |_|closed.set(true)});
+        pending.present(Some(&result_window));
+        let session=crate::online::account_session();
+        let (sender,receiver)=mpsc::channel();
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
+            let result = (|| -> anyhow::Result<crate::installation::DepotOperationRequest> {
                 let store = StateStore::open()?;
                 let client = reqwest::blocking::Client::new();
                 let builds = crate::gog::depot_service::list_builds(
@@ -492,7 +749,7 @@ fn present_existing_depot_operation_dialog(
                     &builds, &marker, kind, None,
                 )?
                 .clone();
-                crate::gog::depot_service::start_operation(
+                let request=crate::gog::depot_service::prepare_operation(
                     &store,
                     &client,
                     crate::gog::depot_service::PrepareOperationRequest {
@@ -514,11 +771,20 @@ fn present_existing_depot_operation_dialog(
                         slug,
                     },
                 )?;
-                Ok(())
+                anyhow::ensure!(crate::online::account_session()==session,"Account changed during preparation");
+                Ok(request)
             })();
-            if let Err(error) = result {
-                tracing::warn!(product_id, %error, "could not start Galaxy depot operation");
+            let _=sender.send(result);
+        });
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            if model.borrow().account_epoch != epoch || closed.get() { return glib::ControlFlow::Break; }
+            match receiver.try_recv() {
+                Ok(Ok(request)) => { pending.close(); confirm_depot_plan(&result_window,&model,request); }
+                Ok(Err(error)) => status.set_label(&notifications::failure_message("Could not prepare required components. Close and retry, or choose offline installers.", &format!("{error:#}"))),
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => status.set_label("Preparation stopped. Close and retry, or choose offline installers."),
             }
+            glib::ControlFlow::Break
         });
     });
 }
@@ -1377,7 +1643,22 @@ fn populate_install_dialog(
     status.set_xalign(0.0);
     status.set_hexpand(true);
     status.set_wrap(true);
-    footer.append(&status);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    status.set_selectable(true);
+    let status_scroll = gtk::ScrolledWindow::builder()
+        .child(&status)
+        .max_content_height(160)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    status_scroll.set_visible(false);
+    status.connect_label_notify({
+        let status_scroll = status_scroll.clone();
+        move |label| {
+            status_scroll.set_visible(!label.label().is_empty());
+        }
+    });
+    root.append(&status_scroll);
     let close = gtk::Button::with_label("Cancel");
     footer.append(&close);
     let install = gtk::Button::new();
@@ -1682,6 +1963,14 @@ fn populate_install_dialog(
         let branch_password = branch_password.clone();
         let action_epoch = model.borrow().account_epoch;
         let action_model = model.clone();
+        let dependency_window = window.clone();
+        let preparation_closed = Rc::new(std::cell::Cell::new(false));
+        dialog.connect_closed({
+            let closed = preparation_closed.clone();
+            move |_| closed.set(true)
+        });
+        let preparing = Rc::new(std::cell::Cell::new(false));
+        let preparation_button = install.clone();
         let windows_product = {
             let model = action_model.clone();
             let galaxy_selected = galaxy_selected.clone();
@@ -1713,6 +2002,9 @@ fn populate_install_dialog(
                 return;
             }
             if galaxy_selected.get() {
+                if preparing.get() {
+                    return;
+                }
                 let selected_branch = branches
                     .borrow()
                     .get(branch.selected() as usize)
@@ -1757,6 +2049,11 @@ fn populate_install_dialog(
                 };
                 status.remove_css_class("error");
                 status.set_label("Preparing Galaxy installation…");
+                preparing.set(true);
+                preparation_button.set_sensitive(false);
+                let preparation_pending = preparing.clone();
+                let preparation_button_result = preparation_button.clone();
+                let session = crate::online::account_session();
                 let (sender, receiver) = mpsc::channel();
                 let password = (!branch_password.text().is_empty()).then(|| {
                     crate::gog::depot_service::BranchPassword::new(
@@ -1790,27 +2087,48 @@ fn populate_install_dialog(
                         }
                         let mut request = request;
                         request.build = build;
-                        crate::gog::depot_service::start_operation(&store, &client, request)
+                        let operation =
+                            crate::gog::depot_service::prepare_operation(&store, &client, request)?;
+                        anyhow::ensure!(
+                            crate::online::account_session() == session,
+                            "Account changed during preparation"
+                        );
+                        Ok(operation)
                     });
                     let _ = sender.send(result);
                 });
                 let status_result = status.clone();
                 let dialog_result = dialog.clone();
+                let plan_window = dependency_window.clone();
+                let plan_model = action_model.clone();
+                let preparation_closed = preparation_closed.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
+                    if plan_model.borrow().account_epoch != action_epoch || preparation_closed.get()
+                    {
+                        return glib::ControlFlow::Break;
+                    }
                     match receiver.try_recv() {
-                        Ok(Ok(_)) => {
+                        Ok(Ok(request)) => {
                             dialog_result.close();
+                            confirm_depot_plan(&plan_window, &plan_model, request);
                             glib::ControlFlow::Break
                         }
                         Ok(Err(error)) => {
-                            status_result.set_label(&format!(
-                                "Could not start Galaxy installation: {error}"
-                            ));
+                            preparation_pending.set(false);
+                            preparation_button_result.set_sensitive(true);
+                            status_result.set_label(&super::notifications::failure_message("", &format!(
+                                "Could not prepare required Depot components: {error:#}\nRetry preparation or choose Offline installers and extras."
+                            )));
                             status_result.add_css_class("error");
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            preparation_pending.set(false);
+                            preparation_button_result.set_sensitive(true);
+                            status_result.set_label("Preparation stopped. Retry or choose Offline installers and extras.");
+                            glib::ControlFlow::Break
+                        }
                     }
                 });
                 return;

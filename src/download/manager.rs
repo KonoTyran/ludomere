@@ -22,6 +22,7 @@ use std::{
 struct Request {
     id: String,
     session: u64,
+    recovery_generation: u64,
     artifacts: Vec<RemoteArtifact>,
     title: String,
     access_token: String,
@@ -36,12 +37,17 @@ struct Request {
 }
 
 enum Command {
+    Quiesce(Vec<i64>, mpsc::Sender<anyhow::Result<()>>),
     RetainInstallers {
+        product_id: i64,
+        generation: u64,
         retention: super::cleanup::Retention,
         job_id: String,
         session: u64,
     },
     RetentionFailed {
+        product_id: i64,
+        generation: u64,
         job_id: String,
         session: u64,
         message: String,
@@ -55,12 +61,14 @@ enum Command {
     EnqueueBackup(
         super::DownloadRequest,
         u64,
+        u64,
         mpsc::Sender<anyhow::Result<()>>,
     ),
     EnqueueWithInstall(
         Vec<super::DownloadRequest>,
         Option<super::AutoInstallRequest>,
         u64,
+        Vec<(i64, u64)>,
         mpsc::Sender<anyhow::Result<usize>>,
     ),
     RetryInstall(i64, mpsc::Sender<anyhow::Result<()>>),
@@ -106,6 +114,7 @@ fn manager() -> &'static ManagerHandle {
                 manager_commands,
                 manager_active,
                 manager_subscribers,
+                HashMap::new(),
             )
         });
         ManagerHandle {
@@ -127,13 +136,15 @@ pub(super) fn subscribe() -> mpsc::Receiver<DownloadManagerEvent> {
 
 pub(super) fn enqueue_backup(request: super::DownloadRequest, session: u64) -> anyhow::Result<()> {
     let (reply, result) = mpsc::channel();
+    let generation = crate::installation::recovery::generation(request.artifacts[0].product_id);
     manager()
         .commands
-        .send(Command::EnqueueBackup(request, session, reply))?;
+        .send(Command::EnqueueBackup(request, session, generation, reply))?;
     result.recv()?
 }
 
 pub(super) fn check_retention(product_id: i64, token: &str, session: u64) -> anyhow::Result<()> {
+    let generation = crate::installation::recovery::generation(product_id);
     for job in StateStore::open()?
         .download_jobs()?
         .into_iter()
@@ -156,6 +167,8 @@ pub(super) fn check_retention(product_id: i64, token: &str, session: u64) -> any
             session,
         )? {
             manager().commands.send(Command::RetainInstallers {
+                product_id,
+                generation,
                 retention,
                 job_id: job.job_id,
                 session,
@@ -201,6 +214,7 @@ fn request_from_download(request: super::DownloadRequest, session: u64) -> Reque
     Request {
         id,
         session,
+        recovery_generation: crate::installation::recovery::generation(artifacts[0].product_id),
         artifacts,
         title,
         access_token,
@@ -225,15 +239,53 @@ pub(super) fn enqueue_with_install(
         "A download group contains no files"
     );
     let (sender, receiver) = mpsc::channel();
+    let mut stamps = requests
+        .iter()
+        .map(|request| {
+            let id = request.artifacts[0].product_id;
+            (id, crate::installation::recovery::generation(id))
+        })
+        .collect::<Vec<_>>();
+    if let Some(choice) = &install {
+        stamps.push((
+            choice.product_id,
+            crate::installation::recovery::generation(choice.product_id),
+        ));
+    }
     manager()
         .commands
         .send(Command::EnqueueWithInstall(
-            requests, install, session, sender,
+            requests, install, session, stamps, sender,
         ))
         .map_err(|_| anyhow::anyhow!("Download manager is unavailable"))?;
     receiver
         .recv()
         .map_err(|_| anyhow::anyhow!("Download registration stopped"))?
+}
+
+pub(crate) fn quiesce_recovery(ids: &[i64], cancel: &AtomicBool) -> anyhow::Result<()> {
+    let (reply, receiver) = mpsc::channel();
+    manager()
+        .commands
+        .send(Command::Quiesce(ids.to_vec(), reply))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("Download manager stopped while pausing this game")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        anyhow::ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Recovery cancelled while stopping downloads"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Downloads are still stopping; no game files were removed. Retry when they stop"
+        );
+    }
 }
 
 pub(super) fn retry_install_after_download(product_id: i64) -> anyhow::Result<()> {
@@ -333,6 +385,7 @@ fn run(
     commands: mpsc::Sender<Command>,
     active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     subscribers: Arc<Mutex<Vec<mpsc::Sender<DownloadManagerEvent>>>>,
+    mut active_products: HashMap<String, i64>,
 ) {
     let mut queued = VecDeque::<Request>::new();
     let mut concurrency = 2_usize;
@@ -340,6 +393,7 @@ fn run(
     let mut authentication_available = false;
     let mut removing = HashSet::<String>::new();
     let mut shutdown_acknowledgement = None::<mpsc::Sender<()>>;
+    let mut quiescence = Vec::<(HashSet<String>, mpsc::Sender<anyhow::Result<()>>)>::new();
     loop {
         let command = match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(command) => Some(command),
@@ -348,12 +402,50 @@ fn run(
         };
         if let Some(command) = command {
             match command {
+                Command::Quiesce(ids, reply) => {
+                    let result = StateStore::open().and_then(|store| store.download_jobs());
+                    match result {
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                        Ok(jobs) => {
+                            let mut jobs = jobs
+                                .iter()
+                                .filter(|job| ids.contains(&job.product_id))
+                                .map(|job| job.job_id.clone())
+                                .collect::<HashSet<_>>();
+                            jobs.extend(
+                                active_products
+                                    .iter()
+                                    .filter(|(_, id)| ids.contains(id))
+                                    .map(|(job, _)| job.clone()),
+                            );
+                            queued
+                                .retain(|request| !ids.contains(&request.artifacts[0].product_id));
+                            for id in &jobs {
+                                if let Some(cancel) = active.lock().unwrap().get(id) {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
+                                cancel_worker(id);
+                            }
+                            quiescence.push((jobs, reply));
+                        }
+                    }
+                }
                 Command::RetentionFailed {
+                    product_id,
+                    generation,
                     job_id,
                     session,
                     message,
                 } => {
+                    if !crate::installation::recovery::current(product_id, generation) {
+                        continue;
+                    }
                     let _ = crate::online::with_account_session(session, || {
+                        let _admission = crate::installation::recovery::admit_generation(
+                            product_id, generation,
+                        )?;
                         StateStore::open()?.set_download_job_status(
                             &job_id,
                             Some(&format!("Installer cleanup deferred: {message}")),
@@ -362,11 +454,19 @@ fn run(
                     publish_queue_snapshot(&subscribers);
                 }
                 Command::RetainInstallers {
+                    product_id,
+                    generation,
                     retention,
                     job_id,
                     session,
                 } => {
+                    if !crate::installation::recovery::current(product_id, generation) {
+                        continue;
+                    }
                     let result = crate::online::with_account_session(session, || {
+                        let _admission = crate::installation::recovery::admit_generation(
+                            product_id, generation,
+                        )?;
                         anyhow::ensure!(shutdown_acknowledgement.is_none(), "Ludomere is closing");
                         let _activity =
                             crate::profile_reset::begin_activity("installer retention commit")?;
@@ -389,12 +489,16 @@ fn run(
                     });
                     publish_queue_snapshot(&subscribers);
                 }
-                Command::EnqueueBackup(request, session, reply) => {
+                Command::EnqueueBackup(request, session, generation, reply) => {
                     let result = crate::online::with_account_session(session, || {
                         let _activity = crate::profile_reset::begin_activity("backup scheduling")?;
                         anyhow::ensure!(shutdown_acknowledgement.is_none(), "Ludomere is closing");
                         let store = StateStore::open()?;
                         let request = request_from_download(request, session);
+                        let _admission = crate::installation::recovery::admit_generation(
+                            request.artifacts[0].product_id,
+                            generation,
+                        )?;
                         let id = request.artifacts[0].product_id;
                         anyhow::ensure!(
                             !crate::installation::is_game_running(id),
@@ -424,7 +528,7 @@ fn run(
                     );
                     let _ = reply.send(result);
                 }
-                Command::EnqueueWithInstall(requests, choice, session, reply) => {
+                Command::EnqueueWithInstall(requests, choice, session, stamps, reply) => {
                     let result = crate::online::with_account_session(
                         session,
                         || -> anyhow::Result<usize> {
@@ -440,6 +544,22 @@ fn run(
                                 })
                                 .transpose()?
                                 .flatten();
+                            let prepared = requests
+                                .iter()
+                                .map(|request| {
+                                    request_from_download(
+                                        super::DownloadRequest {
+                                            artifacts: request.artifacts.clone(),
+                                            title: request.title.clone(),
+                                            access_token: request.access_token.clone(),
+                                            destination: request.destination.clone(),
+                                            events: request.events.clone(),
+                                        },
+                                        session,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let _admission = crate::installation::recovery::admit_stamps(&stamps)?;
                             super::auto_install::clear_for_requests(&store, &requests)?;
                             if let Some(choice) = choice {
                                 store.clear_download_install_intent(choice.product_id)?;
@@ -448,8 +568,7 @@ fn run(
                                 store.save_download_install_intent(&intent)?;
                             }
                             let count = requests.len();
-                            for request in requests {
-                                let request = request_from_download(request, session);
+                            for request in prepared {
                                 if !queued.iter().any(|queued| queued.id == request.id)
                                     && !active
                                         .lock()
@@ -494,6 +613,13 @@ fn run(
                     let _ = reply.send(result);
                 }
                 Command::Enqueue(request) => {
+                    let Ok(_admission) = crate::installation::recovery::admit_generation(
+                        request.artifacts[0].product_id,
+                        request.recovery_generation,
+                    ) else {
+                        let _ = request.listener.send(DownloadEvent::Cancelled);
+                        continue;
+                    };
                     authentication_available = true;
                     if !queued.iter().any(|queued| queued.id == request.id)
                         && !active
@@ -521,6 +647,12 @@ fn run(
                 } => {
                     authentication_available = true;
                     if let Some(request) = queued.iter_mut().find(|request| request.id == id) {
+                        let Ok(_admission) = crate::installation::recovery::admit_generation(
+                            request.artifacts[0].product_id,
+                            request.recovery_generation,
+                        ) else {
+                            continue;
+                        };
                         if reset_retry {
                             request.access_token = access_token;
                             request.retry_started = None;
@@ -532,6 +664,12 @@ fn run(
                     } else if !active.lock().is_ok_and(|active| active.contains_key(&id))
                         && let Some(mut request) = request_from_job(&id, access_token)
                     {
+                        let Ok(_admission) = crate::installation::recovery::admit_generation(
+                            request.artifacts[0].product_id,
+                            request.recovery_generation,
+                        ) else {
+                            continue;
+                        };
                         if reset_retry {
                             request.retry_started = None;
                             request.retry_attempt = 0;
@@ -563,10 +701,19 @@ fn run(
                     }
                 }
                 Command::Terminal(mut request, event) => {
+                    active_products.remove(&request.id);
                     if let Ok(mut active) = active.lock() {
                         active.remove(&request.id);
                     }
-                    if removing.remove(&request.id) {
+                    if !crate::installation::recovery::current(
+                        request.artifacts[0].product_id,
+                        request.recovery_generation,
+                    ) {
+                        if !matches!(event, DownloadEvent::Complete { .. }) {
+                            persist_state(&request, DownloadState::Paused);
+                        }
+                        let _ = request.listener.send(DownloadEvent::Cancelled);
+                    } else if removing.remove(&request.id) {
                         cleanup_job(&request.id);
                         let _ = request.listener.send(DownloadEvent::Cancelled);
                     } else if let DownloadEvent::Failed(failure) = &event
@@ -652,6 +799,8 @@ fn run(
                                     ) {
                                         Ok(Some(retention)) => {
                                             let _ = commands.send(Command::RetainInstallers {
+                                                product_id: request.artifacts[0].product_id,
+                                                generation: request.recovery_generation,
                                                 retention,
                                                 job_id: request.id,
                                                 session: request.session,
@@ -660,6 +809,8 @@ fn run(
                                         Ok(None) => {}
                                         Err(error) => {
                                             let _ = commands.send(Command::RetentionFailed {
+                                                product_id: request.artifacts[0].product_id,
+                                                generation: request.recovery_generation,
                                                 job_id: request.id,
                                                 session: request.session,
                                                 message: crate::updates::status_error(&error),
@@ -678,62 +829,71 @@ fn run(
                         let _ = request.listener.send(event);
                     }
                 }
-                Command::ManifestRefreshed(mut request, mut failure, result) => match result {
-                    Ok(artifacts) => {
-                        let old_id = request.id.clone();
-                        request.artifacts = artifacts;
-                        let refs = request.artifacts.iter().collect::<Vec<_>>();
-                        request.id = job_id(&refs);
-                        if request.id != old_id {
-                            // A refreshed mutable GOG slot can represent different bytes. Never
-                            // append those bytes to partial files belonging to the old revision.
-                            if StateStore::open()
-                                .and_then(|store| {
-                                    super::auto_install::block_replaced_job(
-                                        &store,
-                                        &old_id,
-                                        &request.id,
-                                    )
-                                })
-                                .is_err()
+                Command::ManifestRefreshed(mut request, mut failure, result) => {
+                    if !crate::installation::recovery::current(
+                        request.artifacts[0].product_id,
+                        request.recovery_generation,
+                    ) {
+                        continue;
+                    }
+                    match result {
+                        Ok(artifacts) => {
+                            let old_id = request.id.clone();
+                            request.artifacts = artifacts;
+                            let refs = request.artifacts.iter().collect::<Vec<_>>();
+                            request.id = job_id(&refs);
+                            if request.id != old_id {
+                                // A refreshed mutable GOG slot can represent different bytes. Never
+                                // append those bytes to partial files belonging to the old revision.
+                                if StateStore::open()
+                                    .and_then(|store| {
+                                        super::auto_install::block_replaced_job(
+                                            &store,
+                                            &old_id,
+                                            &request.id,
+                                        )
+                                    })
+                                    .is_err()
+                                {
+                                    failure.message = "Could not update the saved installation request. Retry this download after restarting.".into();
+                                    let _ = request.listener.send(DownloadEvent::Failed(failure));
+                                    continue;
+                                }
+                                cleanup_job(&old_id);
+                            }
+                            if queued.iter().any(|queued| queued.id == request.id)
+                                || active
+                                    .lock()
+                                    .is_ok_and(|active| active.contains_key(&request.id))
                             {
-                                failure.message = "Could not update the saved installation request. Retry this download after restarting.".into();
+                                failure.message =
+                                    "The refreshed GOG revision is already in the download queue"
+                                        .to_owned();
                                 let _ = request.listener.send(DownloadEvent::Failed(failure));
                                 continue;
                             }
-                            cleanup_job(&old_id);
+                            request.handle = Arc::new(AtomicBool::new(false));
+                            request.ready_at = Instant::now();
+                            persist_queued(&request);
+                            set_waiting_status(
+                                &request.id,
+                                Some("Manifest refreshed; waiting to retry"),
+                            );
+                            insert_in_queue_order(&mut queued, request);
                         }
-                        if queued.iter().any(|queued| queued.id == request.id)
-                            || active
-                                .lock()
-                                .is_ok_and(|active| active.contains_key(&request.id))
-                        {
-                            failure.message =
-                                "The refreshed GOG revision is already in the download queue"
-                                    .to_owned();
+                        Err(error) => {
+                            failure.message = format!(
+                                "{}; refreshing this product's GOG manifest did not recover the download: {error}",
+                                failure.message
+                            );
+                            if let Ok(store) = StateStore::open() {
+                                let _ =
+                                    store.set_download_job_failure(&request.id, &failure.message);
+                            }
                             let _ = request.listener.send(DownloadEvent::Failed(failure));
-                            continue;
                         }
-                        request.handle = Arc::new(AtomicBool::new(false));
-                        request.ready_at = Instant::now();
-                        persist_queued(&request);
-                        set_waiting_status(
-                            &request.id,
-                            Some("Manifest refreshed; waiting to retry"),
-                        );
-                        insert_in_queue_order(&mut queued, request);
                     }
-                    Err(error) => {
-                        failure.message = format!(
-                            "{}; refreshing this product's GOG manifest did not recover the download: {error}",
-                            failure.message
-                        );
-                        if let Ok(store) = StateStore::open() {
-                            let _ = store.set_download_job_failure(&request.id, &failure.message);
-                        }
-                        let _ = request.listener.send(DownloadEvent::Failed(failure));
-                    }
-                },
+                }
                 Command::SetConcurrency(limit) => concurrency = limit,
                 Command::Recover(token) => {
                     authentication_available = true;
@@ -815,8 +975,23 @@ fn run(
             }
             continue;
         }
+        quiescence.retain(|(jobs, reply)| {
+            if active.lock().unwrap().keys().any(|id| jobs.contains(id)) {
+                true
+            } else {
+                let _ = reply.send(Ok(()));
+                false
+            }
+        });
         if network_available && authentication_available {
-            schedule(&mut queued, concurrency, &commands, &active, &subscribers);
+            schedule(
+                &mut queued,
+                concurrency,
+                &commands,
+                &active,
+                &subscribers,
+                &mut active_products,
+            );
         }
     }
 }
@@ -827,6 +1002,7 @@ fn schedule(
     commands: &mpsc::Sender<Command>,
     active: &Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     subscribers: &Arc<Mutex<Vec<mpsc::Sender<DownloadManagerEvent>>>>,
+    active_products: &mut HashMap<String, i64>,
 ) {
     loop {
         // Only one logical game/artifact group is active. The configured limit is used by that
@@ -842,6 +1018,12 @@ fn schedule(
         };
         let Some(mut request) = queued.remove(position) else {
             return;
+        };
+        let Ok(_admission) = crate::installation::recovery::admit_generation(
+            request.artifacts[0].product_id,
+            request.recovery_generation,
+        ) else {
+            continue;
         };
         if let Err(error) = ensure_download_directory(&request.destination) {
             set_waiting_status(
@@ -867,6 +1049,7 @@ fn schedule(
         if let Ok(mut active) = active.lock() {
             active.insert(request.id.clone(), worker);
         }
+        active_products.insert(request.id.clone(), request.artifacts[0].product_id);
         let id = request.id.clone();
         let listener = request.listener.clone();
         let requested_pause = request.handle.clone();
@@ -999,10 +1182,17 @@ fn recover_jobs(
         {
             continue;
         }
+        let generation = crate::installation::recovery::generation(job.product_id);
+        let Ok(_admission) =
+            crate::installation::recovery::admit_generation(job.product_id, generation)
+        else {
+            continue;
+        };
         let downloaded = recovered_bytes(&job);
         let _ = store.recover_download_job(&job.job_id, downloaded);
         let (listener, _) = mpsc::channel();
         queued.push_back(Request {
+            recovery_generation: generation,
             session: crate::online::account_session(),
             id: job.job_id,
             artifacts: job.artifacts,
@@ -1049,6 +1239,7 @@ fn request_from_job(id: &str, access_token: String) -> Option<Request> {
     }
     let (listener, _) = mpsc::channel();
     Some(Request {
+        recovery_generation: crate::installation::recovery::generation(job.product_id),
         session: crate::online::account_session(),
         id: job.job_id,
         artifacts: job.artifacts,
@@ -1085,6 +1276,11 @@ fn refresh_request_manifest(request: &Request) -> Result<Vec<RemoteArtifact>, St
     let product = crate::gog::product::fetch(&client, first.product_id)
         .map_err(|error| format!("could not fetch product {}: {error}", first.product_id))?;
     let all_artifacts = crate::gog::product::download_artifacts(first.product_id, &product);
+    let _admission = crate::installation::recovery::admit_generation(
+        first.product_id,
+        request.recovery_generation,
+    )
+    .map_err(|error| error.to_string())?;
     if let Ok(store) = StateStore::open() {
         store
             .observe_download_manifest(first.product_id, &all_artifacts)
@@ -1156,6 +1352,76 @@ fn cleanup_job(id: &str) {
 mod tests {
     use super::{queue_insertion_index, should_refresh_manifest};
     use crate::download::DownloadFailureKind;
+
+    #[test]
+    fn recovery_drains_unrecorded_active_request_and_rejects_late_manifest() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let id = 910009;
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":id,"kind":"installer","name":"Fixture","size_bytes":4,"download_path":"/never-fetched"}
+        ])).unwrap();
+        let (listener, _) = mpsc::channel();
+        let request = request_from_download(
+            crate::download::DownloadRequest {
+                artifacts: artifacts.clone(),
+                title: "Fixture".into(),
+                access_token: "inert".into(),
+                destination: root.path().join("game/installer"),
+                events: listener,
+            },
+            crate::online::account_session(),
+        );
+        let store = StateStore::open().unwrap();
+        assert!(store.download_job(&request.id).unwrap().is_none());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(HashMap::from([(
+            request.id.clone(),
+            cancelled.clone(),
+        )])));
+        let products = HashMap::from([(request.id.clone(), id)]);
+        let (commands, receiver) = mpsc::channel();
+        let worker_commands = commands.clone();
+        let worker = std::thread::spawn(move || {
+            run(
+                receiver,
+                worker_commands,
+                active,
+                Arc::new(Mutex::new(Vec::new())),
+                products,
+            )
+        });
+        let reservation = crate::installation::recovery::Reservation::reserve(&[id]).unwrap();
+        let (reply, drained) = mpsc::channel();
+        commands.send(Command::Quiesce(vec![id], reply)).unwrap();
+        assert!(drained.recv_timeout(Duration::from_millis(75)).is_err());
+        assert!(cancelled.load(Ordering::Relaxed));
+        commands
+            .send(Command::Terminal(request.clone(), DownloadEvent::Cancelled))
+            .unwrap();
+        drained
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        store.delete_download_job(&request.id).unwrap();
+        drop(reservation);
+        commands
+            .send(Command::ManifestRefreshed(
+                request.clone(),
+                crate::download::DownloadFailure {
+                    kind: DownloadFailureKind::TransientNetwork,
+                    message: "fixture".into(),
+                },
+                Ok(artifacts),
+            ))
+            .unwrap();
+        let (reply, done) = mpsc::channel();
+        commands.send(Command::Shutdown(reply)).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(store.download_job(&request.id).unwrap().is_none());
+        assert!(!request.destination.exists());
+    }
 
     #[test]
     fn committed_completion_survives_auth_disable_or_stale_session_without_follow_up() {
@@ -1234,8 +1500,15 @@ mod tests {
             let (subscriber, snapshots) = mpsc::channel();
             let subscribers = Arc::new(Mutex::new(vec![subscriber]));
             let worker_commands = commands.clone();
-            let worker =
-                std::thread::spawn(move || run(receiver, worker_commands, active, subscribers));
+            let worker = std::thread::spawn(move || {
+                run(
+                    receiver,
+                    worker_commands,
+                    active,
+                    subscribers,
+                    HashMap::new(),
+                )
+            });
             commands
                 .send(Command::SetAuthentication(authenticated))
                 .unwrap();

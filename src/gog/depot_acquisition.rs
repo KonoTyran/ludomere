@@ -246,6 +246,14 @@ fn manifest_meta_url_at(base: &str, reference: &str) -> Result<String> {
     ))
 }
 
+pub(crate) fn fetch_repository(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    identity: &str,
+) -> Result<GenerationTwoRepository> {
+    crate::gog::repository::parse(&fetch_bytes(client, token, &manifest_meta_url(identity)?)?)
+}
+
 fn fetch_bytes(client: &reqwest::blocking::Client, token: &str, url: &str) -> Result<Vec<u8>> {
     let mut response = client
         .get(url)

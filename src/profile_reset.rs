@@ -39,6 +39,20 @@ struct ActivityState {
 
 pub(crate) struct ActivityGuard(&'static str);
 
+impl ActivityGuard {
+    pub(crate) fn running_game(&mut self) {
+        let mut state = ACTIVITIES.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = state.counts.get_mut(self.0) {
+            *count -= 1;
+            if *count == 0 {
+                state.counts.remove(self.0);
+            }
+        }
+        self.0 = "running game";
+        *state.counts.entry(self.0).or_default() += 1;
+    }
+}
+
 pub(crate) fn begin_activity(kind: &'static str) -> Result<ActivityGuard> {
     let mut state = ACTIVITIES.lock().unwrap_or_else(|error| error.into_inner());
     ensure!(
@@ -80,6 +94,15 @@ struct Plan {
     data: PathBuf,
     cache: PathBuf,
     protected: Vec<PathBuf>,
+    #[serde(default)]
+    journals: Vec<Journal>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    path: PathBuf,
+    hash: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,6 +219,36 @@ pub fn reserve() -> Result<ResetReservation> {
     Ok(ResetReservation { armed: true })
 }
 
+/// The account is already revoked. Block new work, then drain on the worker thread.
+pub fn reserve_for_sign_out() -> Result<ResetReservation> {
+    let mut state = ACTIVITIES.lock().unwrap_or_else(|error| error.into_inner());
+    ensure!(!state.frozen, "Profile cleanup is already pending");
+    state.frozen = true;
+    *PREPARATION
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = true;
+    Ok(ResetReservation { armed: true })
+}
+
+pub fn keeps_running_games() -> bool {
+    *PREPARATION
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        || PENDING
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+}
+
+pub(crate) fn stopping_operations() -> bool {
+    ACTIVITIES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .frozen
+}
+
 fn release_preparation(unfreeze: bool) {
     if unfreeze {
         ACTIVITIES
@@ -224,6 +277,26 @@ impl Drop for ResetReservation {
 /// Worker-only preflight. Failure does not sign out, erase data, or terminate an operation.
 impl ResetReservation {
     pub fn prepare(mut self, config: &crate::config::Config) -> Result<PendingReset> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        loop {
+            let state = ACTIVITIES.lock().unwrap_or_else(|error| error.into_inner());
+            if state.counts.keys().all(|kind| *kind == "running game") {
+                break;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "Signed out. Profile reset is waiting for {} to stop; retry cleanup. Files were kept.",
+                state
+                    .counts
+                    .keys()
+                    .filter(|kind| **kind != "running game")
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let lock = PROFILE_LOCK
             .get()
             .context("Profile lifecycle lock is unavailable; restart Ludomere")?;
@@ -250,29 +323,23 @@ impl ResetReservation {
                 data.join("comet"),
             ]);
             let store = crate::state::StateStore::open()?;
-            ensure!(
-                store
-                    .installation_operations()?
-                    .iter()
-                    .all(|operation| matches!(operation.state.as_str(), "complete" | "cancelled"))
-                    && store.depot_operations()?.iter().all(|operation| matches!(
-                        operation.state.as_str(),
-                        "complete" | "cancelled" | "abandoned"
-                    )),
-                "Finish or cancel recoverable installation operations before resetting the profile"
-            );
+            let mut journals = Vec::new();
             for library in &config.game_libraries {
                 let staging = library.path.join(".ludomere/staging");
                 validate_path(&staging)?;
                 if staging.is_dir() {
                     for entry in fs::read_dir(staging)? {
-                        ensure!(
-                            !entry?
-                                .file_name()
-                                .to_string_lossy()
-                                .ends_with(".operation.json"),
-                            "Finish or cancel saved installation operations before resetting the profile"
-                        );
+                        let path = entry?.path();
+                        if path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.ends_with(".operation.json"))
+                        {
+                            journals.push(Journal {
+                                hash: journal_hash(&path)?,
+                                path,
+                            });
+                        }
                     }
                 }
             }
@@ -304,6 +371,7 @@ impl ResetReservation {
                 data,
                 cache,
                 protected: expanded,
+                journals,
             };
             validate_plan(&plan, &current_roots())?;
             // Check secret-service accessibility without deleting or logging the credential.
@@ -367,16 +435,20 @@ pub fn retry_pending() -> Result<()> {
 
 /// Called after GTK shutdown. Exec replaces all detached threads before any deletion.
 pub fn finish_application() -> Result<()> {
-    let mut preparing = PREPARATION
+    let preparing = PREPARATION
         .0
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    while *preparing {
-        preparing = PREPARATION
-            .1
-            .wait(preparing)
-            .unwrap_or_else(|error| error.into_inner());
-    }
+    let (preparing, _) = PREPARATION
+        .1
+        .wait_timeout_while(preparing, std::time::Duration::from_secs(5), |preparing| {
+            *preparing
+        })
+        .unwrap_or_else(|error| error.into_inner());
+    ensure!(
+        !*preparing,
+        "Signed out, but profile cleanup is still pending. Profile data and operation records were kept; retry cleanup after reopening Ludomere."
+    );
     drop(preparing);
     let Some(hash) = PENDING
         .lock()
@@ -585,6 +657,33 @@ fn validate_plan(plan: &Plan, roots: &[PathBuf; 3]) -> Result<()> {
             "Invalid protected payload path"
         );
     }
+    for journal in &plan.journals {
+        let library = journal
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("Invalid reset operation journal")?;
+        let name = journal
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Invalid reset journal filename")?;
+        ensure!(
+            plan.protected.contains(&library.to_path_buf())
+                && journal.path.parent() == Some(library.join(".ludomere/staging").as_path())
+                && name.ends_with(".operation.json")
+                && journal.hash.len() == 64,
+            "Reset operation journal is outside configured storage"
+        );
+        validate_path(&journal.path)?;
+        if journal.path.try_exists()? {
+            ensure!(
+                journal_hash(&journal.path)? == journal.hash,
+                "Saved operation changed; review profile reset again"
+            );
+        }
+    }
     for target in targets(plan)? {
         ensure!(
             !roots.iter().any(|root| root.starts_with(&target)),
@@ -629,6 +728,15 @@ fn validate_path(path: &Path) -> Result<()> {
 }
 
 fn remove_profile(plan: &Plan) -> Result<()> {
+    for journal in &plan.journals {
+        if journal.path.try_exists()? {
+            ensure!(
+                journal_hash(&journal.path)? == journal.hash,
+                "Saved operation changed; cleanup remains incomplete"
+            );
+            remove_owned(&journal.path)?;
+        }
+    }
     for target in targets(plan)? {
         remove_owned(&target)?;
     }
@@ -636,6 +744,45 @@ fn remove_profile(plan: &Plan) -> Result<()> {
         remove_owned(&plan.config.join(name))?;
     }
     Ok(())
+}
+
+fn journal_hash(path: &Path) -> Result<String> {
+    validate_path(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.nlink() == 1 && metadata.len() <= 16 * 1024 * 1024,
+        "Saved operation is not a bounded regular file; profile reset remains incomplete"
+    );
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 16 * 1024 * 1024,
+        "Saved operation exceeds its size limit"
+    );
+    use crate::installation::operation_journal::OperationJournal;
+    match serde_json::from_slice::<OperationJournal>(&bytes)
+        .context("Saved operation is malformed; signed out, but profile cleanup needs review")?
+    {
+        OperationJournal::Depot { version: 1, record } => {
+            ensure!(
+                crate::installation::operation_journal::depot_path(&record.staging_path) == path,
+                "Saved operation path does not match its identity"
+            );
+            crate::installation::dependency_setup::ensure_setup_quiescent(&record)?;
+        }
+        OperationJournal::Offline { version: 1, record } => {
+            ensure!(
+                crate::installation::operation_journal::offline_path(&record)? == path,
+                "Saved operation path does not match its identity"
+            );
+        }
+        _ => bail!("Unsupported saved operation; signed out, but profile cleanup needs review"),
+    }
+    Ok(digest(&bytes))
 }
 
 fn remove_owned(path: &Path) -> Result<()> {
@@ -723,6 +870,7 @@ mod tests {
                 directory.path().join("data/cloud-save-deletion-recovery"),
                 directory.path().join("installers"),
             ],
+            journals: Vec::new(),
         };
         for root in [&plan.config, &plan.data, &plan.cache] {
             fs::create_dir_all(root).unwrap();
@@ -751,6 +899,59 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn reset_discards_only_validated_idle_operation_journals_and_preserves_files() {
+        let (_root, mut plan) = fixture();
+        let library = plan.protected[0].clone();
+        let destination = library.join("fixture");
+        let path = crate::installation::operation_journal::path(&library, "fixture").unwrap();
+        let mut record = crate::state::DepotOperationRecord {
+            operation_id: "reset-fixture".into(),
+            product_id: 9,
+            build_id: "1".into(),
+            branch: None,
+            kind: "install".into(),
+            state: "failed".into(),
+            destination: destination.clone(),
+            staging_path: library.join(".ludomere/staging/fixture.part"),
+            plan_json: "{}".into(),
+            bytes_completed: 3,
+            total_bytes: Some(5),
+            error: Some("inert failed setup".into()),
+            created_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        };
+        crate::installation::operation_journal::write_depot(&path, &record).unwrap();
+        write(&destination.join("payload"));
+        write(&library.join(".ludomere/compatibility/fixture/save"));
+        write(&record.staging_path.join("partial"));
+        plan.journals.push(Journal {
+            path: path.clone(),
+            hash: journal_hash(&path).unwrap(),
+        });
+        validate_plan(&plan, &roots(&plan)).unwrap();
+        record.plan_json = serde_json::json!({"setup_process_guard": {
+            "boot": fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim(), "group": null
+        }}).to_string();
+        crate::installation::operation_journal::write_depot(&path, &record).unwrap();
+        assert!(journal_hash(&path).is_err());
+        assert!(remove_profile(&plan).is_err());
+        assert!(path.is_file());
+        record.plan_json = "{}".into();
+        crate::installation::operation_journal::write_depot(&path, &record).unwrap();
+        remove_profile(&plan).unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read(destination.join("payload")).unwrap(), b"fixture");
+        assert!(
+            library
+                .join(".ludomere/compatibility/fixture/save")
+                .is_file()
+        );
+        assert!(record.staging_path.join("partial").is_file());
+        remove_profile(&plan).unwrap();
     }
 
     #[test]

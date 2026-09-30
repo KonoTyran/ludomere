@@ -242,6 +242,10 @@ pub fn set_authenticated(authenticated: bool) {
     manager::set_authenticated(authenticated);
 }
 
+pub fn pause_for_sign_out() -> anyhow::Result<()> {
+    manager::pause_for_sign_out()
+}
+
 pub fn shutdown() {
     manager::shutdown();
 }

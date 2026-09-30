@@ -2,6 +2,268 @@
 
 Last meaningful update: 2026-09-30.
 
+## Current publication
+
+- Final content checkpoint: manager and independent P157 review clear exactly35 intended paths,
+  revised complete feature/fix message and accurate verification limits. No generated/private
+  content; staged diff check clean. Fresh fork main equals local0078c84, permitting fast-forward.
+  Commit and normal HTTPS push to the same fork are authorized without changing remote settings;
+  SSH authentication is unavailable. Final result will be established by matching Git refs.
+
+- User authorizes commit and push of accumulated R53–R58. P157 acquisition prepares complete
+  inventory/message and performs reviewed publication; security independently reviews. Target
+  configured fork main, no force/upstream change. Prior scoped verification remains applicable.
+
+## Fresh Depot preparation failure
+
+- Final scoped disposition: R58/P155–P156 complete, independently reviewed PASS. Corrected merged
+  manifest preparation and installed snapshot persistence/Resume without weakening network parsing.
+  Multi-container fingerprints bind reference indices; old marker reconstruction is narrowly
+  compatible. Manager inspected source, owner/reviewer reports and logs:15 focused owner tests,
+  three independent repeated checks, fmt/all-target Clippy/debug/diff pass. Binary09:20:17UTC.
+  No unresolved scoped issue; no full suite, real profile/game/helper, package, commit or push.
+  User should restart cargo run and Retry preparation; actual fresh Witcher installation remains
+  untested. No additional cache reset needed or global Prototype ready declaration.
+
+- Manager inspected candidate and 12 passing manifest tests. Reference-free validation now uses
+  entry parsing without synthetic network totals, retaining original SFC accounting. Preparation
+  checks snapshot bound early. P156 independently proves zero/one-container hash byte stream
+  unchanged against HEAD0078c84; oldmarker compatibility remains confined to current wire sources.
+  Production prep/cache/journal regression and final checks remain pending; no live-game claim.
+
+- Draft correction covers typed validation/local snapshot codec. Review requires early total
+  snapshot-size validation and narrow preservation of known earlier multi-depot marker hashes
+  only during original-wire current_sources reconstruction; no legacy hash acceptance for new
+  snapshots or target plans. P155 implementing with tamper/refsize and persistence regressions.
+
+- P155 confirms both preparation and final installed-cache boundaries; approved strict internal
+  snapshot codec and validation, retaining legacy wire snapshots/network parser. Multi-container
+  fingerprints must bind reference indices; preserve single-container identity. Focused tests
+  must cover fresh preparation, persisted read/resume, bad references and validation preservation.
+
+- Source confirms merged payload (even without extra dependencies) passes through the single-
+  container wire serializer at preparation and again when saving installed manifests. P156 also
+  identifies fingerprints omit container_index; fixing reference integrity is necessary to R58.
+  P155 must preserve strict wire validation and cover local persistence/readback, not only totals.
+
+- R58/P155 acquisition diagnosis and narrow correction; P156 security independent review.
+  User reset/deleted files then Witcher preparation rejected a small-files container index.
+  Source suggests internal merged manifests being serialized to a single-container wire format;
+  reproduction pending. Preserve prior work and validation, no runtime/user-file operation.
+
+## Persistent controller failure
+
+- Read-only Protonfixes follow-up confirms existing GE/UMU integration already passes resolved
+  GAMEID and STORE=gog. Earlier authorized logs identify BIT.TRIP umu-63710, Witcher umu-default;
+  P152 checks current public UMU database lacks Witcher GOG1495134320. Missing mapping/appropriate
+  store-specific recipe is distinct from stale-prefix XInput remediation. Recommend verifying
+  missing mappings/recipes through existing upstream integration; no dependency/localfix changes
+  or external contribution authorized/performed by this feasibility discussion.
+
+- User hardware acceptance: BIT.TRIP controller now works; Witcher works with explicit four
+  Builtin rows, then fails again after full profile reset removes them. This establishes successful
+  corrected paths for these games, not universal detection. Reset preserves prefix registry but
+  clears proton.json preferences; Witcher still lacks receipt eligibility. Read-only explanation/
+  detection proposal requested, no new product changes. P152 compatibility verifies recommendation.
+
+- Final scoped disposition: P152 diagnosis/P154 correction complete, P153 independently reviewed
+  with no substantive blocker. Manager inspected reports, source, five focused tests/fmt/Clippy/
+  debug/diff PASS; binary08:43:23UTC. Reviewer received exact selected ADD_CONFIG flag-source
+  excerpt; no additional runtime execution or private reads needed. README is generic/current.
+  No registry/DLL/host permissions/settings mutation, dependency modification, full suite, package,
+  commit or push. R57 hardware acceptance remains open; actual loaded-DLL path remains unknown.
+  User next test: restart cargo run, retry BIT.TRIP; explicitly save four Builtin XInput rows for
+  Witcher because it lacks the historical receipt. No global Prototype ready claim.
+
+- P154 candidate now pairs bare/wildcard names, preserves explicit inherited selections and
+  conservatively excludes managed xinput1_3 for incoming native-XInput flags. Manager inspected
+  source and five focused DLL passes (one nested child is not an additional distinct case),
+  fmt/Clippy/diff pass. Independent source review finds no blocker; final debug/report pending.
+  Reference lookup fixture reproduces old conditional loss and new five-mode behavior without
+  executing Wine; it is not proof of actual game DLL loading or controller detection.
+
+- Manager reviewed final /tmp/ludomere-p152-report.md: selected log basenames and IDs, exact
+  receipt distinction, readable host Xbox node, primary pinned lookup evidence and no XInput
+  ProtonFixes rewrite found. Read-only diagnosis complete. P154 correction and P153 final review
+  remain in progress; no runtime probe or further private reads needed before user retest.
+
+- Exact GE11-7 Wine gitlink46b29104 confirms per-key environment/registry precedence and
+  qualified-module→wildcard→bare lookup. P154 implements narrow paired-name correction/tests/docs;
+  P153 reviews managed-default native-policy exclusion. BIT.TRIP ProtonFixes script adds no XInput
+  rule. No loaded-module trace or hardware success established; no runtime probe needed yet.
+
+- Authorized host stat/access check sees controller event10 as a readable/writable character
+  device for this user; sandbox absence was not host absence. No device opened. P153 and P154
+  independently confirm conditional registry-wildcard precedence gap; actual game module path
+  remains unknown. Candidate paired bare/wildcard correction must conservatively preserve explicit
+  upstream native-XInput configuration for managed defaults. Exact pinned source check continues.
+
+- P153 identifies a potential concrete composer defect: Wine tests qualified/wildcard keys before
+  bare names, with environment priority per key. Thus a native wildcard registry key may outrank
+  the requested bare builtin default. Exact GE Wine source review pending; P154 acquisition owns
+  narrow correction proposal/tests. Sysfs sees Xbox Series USB045e:0b12/xpad; agent sandbox lacks
+  its device node, not evidence that the host/game lacks access. Scoped host metadata check allowed.
+
+- P152 bounded diagnostics report both latest launches use GE-Proton11-7/steamrt4 with no saved
+  DLL rows. BIT.TRIP has current-identity old-recipe receipt and builtin-request log; Witcher GOTY
+  lacks receipt/correction. Both registry sets contain native XInput entries. Requested environment
+  policy is not proof of actual loaded DLL or device visibility; independent precedence review and
+  controller metadata checks continue. No unified cause or additional fix claimed.
+
+- Interview settled: cargo run, DLL overrides unchanged; explicit scoped read-only diagnostic
+  permission granted. P152 inspects application of the receipt correction and actual runner/device
+  evidence first; P153 reviews independently. No real prefix mutation or executable probe yet.
+
+- User reports neither BIT.TRIP Runner nor Witcher 3 detects the controller after prior handoff.
+  R57 hardware outcome unresolved; P152 compatibility diagnosis and P153 independent review reopen.
+  Asked whether current cargo run and explicit Builtin overrides were used, and for narrow read-only
+  launch/config/prefix XInput/device-metadata access. No further guessed default or hardware claim.
+  Prior P149–P151 local assurance remains valid only for its stated source/fixture scope.
+
+## Current DLL/controller work
+
+- Final disposition: R56/R57 / P149–P151 complete for scoped local assurance. Per-game five-mode
+  DLL editor and prefix-independent persistence, foreground Windows command composition, native
+  XInput recipe removal and verified old-recipe launch correction implemented. No registry/DLL/
+  device/driver/dependency modification. Manager reviewed /tmp/ludomere-p149-report.md,
+  -p150-report.md and independent -p151-review.md, source, actual editor screenshot and final logs.
+- Final focused DLL4/preference7/GTK1/uninstall1/receipt1 checks pass; overlapping evidence is not
+  a full-suite total. Final fmt/all-target Clippy/debug/diff pass after the publication-size guard.
+  Actual editor five-mode/persistence/error/retry/remove/reopen/closed-save controls pass. Exact
+  final source reconciliation reviewed; no scoped QA/security blocker. Fixture processes stopped.
+- USB Xbox user test remains necessary. The native-only XInput policy is a confirmed own-code
+  deficiency and plausible contributor, not proof of the user's exact device/prefix cause. Old
+  installations lacking matching receipts receive no inferred repair; explicit builtin choices
+  are available through the new editor. Proton runtime policy remains unchanged. Changes remain
+  uncommitted, source ready for cargo run; no package/full suite or global Prototype ready claim.
+  Earlier checkpoints below are superseded by this final scoped disposition.
+- P151 actual editor checks pass all five modes, add/remove/save/cancel/reopen, duplicate/path
+  validation, malformed-load retry, save-failure draft retention/retry, and delayed save after window
+  close without reopening/navigation. Other-game/Proton preferences preserved; manager inspected
+  final editor screenshot. Focused DLL4/GTK1/uninstall1/receipt1 and initial fmt/Clippy/debug pass.
+- Manager found new valid DLL maps could exceed the existing1MiB preference reader limit. P149
+  adds a minimal temporary-file size check before atomic publication, preserving old bytes/draft,
+  with safe actionable size error and targeted regression. P151 confirms source deficiency;
+  existing UI failure evidence remains applicable. Final checks/review pending that correction.
+- P150 receipt/recipe regression passes missing/current/old/unrelated/malformed/oversized/symlink/
+  writable/recreated-prefix cases and verifies no receipt/registry mutation. Report primary-source
+  comparison distinguishes confirmed policy deficiency from untested device success. Old receipts
+  prove prior setup, not absence of later registry-only edits; explicit per-game settings preserve
+  intentional alternatives. Proton's own final runtime policy remains unchanged.
+- P149 editor compiles and initial DLL persistence/composition focused tests pass. Independent P151
+  found repeated-suffix normalization instability; owner rejects that ambiguous form and adds a
+  regression. New setter participates in reset activity guard; ordinary local preferences remain
+  account-independent. Actual editor controls and final checks remain pending.
+- Interview settled: per-game DLL overrides only; USB controller, Lutris GE-Proton10.29 succeeds
+  with Steam running and closed. User answer narrows hypotheses but does not prove Proton-version
+  equivalence or actual affected-prefix state.
+- P150 verified pinned GE11-7 Winetricks xinput installs four native-only overrides; our DirectX
+  recipe invokes it indiscriminately. Proton has no matching normal XInput override; Wine supports
+  process-local override precedence over registry. Approved removal plus old successful receipt/
+  current-prefix gated launch-only builtin correction. Explicit choices remain higher priority;
+  no device/driver/registry changes. P151 independently agrees on source-supported deficiency.
+- P149 uses existing proton.json per-product persistence and Game Settings Compatibility editor;
+  no schema change. Composition preserves managed, inherited and explicit choices, with per-game
+  entries winning. Implementation/relevant tests and independent GUI review pending.
+- R56/R57 user requests Lutris-style DLL overrides and controller diagnosis/correction; Lutris
+  comparison works for Witcher 3. Asked override scope, connection type, Lutris runner and Steam
+  state. Independent source investigation proceeds while those answers are pending.
+- P149 acquisition owns DLL integration, P150 compatibility controller investigation/fixes, P151
+  security independent review. No package/publication/host changes or real game execution. Prior
+  uncommitted P146–P148 work remains preserved. No hardware-specific conclusion yet.
+
+## Current state and logout fixes
+
+- Final disposition: R53–R55 / P146–P148 complete for scoped local assurance. Reports
+  /tmp/ludomere-p146-report.md, -p147-report.md and independent -p148-review.md reviewed by manager;
+  no unresolved scoped QA/security blocker. Final fmt, all-target Clippy with warnings denied,
+  debug build and diff checks pass. Relevant cloud/detail/sidebar/GTK/auth/download/native/reset/
+  contention/recovery regressions pass; overlapping filters are not a full-suite claim.
+- Actual private GUI verifies same-page download/install/completion/cleanup/running actions,
+  requested color priority, sign-out under a held commit lock, signed-out Stop-to-enabled Play,
+  cleanup failure/retry, full-reset failure/retry and fresh launch. Ten payload/prefix/external-save
+  sentinels survive reset byte-for-byte; resume/profile records are removed. Final source differs
+  from the tested UI copy only by reviewed formatting/signature/test changes. Fixture processes
+  stopped, no Xvfb lock remains. Debug timestamp07:50:57UTC, source ready for cargo run.
+- Ordinary logout preserves recoverable interruption; optional reset discards automatic resume
+  records and settings while retaining files. Games keep running. Already-issued cloud requests
+  cannot be recalled; uncertain helpers/malformed records can defer destructive reset while the
+  account remains signed out. Real GOG/runtime/desktop acceptance is not inferred from fixtures.
+  No full suite, package build, new commit/push or global Prototype ready declaration. Earlier
+  checkpoints below are historical and superseded by this final disposition.
+- Final physical P148 regression passes Queued-to-Installing-to-idle and signed-out Stop-to-enabled
+  Play on the same page. With the production commit barrier held for four seconds, sign-out
+  repainted in0.844 seconds while the barrier remained held; manager inspected evidence JSON and
+  final Play/white/signed-out screenshot. This closes the earlier disabled-Stopping screenshot
+  defect; its old dispatch-only check is not counted as a state-refresh pass. Final static/build
+  checks and reviewer handoff remain pending.
+- Final production checkpoint: P147 freezes exact native pause persistence, startup/login recovery
+  normalization, nonblocking account-generation reads with serialized commit barrier, and immediate
+  native scheduling pause before the logout worker starts. P148 source-review accepts these narrow
+  fixes. Early-reset shutdown preserves games during preparation; shutdown waits are bounded.
+  Existing reset9/native28/download6 focused cases pass; final epoch/sign-out regressions, fmt,
+  Clippy/debug and the last physical contention/retained-button checks are pending.
+- Manager review identified that sign-out increments detail generation before the retained-page
+  poll can reach its local-only account-change branch. P146 verifies/corrects this ordering;
+  P148 adds post-sign-out Stop-to-Play to the final physical regression.
+- Final review found synchronous online account-session invalidation could wait on SQLite work
+  on GTK. P147 owns a narrow UI/backend invalidation split; UI revocation remains immediate and
+  the backend barrier runs before cleanup/new login. P148 verifies contention behavior.
+- Native queue pause persistence must target known journals directly and propagate failures;
+  unrelated malformed records must not suppress it. Durable signed-out startup recovery must
+  prevent replay, with required normalization before login can remove that safeguard. No parallel
+  recovery store/schema is authorized. Exceptional storage failure remains actionable cleanup
+  failure while the user stays signed out. Final focused checks/review remain pending.
+- P148 fresh-next-launch reset check passes: first-run setup, signed out, no jobs/intents and reset
+  preference cleared. All private GUI/server processes stopped. UI source hashes match tested
+  controls; remaining backend corrections need focused verification/source reconciliation.
+- User adds green game names while running. Sidebar precedence is running green, downloading
+  blue, installed white, otherwise grey; P146/P148 notified. P148 authorized private exact-diff
+  event-boundary GUI fixtures with real-execution traps/fake keyring and synthetic owned processes.
+- Both interview answers settled: full-reset sign-out retains files but discards automatic resume
+  records/settings; ordinary sign-out retains recovery. Running games stay running. Owners notified;
+  no further product choice blocks the scoped lifecycle implementation.
+- P146 identifies independent primary-button timers: status monitor exits on terminal outcomes,
+  leaving control properties stale and later same-page operations unmonitored. Narrow persistent
+  lifecycle/current-state presentation correction under investigation; sidebar currently uses backup/
+  update classes rather than actual download state. P147 must account for unconditional shutdown
+  stop_all_games when full-reset logout closes the client, without weakening setup-writer guards.
+- P147 concrete sequence approved: revoke generation/clear UI identity first; persist signed-out
+  marker and delete credential off GTK; pause/drain download/setup workers preserving ordinary
+  recovery; optional reset discards validated exact journals only after drain. Running game guards
+  separate from account/cloud work, reset shutdown skips game stop, late account results ignored.
+  Cleanup failure remains signed out and exposes retry through existing control. No schema or
+  broad supervisor design; relevant lifecycle/credential regressions and independent review required.
+- P146 focused detail/priority tests and real GTK idle-restoration regression pass. P148 actual
+  private event-path GUI sees Pause/blue during inert HTTP transfer, same-page Play/white after
+  installed marker + terminal event, Stop/green from running state, then held physical Stop returns
+  Play/white. Guarded Play dispatches correct product without execution. Logout implementation/
+  lifecycle assurance still pending; no aggregate completion claim.
+- P147/P148 reject automatic native queue replay under a different login. Retain prior journals
+  for explicit Resume while allowing new authenticated work. Draft generation-tagged revocation
+  and post-keyring-read recheck address stale credential completion; final tests still required.
+- Integrated all-target compile passes. P146 cloud27 regressions pass, including revoked-session
+  transfer/local-write refusal. P148 physical ordinary sign-out during held inert HTTP transfer,
+  failed Depot state and synthetic running state clears identity immediately, preserves current
+  detail Stop and leaves UI sensitive. Injected credential deletion failure produces durable
+  signed-out marker and Retry cleanup control; manager inspected actual screenshot. Transfer drain,
+  full-reset/game survival, final lifecycle tests and final review remain pending.
+- P147 focused auth, real local-download pause/stale commands and owned synthetic-game survival
+  tests pass. P148 full-reset failure/retry physically passes: malformed record leaves signed-out
+  sensitive UI; known inert repaired record allows retry/exec removing private profile and exact
+  resume journal while preserving all10 payload/prefix/save sentinels byte-for-byte. Fresh restart
+  and final source reconciliation pending. Unbounded shutdown Condvar finding is being corrected
+  with bounded wait and logout marker persistence before credential/manager waits; no success
+  claim for impossible durable cleanup when both filesystem and credential storage fail.
+- Prior P145 delivered0078c84 to origin/main, remote/local refs matched and tree was clean.
+- User now requests immediate detail action refresh, white/blue/grey sidebar states, and logout
+  unblocked by failed/active work with interruption recovery. P146 compatibility UI, P147 acquisition
+  lifecycle backend, P148 security independent assurance. Full-reset recovery-record retention and
+  running-game behavior questions pending; independent investigation/UI work proceeds.
+- Prior reset deliberately refuses active activity and deletes queue/config state; simply removing
+  the guard would violate safe cleanup. New lifecycle must settle logout without unsafe concurrent
+  deletion or stale account work. No actual user data/process changes during verification.
+
 ## Current commit and push
 
 - User confirms Witcher 3 (previous installation), BIT.TRIP Runner, and newly downloaded Coffee

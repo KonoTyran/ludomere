@@ -1,5 +1,68 @@
 # Project specification
 
+## Commit and push accumulated fixes — 2026-09-30
+
+User: "Commit what you have and push." Publish current R53–R58 source, tests, documentation and
+coordination records to the configured fork branch with a comprehensive accurate commit message.
+No new features, package build, full-suite rerun, force push or upstream mutation requested.
+
+## Fresh Witcher Depot preparation failure — 2026-09-30
+
+User removed downloads/install directories and reset the profile, then received:
+"Could not prepare required Depot components: wire depot manifest has an invalid small-files
+container index. Retry preparation or choose Offline installers and extras."
+- R58: Diagnose and correct this Depot preparation failure while preserving valid container/file
+  associations, required dependency integrity, safe paths and explicit offline fallback. Preserve
+  prior uncommitted work; relevant tests only, no actual user-data deletion or game execution.
+
+## Controller failure after initial correction — 2026-09-30
+
+User subsequently confirms BIT.TRIP detects the controller with automatic correction, and Witcher
+detects it with the four explicit DLL overrides. Full profile reset removes those overrides and
+Witcher detection fails again. User asks for explanation and feasibility of detecting required
+overrides; no new repair/reset policy or implementation is authorized by this question.
+
+User reports the controller remains undetected in BIT.TRIP Runner and Witcher 3. R57 remains
+unresolved for actual hardware. Verify applied launch policy, runner version and runtime/device
+visibility before further defaults. Prior source/fixture checks are not hardware acceptance.
+Narrow read-only diagnostic access and exact latest test settings are being clarified.
+User authorizes the offered read-only launch logs, selected Proton/DLL settings, XInput-related
+prefix entries and controller device/permission metadata; exclude credentials, saves and raw input.
+User confirms latest test used cargo run with DLL overrides unchanged.
+`{"user_answers":{"controller_diagnostics":"scoped_read_only_approved","latest_controller_test":"cargo_run_overrides_unchanged"}}`
+
+## DLL overrides and controller investigation — 2026-09-30
+
+User requests DLL override support similar to Lutris, and investigation/correction of clear
+deficiencies preventing an Xbox controller working in Ludomere's Wine/Proton games. Witcher 3
+and BIT.TRIP Runner do not see it; user confirms Witcher 3 controller works through Lutris.
+- R56: Provide editable DLL load-order overrides integrated with existing Windows compatibility
+  settings and launch behavior. User chooses per-game only, with the five offered modes.
+  Preserve built-in compatibility fixes and explicit user intent; no downloaded DLLs requested.
+- R57: Compare relevant Ludomere launch/environment behavior with unchanged UMU/Proton and Lutris,
+  investigate controller visibility, and correct evidenced own-code deficiencies. Connection type,
+  comparison: USB Xbox; Lutris GE-Proton10.29 works with Steam both running and closed.
+  Generic Arch behavior required; no
+  speculative host drivers/udev/permissions changes or dependency patches. Preserve existing work.
+No new package/commit/push requested; use relevant tests and proportionate independent review.
+`{"user_answers":{"dll_override_scope":"per_game_only","controller_connection":"usb","lutris_runner":"GE-Proton10.29","steam_comparison":"works_running_and_closed"}}`
+
+## Immediate action state, sidebar colors and unrestricted sign-out — 2026-09-30
+
+User requests three follow-ups after the push:
+- R53: Correct the game-detail primary action remaining stale after file operations. Completion
+  must update the current detail view in place without navigating away/reopening the game.
+- R54: Game-list text is green while running (user follow-up), blue while downloading, white
+  when installed, grey otherwise, in that precedence order. Update immediately with operation state.
+- R55: Downloads or failed/in-progress operations must never prohibit logout. Interrupt work
+  safely and retain sufficient state for resumption/recovery after exit or later login; do not
+  require manual repair merely to sign out. Preserve account isolation and filesystem integrity.
+Interview settled: ordinary logout retains recovery state; optional full profile reset retains
+files but discards automatic resume records/settings, as before. Running games remain running
+on sign-out, including when full reset closes the client. Interrupt downloads/setup work safely.
+`{"user_answers":{"reset_interrupted_work":"full_reset_discard_automatic_resume_retain_files","running_game_signout":"keep_running"}}`
+No package build, new commit/push or unrelated redesign requested. Use focused tests for changes.
+
 ## Game verification and publication — 2026-09-30
 
 User confirms the existing Witcher 3 installation runs, BIT.TRIP Runner successfully runs, and

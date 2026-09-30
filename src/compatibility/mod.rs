@@ -3,6 +3,7 @@ mod backend;
 pub(crate) mod comet;
 pub mod components;
 mod database;
+mod dll_overrides;
 mod fixes;
 mod paths;
 mod process;
@@ -11,6 +12,7 @@ mod umu;
 
 pub use backend::*;
 pub use database::{UmuDatabaseEntry, profile_for_use, resolve_profile};
+pub use dll_overrides::{DllLoadOrder, apply_game_dll_overrides, normalize_dll_overrides};
 pub use fixes::{
     LaunchFixDefinition, LaunchFixOperation, available_fixes, effective_fixes, recommended_fix_ids,
 };
@@ -18,8 +20,9 @@ pub use paths::*;
 pub use process::CompatibilityProcess;
 pub(crate) use process::append_step_log;
 pub use proton::{
-    ProtonFamily, ProtonInstallation, ProtonPreferences, discover_proton, proton_preferences,
-    select_proton, set_default_proton, set_game_proton, validate_proton,
+    ProtonFamily, ProtonInstallation, ProtonPreferences, discover_proton, game_dll_overrides,
+    proton_preferences, select_proton, set_default_proton, set_game_dll_overrides, set_game_proton,
+    validate_proton,
 };
 pub use umu::UmuBackend;
 

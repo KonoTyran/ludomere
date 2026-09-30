@@ -1329,6 +1329,13 @@ mod tests {
                 "7".into(),
                 PathBuf::from("/external/UMU-Proton"),
             )]),
+            dll_overrides: std::collections::BTreeMap::from([(
+                "7".into(),
+                std::collections::BTreeMap::from([(
+                    "dinput8".into(),
+                    crate::compatibility::DllLoadOrder::Builtin,
+                )]),
+            )]),
         })
         .unwrap();
         fs::write(&preferences, &saved).unwrap();

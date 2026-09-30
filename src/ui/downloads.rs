@@ -206,6 +206,9 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             sample_transfer_history(&mut state);
         }
         let Some(snapshot) = latest else {
+            if depot_changed {
+                update_sidebar_download_styles(&w, &model.borrow());
+            }
             if depot_changed && w.content.visible_child_name().as_deref() == Some("downloads") {
                 rebuild_downloads_page(&w, &model.borrow());
             } else if w.content.visible_child_name().as_deref() == Some("downloads") {
@@ -249,6 +252,9 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             state.download_jobs = snapshot.jobs;
             changed
         };
+        if jobs_changed || depot_changed {
+            update_sidebar_download_styles(&w, &model.borrow());
+        }
         if !managed_file_changes.is_empty() {
             let affected_games = owning_game_ids(&model.borrow(), &managed_file_changes);
             // Installation/update availability is derived from the managed-file

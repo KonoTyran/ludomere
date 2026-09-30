@@ -139,6 +139,7 @@ pub(super) fn show_game_settings(
     }
     compatibility_page.add(&compatibility_group);
     compatibility_page.add(&proton_selection_group(&window, Some(game.product_id)).0);
+    compatibility_page.add(&dll_overrides::group(game.product_id));
 
     let fixes_group = adw::PreferencesGroup::new();
     fixes_group.set_title("Compatibility fixes");
@@ -185,7 +186,7 @@ pub(super) fn show_game_settings(
     let reset_row = adw::ActionRow::new();
     reset_row.set_title("Recommended settings");
     reset_row
-        .set_subtitle("Discard manual changes and use the shipped recommendations for this game.");
+        .set_subtitle("Reset the compatibility-fix switches to shipped recommendations. DLL overrides are unchanged.");
     let reset = gtk::Button::with_label("Reapply Recommended");
     reset.set_valign(gtk::Align::Center);
     reset.set_sensitive(installed.is_some());

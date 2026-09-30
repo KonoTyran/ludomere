@@ -84,6 +84,7 @@ pub trait CompatibilityBackend: Send + Sync {
 
 #[derive(Debug)]
 pub enum CompatibilityFailure {
+    PreferencesTooLarge,
     ProtonMissing,
     ProtonSelectionMissing(PathBuf),
     RuntimeMissing(String),
@@ -118,6 +119,11 @@ pub enum CompatibilityFailure {
 impl fmt::Display for CompatibilityFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PreferencesTooLarge => write!(
+                f,
+                "Compatibility preferences exceed {}. Remove some DLL override rows before saving; existing preferences were not changed.",
+                crate::domain::human_size(1024 * 1024)
+            ),
             Self::ProtonMissing => write!(
                 f,
                 "No compatible Proton version was found. Choose a folder or download a version in Proton settings."

@@ -234,10 +234,20 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     let events = crate::installation::subscribe_installation_events();
     let depot_events = crate::installation::subscribe_depot_events();
     let mut depot_states = HashMap::<String, String>::new();
+    let mut running_products = HashSet::new();
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let mut changed_products = HashSet::new();
+        let running = model
+            .borrow()
+            .installed_games
+            .keys()
+            .filter(|id| crate::installation::is_game_running(**id))
+            .copied()
+            .collect::<HashSet<_>>();
+        let running_changed = running != running_products;
+        running_products = running;
         let mut terminal_products = HashSet::new();
         let mut outcomes = HashMap::new();
         let mut activity_changed = false;
@@ -398,6 +408,9 @@ fn start_installation_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
             rebuild_sidebar_presentation(&w, &mut model.borrow_mut());
         }
         if changed_products.is_empty() {
+            if running_changed {
+                update_sidebar_download_styles(&w, &model.borrow());
+            }
             return glib::ControlFlow::Continue;
         }
 
@@ -1251,9 +1264,6 @@ pub(super) fn connect_actions(
     {
         let model = model.clone();
         w.window.connect_close_request(move |window| {
-            if model.borrow().logout_pending && model.borrow().config.clear_profile_on_sign_out {
-                return glib::Propagation::Stop;
-            }
             let maximized = window.is_maximized();
             let mut state = model.borrow_mut();
             state.config.window_maximized = maximized;
@@ -1351,29 +1361,26 @@ pub(super) fn connect_actions(
             if model.borrow().logout_pending {
                 return;
             }
-            let reservation = if model.borrow().config.clear_profile_on_sign_out {
-                match crate::profile_reset::reserve() {
-                    Ok(reservation) => Some(reservation),
-                    Err(error) => {
-                        show_status(&w, &format!("Could not sign out: {error}"));
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            auth::begin_sign_out();
+            crate::installation::request_sign_out_pause();
             cancel_cover_indicators(&w);
             w.notifications.clear();
             show_progress(&w, "");
-            let (config, previous_sections) = {
+            let config = {
                 let mut state = model.borrow_mut();
                 state.logout_pending = true;
                 state.token_refresh_in_progress = false;
                 state.core_loading = false;
-                let previous = state.section_states.clone();
-                invalidate_section_requests(&mut state);
-                (state.config.clone(), previous)
+                state.account_token = None;
+                state.account_profile = None;
+                invalidate_section_requests_ui(&mut state);
+                state.config.clone()
             };
+            download::set_authenticated(false);
+            update_header_network_indicator(&w, &model.borrow());
+            update_account_widgets(&w, None);
+            update_account_library_status(&w, &model.borrow());
+            let reservation = config.clear_profile_on_sign_out.then(crate::profile_reset::reserve_for_sign_out);
             w.sign_out.set_sensitive(false);
             w.sign_in.set_sensitive(false);
             let reset_windows = if config.clear_profile_on_sign_out {
@@ -1396,28 +1403,37 @@ pub(super) fn connect_actions(
             w.sync_options.set_visible(false);
             w.account_popover.popdown();
             show_progress(&w, if config.clear_profile_on_sign_out {
-                "Preparing profile reset; Ludomere will close…"
+                "Signed out. Stopping background work before clearing the profile…"
             } else {
-                "Signing out of GOG…"
+                "Signed out. Clearing saved login and pausing background work…"
             });
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<bool> {
+                    let marker = auth::persist_sign_out();
+                    crate::online::invalidate_library_session();
+                    let paused = crate::installation::pause_for_sign_out();
+                    let credentials = auth::logout();
+                    marker?;
+                    paused?;
                     if let Some(reservation) = reservation {
+                        let reservation = reservation?;
+                        credentials?;
+                        download::pause_for_sign_out()?;
+                        crate::installation::wait_for_paused()?;
                         reservation.prepare(&config)?.commit()?;
                         return Ok(true);
                     }
-                    auth::logout()?;
-                    if let Ok(store) = StateStore::open() {
-                        let _ = store.clear_cached_profile();
-                    }
+                    credentials?;
+                    crate::installation::wait_for_paused()?;
+                    crate::installation::normalize_signed_out_operations()?;
+                    crate::installation::finish_sign_out_pause();
                     Ok(false)
                 })();
                 let _ = sender.send(result);
             });
             let w = w.clone();
             let model = model.clone();
-            let mut previous_sections = Some(previous_sections);
             glib::timeout_add_local(Duration::from_millis(50), move || {
                 let result = match receiver.try_recv() {
                     Ok(result) => result,
@@ -1440,30 +1456,20 @@ pub(super) fn connect_actions(
                 }
                 match result {
                     Ok(false) => {
-                        {
-                            let mut state = model.borrow_mut();
-                            state.account_profile = None;
-                            state.account_token = None;
-                            state.token_refresh_in_progress = false;
-                        }
-                        download::set_authenticated(false);
                         update_header_network_indicator(&w, &model.borrow());
                         update_account_widgets(&w, None);
                         update_account_library_status(&w, &model.borrow());
-                        show_status(&w, "Signed out of GOG");
+                        w.sign_out.set_label("Sign out");
+                        show_status(&w, "Signed out of GOG. Interrupted operations can be resumed after signing in; running games continue.");
                     }
                     Err(error) => {
-                        model.borrow_mut().section_states = previous_sections.take().unwrap_or_default()
-                            .into_iter().map(|(key, state)| {
-                                (key, if matches!(state, SectionState::Loading) {
-                                    SectionState::Failed("Loading was interrupted while signing out. Retry.".into())
-                                } else {
-                                    state
-                                })
-                            }).collect();
-                        refresh_filters(&w, &model.borrow());
-                        refresh_collection_metadata(&w, &model);
-                        show_status(&w, &format!("Could not sign out: {error}. Reopen game details to resume loading."));
+                        w.sign_out.set_label(if model.borrow().config.clear_profile_on_sign_out {
+                            "Retry profile reset"
+                        } else {
+                            "Retry sign-out cleanup"
+                        });
+                        w.sign_out.set_visible(true);
+                        show_status(&w, &format!("Signed out. Cleanup is incomplete: {error}. Use the account menu to retry."));
                     }
                     Ok(true) => unreachable!(),
                 }

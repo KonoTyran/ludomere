@@ -73,7 +73,10 @@ pub struct RuntimeRequirement {
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
-    ensure!(!cancelled.load(Ordering::Relaxed), "Download cancelled");
+    ensure!(
+        !cancelled.load(Ordering::Relaxed) && !crate::profile_reset::stopping_operations(),
+        "Download cancelled"
+    );
     Ok(())
 }
 

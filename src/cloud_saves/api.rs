@@ -69,6 +69,9 @@ pub fn exchange_scoped_token(
 }
 
 pub trait Storage {
+    fn ensure_current(&self) -> Result<()> {
+        Ok(())
+    }
     fn account_id(&self) -> Option<&str> {
         None
     }
@@ -95,6 +98,7 @@ pub struct CloudClient {
     client_id: String,
     access_token: String,
     base_url: String,
+    auth_session: u64,
 }
 
 impl CloudClient {
@@ -105,7 +109,13 @@ impl CloudClient {
             client_id,
             access_token,
             base_url: BASE_URL.into(),
+            auth_session: crate::auth::session(),
         }
+    }
+
+    pub(super) fn for_session(mut self, session: u64) -> Self {
+        self.auth_session = session;
+        self
     }
 
     #[cfg(test)]
@@ -145,11 +155,15 @@ impl CloudClient {
 }
 
 impl Storage for CloudClient {
+    fn ensure_current(&self) -> Result<()> {
+        super::ensure_session(self.auth_session)
+    }
     fn account_id(&self) -> Option<&str> {
         Some(&self.user_id)
     }
 
     fn download_revision(&self, object: &RemoteObject) -> Result<Vec<u8>> {
+        self.ensure_current()?;
         validate_remote_path(&object.namespace)?;
         validate_remote_path(&object.path)?;
         let revision = conditional_revision(&object.etag)?;
@@ -196,10 +210,12 @@ impl Storage for CloudClient {
         if decoded.len() > MAX_RESPONSE {
             bail!("expanded cloud-save object exceeds the safety limit");
         }
+        self.ensure_current()?;
         Ok(decoded)
     }
 
     fn delete_revision(&self, object: &RemoteObject) -> Result<()> {
+        self.ensure_current()?;
         validate_remote_path(&object.namespace)?;
         validate_remote_path(&object.path)?;
         self.client
@@ -218,9 +234,10 @@ impl Storage for CloudClient {
                     "cloud save changed or deletion was rejected; refresh before retrying"
                 )
             })?;
-        Ok(())
+        self.ensure_current()
     }
     fn list(&self) -> Result<Vec<RemoteObject>> {
+        self.ensure_current()?;
         let response = self
             .client
             .get(self.listing_url()?)
@@ -239,10 +256,12 @@ impl Storage for CloudClient {
         if listed.len() > MAX_FILES {
             bail!("cloud-save listing contains too many files");
         }
+        self.ensure_current()?;
         listed.into_iter().map(remote_object_from_listing).collect()
     }
 
     fn download(&self, namespace: &str, path: &str) -> Result<Vec<u8>> {
+        self.ensure_current()?;
         validate_remote_path(path)?;
         let response = self
             .client
@@ -267,6 +286,7 @@ impl Storage for CloudClient {
         if decoded.len() > MAX_RESPONSE {
             bail!("expanded cloud-save object exceeds the safety limit");
         }
+        self.ensure_current()?;
         Ok(decoded)
     }
 
@@ -277,12 +297,14 @@ impl Storage for CloudClient {
         data: &[u8],
         modified_at: i64,
     ) -> Result<RemoteObject> {
+        self.ensure_current()?;
         validate_remote_path(path)?;
         if data.len() > MAX_RESPONSE {
             bail!("cloud-save object exceeds the safety limit");
         }
         let compressed = deterministic_gzip(data)?;
         let etag = format!("{:x}", md5::compute(&compressed));
+        self.ensure_current()?;
         self.client
             .put(self.object_url(namespace, path)?)
             .bearer_auth(&self.access_token)
@@ -292,6 +314,7 @@ impl Storage for CloudClient {
             .body(compressed)
             .send()?
             .error_for_status()?;
+        self.ensure_current()?;
         Ok(RemoteObject {
             namespace: namespace.into(),
             path: path.into(),
@@ -381,6 +404,30 @@ fn validate_remote_path(path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_client_refuses_requests_before_contacting_storage() {
+        let cloud = CloudClient::new(
+            client().unwrap(),
+            "fixture".into(),
+            "fixture".into(),
+            "fixture".into(),
+        )
+        .for_session(crate::auth::session().wrapping_add(1))
+        .with_base_url("http://127.0.0.1:9/v1".into());
+        for result in [
+            cloud.list().map(|_| ()),
+            cloud.download("main", "save").map(|_| ()),
+            cloud.upload("main", "save", b"data", 1).map(|_| ()),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("GOG session changed")
+            );
+        }
+    }
 
     #[test]
     fn chunked_listing_without_content_length_is_bounded_while_reading() {

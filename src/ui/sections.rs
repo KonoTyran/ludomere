@@ -117,9 +117,15 @@ fn local_action_details(game: Game) -> Vec<DetailPageModel> {
 }
 
 pub(super) fn invalidate_section_requests(model: &mut AppModel) {
-    model.account_epoch = model.account_epoch.wrapping_add(1);
     model.detail_generation = model.detail_generation.wrapping_add(1);
     model.detail_target = None;
+    invalidate_section_requests_ui(model);
+    online::invalidate_library_session();
+}
+
+/// Sign-out revokes presentation immediately; its worker drains backend session locks.
+pub(super) fn invalidate_section_requests_ui(model: &mut AppModel) {
+    model.account_epoch = model.account_epoch.wrapping_add(1);
     model.organization_pending = false;
     model.hidden_pending.clear();
     model.policy_saving.clear();
@@ -139,7 +145,6 @@ pub(super) fn invalidate_section_requests(model: &mut AppModel) {
     model.sync_failed = false;
     model.cover_states.clear();
     model.icon_states.clear();
-    online::invalidate_library_session();
 }
 
 pub(super) fn request_product_section(

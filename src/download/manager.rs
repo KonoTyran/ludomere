@@ -37,6 +37,7 @@ struct Request {
 }
 
 enum Command {
+    PauseForSignOut(mpsc::Sender<()>),
     Quiesce(Vec<i64>, mpsc::Sender<anyhow::Result<()>>),
     RetainInstallers {
         product_id: i64,
@@ -77,6 +78,7 @@ enum Command {
         id: String,
         access_token: String,
         reset_retry: bool,
+        session: u64,
     },
     Remove(String),
     Terminal(Request, DownloadEvent),
@@ -86,7 +88,7 @@ enum Command {
         Result<Vec<RemoteArtifact>, String>,
     ),
     SetConcurrency(usize),
-    Recover(String),
+    Recover(String, u64),
     SetNetwork(bool),
     SetAuthentication(bool),
     Shutdown(mpsc::Sender<()>),
@@ -327,6 +329,7 @@ pub(super) fn resume(id: &str, access_token: String, reset_retry: bool) -> bool 
             id: id.to_owned(),
             access_token,
             reset_retry,
+            session: crate::online::account_session(),
         })
         .is_ok()
 }
@@ -353,7 +356,10 @@ pub(super) fn set_concurrency(limit: usize) {
 }
 
 pub(super) fn recover(access_token: String) {
-    let _ = manager().commands.send(Command::Recover(access_token));
+    let _ = manager().commands.send(Command::Recover(
+        access_token,
+        crate::online::account_session(),
+    ));
 }
 
 pub(super) fn set_network(available: bool) {
@@ -364,6 +370,13 @@ pub(super) fn set_authenticated(authenticated: bool) {
     let _ = manager()
         .commands
         .send(Command::SetAuthentication(authenticated));
+}
+
+pub(super) fn pause_for_sign_out() -> anyhow::Result<()> {
+    let (reply, result) = mpsc::channel();
+    manager().commands.send(Command::PauseForSignOut(reply))?;
+    result.recv_timeout(Duration::from_secs(45))
+        .map_err(|_| anyhow::anyhow!("Signed out. Downloads are still stopping; retry profile reset shortly. Partial files were kept."))
 }
 
 pub(super) fn shutdown() {
@@ -393,6 +406,7 @@ fn run(
     let mut authentication_available = false;
     let mut removing = HashSet::<String>::new();
     let mut shutdown_acknowledgement = None::<mpsc::Sender<()>>;
+    let mut pause_acknowledgements = Vec::new();
     let mut quiescence = Vec::<(HashSet<String>, mpsc::Sender<anyhow::Result<()>>)>::new();
     loop {
         let command = match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -402,6 +416,13 @@ fn run(
         };
         if let Some(command) = command {
             match command {
+                Command::PauseForSignOut(reply) => {
+                    authentication_available = false;
+                    for handle in active.lock().unwrap().values() {
+                        handle.store(true, Ordering::Relaxed);
+                    }
+                    pause_acknowledgements.push(reply);
+                }
                 Command::Quiesce(ids, reply) => {
                     let result = StateStore::open().and_then(|store| store.download_jobs());
                     match result {
@@ -613,6 +634,10 @@ fn run(
                     let _ = reply.send(result);
                 }
                 Command::Enqueue(request) => {
+                    if request.session != crate::online::account_session() {
+                        let _ = request.listener.send(DownloadEvent::Cancelled);
+                        continue;
+                    }
                     let Ok(_admission) = crate::installation::recovery::admit_generation(
                         request.artifacts[0].product_id,
                         request.recovery_generation,
@@ -644,7 +669,11 @@ fn run(
                     id,
                     access_token,
                     reset_retry,
+                    session,
                 } => {
+                    if session != crate::online::account_session() {
+                        continue;
+                    }
                     authentication_available = true;
                     if let Some(request) = queued.iter_mut().find(|request| request.id == id) {
                         let Ok(_admission) = crate::installation::recovery::admit_generation(
@@ -655,6 +684,8 @@ fn run(
                         };
                         if reset_retry {
                             request.access_token = access_token;
+                            request.session = session;
+                            request.handle = Arc::new(AtomicBool::new(false));
                             request.retry_started = None;
                             request.retry_attempt = 0;
                             request.ready_at = Instant::now();
@@ -736,7 +767,17 @@ fn run(
                     {
                         persist_queued(&request);
                         let _ = request.listener.send(DownloadEvent::Cancelled);
+                    } else if request.session != crate::online::account_session()
+                        && !matches!(event, DownloadEvent::Complete { .. })
+                    {
+                        persist_queued(&request);
+                        set_waiting_status(
+                            &request.id,
+                            Some("Signed out; resume after signing in"),
+                        );
+                        let _ = request.listener.send(DownloadEvent::Cancelled);
                     } else if let DownloadEvent::Failed(failure) = &event
+                        && authentication_available
                         && should_refresh_manifest(failure.kind, request.manifest_refresh_attempted)
                     {
                         request.manifest_refresh_attempted = true;
@@ -830,10 +871,12 @@ fn run(
                     }
                 }
                 Command::ManifestRefreshed(mut request, mut failure, result) => {
-                    if !crate::installation::recovery::current(
-                        request.artifacts[0].product_id,
-                        request.recovery_generation,
-                    ) {
+                    if request.session != crate::online::account_session()
+                        || !crate::installation::recovery::current(
+                            request.artifacts[0].product_id,
+                            request.recovery_generation,
+                        )
+                    {
                         continue;
                     }
                     match result {
@@ -895,10 +938,15 @@ fn run(
                     }
                 }
                 Command::SetConcurrency(limit) => concurrency = limit,
-                Command::Recover(token) => {
+                Command::Recover(token, session) => {
+                    if session != crate::online::account_session() {
+                        continue;
+                    }
                     authentication_available = true;
                     for request in &mut queued {
                         request.access_token.clone_from(&token);
+                        request.session = session;
+                        request.handle = Arc::new(AtomicBool::new(false));
                         set_waiting_status(&request.id, None);
                     }
                     recover_jobs(&mut queued, &active, token);
@@ -975,6 +1023,11 @@ fn run(
             }
             continue;
         }
+        if active.lock().is_ok_and(|active| active.is_empty()) {
+            for reply in pause_acknowledgements.drain(..) {
+                let _ = reply.send(());
+            }
+        }
         quiescence.retain(|(jobs, reply)| {
             if active.lock().unwrap().keys().any(|id| jobs.contains(id)) {
                 true
@@ -1019,6 +1072,11 @@ fn schedule(
         let Some(mut request) = queued.remove(position) else {
             return;
         };
+        if request.session != crate::online::account_session() {
+            persist_queued(&request);
+            set_waiting_status(&request.id, Some("Signed out; resume after signing in"));
+            continue;
+        }
         let Ok(_admission) = crate::installation::recovery::admit_generation(
             request.artifacts[0].product_id,
             request.recovery_generation,
@@ -1352,6 +1410,86 @@ fn cleanup_job(id: &str) {
 mod tests {
     use super::{queue_insertion_index, should_refresh_manifest};
     use crate::download::DownloadFailureKind;
+
+    #[test]
+    fn sign_out_drains_active_work_and_ignores_old_resume_and_manifest_commands() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id": 910147, "kind":"installer", "name":"Fixture", "size_bytes":4, "download_path":"/never-fetched"}
+        ])).unwrap();
+        let (listener, _) = mpsc::channel();
+        let request = request_from_download(
+            super::super::DownloadRequest {
+                artifacts: artifacts.clone(),
+                title: "Fixture".into(),
+                access_token: "inert".into(),
+                destination: root.path().join("game/installer"),
+                events: listener,
+            },
+            crate::online::account_session().wrapping_sub(1),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(Mutex::new(HashMap::from([(
+            request.id.clone(),
+            cancelled.clone(),
+        )])));
+        let products = HashMap::from([(request.id.clone(), 910147)]);
+        let (commands, receiver) = mpsc::channel();
+        let worker_commands = commands.clone();
+        let worker = std::thread::spawn(move || {
+            run(
+                receiver,
+                worker_commands,
+                active,
+                Arc::new(Mutex::new(Vec::new())),
+                products,
+            )
+        });
+        let (reply, paused) = mpsc::channel();
+        commands.send(Command::PauseForSignOut(reply)).unwrap();
+        assert!(paused.recv_timeout(Duration::from_millis(75)).is_err());
+        assert!(cancelled.load(Ordering::Relaxed));
+        let failure = DownloadFailure {
+            kind: DownloadFailureKind::ManifestChanged,
+            message: "inert".into(),
+        };
+        commands
+            .send(Command::Terminal(
+                request.clone(),
+                DownloadEvent::Failed(failure.clone()),
+            ))
+            .unwrap();
+        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        commands
+            .send(Command::Recover("old-token".into(), request.session))
+            .unwrap();
+        commands
+            .send(Command::Resume {
+                id: request.id.clone(),
+                access_token: "old-token".into(),
+                reset_retry: true,
+                session: request.session,
+            })
+            .unwrap();
+        commands
+            .send(Command::ManifestRefreshed(
+                request.clone(),
+                failure,
+                Ok(Vec::new()),
+            ))
+            .unwrap();
+        let (reply, stopped) = mpsc::channel();
+        commands.send(Command::Shutdown(reply)).unwrap();
+        stopped.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        let store = StateStore::open().unwrap();
+        let job = store.download_job(&request.id).unwrap().unwrap();
+        assert_eq!(job.state, DownloadState::Queued);
+        assert_eq!(job.artifacts.len(), 1);
+        assert_eq!(job.artifacts[0].download_path, "/never-fetched");
+        assert!(!request.destination.exists());
+    }
 
     #[test]
     fn recovery_drains_unrecorded_active_request_and_rejects_late_manifest() {

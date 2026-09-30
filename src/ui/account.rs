@@ -56,12 +56,15 @@ pub(super) fn begin_account_exchange(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
     if model.borrow().logout_pending {
         return;
     }
+    // A new login must not lend its credentials to an older game's cloud callbacks.
+    auth::invalidate_session();
     let epoch = model.borrow().account_epoch;
     show_progress(w, "Signing in to GOG…");
     w.sign_in.set_sensitive(false);
     let (sender, receiver) = mpsc::channel();
+    let auth_session = auth::session();
     std::thread::spawn(move || {
-        let _ = sender.send(auth::exchange_code(&code));
+        let _ = sender.send(auth::exchange_code(&code, auth_session));
     });
     poll_account_result(w, model, receiver, epoch);
 }
@@ -73,8 +76,9 @@ pub(super) fn start_account_restore(
 ) {
     let epoch = model.borrow().account_epoch;
     let (sender, receiver) = mpsc::channel();
+    let auth_session = auth::session();
     std::thread::spawn(move || {
-        let _ = sender.send(auth::restore());
+        let _ = sender.send(auth::restore(auth_session));
     });
     let w = w.clone();
     let model = model.clone();
@@ -166,10 +170,9 @@ pub(super) fn cache_and_display_profile(
     profile: auth::Profile,
 ) {
     let profile_to_cache = profile.clone();
+    let auth_session = auth::session();
     std::thread::spawn(move || {
-        if let Ok(store) = StateStore::open()
-            && let Err(error) = store.cache_profile(&profile_to_cache)
-        {
+        if let Err(error) = auth::cache_profile_if_current(&profile_to_cache, auth_session) {
             tracing::warn!(%error, "could not cache GOG profile");
         }
     });
@@ -212,10 +215,11 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
         };
         let epoch = model.borrow().account_epoch;
         let (sender, receiver) = mpsc::channel();
+        let auth_session = auth::session();
         std::thread::spawn(move || {
             let result = match token {
-                Some(token) => auth::refresh(&token).map(Some),
-                None => auth::restore(),
+                Some(token) => auth::refresh(&token, auth_session).map(Some),
+                None => auth::restore(auth_session),
             };
             let _ = sender.send(result);
         });

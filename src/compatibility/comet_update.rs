@@ -112,7 +112,10 @@ fn active_at(root: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn cancelled(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::Relaxed), "Comet update cancelled");
+    ensure!(
+        !cancel.load(Ordering::Relaxed) && !crate::profile_reset::stopping_operations(),
+        "Comet update cancelled"
+    );
     Ok(())
 }
 

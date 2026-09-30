@@ -685,6 +685,31 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
         .map(|(&id, _)| id)
         .collect();
     let installed = model.installed_games.values().cloned().collect::<Vec<_>>();
+    let running = model
+        .games
+        .iter()
+        .filter(|game| crate::installation::is_game_running(game.product_id))
+        .map(|game| game.product_id)
+        .collect();
+    let downloading_products = model
+        .download_jobs
+        .iter()
+        .filter(|job| job.state == DownloadState::Downloading)
+        .map(|job| job.product_id)
+        .chain(
+            model
+                .depot_operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation.state.as_str(),
+                        "downloading" | "materializing" | "dependencies"
+                    )
+                })
+                .map(|operation| operation.product_id),
+        )
+        .collect::<HashSet<_>>();
+    let downloading = owning_game_ids(model, &downloading_products);
     apply_sidebar_download_styles(
         w,
         &coverage,
@@ -695,6 +720,8 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
             updates: &updates,
             dlcs: &dlcs,
             dlc_updates: &dlc_updates,
+            running: &running,
+            downloading: &downloading,
         },
         model.config.show_backup_status,
     );
@@ -705,6 +732,44 @@ struct SidebarInstallationSnapshot<'a> {
     updates: &'a HashSet<i64>,
     dlcs: &'a HashMap<i64, HashSet<i64>>,
     dlc_updates: &'a HashMap<i64, HashSet<i64>>,
+    running: &'a HashSet<i64>,
+    downloading: &'a HashSet<i64>,
+}
+
+fn sidebar_state_class(running: bool, downloading: bool, installed: bool) -> &'static str {
+    if running {
+        "game-state-running"
+    } else if downloading {
+        "game-state-downloading"
+    } else if installed {
+        "game-state-installed"
+    } else {
+        "game-state-unavailable"
+    }
+}
+
+#[test]
+fn sidebar_color_priority_tracks_activity_before_installedness() {
+    for installed in [false, true] {
+        for downloading in [false, true] {
+            assert_eq!(
+                sidebar_state_class(true, downloading, installed),
+                "game-state-running"
+            );
+        }
+        assert_eq!(
+            sidebar_state_class(false, true, installed),
+            "game-state-downloading"
+        );
+    }
+    assert_eq!(
+        sidebar_state_class(false, false, true),
+        "game-state-installed"
+    );
+    assert_eq!(
+        sidebar_state_class(false, false, false),
+        "game-state-unavailable"
+    );
 }
 
 fn apply_sidebar_download_styles(
@@ -720,6 +785,8 @@ fn apply_sidebar_download_styles(
         if let Ok(id) = widget.widget_name().parse::<i64>() {
             let coverage = coverage.get(&id).copied().unwrap_or_default();
             for class in [
+                "game-state-running",
+                "game-state-downloading",
                 "game-state-installed",
                 "game-state-update",
                 "game-state-backup",
@@ -750,13 +817,13 @@ fn apply_sidebar_download_styles(
                 && required_dlcs.get(&id).is_some_and(|required| {
                     !required.is_subset(installation_state.dlcs.get(&id).unwrap_or(&HashSet::new()))
                 });
-            let (class, tooltip, opacity) = if let Some(operation) = active_operation.as_ref() {
+            let tooltip = if let Some(operation) = active_operation.as_ref() {
                 if operation.queued {
-                    ("game-state-pending", "Installation queued", 1.0)
+                    "Installation queued"
                 } else if operation.state == crate::domain::InstallationState::Uninstalling {
-                    ("game-state-pending", "Uninstalling", 1.0)
+                    "Uninstalling"
                 } else {
-                    ("game-state-pending", "Installing", 1.0)
+                    "Installing"
                 }
             } else {
                 match installation.map(|game| game.state) {
@@ -769,46 +836,42 @@ fn apply_sidebar_download_styles(
                                 .is_some_and(|updates| !updates.is_empty())
                             || (show_backup_status && coverage != InstallerCoverage::Complete)
                         {
-                            (
-                                "game-state-update",
-                                "Download or installation required",
-                                1.0,
-                            )
+                            "Download or installation required"
                         } else {
-                            (
-                                "game-state-installed",
-                                if show_backup_status {
-                                    "Installed and fully backed up"
-                                } else {
-                                    "Installed"
-                                },
-                                1.0,
-                            )
+                            if show_backup_status {
+                                "Installed and fully backed up"
+                            } else {
+                                "Installed"
+                            }
                         }
                     }
                     Some(crate::domain::InstallationState::UninstallFailed) => {
-                        ("game-state-update", "Installation needs attention", 1.0)
+                        "Installation needs attention"
                     }
-                    _ if show_backup_status && coverage == InstallerCoverage::Complete => (
-                        "game-state-backup",
-                        "All preferred installers backed up · not installed",
-                        0.88,
-                    ),
-                    _ if show_backup_status && coverage == InstallerCoverage::Partial => (
-                        "game-state-partial-backup",
-                        "Some preferred installers are missing",
-                        0.72,
-                    ),
-                    _ => (
-                        "game-state-unavailable",
-                        "Not installed · no installer backup",
-                        0.48,
-                    ),
+                    _ if show_backup_status && coverage == InstallerCoverage::Complete => {
+                        "All preferred installers backed up · not installed"
+                    }
+                    _ if show_backup_status && coverage == InstallerCoverage::Partial => {
+                        "Some preferred installers are missing"
+                    }
+                    _ => "Not installed · no installer backup",
                 }
             };
-            widget.add_css_class(class);
-            widget.set_opacity(opacity);
-            widget.set_tooltip_text(Some(tooltip));
+            let running = installation_state.running.contains(&id);
+            let downloading = installation_state.downloading.contains(&id);
+            widget.add_css_class(sidebar_state_class(
+                running,
+                downloading,
+                installation.is_some(),
+            ));
+            widget.set_opacity(1.0);
+            widget.set_tooltip_text(Some(if running {
+                "Running"
+            } else if downloading {
+                "Downloading"
+            } else {
+                tooltip
+            }));
             if let (Some(base_title), Some(title)) = (
                 titles.get(&id),
                 find_named_descendant(&widget, "sidebar-game-title").and_downcast::<gtk::Label>(),

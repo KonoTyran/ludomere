@@ -3,6 +3,7 @@ use crate::{
     domain::{DepotOperationKind, InstalledGame},
     state::{DepotOperationRecord, InstallationOperationRecord, StateStore},
 };
+use anyhow::Context;
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -149,6 +150,7 @@ struct DepotManagerState {
     abandon_requested: std::collections::HashSet<String>,
     subscribers: Vec<mpsc::Sender<DepotManagerEvent>>,
     shutting_down: bool,
+    paused_for_sign_out: bool,
 }
 
 static DEPOT_MANAGER: LazyLock<Mutex<DepotManagerState>> =
@@ -378,10 +380,22 @@ struct ManagerState {
     snapshots: HashMap<i64, InstallationOperationSnapshot>,
     subscribers: Vec<mpsc::Sender<InstallationManagerEvent>>,
     shutting_down: bool,
+    paused_for_sign_out: bool,
+    pause_errors: Vec<String>,
 }
 
 static MANAGER: LazyLock<Mutex<ManagerState>> =
     LazyLock::new(|| Mutex::new(ManagerState::default()));
+static SIGN_OUT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn request_sign_out_pause() {
+    SIGN_OUT_PAUSE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn finish_sign_out_pause() {
+    MANAGER.lock().unwrap().paused_for_sign_out = false;
+    SIGN_OUT_PAUSE.store(false, std::sync::atomic::Ordering::Release);
+}
 
 pub fn subscribe_installation_events() -> mpsc::Receiver<InstallationManagerEvent> {
     let (sender, receiver) = mpsc::channel();
@@ -514,6 +528,12 @@ pub fn recover_depot_operations() -> anyhow::Result<usize> {
 }
 
 pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
+    if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let Ok(_activity) = crate::profile_reset::begin_activity("installation registration") else {
+        return false;
+    };
     if super::recovery::pending(&request.destination, request.product_id).unwrap_or(true) {
         return false;
     }
@@ -553,11 +573,13 @@ pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
         || offline_conflict
         || MANAGER.lock().unwrap().shutting_down
         || manager.shutting_down
+        || (manager.paused_for_sign_out && !crate::auth::session_is_current(crate::auth::session()))
         || persist_depot_request(&request).is_err()
     {
         return false;
     }
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    manager.paused_for_sign_out = false;
     manager
         .active
         .insert(request.operation_id.clone(), cancelled.clone());
@@ -1553,7 +1575,7 @@ fn current_manifest(
             "ludomere:installed-with-dependencies",
         )?
     {
-        let manifest = crate::gog::depot_manifest::parse(record.manifest_json.as_bytes())?;
+        let manifest = crate::gog::depot_manifest::parse_snapshot(record.manifest_json.as_bytes())?;
         anyhow::ensure!(
             manifest.identity() == provenance.manifest_fingerprint,
             "Installed dependency ownership manifest is damaged"
@@ -1564,7 +1586,7 @@ fn current_manifest(
         return request
             .current_manifest_json
             .as_deref()
-            .map(|json| crate::gog::depot_manifest::parse(json.as_bytes()))
+            .map(|json| crate::gog::depot_manifest::parse_snapshot(json.as_bytes()))
             .transpose();
     }
     let marker = super::marker::load(&request.destination)?
@@ -1578,8 +1600,27 @@ fn current_manifest(
     current.current_sources.clear();
     current.build_id = provenance.build_id.clone();
     current.branch = provenance.branch.clone();
+    let fingerprint = provenance.manifest_fingerprint.clone();
     current.target_marker = marker;
-    merge_depot_sources(&current).map(|(manifest, _)| Some(manifest))
+    // Old markers hash only their installed wire payload, not today's target dependencies.
+    // Derive indices afresh from those strict sources; never accept this legacy hash for
+    // a typed snapshot or a newly planned target.
+    current.dependency_plan = None;
+    current
+        .target_marker
+        .galaxy_depot
+        .as_mut()
+        .unwrap()
+        .manifest_fingerprint
+        .clear();
+    let manifest = merge_depot_sources(&current)?.0;
+    anyhow::ensure!(
+        manifest.identity() == fingerprint
+            || (manifest.small_files_containers.len() > 1
+                && manifest.legacy_payload_identity() == fingerprint),
+        "Installed depot source manifests do not match marker provenance; prepare recovery before updating"
+    );
+    Ok(Some(manifest))
 }
 
 fn materialize_support_network(
@@ -1937,7 +1978,7 @@ fn finalize_depot_metadata(
         product_id: request.product_id,
         build_id: request.build_id.clone(),
         depot_id: "ludomere:installed-with-dependencies".into(),
-        manifest_json: combined.canonical_json()?,
+        manifest_json: combined.snapshot_json()?,
         first_seen_at: now,
         last_seen_at: now,
     })?;
@@ -2804,6 +2845,12 @@ pub fn enqueue_installation(
     install_base: bool,
     interactive_prompts: bool,
 ) -> bool {
+    if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let Ok(_activity) = crate::profile_reset::begin_activity("installation registration") else {
+        return false;
+    };
     let product_id = plan.product_id;
     if super::recovery::pending(&plan.installation_directory, product_id).unwrap_or(true) {
         return false;
@@ -2871,6 +2918,11 @@ pub fn enqueue_downloaded_installation(
     game: InstalledGame,
     additional_installers: Vec<AdditionalInstaller>,
 ) -> anyhow::Result<()> {
+    let _activity = crate::profile_reset::begin_activity("installation registration")?;
+    anyhow::ensure!(
+        !SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire),
+        "Sign-out cleanup is pending; retry installation afterward"
+    );
     let product_id = game.product_id;
     anyhow::ensure!(
         !super::recovery::pending(&game.installation_directory, product_id)?,
@@ -3002,6 +3054,12 @@ pub fn enqueue_uninstallation_with_cleanup(
     game: InstalledGame,
     cleanup: Option<crate::download::ManagedDownloads>,
 ) -> bool {
+    if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let Ok(_activity) = crate::profile_reset::begin_activity("installation registration") else {
+        return false;
+    };
     let product_id = game.product_id;
     if super::recovery::pending(&game.installation_directory, product_id).unwrap_or(true) {
         return false;
@@ -3060,21 +3118,27 @@ pub fn enqueue_uninstallation_with_cleanup(
 }
 
 fn schedule_next() {
-    let operation = {
+    let (operation, session) = {
         let mut manager = MANAGER.lock().unwrap();
-        if manager.shutting_down || !manager.active.is_empty() {
+        if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire)
+            || manager.shutting_down
+            || (manager.paused_for_sign_out
+                && !crate::auth::session_is_current(crate::auth::session()))
+            || !manager.active.is_empty()
+        {
             return;
         }
-        manager.queue.pop_front()
+        manager.paused_for_sign_out = false;
+        (manager.queue.pop_front(), crate::auth::session())
     };
     match operation {
-        Some(QueuedOperation::Installation(plan)) => start_queued_installation(plan),
-        Some(QueuedOperation::Uninstallation(game)) => start_queued_uninstallation(game),
+        Some(QueuedOperation::Installation(plan)) => start_queued_installation(plan, session),
+        Some(QueuedOperation::Uninstallation(game)) => start_queued_uninstallation(game, session),
         None => {}
     }
 }
 
-fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
+fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session: u64) {
     let Ok(admission) = super::recovery::admit_generation(
         persisted_plan.game.product_id,
         persisted_plan.recovery_generation,
@@ -3113,6 +3177,7 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
         return;
     }
     let product_id = persisted_plan.game.product_id;
+    let paused_game = persisted_plan.game.clone();
     let download_intent = persisted_plan.download_intent_id.clone();
     let running_message = if persisted_plan
         .game
@@ -3124,18 +3189,32 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
     } else {
         "Running native installer"
     };
+    let mut manager = MANAGER.lock().unwrap();
+    if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire)
+        || crate::auth::session() != session
+        || manager.paused_for_sign_out
+        || manager.shutting_down
+    {
+        drop(manager);
+        persist_existing_operation(
+            product_id,
+            "paused",
+            Some("Interrupted by sign-out; start this operation again to resume"),
+            None,
+            None,
+        );
+        return;
+    }
     let handle = super::executor::start_installation(
         persisted_plan.game.clone(),
         persisted_plan.additional_installers.clone(),
         persisted_plan.install_base,
         persisted_plan.interactive_prompts,
     );
-    {
-        let mut manager = MANAGER.lock().unwrap();
-        manager
-            .active
-            .insert(product_id, OperationControl::Installation(handle.control()));
-    }
+    manager
+        .active
+        .insert(product_id, OperationControl::Installation(handle.control()));
+    drop(manager);
     drop(admission);
     persist_existing_operation(product_id, "running", Some(running_message), None, None);
     {
@@ -3159,16 +3238,26 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
                     | InstallationEvent::Cancelled
                     | InstallationEvent::Failed(_)
             );
-            let shutting_down = MANAGER.lock().unwrap().shutting_down;
+            let shutting_down = {
+                let manager = MANAGER.lock().unwrap();
+                manager.shutting_down || manager.paused_for_sign_out
+            };
             if shutting_down && !matches!(event, InstallationEvent::Complete { .. }) {
                 if terminal {
-                    persist_existing_operation(
-                        product_id,
-                        "queued",
-                        Some("Queued after application shutdown"),
-                        None,
-                        None,
-                    );
+                    if MANAGER.lock().unwrap().paused_for_sign_out {
+                        if let Err(error) = pause_game_operation(&paused_game) {
+                            MANAGER.lock().unwrap().pause_errors.push(error.to_string());
+                        }
+                    } else {
+                        persist_existing_operation(
+                            product_id,
+                            "queued",
+                            Some("Interrupted; start this operation again to resume"),
+                            None,
+                            None,
+                        );
+                    }
+                    publish_sign_out_pause(product_id);
                 }
             } else {
                 update_installation_snapshot(product_id, &event);
@@ -3189,21 +3278,36 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan) {
     });
 }
 
-fn start_queued_uninstallation(plan: PersistedUninstallationPlan) {
+fn start_queued_uninstallation(plan: PersistedUninstallationPlan, session: u64) {
     let product_id = plan.game.product_id;
+    let paused_game = plan.game.clone();
     let Ok(admission) = super::recovery::admit_generation(product_id, plan.recovery_generation)
     else {
         schedule_next();
         return;
     };
-    let handle = super::executor::start_uninstallation(plan.game);
+    let mut manager = MANAGER.lock().unwrap();
+    if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire)
+        || crate::auth::session() != session
+        || manager.paused_for_sign_out
+        || manager.shutting_down
     {
-        let mut manager = MANAGER.lock().unwrap();
-        manager.active.insert(
+        drop(manager);
+        persist_existing_operation(
             product_id,
-            OperationControl::Uninstallation(handle.control()),
+            "paused",
+            Some("Interrupted by sign-out; start this operation again to resume"),
+            None,
+            None,
         );
+        return;
     }
+    let handle = super::executor::start_uninstallation(plan.game);
+    manager.active.insert(
+        product_id,
+        OperationControl::Uninstallation(handle.control()),
+    );
+    drop(manager);
     drop(admission);
     persist_existing_operation(
         product_id,
@@ -3245,16 +3349,26 @@ fn start_queued_uninstallation(plan: PersistedUninstallationPlan) {
                     | UninstallationEvent::Cancelled
                     | UninstallationEvent::Failed(_)
             );
-            let shutting_down = MANAGER.lock().unwrap().shutting_down;
+            let shutting_down = {
+                let manager = MANAGER.lock().unwrap();
+                manager.shutting_down || manager.paused_for_sign_out
+            };
             if shutting_down && !matches!(event, UninstallationEvent::Complete) {
                 if terminal {
-                    persist_existing_operation(
-                        product_id,
-                        "queued",
-                        Some("Queued after application shutdown"),
-                        None,
-                        None,
-                    );
+                    if MANAGER.lock().unwrap().paused_for_sign_out {
+                        if let Err(error) = pause_game_operation(&paused_game) {
+                            MANAGER.lock().unwrap().pause_errors.push(error.to_string());
+                        }
+                    } else {
+                        persist_existing_operation(
+                            product_id,
+                            "queued",
+                            Some("Interrupted; start this operation again to resume"),
+                            None,
+                            None,
+                        );
+                    }
+                    publish_sign_out_pause(product_id);
                 }
             } else {
                 update_uninstallation_snapshot(product_id, &event);
@@ -3463,6 +3577,7 @@ pub(super) fn finish_recovery(ids: &[i64]) {
 }
 
 pub fn recover_interrupted_operations() -> anyhow::Result<usize> {
+    let signed_out = crate::auth::restoration_blocked()?;
     migrate_legacy_operation_records()?;
     let mut recovered = 0;
     let mut operations = super::operation_journal::scan()?
@@ -3500,6 +3615,20 @@ pub fn recover_interrupted_operations() -> anyhow::Result<usize> {
             continue;
         };
         let product_id = queued.product_id();
+        if operation.state == "paused" || signed_out {
+            let snapshot = InstallationOperationSnapshot {
+                product_id,
+                state: crate::domain::InstallationState::Failed,
+                message: Some(
+                    "Interrupted by sign-out; start this operation again to resume".into(),
+                ),
+                percentage: None,
+                queued: false,
+            };
+            manager.snapshots.insert(product_id, snapshot.clone());
+            recovered_snapshots.push(snapshot);
+            continue;
+        }
         if let QueuedOperation::Installation(plan) = &queued
             && plan.download_intent_id.is_some()
         {
@@ -3559,8 +3688,130 @@ pub fn start_recovered_operations() {
     schedule_next();
 }
 
+pub fn pause_for_sign_out() -> anyhow::Result<()> {
+    let queued = {
+        let mut manager = MANAGER.lock().unwrap();
+        manager.paused_for_sign_out = true;
+        manager.pause_errors.clear();
+        let queued = manager.queue.drain(..).collect::<Vec<_>>();
+        for control in manager.active.values() {
+            match control {
+                OperationControl::Installation(control) => control.cancel(),
+                OperationControl::Uninstallation(control) => control.cancel(),
+            }
+        }
+        queued
+    };
+    for operation in queued {
+        let game = match &operation {
+            QueuedOperation::Installation(plan) => &plan.game,
+            QueuedOperation::Uninstallation(plan) => &plan.game,
+        };
+        if let Err(error) = pause_game_operation(game) {
+            MANAGER.lock().unwrap().pause_errors.push(error.to_string());
+        }
+        publish_sign_out_pause(game.product_id);
+    }
+    let mut manager = DEPOT_MANAGER.lock().unwrap();
+    manager.paused_for_sign_out = true;
+    for cancelled in manager.active.values() {
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    drop(manager);
+    let manager = MANAGER.lock().unwrap();
+    anyhow::ensure!(
+        manager.pause_errors.is_empty(),
+        "Signed out, but saving interrupted installation state failed: {}. Retry cleanup before signing in.",
+        manager.pause_errors.join("; ")
+    );
+    Ok(())
+}
+
+fn pause_game_operation(game: &InstalledGame) -> anyhow::Result<()> {
+    let library = game
+        .installation_directory
+        .parent()
+        .context("Installation has no library")?;
+    let slug = game
+        .installation_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Invalid installation directory")?;
+    let path = super::operation_journal::path(library, slug)?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    let super::operation_journal::OperationJournal::Offline { mut record, .. } =
+        super::operation_journal::read(&path)?
+    else {
+        anyhow::bail!("Saved installation changed; review cleanup before signing in");
+    };
+    anyhow::ensure!(
+        record.product_id == game.product_id,
+        "Saved installation identity changed"
+    );
+    record.state = "paused".into();
+    record.message = Some("Interrupted by sign-out; start this operation again to resume".into());
+    record.updated_at = chrono::Utc::now().timestamp();
+    super::operation_journal::write_offline(&path, &record)
+}
+
+/// Resolve a failed pause before a new explicit login removes the durable sign-out barrier.
+pub(crate) fn normalize_signed_out_operations() -> anyhow::Result<()> {
+    wait_for_paused()?;
+    migrate_legacy_operation_records()?;
+    for (path, journal) in super::operation_journal::scan()? {
+        if let super::operation_journal::OperationJournal::Offline { mut record, .. } = journal {
+            record.state = "paused".into();
+            record.message =
+                Some("Interrupted by sign-out; start this operation again to resume".into());
+            super::operation_journal::write_offline(&path, &record)?;
+        }
+    }
+    Ok(())
+}
+
+fn publish_sign_out_pause(product_id: i64) {
+    let mut manager = MANAGER.lock().unwrap();
+    if !manager.paused_for_sign_out {
+        return;
+    }
+    let snapshot = InstallationOperationSnapshot {
+        product_id,
+        state: crate::domain::InstallationState::Failed,
+        message: Some("Interrupted by sign-out; start this operation again to resume".into()),
+        percentage: None,
+        queued: false,
+    };
+    manager.snapshots.insert(product_id, snapshot.clone());
+    drop(manager);
+    publish(InstallationManagerEvent::OperationRecovered(snapshot));
+}
+
+pub fn wait_for_paused() -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        if MANAGER.lock().unwrap().active.is_empty()
+            && DEPOT_MANAGER.lock().unwrap().active.is_empty()
+        {
+            let manager = MANAGER.lock().unwrap();
+            anyhow::ensure!(
+                manager.pause_errors.is_empty(),
+                "Signed out, but interrupted installation state needs cleanup before signing in: {}",
+                manager.pause_errors.join("; ")
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "Signed out. Installation helpers are still stopping; retry profile reset shortly. Files and recovery records were kept."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 pub fn shutdown() {
-    let active_products = {
+    let (active_products, paused) = {
         let mut manager = MANAGER.lock().unwrap();
         manager.shutting_down = true;
         for control in manager.active.values() {
@@ -3569,12 +3820,15 @@ pub fn shutdown() {
                 OperationControl::Uninstallation(control) => control.cancel(),
             }
         }
-        manager.active.keys().copied().collect::<Vec<_>>()
+        (
+            manager.active.keys().copied().collect::<Vec<_>>(),
+            manager.paused_for_sign_out,
+        )
     };
     for product_id in active_products {
         persist_existing_operation(
             product_id,
-            "queued",
+            if paused { "paused" } else { "queued" },
             Some("Queued after application shutdown"),
             None,
             None,
@@ -3802,6 +4056,115 @@ fn persist_existing_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_out_native_journal_is_retained_without_automatic_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = std::fs::read(crate::config::Config::path()).ok();
+        let config = crate::config::Config {
+            game_libraries: vec![crate::config::GameLibrary {
+                id: "signout-fixture".into(),
+                name: "Fixture".into(),
+                path: root.path().to_owned(),
+                default: true,
+            }],
+            ..crate::config::Config::default()
+        };
+        config.save().unwrap();
+        let game = super::super::marker::game_from_marker(
+            &marker(false),
+            "signout-fixture".into(),
+            root.path().join("fixture"),
+            None,
+        );
+        let plan = PersistedInstallationPlan {
+            recovery_generation: super::super::recovery::generation(game.product_id),
+            game,
+            additional_installers: vec![],
+            install_base: true,
+            interactive_prompts: false,
+            download_intent_id: None,
+        };
+        persist_operation(
+            plan.game.product_id,
+            "install",
+            "queued",
+            &plan,
+            None,
+            None,
+            Some(1),
+        );
+        let path = super::super::operation_journal::path(root.path(), "fixture").unwrap();
+        let unrelated = super::super::operation_journal::path(root.path(), "unrelated").unwrap();
+        std::fs::write(&unrelated, b"malformed unrelated record").unwrap();
+        MANAGER
+            .lock()
+            .unwrap()
+            .queue
+            .push_back(QueuedOperation::Installation(plan.clone()));
+        request_sign_out_pause();
+        schedule_next();
+        assert_eq!(MANAGER.lock().unwrap().queue.len(), 1);
+        assert!(MANAGER.lock().unwrap().active.is_empty());
+        pause_for_sign_out().unwrap();
+        wait_for_paused().unwrap();
+        assert!(MANAGER.lock().unwrap().queue.is_empty());
+        std::fs::remove_file(unrelated).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            persist_operation(
+                plan.game.product_id,
+                "install",
+                "queued",
+                &plan,
+                None,
+                None,
+                Some(1),
+            );
+            std::fs::set_permissions(
+                path.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .unwrap();
+            MANAGER
+                .lock()
+                .unwrap()
+                .queue
+                .push_back(QueuedOperation::Installation(plan.clone()));
+            assert!(pause_for_sign_out().is_err());
+            crate::auth::persist_sign_out().unwrap();
+            assert_eq!(recover_interrupted_operations().unwrap(), 0);
+            assert!(MANAGER.lock().unwrap().queue.is_empty());
+            MANAGER.lock().unwrap().pause_errors.clear();
+            assert!(normalize_signed_out_operations().is_err());
+            std::fs::set_permissions(
+                path.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            normalize_signed_out_operations().unwrap();
+            std::fs::remove_file(crate::identity::config_root().join(".gog-signed-out")).unwrap();
+        }
+        MANAGER.lock().unwrap().paused_for_sign_out = false;
+        assert_eq!(recover_interrupted_operations().unwrap(), 0);
+        assert!(MANAGER.lock().unwrap().queue.is_empty());
+        start_queued_installation(plan, crate::auth::session().wrapping_sub(1));
+        assert!(MANAGER.lock().unwrap().active.is_empty());
+        let super::super::operation_journal::OperationJournal::Offline { record, .. } =
+            super::super::operation_journal::read(&path).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(record.state, "paused");
+        *MANAGER.lock().unwrap() = ManagerState::default();
+        finish_sign_out_pause();
+        DEPOT_MANAGER.lock().unwrap().paused_for_sign_out = false;
+        if let Some(previous) = previous {
+            std::fs::write(crate::config::Config::path(), previous).unwrap();
+        } else {
+            std::fs::remove_file(crate::config::Config::path()).unwrap();
+        }
+    }
     use crate::{
         domain::{
             GalaxyDepotDlcProvenance, GalaxyDepotIdentity, GalaxyDepotProvenance,
@@ -3961,7 +4324,7 @@ mod tests {
         // Model the real schedule_next gap: plan was removed from the queue before recovery.
         let reservation = super::super::recovery::Reservation::reserve(&[game.product_id]).unwrap();
         drop(reservation);
-        start_queued_installation(plan);
+        start_queued_installation(plan, crate::auth::session());
         assert!(
             !MANAGER
                 .lock()
@@ -4244,6 +4607,169 @@ mod tests {
             prepare_required_dependencies(&mut request, &std::sync::atomic::AtomicBool::new(false))
                 .unwrap_err();
         assert!(error.to_string().contains("complete selected build"));
+    }
+
+    #[test]
+    fn merged_small_file_manifest_prepares_persists_and_resumes_with_dependencies() {
+        use crate::gog::depot_manifest::{DepotEntry, parse_snapshot};
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let wire = |path: &str, number: u64| {
+            let digest = format!("{number:032x}");
+            let chunk = serde_json::json!({"compressedMd5":digest,"compressedSize":1,"md5":digest,"size":1});
+            serde_json::json!({"version":2,"depot":{"items":[{"type":"DepotFile","path":path,"chunks":[chunk.clone()],"sfcRef":{"offset":0,"size":1}}],"smallFilesContainer":{"chunks":[chunk]}}}).to_string()
+        };
+        let mut request = request(false);
+        request.destination = root.path().join("game");
+        request.library_root = root.path().to_owned();
+        request.staging_path = root.path().join(".ludomere/staging/game.json");
+        request.current_sources.clear();
+        request.sources[0].manifest_json = Some(wire("first.dat", 1));
+        request.sources[0].content_root = Some("/".into());
+        let mut second = request.sources[0].clone();
+        second.depot_id = "second".into();
+        second.manifest_id = "second-m".into();
+        second.manifest_json = Some(wire("second.dat", 2));
+        request.sources.push(second);
+        let provenance = request.target_marker.galaxy_depot.as_mut().unwrap();
+        provenance.manifest_fingerprint.clear();
+        provenance.depots.push(GalaxyDepotIdentity {
+            depot_id: "second".into(),
+            manifest_id: "second-m".into(),
+        });
+        let mut compressed =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        compressed
+            .write_all(wire("dependency.dat", 3).as_bytes())
+            .unwrap();
+        let bytes = compressed.finish().unwrap();
+        request.dependency_plan = Some(crate::gog::dependencies::Plan {
+            version: 1,
+            catalog_build: "1".into(),
+            entries: vec![crate::gog::dependencies::Dependency {
+                id: "GameLocal".into(),
+                name: "Game local fixture".into(),
+                manifest_id: format!("{:x}", md5::compute(&bytes)),
+                manifest_bytes: bytes,
+                method: crate::gog::dependencies::Method::GameFiles,
+            }],
+        });
+        let identity = planned_manifest_identity(&request).unwrap();
+        request
+            .target_marker
+            .galaxy_depot
+            .as_mut()
+            .unwrap()
+            .manifest_fingerprint = identity.clone();
+        let payload = merge_depot_sources(&request).unwrap().0;
+        assert_eq!(payload.small_files_containers.len(), 2);
+        // Both plan=None merged payload and payload+dependency triggered the old wire error.
+        assert!(
+            payload
+                .canonical_json()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid small-files container index")
+        );
+        assert_eq!(
+            super::super::dependency_setup::combined_manifest(&payload, None).unwrap(),
+            payload
+        );
+        let combined = super::super::dependency_setup::combined_manifest(
+            &payload,
+            request.dependency_plan.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(combined.small_files_containers.len(), 3);
+        assert_eq!(
+            combined
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    DepotEntry::File(file) =>
+                        file.small_file.map(|reference| reference.container_index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(combined.identity(), identity);
+        request.current_manifest_json = Some(combined.snapshot_json().unwrap());
+        persist_depot_request(&request).unwrap();
+        let journal = super::super::operation_journal::read(
+            &super::super::operation_journal::depot_path(&request.staging_path),
+        )
+        .unwrap();
+        let super::super::operation_journal::OperationJournal::Depot { record, .. } = journal
+        else {
+            panic!()
+        };
+        let saved: PersistedDepotPlan = serde_json::from_str(&record.plan_json).unwrap();
+        request.current_manifest_json = saved.current_manifest_json;
+        request.dependency_plan = saved.dependency_plan;
+        assert_eq!(current_manifest(&request).unwrap().unwrap(), combined);
+
+        super::super::marker::write(&request.target_marker, &request.destination).unwrap();
+        let store = StateStore::open().unwrap();
+        let mut record = crate::state::DepotManifestRecord {
+            manifest_identity: identity,
+            product_id: 7,
+            build_id: request.build_id.clone(),
+            depot_id: "ludomere:installed-with-dependencies".into(),
+            manifest_json: combined.snapshot_json().unwrap(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        };
+        store.save_depot_manifest(&record).unwrap();
+        request.current_manifest_json = None;
+        assert_eq!(current_manifest(&request).unwrap().unwrap(), combined);
+        assert_eq!(
+            parse_snapshot(record.manifest_json.as_bytes()).unwrap(),
+            combined
+        );
+
+        // Pre-combined-snapshot markers bind only strict original wire payloads.
+        let mut old_marker = request.target_marker.clone();
+        old_marker
+            .galaxy_depot
+            .as_mut()
+            .unwrap()
+            .manifest_fingerprint = payload.legacy_payload_identity();
+        super::super::marker::write(&old_marker, &request.destination).unwrap();
+        request.current_sources = request.sources.clone();
+        assert_eq!(
+            current_manifest(&request).unwrap().unwrap(),
+            payload,
+            "today's target GameFiles plan must not alter historical installed identity"
+        );
+        request.current_sources[0].manifest_json = Some(wire("tampered.dat", 1));
+        assert!(current_manifest(&request).is_err());
+
+        // Legacy identity is never a bypass for tampered typed snapshots.
+        super::super::marker::write(&request.target_marker, &request.destination).unwrap();
+        let mut swapped = combined.clone();
+        if let DepotEntry::File(file) = &mut swapped.entries[0] {
+            file.small_file.as_mut().unwrap().container_index = 1;
+        }
+        record.manifest_json = swapped.snapshot_json().unwrap();
+        store.save_depot_manifest(&record).unwrap();
+        assert!(
+            current_manifest(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("ownership manifest is damaged")
+        );
+        let mut target = request.clone();
+        target
+            .target_marker
+            .galaxy_depot
+            .as_mut()
+            .unwrap()
+            .manifest_fingerprint = payload.legacy_payload_identity();
+        assert!(
+            merge_depot_sources(&target).is_err(),
+            "new targets cannot use legacy identity acceptance"
+        );
     }
 
     #[test]

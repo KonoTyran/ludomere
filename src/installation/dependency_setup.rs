@@ -151,11 +151,12 @@ pub(crate) fn run_tracked(
     result
 }
 
-// These existing recipes preserve the user-verified DirectX/MSVC installations. A receipt
-// describes this compatibility method, never claims the catalog's native installer ran.
+// Preserve the reviewed graphics/audio and MSVC recipes, but use Proton's builtin XInput
+// controller stack instead of Winetricks' native-only XInput registry overrides.
+// A receipt describes this method, never claims the catalog's native installer ran.
 pub(crate) fn override_verbs(id: &str, requested: &[String]) -> Option<Vec<String>> {
     let verbs: &[&str] = match id {
-        "DirectX" => &["d3dcompiler_43", "d3dx9", "xact", "xinput"],
+        "DirectX" => &["d3dcompiler_43", "d3dx9", "xact"],
         "MSVC2010" | "MSVC2010_x64" => &["vcrun2010"],
         "MSVC2012" | "MSVC2012_x64" => &["vcrun2012"],
         "MSVC2013" | "MSVC2013_x64" => &["vcrun2013"],
@@ -250,12 +251,17 @@ pub(crate) fn combined_manifest(
             if let DepotEntry::File(file) = &mut entry
                 && let Some(reference) = &mut file.small_file
             {
-                reference.container_index += offset;
+                reference.container_index = reference
+                    .container_index
+                    .checked_add(offset)
+                    .context("small-files container index overflows")?;
             }
             combined.entries.push(entry);
         }
     }
-    crate::gog::depot_manifest::parse(combined.canonical_json()?.as_bytes())
+    // Preparation must also prove the final ownership snapshot fits the local format.
+    combined.snapshot_json()?;
+    Ok(combined)
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +304,49 @@ struct Receipts {
     version: u32,
     prefix: PrefixIdentity,
     complete: BTreeSet<String>,
+}
+
+/// Provenance for a launch-only correction of our former native-XInput recipe.
+/// An unrelated prefix or a Winetricks log alone is not evidence of this recipe.
+pub(crate) fn legacy_xinput_recipe(prefix: &Path) -> Result<bool> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(prefix.join(".ludomere-gog-dependencies.json"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 1
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0
+            && metadata.len() <= 1024 * 1024,
+        "Unsafe dependency completion record"
+    );
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 1024 * 1024,
+        "Dependency completion record exceeds the safety limit"
+    );
+    let receipts: Receipts = serde_json::from_slice(&bytes)?;
+    ensure!(
+        receipts.version == 1,
+        "Unsupported dependency completion record version"
+    );
+    if receipts.prefix != prefix_identity(prefix)? {
+        return Ok(false);
+    }
+    Ok(receipts.complete.iter().any(|key| {
+        key.strip_suffix(":winetricks-v1:d3dcompiler_43,d3dx9,xact,xinput")
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }))
 }
 
 fn complete_step(
@@ -1002,6 +1051,70 @@ mod tests {
         file.executable = !file.executable;
         assert!(combined_manifest(&conflicting, Some(&plan)).is_err());
     }
+    #[test]
+    fn xinput_correction_requires_our_exact_receipt_and_current_prefix() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("prefix");
+        fs::create_dir_all(prefix.join("drive_c")).unwrap();
+        for registry in ["system.reg", "user.reg"] {
+            fs::write(prefix.join(registry), "WINE REGISTRY Version 2\n").unwrap();
+        }
+        let path = prefix.join(".ludomere-gog-dependencies.json");
+        assert!(!legacy_xinput_recipe(&prefix).unwrap());
+        let recipe = format!(
+            "{}:winetricks-v1:d3dcompiler_43,d3dx9,xact,xinput",
+            "a".repeat(64)
+        );
+        complete_step(&prefix, recipe, &|| false, || Ok(())).unwrap();
+        assert!(legacy_xinput_recipe(&prefix).unwrap());
+        let original = fs::read(&path).unwrap();
+        let registry = fs::read(prefix.join("user.reg")).unwrap();
+        assert!(legacy_xinput_recipe(&prefix).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(prefix.join("user.reg")).unwrap(), registry);
+
+        for key in [
+            "xinput",
+            "not-a-digest:winetricks-v1:d3dcompiler_43,d3dx9,xact,xinput",
+            "abc:winetricks-v1:xinput",
+        ] {
+            let mut receipt: Receipts = serde_json::from_slice(&original).unwrap();
+            receipt.complete = BTreeSet::from([key.to_owned()]);
+            fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            assert!(!legacy_xinput_recipe(&prefix).unwrap());
+        }
+        fs::write(&path, b"malformed").unwrap();
+        assert!(legacy_xinput_recipe(&prefix).is_err());
+        fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(legacy_xinput_recipe(&prefix).is_err());
+        fs::write(&path, &original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(legacy_xinput_recipe(&prefix).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let saved = prefix.join("saved-receipt");
+        fs::rename(&path, &saved).unwrap();
+        symlink(&saved, &path).unwrap();
+        assert!(legacy_xinput_recipe(&prefix).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        fs::rename(prefix.join("drive_c"), prefix.join("old-drive")).unwrap();
+        fs::create_dir(prefix.join("drive_c")).unwrap();
+        assert!(!legacy_xinput_recipe(&prefix).unwrap());
+
+        let current = override_verbs("DirectX", &["DirectX".into()]).unwrap();
+        assert_eq!(current, ["d3dcompiler_43", "d3dx9", "xact"]);
+        complete_step(
+            &prefix,
+            format!("{}:winetricks-v1:{}", "a".repeat(64), current.join(",")),
+            &|| false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!legacy_xinput_recipe(&prefix).unwrap());
+    }
+
     #[test]
     fn partial_retry_revision_and_recreated_prefix_never_reuse_wrong_success() {
         let root = tempfile::tempdir().unwrap();

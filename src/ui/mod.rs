@@ -17,6 +17,7 @@ mod cloud_management;
 mod collections;
 mod comet;
 mod details;
+mod dll_overrides;
 mod download_chooser;
 mod downloads;
 mod executable_chooser;
@@ -761,10 +762,10 @@ const CSS: &str = r#"
 .game-grid flowboxchild:hover,
 .game-grid flowboxchild:active,
 .game-grid flowboxchild:selected { background: transparent; box-shadow: none; outline: none; padding: 0; }
-.game-state-update label { color: #62a8e5; }
-.game-state-partial-backup label { color: #d98b45; }
-.game-state-backup label { color: #d5b36a; }
-.game-state-pending label { color: #78aeed; }
+.game-state-running label { color: #71d28b; }
+.game-state-downloading label { color: #62a8e5; }
+.game-state-installed label { color: #ffffff; }
+.game-state-unavailable label { color: #909090; }
 .portrait-frame, .hero-card { border-radius: 10px; background: #20242b; }
 .game-card .hero-card { border-radius: 8px 8px 0 0; }
 .card-caption { background: #303030; color: white; border-radius: 0 0 8px 8px; padding: 9px 10px; }

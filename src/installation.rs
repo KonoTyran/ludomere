@@ -9,6 +9,8 @@ use std::{
 };
 
 pub(crate) mod dependency_setup;
+pub(crate) use manager::normalize_signed_out_operations;
+pub(crate) use manager::{finish_sign_out_pause, request_sign_out_pause};
 pub mod depot;
 pub mod depot_actions;
 pub mod depot_metadata;
@@ -17,7 +19,7 @@ mod executor;
 mod launcher;
 mod manager;
 mod marker;
-mod operation_journal;
+pub(crate) mod operation_journal;
 mod patch;
 pub mod recovery;
 pub use recovery::{
@@ -42,10 +44,10 @@ pub use manager::{
     cancel_depot_operation, cancel_operation, depot_operation_snapshot,
     depot_operation_snapshot_for_product, depot_operation_snapshots, enqueue_depot_operation,
     enqueue_downloaded_installation, enqueue_installation, enqueue_uninstallation,
-    enqueue_uninstallation_with_cleanup, installation_operation_snapshot, prepare_depot_resume,
-    recover_depot_operations, recover_interrupted_operations, respond_to_installation,
-    resume_depot_operation, shutdown, start_recovered_operations, subscribe_depot_events,
-    subscribe_installation_events,
+    enqueue_uninstallation_with_cleanup, installation_operation_snapshot, pause_for_sign_out,
+    prepare_depot_resume, recover_depot_operations, recover_interrupted_operations,
+    respond_to_installation, resume_depot_operation, shutdown, start_recovered_operations,
+    subscribe_depot_events, subscribe_installation_events, wait_for_paused,
 };
 pub use marker::{
     InstallationMarker, InstalledDlc, from_game as installation_marker_from_game,

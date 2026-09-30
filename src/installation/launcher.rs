@@ -64,7 +64,7 @@ pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
             return receiver;
         }
     };
-    let activity = match crate::profile_reset::begin_activity("game or cloud sync") {
+    let activity = match crate::profile_reset::begin_activity("game launch") {
         Ok(activity) => activity,
         Err(error) => {
             let _ = sender.send(LaunchEvent::Failed(error.to_string()));
@@ -81,8 +81,9 @@ pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
         games.insert(game.product_id, stop_sender);
     }
     drop(admission);
+    let session = crate::auth::session();
     thread::spawn(move || {
-        let _activity = activity;
+        let mut activity = activity;
         let product_id = game.product_id;
         let capture = super::runtime_logs::create(product_id);
         let result = match capture {
@@ -99,7 +100,15 @@ pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
                         }
                     ),
                 );
-                let result = run_game(&game, &sender, &stop_receiver, &path, &mut file);
+                let result = run_game(
+                    &game,
+                    &sender,
+                    &stop_receiver,
+                    &path,
+                    &mut file,
+                    session,
+                    &mut activity,
+                );
                 match &result {
                     Ok((_, seconds, exit_code)) => super::runtime_logs::diagnostic(
                         &mut file,
@@ -180,6 +189,8 @@ fn run_game(
     stop: &mpsc::Receiver<()>,
     log_path: &std::path::Path,
     log: &mut File,
+    session: u64,
+    activity: &mut crate::profile_reset::ActivityGuard,
 ) -> Result<(i64, u64, Option<i32>)> {
     let mut game = game.clone();
     let backend = game
@@ -199,7 +210,9 @@ fn run_game(
             );
         }
     }
-    prepare_cloud_saves(&game, events)?;
+    if crate::auth::session_is_current(session) {
+        prepare_cloud_saves(&game, events, session)?;
+    }
     let executable = game
         .primary_executable
         .as_ref()
@@ -216,7 +229,11 @@ fn run_game(
         .and_then(|store| store.compatibility_fix_overrides(game.product_id))
         .unwrap_or_default();
     let fixes = crate::compatibility::effective_fixes(game.product_id, &fix_overrides);
-    let _comet = start_online_services_fix(&game, backend.as_ref(), &fixes, log_path, log);
+    let mut comet = if crate::auth::session_is_current(session) {
+        start_online_services_fix(&game, backend.as_ref(), &fixes, log_path, log)
+    } else {
+        None
+    };
     let started_at = chrono::Utc::now().timestamp();
     let timer = Instant::now();
     let mut command = if let Some(compatibility) = &game.compatibility {
@@ -227,18 +244,50 @@ fn run_game(
         let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
         crate::compatibility::configure_library_drive(&prefix, library)
             .map_err(|error| anyhow::anyhow!(error))?;
-        backend
-            .as_ref()
-            .unwrap()
-            .command(&crate::compatibility::CompatibilityRunRequest {
-                prefix,
-                profile: compatibility.profile.clone(),
-                executable: executable.clone(),
-                arguments: game.launch_arguments.clone(),
-                working_directory: None,
-                log_path: log_path.to_owned(),
-                background: false,
-            })?
+        let defaults = match super::dependency_setup::legacy_xinput_recipe(&prefix) {
+            Ok(true) => {
+                super::runtime_logs::diagnostic(
+                    log,
+                    "Verified previous Ludomere DirectX recipe: builtin XInput defaults requested; explicit inherited and per-game selections take priority.",
+                );
+                vec![
+                    ("xinput1_1", crate::compatibility::DllLoadOrder::Builtin),
+                    ("xinput1_2", crate::compatibility::DllLoadOrder::Builtin),
+                    ("xinput1_3", crate::compatibility::DllLoadOrder::Builtin),
+                    ("xinput9_1_0", crate::compatibility::DllLoadOrder::Builtin),
+                ]
+            }
+            Ok(false) => Vec::new(),
+            Err(_) => {
+                super::runtime_logs::diagnostic(
+                    log,
+                    "Could not verify the previous DirectX recipe; automatic XInput correction was not applied.",
+                );
+                Vec::new()
+            }
+        };
+        let mut command =
+            backend
+                .as_ref()
+                .unwrap()
+                .command(&crate::compatibility::CompatibilityRunRequest {
+                    prefix,
+                    profile: compatibility.profile.clone(),
+                    executable: executable.clone(),
+                    arguments: game.launch_arguments.clone(),
+                    working_directory: None,
+                    log_path: log_path.to_owned(),
+                    background: false,
+                })?;
+        let dll_overrides = crate::compatibility::game_dll_overrides(game.product_id)?;
+        crate::compatibility::apply_game_dll_overrides(&mut command, &dll_overrides, &defaults)?;
+        for (name, order) in &dll_overrides {
+            super::runtime_logs::diagnostic(
+                log,
+                &format!("Per-game DLL override: {name} — {}", order.label()),
+            );
+        }
+        command
     } else {
         let mut command = Command::new(executable);
         command.args(&game.launch_arguments);
@@ -257,14 +306,22 @@ fn run_game(
         .stderr(Stdio::from(stderr));
     #[cfg(unix)]
     command.process_group(0);
+    anyhow::ensure!(
+        crate::auth::session() == session,
+        "Launch interrupted by sign-out; start the game again to play offline"
+    );
     let mut child = command
         .spawn()
         .with_context(|| format!("could not launch {}", executable.display()))?;
     let process_group = child.id();
+    activity.running_game();
     super::runtime_logs::diagnostic(log, &format!("Game process started: PID {process_group}"));
     events.send(LaunchEvent::Started).ok();
     let mut leader_status = None;
     let status = loop {
+        if !crate::auth::session_is_current(session) {
+            drop(comet.take());
+        }
         if stop.try_recv().is_ok() {
             super::runtime_logs::diagnostic(log, "Stop requested");
             stop_process_group(process_group, &mut child)?;
@@ -288,11 +345,17 @@ fn run_game(
     let seconds = timer.elapsed().as_secs();
     super::runtime_logs::diagnostic(log, &format!("Game process exited: {status}"));
     StateStore::open()?.record_game_session(game.product_id, started_at, seconds)?;
-    finish_cloud_saves(&game, events);
+    if crate::auth::session_is_current(session) {
+        finish_cloud_saves(&game, events, session);
+    }
     Ok((started_at, seconds, status.code()))
 }
 
-fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>) -> Result<()> {
+fn prepare_cloud_saves(
+    game: &InstalledGame,
+    events: &mpsc::Sender<LaunchEvent>,
+    session: u64,
+) -> Result<()> {
     if game.compatibility.is_none()
         || !game
             .installer_operating_system
@@ -318,7 +381,7 @@ fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>)
     .map(|build| build.build_id.as_str());
     let needs_discovery = cloud_discovery_required(&record, selected_build_id);
     if needs_discovery {
-        match crate::cloud_saves::discover_and_store(game, &record.locations) {
+        match crate::cloud_saves::discover_and_store_for_session(game, &record.locations, session) {
             Ok(_) => {
                 record = store.cloud_save_record(game.product_id)?;
             }
@@ -333,7 +396,7 @@ fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>)
         events
             .send(LaunchEvent::EnablementRequired { respond })
             .ok();
-        let enabled = answer.recv().unwrap_or(false);
+        let enabled = launch_answer(&answer, session)?.unwrap_or(false);
         record.preference = if enabled {
             crate::domain::CloudSavePreference::Enabled
         } else {
@@ -352,7 +415,7 @@ fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>)
     events
         .send(LaunchEvent::CloudSyncStarted(CloudSyncPhase::BeforeLaunch))
         .ok();
-    match crate::cloud_saves::sync(request) {
+    match crate::cloud_saves::sync_for_session(request, session) {
         Ok(result) if result.conflicts.is_empty() => Ok(()),
         Ok(result) => {
             let (respond, answer) = mpsc::channel();
@@ -362,20 +425,27 @@ fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>)
                     respond,
                 })
                 .ok();
-            let Some(mode) = answer.recv().unwrap_or(None) else {
+            let Some(mode) = launch_answer(&answer, session)?.flatten() else {
                 return Ok(());
             };
             events
                 .send(LaunchEvent::CloudSyncStarted(CloudSyncPhase::BeforeLaunch))
                 .ok();
-            crate::cloud_saves::sync(crate::cloud_saves::CloudSyncRequest {
-                game: game.clone(),
-                locations: record.locations,
-                mode,
-            })?;
+            crate::cloud_saves::sync_for_session(
+                crate::cloud_saves::CloudSyncRequest {
+                    game: game.clone(),
+                    locations: record.locations,
+                    mode,
+                },
+                session,
+            )?;
             Ok(())
         }
         Err(error) => {
+            anyhow::ensure!(
+                crate::auth::session_is_current(session),
+                "Launch interrupted by sign-out"
+            );
             if store
                 .cloud_save_record(game.product_id)
                 .is_ok_and(|record| {
@@ -391,11 +461,31 @@ fn prepare_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>)
                     respond,
                 })
                 .ok();
-            if answer.recv().unwrap_or(false) {
+            if launch_answer(&answer, session)?.unwrap_or(false) {
                 Ok(())
             } else {
                 anyhow::bail!("launch cancelled because cloud saves could not synchronize")
             }
+        }
+    }
+}
+
+fn launch_answer<T>(answer: &mpsc::Receiver<T>, session: u64) -> Result<Option<T>> {
+    loop {
+        anyhow::ensure!(
+            crate::auth::session_is_current(session),
+            "Launch interrupted by sign-out"
+        );
+        match answer.recv_timeout(Duration::from_millis(100)) {
+            Ok(value) => {
+                anyhow::ensure!(
+                    crate::auth::session_is_current(session),
+                    "Launch interrupted by sign-out"
+                );
+                return Ok(Some(value));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
         }
     }
 }
@@ -420,7 +510,7 @@ fn cloud_sync_enabled(record: &crate::state::CloudSaveRecord) -> bool {
         && record.preference == crate::domain::CloudSavePreference::Enabled
 }
 
-fn finish_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>) {
+fn finish_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>, session: u64) {
     let Ok(store) = StateStore::open() else {
         return;
     };
@@ -433,11 +523,14 @@ fn finish_cloud_saves(game: &InstalledGame, events: &mpsc::Sender<LaunchEvent>) 
     events
         .send(LaunchEvent::CloudSyncStarted(CloudSyncPhase::AfterExit))
         .ok();
-    match crate::cloud_saves::sync(crate::cloud_saves::CloudSyncRequest {
-        game: game.clone(),
-        locations: record.locations,
-        mode: crate::domain::CloudSyncMode::Normal,
-    }) {
+    match crate::cloud_saves::sync_for_session(
+        crate::cloud_saves::CloudSyncRequest {
+            game: game.clone(),
+            locations: record.locations,
+            mode: crate::domain::CloudSyncMode::Normal,
+        },
+        session,
+    ) {
         Ok(result) if result.conflicts.is_empty() => {
             events.send(LaunchEvent::PostExitSync(result)).ok();
         }
@@ -806,6 +899,53 @@ mod tests {
         CompatibilityBackendKind, GameCompatibilityPreferences, UmuProfile, UmuProfileSource,
     };
     use std::{process::Command, thread, time::Duration};
+
+    #[test]
+    fn sign_out_keeps_owned_synthetic_game_running_and_reset_can_reserve() {
+        if std::env::var_os("LUDOMERE_SIGNOUT_GAME_FIXTURE").is_none() {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "installation::launcher::tests::sign_out_keeps_owned_synthetic_game_running_and_reset_can_reserve", "--nocapture"])
+                .env("LUDOMERE_SIGNOUT_GAME_FIXTURE", "1").status().unwrap().success());
+            return;
+        }
+        crate::auth::invalidate_session();
+        let root = tempfile::tempdir().unwrap();
+        let heartbeat = root.path().join("heartbeat");
+        let mut game = test_game(
+            root.path().to_path_buf(),
+            PathBuf::from("/usr/bin/python3"),
+            false,
+        );
+        game.product_id = 918887;
+        game.launch_arguments = vec!["-c".into(),
+            "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]);\nwhile True:\n p.write_text(str(time.monotonic_ns())); time.sleep(0.02)".into(),
+            heartbeat.to_string_lossy().into_owned()];
+        let events = launch_game(game);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LaunchEvent::Started
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !heartbeat.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        crate::auth::invalidate_session();
+        let before = fs::read(&heartbeat).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_ne!(fs::read(&heartbeat).unwrap(), before);
+        let reservation = crate::profile_reset::reserve_for_sign_out().unwrap();
+        assert!(crate::profile_reset::keeps_running_games());
+        assert!(is_game_running(918887));
+        assert!(crate::profile_reset::begin_activity("new setup").is_err());
+        drop(reservation);
+        assert!(!crate::profile_reset::keeps_running_games());
+        assert!(stop_game(918887));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            LaunchEvent::Exited { .. }
+        ));
+        assert!(heartbeat.is_file());
+    }
 
     fn cloud_record(
         availability: crate::domain::CloudSaveAvailability,

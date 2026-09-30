@@ -26,6 +26,8 @@ Transfer progress does not rescan downloaded files. If local-state inspection fa
 keeps the previous state and reports the error; use **Manage → Refresh local state** to retry. Uninstall checks the
 current downloaded files before offering optional cleanup, with a separate retry control.
 Displayed sizes and rates use decimal byte units (1 MB = 1,000,000 bytes).
+Sidebar game names are green while running, blue while downloading, white when installed, and grey
+otherwise, in that priority order. File-operation completion updates the open game's action in place.
 Installation and launch failures retain their full diagnostic text in Notifications, with sensitive
 URLs/credential fields redacted. **View error** expands the current game's failure, including a
 recovered installation failure, without switching to Downloads; Resume remains a separate action.
@@ -187,12 +189,37 @@ installing a newer version elsewhere does not change it. Game settings can overr
 or return to inheriting it. These preferences survive uninstall. If a saved directory disappears,
 choose a replacement: Ludomere does not silently switch versions.
 
+Game Settings → Compatibility → DLL overrides provides per-game DLL names with Native, Builtin,
+Native then Builtin, Builtin then Native, or Disabled load order. Save applies the rows to the next
+Windows game launch; Cancel Changes restores the saved rows. Removing a row restores existing
+defaults. These preferences survive uninstall and prefix recreation. They do not download DLLs,
+change the prefix registry, or affect native games and installer/setup commands. Explicit choices
+override matching Ludomere defaults and incoming DLL selections; Proton can still apply its own
+runtime compatibility policy. Each choice covers both Wine's bare and wildcard DLL-name keys so
+an existing wildcard registry entry cannot defeat it for a qualified load. An exact path registry
+entry or later runtime policy can still take precedence; no registry is rewritten.
+For an older prefix without a verified Ludomere recipe receipt, open the game's Compatibility
+settings, add `xinput1_1`, `xinput1_2`, `xinput1_3`
+and `xinput9_1_0`, select **Builtin** for each, Save, then restart the game. Remove those rows to
+return to existing defaults. This is an explicit user choice, not a guarantee of controller support.
+
 The download controls offer stable current and historical GE-Proton and UMU-Proton releases;
 Valve Proton is discovery-only. Missing Proton or a required Steam Linux Runtime produces an offer
 from a direct user action. Downloads show progress, support cancellation, verify publisher
 checksums, and publish only completed installations. Retry the requested action after preparation.
 Recovered/background operations fail with an actionable error instead of acquiring components or
 opening dialogs. A private UMU adapter prevents its usual automatic component acquisition.
+
+DirectX setup leaves XInput controller handling to Proton instead of installing native-only
+XInput overrides. For an existing prefix with a matching Ludomere receipt for the old recipe,
+game launches prefer Proton's builtins for the four affected XInput DLLs without changing the
+prefix or its registry. Explicit inherited or per-game DLL choices take priority. The receipt
+cannot distinguish later registry-only customization; use an explicit per-game choice to keep a
+different XInput load order. Missing or unverifiable receipts do not trigger this correction;
+no SDL/HID or host device settings change.
+The managed `xinput1_3` correction is omitted when incoming `STEAM_COMPAT_CONFIG` or
+`PROTON_ADD_CONFIG` requests `usenativexinput13`; explicit per-game DLL choices remain deliberate
+overrides. This does not emulate Proton's full runtime policy or alter its configuration flags.
 
 ## Development
 
@@ -239,9 +266,16 @@ download location are `$XDG_DATA_HOME/ludomere/games`. The executable is `ludome
 Settings → Account → **Clear full profile when signing out** is off by default. Enabling it only
 saves the preference. On your next sign-out, Ludomere closes and clears login data, settings,
 favorites, tags, playtime, queue records, cached metadata, images and logs. Games, downloaded
-installers, Proton versions and runtimes stay intact. Finish active work and finish or cancel
-unfinished installations before resetting. If cleanup fails, Ludomere offers Retry or Close
-without starting library workers. The
+installers, Proton versions and runtimes stay intact. Sign-out revokes the account immediately,
+pauses downloads and interrupts setup safely; running games continue. Without full reset,
+interrupted operations remain recoverable after signing in. Full reset discards queue and
+automatic-resume records after their writers stop, while keeping downloaded and installed files.
+If cleanup cannot finish, the account stays signed out and the account menu offers a cleanup retry.
+If an interrupted installation record could not be saved, its cleanup must finish before a new
+sign-in can remove the sign-out barrier; this prevents old work from restarting under another account.
+A reset already committed for process replacement offers Retry or Close without starting library
+workers. Kept-running games cannot start further cloud synchronization or GOG online services
+under the old account; a cloud request already sent cannot be recalled. The
 next launch starts signed out with default settings, including this toggle off; add any custom
 game-library paths again to use their preserved installations.
 

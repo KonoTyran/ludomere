@@ -25,6 +25,7 @@ pub(super) struct Build {
 pub struct CometSession {
     child: Child,
     credential_root: PathBuf,
+    _activity: crate::profile_reset::ActivityGuard,
 }
 
 impl Drop for CometSession {
@@ -41,6 +42,7 @@ pub fn start(
     profile: &super::UmuProfile,
     log_path: &Path,
 ) -> Result<Option<CometSession>> {
+    let session = auth::session();
     let Some(token) = auth::load_saved_token()? else {
         return Ok(None);
     };
@@ -49,10 +51,11 @@ pub fn start(
     };
     let runtime = ensure_runtime()?;
     install_dummy_service(backend, prefix, profile, log_path, &runtime.service)?;
-    start_session(&runtime.comet, log_path, &token, &account.username)
+    start_session(&runtime.comet, log_path, &token, &account.username, session)
 }
 
 pub fn start_native(log_path: &Path) -> Result<Option<CometSession>> {
+    let session = auth::session();
     let Some(token) = auth::load_saved_token()? else {
         return Ok(None);
     };
@@ -60,7 +63,7 @@ pub fn start_native(log_path: &Path) -> Result<Option<CometSession>> {
         return Ok(None);
     };
     let runtime = ensure_runtime()?;
-    start_session(&runtime.comet, log_path, &token, &account.username)
+    start_session(&runtime.comet, log_path, &token, &account.username, session)
 }
 
 fn start_session(
@@ -68,7 +71,13 @@ fn start_session(
     _log_path: &Path,
     token: &auth::Token,
     username: &str,
+    session: u64,
 ) -> Result<Option<CometSession>> {
+    ensure!(
+        auth::session_is_current(session),
+        "GOG session changed; online services were not started"
+    );
+    let activity = crate::profile_reset::begin_activity("GOG online service")?;
     let credential_root = write_credentials(token)?;
     let child = match session_command(comet, &credential_root, username).spawn() {
         Ok(child) => child,
@@ -77,10 +86,16 @@ fn start_session(
             return Err(error).context("could not start Comet");
         }
     };
-    Ok(Some(CometSession {
+    let service = CometSession {
         child,
         credential_root,
-    }))
+        _activity: activity,
+    };
+    ensure!(
+        auth::session_is_current(session),
+        "GOG session changed; online services were stopped"
+    );
+    Ok(Some(service))
 }
 
 fn session_command(comet: &Path, credential_root: &Path, username: &str) -> Command {

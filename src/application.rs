@@ -12,9 +12,14 @@ pub fn build() -> adw::Application {
     app.connect_activate(crate::ui::build_window);
     app.connect_shutdown(|_| {
         crate::ui::shutdown_tray();
-        crate::installation::stop_all_games();
+        if !crate::profile_reset::keeps_running_games() {
+            crate::installation::stop_all_games();
+        }
         crate::installation::shutdown();
         crate::download::shutdown();
+        if let Err(error) = crate::auth::wait_for_sign_out() {
+            tracing::warn!(%error, "sign-out cleanup did not finish before closing");
+        }
     });
     app
 }

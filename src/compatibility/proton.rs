@@ -28,6 +28,7 @@ pub struct ProtonInstallation {
 pub struct ProtonPreferences {
     pub default: Option<PathBuf>,
     pub overrides: BTreeMap<String, PathBuf>,
+    pub dll_overrides: BTreeMap<String, BTreeMap<String, super::DllLoadOrder>>,
 }
 
 /// Validate a Proton directory without executing or changing an external installation.
@@ -208,6 +209,39 @@ pub fn proton_preferences() -> Result<ProtonPreferences> {
     read_preferences(&crate::identity::config_root().join("proton.json"))
 }
 
+pub fn game_dll_overrides(
+    product_id: i64,
+) -> anyhow::Result<BTreeMap<String, super::DllLoadOrder>> {
+    super::normalize_dll_overrides(
+        proton_preferences()?
+            .dll_overrides
+            .remove(&product_id.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+pub fn set_game_dll_overrides(
+    product_id: i64,
+    overrides: BTreeMap<String, super::DllLoadOrder>,
+) -> anyhow::Result<()> {
+    let _activity = crate::profile_reset::begin_activity("saving DLL preferences")?;
+    let overrides = super::normalize_dll_overrides(overrides)?;
+    update_preferences(
+        &crate::identity::config_root().join("proton.json"),
+        |preferences| {
+            if overrides.is_empty() {
+                preferences.dll_overrides.remove(&product_id.to_string());
+            } else {
+                preferences
+                    .dll_overrides
+                    .insert(product_id.to_string(), overrides);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
 fn read_preferences(path: &Path) -> Result<ProtonPreferences> {
     match read_bounded(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|error| {
@@ -238,6 +272,9 @@ fn update_preferences<T>(
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     serde_json::to_writer_pretty(&mut temporary, &preferences)
         .map_err(|error| CompatibilityFailure::Io(error.to_string()))?;
+    if temporary.as_file().metadata()?.len() > 1024 * 1024 {
+        return Err(CompatibilityFailure::PreferencesTooLarge);
+    }
     temporary.as_file().sync_all()?;
     temporary
         .persist(path)
@@ -306,6 +343,146 @@ fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_dll_preferences_never_replace_the_readable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proton.json");
+        fs::write(&path, br#"{"default":"/inert/Proton","overrides":{"7":"/inert/Custom"},"dll_overrides":{"7":{"dinput8":"builtin"}}}"#).unwrap();
+        let before = fs::read(&path).unwrap();
+        let rows = super::super::normalize_dll_overrides((0..128).map(|index| {
+            (
+                format!("dll_{index:03}_{}", "x".repeat(120)),
+                super::super::DllLoadOrder::NativeThenBuiltin,
+            )
+        }))
+        .unwrap();
+        let error = update_preferences(&path, |preferences| {
+            for product_id in 100..180 {
+                preferences
+                    .dll_overrides
+                    .insert(product_id.to_string(), rows.clone());
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(error, CompatibilityFailure::PreferencesTooLarge));
+        assert!(error.to_string().contains("Remove some DLL override rows"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let saved = read_preferences(&path).unwrap();
+        assert_eq!(saved.default, Some(PathBuf::from("/inert/Proton")));
+        assert_eq!(saved.overrides["7"], PathBuf::from("/inert/Custom"));
+        assert_eq!(
+            saved.dll_overrides["7"]["dinput8"],
+            super::super::DllLoadOrder::Builtin
+        );
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            2,
+            "failed temporary publication must be removed; only preferences and lock remain"
+        );
+        update_preferences(&path, |preferences| {
+            preferences.dll_overrides.remove("7");
+            Ok(())
+        })
+        .unwrap();
+        assert!(read_preferences(&path).unwrap().dll_overrides.is_empty());
+    }
+
+    #[test]
+    fn dll_preferences_persist_independently_and_preserve_other_selections() {
+        if std::env::var_os("LUDOMERE_DLL_PREFERENCES_FIXTURE").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "compatibility::proton::tests::dll_preferences_persist_independently_and_preserve_other_selections", "--nocapture"])
+                .env("LUDOMERE_DLL_PREFERENCES_FIXTURE", "1");
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+            ] {
+                let path = root.path().join(key);
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                command.env(key, path);
+            }
+            assert!(command.status().unwrap().success());
+            return;
+        }
+        let path = crate::identity::config_root().join("proton.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Existing user file, predating DLL rows. No game, prefix or executable exists.
+        fs::write(
+            &path,
+            br#"{"default":"/inert/Proton","overrides":{"8":"/inert/Other"}}"#,
+        )
+        .unwrap();
+        assert!(game_dll_overrides(7).unwrap().is_empty());
+        set_game_dll_overrides(
+            7,
+            BTreeMap::from([("DINPUT8.DLL".into(), super::super::DllLoadOrder::Disabled)]),
+        )
+        .unwrap();
+        set_game_dll_overrides(
+            8,
+            BTreeMap::from([("dxgi".into(), super::super::DllLoadOrder::Native)]),
+        )
+        .unwrap();
+        assert_eq!(
+            game_dll_overrides(7).unwrap()["dinput8"],
+            super::super::DllLoadOrder::Disabled
+        );
+        assert_eq!(
+            proton_preferences().unwrap().default,
+            Some(PathBuf::from("/inert/Proton"))
+        );
+        assert_eq!(
+            proton_preferences().unwrap().overrides["8"],
+            PathBuf::from("/inert/Other")
+        );
+        // A separate Proton setting update reads the latest DLL maps under the same lock.
+        update_preferences(&path, |saved| {
+            saved
+                .overrides
+                .insert("9".into(), PathBuf::from("/inert/Third"));
+            Ok(())
+        })
+        .unwrap();
+        set_game_dll_overrides(7, BTreeMap::new()).unwrap();
+        assert!(game_dll_overrides(7).unwrap().is_empty());
+        assert_eq!(
+            game_dll_overrides(8).unwrap()["dxgi"],
+            super::super::DllLoadOrder::Native
+        );
+        assert_eq!(
+            proton_preferences().unwrap().overrides["9"],
+            PathBuf::from("/inert/Third")
+        );
+        let before = fs::read(&path).unwrap();
+        assert!(
+            set_game_dll_overrides(
+                7,
+                BTreeMap::from([("bad;name".into(), super::super::DllLoadOrder::Native)])
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let reservation = crate::profile_reset::reserve_for_sign_out().unwrap();
+        assert!(set_game_dll_overrides(7, BTreeMap::new()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(reservation);
+        fs::write(
+            &path,
+            br#"{"dll_overrides":{"7":{"foo.dll.dll":"builtin"}}}"#,
+        )
+        .unwrap();
+        assert!(game_dll_overrides(7).is_err());
+        fs::write(&path, br#"{"dll_overrides":{"7":{"foo":"unknown-mode"}}}"#).unwrap();
+        assert!(game_dll_overrides(7).is_err());
+    }
 
     fn fixture(root: &Path, name: &str) -> PathBuf {
         let path = root.join(name);

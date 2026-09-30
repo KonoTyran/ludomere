@@ -234,7 +234,8 @@ struct FormattedImage {
 }
 
 static LIBRARY_SESSION: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-static ACCOUNT_SESSION: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+static ACCOUNT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ACCOUNT_COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static COVER_PRIORITY: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 static FAILED_IMAGES: std::sync::Mutex<ImageRetryState> = std::sync::Mutex::new(ImageRetryState {
     session: 0,
@@ -285,28 +286,26 @@ pub fn begin_library_session() -> u64 {
 }
 
 pub fn invalidate_library_session() {
-    let mut account = ACCOUNT_SESSION
+    let _account = ACCOUNT_COMMIT
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    *account = account.wrapping_add(1);
+    ACCOUNT_SESSION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     begin_library_session();
 }
 
 pub fn account_session() -> u64 {
-    *ACCOUNT_SESSION
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+    ACCOUNT_SESSION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub(crate) fn with_account_session<T>(
     session: u64,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let current = ACCOUNT_SESSION
+    let _current = ACCOUNT_COMMIT
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     anyhow::ensure!(
-        *current == session,
+        account_session() == session,
         "The signed-in account changed; choose the download again"
     );
     operation()
@@ -1223,11 +1222,11 @@ pub fn fetch_product_section(
             result.galaxy_builds = builds;
         }
     }
-    let account = ACCOUNT_SESSION
+    let _account = ACCOUNT_COMMIT
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     anyhow::ensure!(
-        *account == session,
+        account_session() == session,
         "Account changed while metadata was loading; retry for the current account"
     );
     for (id, artifacts) in manifests {
@@ -2453,6 +2452,43 @@ pub(crate) fn normalize_asset_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_generation_reads_do_not_wait_for_commit_but_invalidation_does() {
+        let session = account_session();
+        let (entered, held) = std::sync::mpsc::channel();
+        let (release, ready) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            with_account_session(session, || {
+                entered.send(()).unwrap();
+                ready.recv().unwrap();
+                Ok(())
+            })
+            .unwrap()
+        });
+        held.recv().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(account_session(), session);
+        crate::installation::request_sign_out_pause();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let (done, invalidated) = std::sync::mpsc::channel();
+        let invalidator = std::thread::spawn(move || {
+            invalidate_library_session();
+            done.send(()).unwrap();
+        });
+        assert!(invalidated.recv_timeout(Duration::from_millis(20)).is_err());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        invalidated.recv_timeout(Duration::from_secs(1)).unwrap();
+        invalidator.join().unwrap();
+        assert!(
+            with_account_session(session, || -> Result<()> {
+                panic!("obsolete commit must not run")
+            })
+            .is_err()
+        );
+        crate::installation::finish_sign_out_pause();
+    }
 
     #[test]
     fn screenshot_cache_repairs_corruption_deduplicates_and_hides_sensitive_urls() {

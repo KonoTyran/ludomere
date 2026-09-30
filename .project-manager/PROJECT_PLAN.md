@@ -1,5 +1,150 @@
 # Project plan
 
+## P157 — Commit and push state, logout, DLL and Depot corrections
+
+- User explicitly authorizes publication of current R53–R58 work. In_progress; acquisition owns
+  inventory/message/staging/commit/push, security independently reviews scope and claims. Root
+  owns records only. Include existing source/tests/README/records; exclude artifacts/private logs.
+- Acceptance: comprehensive useful message, exact reviewed inventory, diff checks, successful
+  normal push to LegendaryLinux/ludomere main and matching remote/local refs. Prior verification
+  remains applicable; no unnecessary test/build rerun. No force, upstream write or product edits.
+- Authorize necessary local Git and authenticated fork network operations without printing secrets;
+  stop on divergence, unexpected content or new permissions. Return paths/message/review and refs.
+- Content review complete: exact35 source/README/record paths and comprehensive message cleared
+  by manager and independent /tmp/ludomere-p157-review.md. Staged diff checks pass; fresh fork main
+  matches local0078c84. Commit and normal same-fork HTTPS push authorized. No code or test rerun;
+  final publication result is verified through local/remote refs and reported in the handoff.
+
+## P155–P156 — Multiple-container Depot preparation
+
+- R58/R49; complete for scoped local assurance. P155 acquisition owns dependency/manifest diagnosis, minimal correction,
+  focused regressions and necessary README. P156 security independently reviews integrity and
+  regression evidence. Root records only; preserve P146–P154 uncommitted work.
+- Suspected boundary: combined_manifest offsets internal container indices, then canonical_json
+  serializes through a single-container wire format. Establish actual call chain and reproduce.
+- Acceptance: valid multi-container game/dependency combination prepares without losing container
+  references or weakening path/hash/size validation; invalid references still fail; meaningful
+  before/after regression plus focused tests/fmt/Clippy/debug and independent review.
+- Authorize repository/public primary metadata reads, scoped source/test edits and private HOME/
+  allXDG/bus inert fixtures. No credentials/real profile or new private logs, user deletion, actual
+  helpers/games, dependency patches, schema/package/commit/push or full suite. Escalate broader
+  behavior/trust changes. Reports include cause, paths, evidence, limits and outstanding findings.
+- Accepted approach: explicit versioned internal snapshot in existing manifest JSON field, strict
+  network/wire parser unchanged; typed combined validation reuses existing path/hash/chunk rules
+  plus full reference size/bounds checks. Installed snapshot/current-manifest readback understands
+  internal format and existing wire snapshots. Multi-container identities bind indices; preserve
+  existing valid single-container fingerprints. No database schema or dependency changes.
+- Known pre-P136 multi-depot markers may have the earlier unbound fingerprint despite the current
+  snapshot serializer regression. Permit exact legacy identity comparison only when reconstructing
+  an existing marker from original strict wire current_sources; never new typed snapshots/targets.
+  Preserve depot/build provenance and cover tampered-source refusal. Preparation also checks final
+  snapshot size before payload work to prevent a late persistence-size failure.
+- Manager reviewed source, /tmp/ludomere-p155-report.md and independent -p156-review.md PASS,
+  owner15 focused passes and reviewer3 repeated targeted passes, fmt/all-target Clippy/debug/diff
+  evidence. Preparation, installed cache and journal/Resume preserve multiple containers; malformed
+  data still fails. Debug09:20:17UTC. No full suite, actual game/helper, package or publication;
+  fresh Witcher installation remains user acceptance. No unresolved scoped finding.
+
+## P152–P153 — Persistent controller detection failure
+
+- R57 reopened. P152 compatibility owns source/runtime differential diagnosis and a concrete
+  evidence-based correction proposal; P153 security independently reviews diagnosis and any probes.
+  In_progress. Root records only; preserve all prior uncommitted changes.
+- Authorize repository/public primary/runtime-source reads and inert private diagnostic preparation.
+  No speculative controller defaults, dependency edits, user-prefix mutation, real games, raw input,
+  host permission changes, package or commit. User-private diagnostic access pending scoped answer.
+- Acceptance: establish whether the previous XInput correction applied, selected runner and device
+  visibility differences, separate proven findings from hypotheses, then fix demonstrated own-code
+  defects with focused regression/review. No hardware success assertion without actual evidence.
+- Workers return safe reports with sources, paths, tests, findings, limits and needed next checks.
+  Escalate new private access/execution or policy choices before proceeding. Relevant tests only.
+- User approved exactly the offered read-only diagnostics (launch logs/settings/XInput prefix
+  entries/controller metadata), excluding credentials/saves/raw input. Latest cargo run retained
+  unchanged overrides. P152 owns reads; P153 coordinates independent review, no duplicate broad scans.
+- P154 acquisition reactivated for the DLL composer's wildcard-versus-bare lookup proposal,
+  src/compatibility/dll_overrides.rs, focused tests and coordinated README only. P153 found Wine's
+  environment precedence applies per lookup key, so native wildcard registry entries may outrank
+  bare environment defaults. Exact runtime source verification/proposal precedes any edits.
+  Preserve inherited/per-game priority, conditional receipt policy and unrelated uncommitted work.
+- Exact GE11-7 Wine46b29104 confirms the conditional gap. P154 authorized paired bare/wildcard
+  composition for chosen DLLs, conservative managed-only exclusion for explicit upstream native
+  XInput configuration, focused source-backed lookup regressions and precise README guidance.
+  P153 independently reviews. No runtime probe needed before this evidenced correction; actual
+  loaded module/controller outcome remains user acceptance. Relevant tests/fmt/Clippy/debug only.
+- P152 diagnosis and P154 correction complete for scoped local assurance; manager reviewed
+  /tmp/ludomere-p152-report.md, -p152-composer-report.md, exact source and final logs. P153 review
+  finds no scoped blocker. Five focused tests/fmt/all-target Clippy/debug/diff pass. No UI changes,
+  full suite, dependency code changes, package/commit or user-profile mutation. R57 actual hardware
+  acceptance remains open: retry BIT.TRIP automatically, Witcher requires explicit Builtin rows.
+
+## P149–P151 — DLL overrides and controller compatibility
+
+- Complete for scoped local assurance. P149 acquisition owns DLL persistence/editor/launch integration for R56;
+  user chose per-game only. P150 compatibility investigates R57
+  own UMU/Proton command environment and public primary Lutris/runtime evidence, proposing and
+  implementing only confirmed necessary fixes. Agree ownership before edits to shared compatibility
+  paths. P151 security independently reviews and exercises affected controls after implementation.
+- Acceptance: editable/persistent validated DLL modes with deterministic composition, actionable
+  errors and native independence; source-supported controller diagnosis, correction with relevant
+  regression evidence, no unproven hardware success claim. No schema bump absent necessity.
+- Root records only. Authorize source/public-primary read-only research and scoped changes/tests,
+  private HOME/allXDG/bus/inert fixtures, final fmt/Clippy/debug. No full suite, real user profile or
+  game/helper execution, raw input capture, credentials, system changes, package/publication.
+  Relevant device metadata-only diagnostics may be proposed when needed; no blanket host scans.
+  Escalate ambiguous semantics, new access/execution or unconfirmed broad work. Reports must list
+  paths, evidence, limitations and findings; preserve all P146–P148 uncommitted changes.
+- P149 design accepted: existing atomic proton.json gains default-empty per-game DLL maps, five
+  typed modes with name validation, worker-backed Game Settings/Compatibility rows. Foreground
+  Windows launch only; managed defaults then inherited/command then explicit per-game choices.
+  Owner paths compatibility DLL module/proton/mod, launcher, UI DLL editor/game_settings/mod and
+  coordinated README. P150 owns dependency_setup plus bounded receipt helper/tests and supplies
+  provenance defaults; no shared launcher edits without P149 coordination.
+- P150 correction accepted after primary evidence: remove blanket native xinput from DirectX
+  recipe; only a validated successful old-method receipt bound to current prefix identity adds
+  launch-local builtin defaults for its four affected XInput DLLs. Preserve inherited/per-game
+  intent, no registry or DLL mutation. Missing/malformed/recreated-prefix evidence does not trigger.
+  User hardware cause remains unverified. P149 owns final proportionate checks after source freeze.
+- Manager reviewed P149/P150 reports and independent P151 scoped PASS, source, final logs and
+  representative actual editor screenshot. DLL4/preference7/GTK1/uninstall1/receipt1 focused checks
+  pass (overlapping filters distinguished); final fmt/all-target Clippy/debug/diff pass. GUI tests
+  cover five modes, validation, cancel, save/load failure retries, removal/reopen and delayed save
+  after close. Repeated-suffix and oversized-publication findings closed; previous preferences
+  preserved on failure. Private fixtures stopped. No full suite/package/commit/push; user hardware
+  verification and broader original gates remain outstanding, no global Prototype ready claim.
+
+## P146–P148 — Immediate state, sidebar colors and recoverable logout
+
+- R53/R54: P146 compatibility owns detail/action refresh, sidebar styles and relevant UI tests/docs.
+  R55: P147 acquisition owns auth/download/install/reset lifecycle backend and coordinated sign-out
+  UI region in window.rs. Agree file regions/APIs before edits; root records only. P148 security
+  independently reviews lifecycle/privacy plus physically exercises affected controls.
+- Complete for scoped local assurance. Starting source0078c84 was clean and pushed. No unrelated refactor/schema/
+  dependency/package/publication. Scoped source tests/docs and private HOME/allXDG/bus/local HTTP/
+  inert-process/GTK fixtures allowed; no real profile, tokens, game/helper execution or user deletion.
+- Acceptance: visible detail action settles immediately after file completion without navigation;
+  sidebar follows green running/blue downloading/white installed/grey otherwise; sign-out remains usable across
+  failed and active operations, no stale-account callbacks/credential resurrection, recoverable
+  interruption with honest partial/error handling and no blocking GTK work. Reset/running-game
+  choices are settled below. Proportionate tests/fmt/Clippy/
+  debug and independent review; no full suite solely for this change. Escalate material new scope.
+- Interview settled: full reset discards resume records/settings but retains files; running games
+  stay running. P147 minimal auth-generation/logout marker, install pause/drain/resume, account
+  callback guards, separate game/cloud activity and conditional reset shutdown approved as R55
+  necessities. Reset errors leave signed-out UI with existing-button retry; no new screen/schema.
+- After UI freeze, P146 also owns narrowly scoped cloud_saves/{mod,api,sync}.rs captured-session
+  cancellation guards/tests necessary to keep running games from uploading after sign-out. Agree
+  sync_for_session API with P147 launcher owner; no broader cloud feature/refactor. P148 reviews.
+- Confirmed final R55 contention correction adds sections.rs and online.rs to P147: preserve the
+  sign-out detail page lifetime, move backend invalidation to its worker, and make generation reads
+  nonblocking while retaining the existing serialized persistence barrier. No broad session redesign.
+  Exact journal pause failures must surface, and durable logout prevents replay until normalization.
+- Manager reviewed final P146/P147 reports and independent P148 scoped PASS, source/diff checks,
+  focused tests, actual private GUI evidence and source reconciliation. Final fmt/all-target Clippy
+  with warnings denied/debug pass; no full suite/package/publication. Same-page actions, all four
+  colors, held-barrier logout, post-logout Stop-to-Play, reset/retry/fresh launch and file preservation
+  pass. Private fixture processes stopped. Real-service/runtime acceptance remains user-assisted;
+  no global Prototype ready declaration. New changes remain uncommitted for cargo run testing.
+
 ## P145 — Commit and push verified installation improvements
 
 - User authorizes current changes committed and pushed. In_progress; compatibility owns exact

@@ -107,14 +107,23 @@ reuploaded unless you modify them, explicitly Force upload, or reset the profile
 Cloud recovery copies are preserved by full profile reset, while account-scoped synchronization
 and deletion tracking are reset; preserved local saves can upload again afterward.
 
-The one-time setup guide opens with your existing folder and Proton preferences. Both folder fields
+The one-time setup wizard welcomes you, then shows one step at a time: game folder, download folder,
+Proton choice, and Windows runtime readiness. Back retains your drafts; Next checks the relevant
+choice before advancing. Skip for now keeps existing folder defaults and leaves Finish setup
+available; completed profiles are not automatically taken through setup again. Both folder fields
 have a directory picker and remain editable. Changing the game folder suggests its `downloads`
 subfolder; editing the download folder independently never changes the game folder. Proton choices
-show their full paths, including a selectable wrapping path below the version selector. Check Windows
-requirements, then save the settings before optional GOG sign-in opens in its own modal. Close the
+show their full paths, including a selectable wrapping path below the version selector. Choosing a
+version saves it automatically; Custom Proton Directory reveals the folder picker. Proton downloads
+are offered when no valid existing versions are detected. The next step automatically checks the
+selected Proton's Steam Linux Runtime and enables its download only when missing. Save the settings
+before optional GOG sign-in opens in its own modal. Close the
 sign-in modal to skip; already signed-in users do not need to sign in again. Failed saves keep your
-edits in the setup form for retry. You can defer Windows
-setup or close the guide; Finish setup remains available without repeatedly opening the guide.
+edits in the wizard for retry. Skip or close the wizard to finish later without saving folder drafts;
+Finish setup remains available without repeatedly opening it.
+Explicit Proton selection and component-download actions save independently;
+skipping does not undo those choices or completed downloads. Navigation waits for active component
+work, while closing or skipping cancels it. Folder defaults are committed only by the final Save.
 Ready Windows actions use saved defaults and per-game overrides after a background check. Missing
 components show an actionable status; downloads still require an explicit choice in setup.
 

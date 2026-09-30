@@ -1,5 +1,54 @@
 # Project specification
 
+## Publish onboarding wizard — 2026-09-30
+
+User: "Commit and push, then update the PR to reflect the new additions." Publish the current
+R60/R61 wizard and refinements to the fork and update existing upstream-main PR6, retaining its
+feature/fix coverage concisely. No new implementation, tests, builds or package requested.
+
+## Simplify welcome wizard controls — 2026-09-30
+
+Follow-up: "The custom proton directory should not be selected by default. It should be placed at
+the bottom of the list." Preserve saved selection; otherwise prefer detected versions, keeping
+Custom an explicit final option. User explicitly requests no tests for this correction.
+
+User requests these corrections to R60:
+- R61 Step 2 description: "Choose the directory where your games will be installed."
+- Step 4 title: "Select Proton Version". Description (user's subsequent text-only correction): "Select the version of Proton you wish to
+  use by default below. This version will be used to launch all Windows games. You may
+  override this choice on a per-game basis later." Apply user selection changes automatically;
+  remove the Apply button. Add "Custom Proton Directory" to the selector and show a directory
+  chooser button only for that option. Remove the Windows-later checkbox. Show acquisition only
+  when no existing Proton versions are detected, titled "Download Proton", description:
+  "No Proton versions have been detected on your system. You may browse for and download Proton
+  runtimes here."
+- Step 5 title: "Verify Steam Linux Runtime". Description: "Proton also needs a Steam Linux
+  Runtime. If it has not been detected on your system, click the button below to download it."
+  Automatically check on entry; disable download when found and show "Steam Linux Runtime found!
+  You're all set!" Otherwise enable download and show "Click the button below to download the
+  missing runtime." Remove Check Windows requirements, Windows-later checkbox and their existing
+  explanatory text. Keep explicit downloads and Skip for now.
+- Clarifying only Skip on Steps 4/5: save folders/defer Windows/continue to sign-in versus existing
+  close-without-folder-save behavior. Independent copy/selection/readiness work may proceed.
+  Preserve prior uncommitted wizard work; no package/publication/schema/dependency change requested.
+- Optional Skip question remains unanswered; manager explicitly states preserving the already
+  accepted close/discard-folder-drafts/Finish-later behavior meanwhile. This is continuity of prior
+  behavior, not acceptance of the proposed new save-and-continue option. A later answer may steer it.
+
+## Guided first-launch onboarding — 2026-09-30
+
+User: "Update the initial launch setup modal which configures defaults and then prompts for GOG
+login to an onboarding wizard. Greet the user, say welcome, and guide them through each individual
+step of the initial setup process."
+- R60: Replace the all-in-one initial setup form with a welcoming sequential wizard, individual
+  existing setup steps, clear progress and Back/Next navigation. Retain folder pickers/one-way
+  download suggestion, readable Proton paths, explicit component acquisition, prefilled settings,
+  validation/durable save and optional GOG sign-in only after defaults are completed.
+  Previously agreed Windows deferral remains, as confirmed below. No new components,
+  account access, forced re-onboarding, schema, packaging or publication requested.
+- User confirms: "Yes—keep Skip and Finish setup later (Recommended)."
+  `{"user_answers":{"windows_setup_deferral":"keep_skip_and_finish_setup_later"}}`
+
 ## Publish prefix cleanup and condense upstream PR — 2026-09-30
 
 User: "Commit and push, then update the PR with all the new features and fixes. The PR text is also

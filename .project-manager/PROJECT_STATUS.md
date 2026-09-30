@@ -2,6 +2,130 @@
 
 Last meaningful update: 2026-09-30.
 
+## Current publication
+
+- P170/P171 in progress: user requests commit, push and PR6 update for R60/R61. Six modified paths
+  reviewed; acquisition owns git publication, security owns concise PR additions, root owns records.
+  No new checks requested or run; latest selector correction remains source-reviewed only. Earlier
+  focused wizard checks remain historical evidence. Publication outcome will be verified remotely.
+- Manager approved the six-path inventory and comprehensive commit message, with origin main and
+  PR6 head verified at 8c2f275 before publication. Records/source frozen for commit. Final publication
+  evidence will be in /tmp/ludomere-p170-report.md and /tmp/ludomere-p171-report.md and the user
+  handoff; this snapshot deliberately records authorization before remote operations occur.
+
+## Current wizard simplification
+
+- P168/P169 follow-up complete after source-only review: Custom is last and never the default.
+  Saved choices are retained; otherwise suggest the first detected version or an empty-state prompt.
+  Next confirms an unsaved detected suggestion off GTK. Manager inspected the incremental source
+  diff and owner/independent reports: /tmp/ludomere-p168-report.md, /tmp/ludomere-p169-review.md.
+  No open material source finding. No tests, GUI, builds or lint run, as requested; earlier R61
+  execution evidence does not cover these new lines. No package or publication performed.
+
+- Subsequent user-requested text-only correction removes the second "by default" from Step4's
+  description. Compatibility changed only that product string; manager verified exact text.
+  No tests/builds/lint run, as explicitly requested. No behavior changes or new assurance needed.
+
+- Final disposition: R61/P166–P167 complete for scoped local assurance. Exact requested copy,
+  automatic wizard Proton saves, conditional Custom picker/empty-discovery downloads, automatic
+  selected-runtime readiness/status/action and removal of redundant controls delivered. Skip retains
+  existing close/discard-folder-drafts behavior; normal completion clears old deferral only after
+  readiness/save. Manager reviewed owner/independent reports, screenshots, logs and identical final
+  setup/proton source hashes. Four focused tests/fmt/Clippy/debug/diff pass, independent scoped PASS.
+  Physical auto-save/failure restoration/custom/empty/busy/cancel/readiness/retry/save/login/restart
+  pass; no unresolved material finding. Private fixtures stopped. No real payload/auth/helper/game
+  execution, full suite/package/commit/push or global Prototype ready claim. Debug21:19:03UTC.
+  Reports: /tmp/ludomere-p166-report.md and /tmp/ludomere-p167-review.md.
+
+- Final empty-list GUI found sole Custom option displayed without its chooser, blocking manual
+  selection when discovery is empty. Owner correction/independent recheck required. Root also
+  requested removal of the remaining old optional-login paragraph per exact Step5 text request;
+  actual saved-before-login behavior remains. Other tested selection/runtime transitions pass.
+
+- Independent physical auto-save/custom Cancel-invalid-valid/save-failure restoration and runtime
+  missing/found/error/Retry pass. Normal Finish changes seeded deferred=true to false and durably
+  saves before inert optional login. Manager reviewed Step2/Step4 and runtime-found screenshots.
+  Final empty-discovery/acquisition exclusion and retained-transfer-error review remain pending.
+
+- Root identified new conditional-group concurrency risk: a custom save during acquisition could
+  hide active progress/Cancel and a later download could replace that choice. Owner must serialize
+  wizard selection/acquisition controls and keep active acquisition visible until settlement;
+  reviewer covers synthetic interaction. No real downloader/backend policy expansion.
+
+- Combined candidate passes all-target compilation. Auto-save errors restore saved selection while
+  retaining the error; runtime message is above its action and only successful transfers trigger
+  automatic recheck, preserving failed/cancelled download detail. Normal completion validates
+  readiness/clears deferral; Skip retains prior behavior. Focused checks and independent UI pending.
+
+- Draft auto-save review identified failed persistence leaving the requested row displayed while
+  Next could use the older saved default. Owner must restore a truthful saved selection or block
+  advancement until resolved, retaining readable error. Independent private write-failure recheck
+  required. Population suppression and serialized user saves are source-reviewed positively.
+
+- Optional Skip answer has not arrived; publicly retaining its existing close/discard-folder-drafts
+  behavior allows work to finish without inferring approval for new save-and-continue semantics.
+  Ordinary Finish must validate Windows readiness and clear prior deferral after checkbox removal.
+  Automatic runtime checks use read-only saved selection rather than mutating select_proton.
+
+- Minimal shared-control contract accepted. Discovery/reload must not trigger auto-save; custom
+  sentinel saves only a valid chosen folder. Runtime readiness checks selected Proton off GTK on
+  entry/reentry/after transfer, with generation guards. Preserve ordinary Settings and existing
+  per-game repair context. Independent inert fixtures cover distinct runtime variants; Skip answer
+  remains pending while controls proceed.
+
+- R61 requested exact simpler copy, automatic Proton selection/custom-directory option, hidden
+  downloads when installations exist, and automatic Steam-runtime readiness with conditional
+  download action. P166 compatibility implementation/P167 security independent review. Clarify
+  Skip semantics after removing checkboxes; independent work proceeds. Preserve uncommitted R60,
+  use focused tests only, no real account/components/package or publication.
+
+## Current onboarding wizard
+
+- Final disposition: R60/P164–P165 complete for scoped local assurance. Five-step welcome wizard
+  preserves existing defaults and explicit acquisition, Skip/Finish setup later, draft validation
+  and separate optional login after successful save. Manager reviewed source, both reports,
+  actual screenshots and exact-final logs; two focused tests/fmt/Clippy/debug/diff pass.
+  Independent physical navigation/picker/draft/selection/busy-cancel/Skip/readiness/defer/save-error/
+  retry/restart checks pass, with no unresolved material finding. Final source delta reconciled;
+  private app/bus stopped and display lock absent. Debug20:29:43UTC ready for cargo run.
+  Login uses an inert boundary to verify ordering; actual auth/acquisition and all host portal
+  variants remain untested. No full suite/package/commit/push or global Prototype ready claim.
+  Reports: /tmp/ludomere-p164-report.md and /tmp/ludomere-p165-review.md.
+
+- Physical folder pickers, Back/Next draft retention, independent download override, full Proton
+  path/Apply and busy lookup Cancel/Skip pass. Skip discards folder drafts, retains explicit Proton
+  choice, cancels lookup and leaves Finish setup usable. Narrow visibility fix source-reviewed;
+  exact final fmt/Clippy/debug/diff pass. Final save-failure/order/restart checks remain pending.
+
+- Final source review found Skip could newly hide an already-visible Finish setup action for a
+  completed profile with missing components. Owner is preserving existing visibility on Close;
+  independent reviewer will check the narrow correction. No broader readiness redesign.
+
+- Manager inspected actual Welcome/Game-folder screenshots and passing relative-path refusal.
+  Two focused folder-validation tests, fmt/all-target Clippy/debug pass at checkpoint; no full
+  suite. Independent picker/draft/deferral/cancellation/save-order review remains in progress.
+
+- Compile-safe wizard checkpoint passes all-target check. Final save freezes page controls and
+  restores them on failure; direct Proton busy state covers discovery/Apply/folder picking. Private
+  changed-control GUI review begins; focused regressions, README and final checks remain pending.
+
+- Five-step design accepted; implementation and independent control review underway. Back retains
+  folder drafts; existing explicit Proton actions persist immediately and are labelled accordingly.
+  Busy/cancel lifecycle must prevent hidden acquisition after Skip/Close. Final GOG ordering uses
+  an inert private review boundary; no actual credentials, component downloads or helper execution.
+
+- Interview settled: keep Skip and Finish setup later. Sequential scope is Welcome, game folder,
+  download folder, Proton choice, runtime readiness and save before optional GOG sign-in. Existing
+  completed profiles retain their completion state; wizard presentation does not reset preferences.
+
+- R60 user requests a welcome and individual guided setup steps. P164 compatibility implementation,
+  P165 security independent control/lifecycle review. Initial inventory shows one PreferencesPage
+  with folders, Proton/acquisition and requirements, followed by saved-settings optional login.
+  Preserve existing contracts and only restructure this requested flow; Windows deferral remains
+  confirmed. No real profile/service/component operation.
+- Prior P161–P163 completed:8c2f275 pushed to fork main; PR6 exact body readback matched reviewed
+  text,2391→1802 words with full coverage; current branch clean before R60 records.
+
 ## Current commit and PR update
 
 - P161 content checkpoint cleared by manager/P163: exact9 intended paths, unchanged verified

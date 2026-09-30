@@ -1,5 +1,85 @@
 # Project plan
 
+## P170–P171 — Publish onboarding wizard and update PR
+
+- In progress; user-authorized R60/R61 publication. P170 acquisition reviews and commits the six
+  changed paths, pushes normally to verified origin main, and verifies remote HEAD. P171 security
+  prepares a concise PR6 body retaining existing coverage, adds wizard/refinements, and publishes
+  after push verification and manager review. Root owns records and release decision.
+- No product edits, tests, builds, lint, package, force push or merge. Preserve prior work and
+  distinguish earlier validation from the latest untested source-only correction. Acceptance:
+  accurate commit, matching local/remote commit, clean tree, verified PR body/base/head.
+
+
+## P168–P169 — Default detected Proton rather than Custom
+
+- R61 follow-up; complete after source-only review. Compatibility owns minimal selector/Next glue; security independently
+  reviews source only. Keep saved choice else detected-first, Custom last/explicit including empty
+  discovery; preselected visible choice must be accepted by Next without change-away/back. Preserve
+  read-only discovery and all prior work. Root records only. User explicitly forbids tests; no tests,
+  GUI fixtures, build/lint/package/publication. Scoped source/diff inspection only; report limits.
+- Manager reviewed the two-file incremental diff and reports /tmp/ludomere-p168-report.md and
+  /tmp/ludomere-p169-review.md. Saved choice retained, detected version suggested without discovery
+  writes, empty prompt precedes Custom, and direct Next confirms the suggestion off GTK. No open
+  material source finding. This correction remains uncompiled and unexercised per user instruction.
+
+## P166–P167 — Simplified Proton/runtime wizard steps
+
+- R61; complete for scoped local assurance. P166 compatibility owns setup/proton presentation, necessary minimal shared
+  UI composition, scoped regressions/README. P167 security independently reviews changed controls
+  and async selection/save/readiness/consent boundaries. Root owns records only.
+- Acceptance: exact requested copy, automatic user-driven Proton persistence, conditional custom
+  picker/download group, runtime auto-check on entry with truthful loading/found/missing/error and
+  download enablement; remove redundant controls. Preserve defaults on failed/cancelled custom
+  choice, reject stale callbacks, prevent selection races, retain explicit acquisition and separate
+  optional login. Skip semantics pending user answer only; completed-profile behavior unchanged.
+- Authorize scoped source/docs/tests, private HOME/allXDG/bus/Xvfb inert fixtures, relevant tests,
+  fmt/Clippy/debug. No full suite, real profile/credentials/account/helper/game/network payloads,
+  schema/dependency/package/commit/push. Preserve all R60 work. No unrelated Settings redesign;
+  report essential shared changes and material ambiguities before changing policy. Return changed
+  paths, controls/evidence, test logs, risks/limits; reviewer never fixes product code.
+- Accepted minimal design: wizard-only auto-save mode on existing selector with guarded population,
+  serialized saves/custom sentinel and detection state; runtime controls expose check results on
+  entry/reentry/transfer completion. Ordinary Settings unchanged. Initial/default onboarding uses
+  exact requested default copy; existing per-game repair retains per-game persistence/context.
+  Unsupported/no-runtime-required states remain truthful; no external runtime/backend redesign.
+- Pending optional Skip answer does not block retaining its existing close/discard behavior, stated
+  to user. Removing deferral checkboxes must not leave an invisible prior deferred flag bypassing
+  completion readiness; successful normal Finish validates readiness and clears deferral.
+- Manager reviewed /tmp/ludomere-p166-report.md and independent -p167-review.md scoped PASS,
+  final source hashes, actual screenshots and logs. Four focused tests, fmt/all-target Clippy/debug/
+  diff pass; exact final UI matches physically tested source. Auto-save/custom/empty-discovery,
+  cross-group busy/Skip, selected-runtime readiness/error/cancel/retry, save/login/restart pass.
+  No unresolved material finding; private fixtures stopped. Real payload/auth/runtime execution
+  untested, no full suite/package/publication or global Prototype ready declaration.
+
+## P164–P165 — Welcoming sequential onboarding
+
+- R60; complete for scoped local assurance. P164 compatibility owns setup wizard presentation, minimal shared Proton UI
+  composition and README/tests. P165 security independently inventories/exercises changed controls
+  and reviews persistence/consent/lifecycle boundaries. Root owns records; no product edits.
+- Acceptance: Welcome, individual game-folder/download-folder/Proton/runtime steps and final
+  settings completion before optional GOG sign-in; Back retains drafts, Next validates relevant
+  input, step position is clear, explicit downloads and existing choices preserved. Close/failure/
+  retry/account change cannot commit incomplete defaults or open login unexpectedly. Existing
+  completed profiles do not automatically repeat onboarding; Finish setup remains usable.
+- Authorize scoped source/docs/tests and private HOME/allXDG/bus/inert GTK fixtures, focused
+  tests/fmt/Clippy/debug. No actual profile/credentials/account login/helper execution/network
+  payloads, schema/dependency/package/commit/push/full suite. Preserve prior behavior except the
+  requested presentation. Report design/API before edits that change persistence/acquisition;
+  escalate material product choices. Owner/reviewer reports contain paths/evidence/limits.
+- Accepted composition: five steps Welcome/Game folder/Download folder/Proton/Windows runtime,
+  then existing separate optional login after durable defaults save. Explicit Proton selection and
+  downloads retain immediate persistence with truthful copy; folder drafts save only on completion.
+  Minimal scoped acquisition busy/cancel handles protect navigation/Skip/Close, preserving Settings.
+  P165 uses private inert result boundaries for acquisition/login ordering, with limitations stated.
+- Manager reviewed source, /tmp/ludomere-p164-report.md and independent -p165-review.md PASS,
+  actual screenshots and logs. Two focused tests/fmt/all-target Clippy/debug/diff pass. Navigation,
+  pickers/drafts, explicit selection, busy Cancel/Skip, readiness/deferral, save failure/retry,
+  save-before-login and restart pass isolated controls. Final source delta reconciled, fixtures
+  stopped; no unresolved scoped finding. Real acquisition/auth and host portal variants untested;
+  no full suite, package or publication, and no global Prototype ready declaration.
+
 ## P161–P163 — Publish prefix cleanup and concise complete PR
 
 - In_progress. P161 acquisition inventories/stages/commits/pushes R59 to fork main; P162

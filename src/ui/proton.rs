@@ -13,7 +13,7 @@ pub(super) fn proton_page(window: &adw::ApplicationWindow) -> adw::PreferencesPa
     page.set_title("Proton");
     let (selection, refresh) = proton_selection_group(window, None);
     page.add(&selection);
-    page.add(&acquisition_group(None, refresh));
+    page.add(&acquisition_group(None, refresh, ComponentScope::All).group);
     page
 }
 
@@ -21,6 +21,25 @@ pub(super) fn proton_selection_group(
     window: &adw::ApplicationWindow,
     product_id: Option<i64>,
 ) -> (adw::PreferencesGroup, Rc<dyn Fn()>) {
+    let selection = proton_selection_group_guarded(window, product_id, None, None);
+    (selection.group, selection.refresh)
+}
+
+pub(super) struct ProtonSelection {
+    pub group: adw::PreferencesGroup,
+    pub refresh: Rc<dyn Fn()>,
+    pub busy: Rc<std::cell::Cell<bool>>,
+    pub detected: Rc<std::cell::Cell<Option<bool>>>,
+    pub selected_path: Rc<dyn Fn() -> anyhow::Result<Option<PathBuf>>>,
+}
+
+pub(super) fn proton_selection_group_guarded(
+    window: &adw::ApplicationWindow,
+    product_id: Option<i64>,
+    active: Option<Rc<dyn Fn() -> bool>>,
+    acquisition_busy: Option<Rc<std::cell::Cell<bool>>>,
+) -> ProtonSelection {
+    let automatic = active.is_some();
     let group = adw::PreferencesGroup::new();
     group.set_title(if product_id.is_some() {
         "Proton override"
@@ -70,9 +89,12 @@ pub(super) fn proton_selection_group(
         );
     });
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_widget_name("proton-selection-actions");
     buttons.set_margin_top(8);
     let apply = gtk::Button::with_label("Use selected version");
+    apply.set_visible(!automatic);
     let browse = gtk::Button::with_label("Choose folder…");
+    browse.set_visible(!automatic);
     let refresh = gtk::Button::with_label("Refresh");
     buttons.append(&apply);
     buttons.append(&browse);
@@ -84,6 +106,11 @@ pub(super) fn proton_selection_group(
     status.set_selectable(true);
     group.add(&status);
     let paths = Rc::new(RefCell::new(Vec::<Option<PathBuf>>::new()));
+    let busy = Rc::new(std::cell::Cell::new(false));
+    let detected = Rc::new(std::cell::Cell::new(None));
+    let custom_index = Rc::new(std::cell::Cell::new(gtk::INVALID_LIST_POSITION));
+    let saved_index = Rc::new(std::cell::Cell::new(gtk::INVALID_LIST_POSITION));
+    let save_error = Rc::new(RefCell::new(None::<String>));
     let reload: Rc<dyn Fn()> = Rc::new({
         let choices = choices.clone();
         let selected = selected.clone();
@@ -91,7 +118,19 @@ pub(super) fn proton_selection_group(
         let status = status.clone();
         let buttons = buttons.clone();
         let apply = apply.clone();
+        let busy = busy.clone();
+        let detected = detected.clone();
+        let custom_index = custom_index.clone();
+        let saved_index = saved_index.clone();
+        let active = active.clone();
+        let browse = browse.clone();
+        let save_error = save_error.clone();
         move || {
+            if active.as_ref().is_some_and(|active| !active()) {
+                return;
+            }
+            busy.set(true);
+            selected.set_sensitive(false);
             buttons.set_sensitive(false);
             status.set_label("Looking for installed Proton versions…");
             let (sender, receiver) = mpsc::channel();
@@ -121,9 +160,21 @@ pub(super) fn proton_selection_group(
             let status = status.clone();
             let buttons = buttons.clone();
             let apply = apply.clone();
+            let busy = busy.clone();
+            let detected = detected.clone();
+            let custom_index = custom_index.clone();
+            let saved_index = saved_index.clone();
+            let active = active.clone();
+            let browse = browse.clone();
+            let save_error = save_error.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                if active.as_ref().is_some_and(|active| !active()) {
+                    busy.set(false);
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(Ok((preferences, installations))) => {
+                        detected.set(Some(!installations.is_empty()));
                         let saved = product_id
                             .and_then(|id| preferences.overrides.get(&id.to_string()))
                             .or(preferences.default.as_ref());
@@ -150,16 +201,33 @@ pub(super) fn proton_selection_group(
                             ));
                             entries.push(Some(saved.clone()));
                         }
+                        if automatic && entries.is_empty() {
+                            entries.push(None);
+                            labels.push("Select a Proton version".into());
+                        }
                         let index = if product_id
                             .is_some_and(|id| !preferences.overrides.contains_key(&id.to_string()))
+                            && (!automatic || saved.is_some())
                         {
                             0
                         } else {
-                            entries
-                                .iter()
-                                .position(|path| path.as_ref() == saved)
+                            saved
+                                .and_then(|saved| {
+                                    entries.iter().position(|path| path.as_ref() == Some(saved))
+                                })
+                                .or_else(|| {
+                                    if automatic {
+                                        entries.iter().position(Option::is_some)
+                                    } else {
+                                        None
+                                    }
+                                })
                                 .unwrap_or(0)
                         };
+                        if automatic {
+                            custom_index.set(entries.len() as u32);
+                            labels.push("Custom Proton Directory".into());
+                        }
                         choices.splice(
                             0,
                             choices.n_items(),
@@ -167,112 +235,222 @@ pub(super) fn proton_selection_group(
                         );
                         *paths.borrow_mut() = entries;
                         apply.set_sensitive(!paths.borrow().is_empty());
+                        saved_index.set(index as u32);
                         selected.set_selected(index as u32);
-                        status.set_label(&preferences.default.map_or_else(
+                        browse.set_visible(!automatic || index as u32 == custom_index.get());
+                        status.set_label(&save_error.borrow_mut().take().unwrap_or_else(|| if automatic { String::new() } else { preferences.default.map_or_else(
                             || "No default saved. Choose a detected version, a folder, or download one below.".into(),
                             |path| format!("Application default: {}", path.display()),
-                        ));
+                        ) }));
                         buttons.set_sensitive(true);
+                        selected.set_sensitive(true);
+                        busy.set(false);
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {
+                        busy.set(false);
                         status.set_label(&format!("Could not read Proton preferences: {error}"));
                         buttons.set_sensitive(true);
+                        selected.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        busy.set(false);
                         status.set_label("Proton discovery stopped unexpectedly");
                         buttons.set_sensitive(true);
+                        selected.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                 }
             });
         }
     });
-    apply.connect_clicked({
+    let save: Rc<dyn Fn(Option<PathBuf>)> = Rc::new({
+        let busy = busy.clone();
         let status = status.clone();
         let buttons = buttons.clone();
+        let selected = selected.clone();
         let reload = reload.clone();
+        let active = active.clone();
+        let acquisition_busy = acquisition_busy.clone();
+        move |path| {
+            if busy.get()
+                || acquisition_busy.as_ref().is_some_and(|busy| busy.get())
+                || active.as_ref().is_some_and(|active| !active())
+            {
+                return;
+            }
+            busy.set(true);
+            status.set_label("Validating and saving Proton selection…");
+            buttons.set_sensitive(false);
+            selected.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = match product_id {
+                    Some(id) => compatibility::set_game_proton(id, path.as_deref()),
+                    None => compatibility::set_default_proton(
+                        path.as_deref().expect("global selection has a path"),
+                    ),
+                };
+                let _ = sender.send(result.map_err(|error| error.to_string()));
+            });
+            let busy = busy.clone();
+            let active = active.clone();
+            let reload = reload.clone();
+            let save_error = save_error.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if active.as_ref().is_some_and(|active| !active()) {
+                    busy.set(false);
+                    return glib::ControlFlow::Break;
+                }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err("Saving Proton selection stopped unexpectedly".into()),
+                };
+                *save_error.borrow_mut() = result.err();
+                reload();
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    apply.connect_clicked({
+        let paths = paths.clone();
+        let selected = selected.clone();
+        let save = save.clone();
         move |_| {
             let Some(path) = paths.borrow().get(selected.selected() as usize).cloned() else {
                 return;
             };
-            save_selection(product_id, path, &status, &buttons, reload.clone());
+            save(path);
         }
     });
+    if automatic {
+        selected.connect_selected_notify({
+            let paths = paths.clone();
+            let busy = busy.clone();
+            let browse = browse.clone();
+            let status = status.clone();
+            let active = active.clone();
+            let save = save.clone();
+            let acquisition_busy = acquisition_busy.clone();
+            let custom_index = custom_index.clone();
+            move |selected| {
+                if acquisition_busy.as_ref().is_some_and(|busy| busy.get()) {
+                    if selected.selected() != saved_index.get() { selected.set_selected(saved_index.get()); }
+                    return;
+                }
+                if busy.get() || active.as_ref().is_some_and(|active| !active()) { return; }
+                let custom = selected.selected() == custom_index.get();
+                browse.set_visible(custom);
+                if custom {
+                    status.set_label("Choose a Proton directory. Your saved selection stays unchanged until a valid folder is selected.");
+                } else if let Some(path) = paths.borrow().get(selected.selected() as usize).cloned() {
+                    if path.is_some() || product_id.is_some() { save(path); }
+                }
+            }
+        });
+    }
     browse.connect_clicked({
         let window = window.clone();
-        let reload = reload.clone();
+        let active = active.clone();
+        let busy = busy.clone();
+        let selected = selected.clone();
+        let save = save.clone();
+        let acquisition_busy = acquisition_busy.clone();
         move |_| {
+            if busy.get() || acquisition_busy.as_ref().is_some_and(|busy| busy.get()) {
+                return;
+            }
+            busy.set(true);
+            selected.set_sensitive(false);
+            buttons.set_sensitive(false);
             let chooser = gtk::FileDialog::builder()
                 .title("Choose a Proton installation folder")
                 .build();
-            let status = status.clone();
             let buttons = buttons.clone();
-            let reload = reload.clone();
+            let active = active.clone();
+            let busy = busy.clone();
+            let selected = selected.clone();
+            let save = save.clone();
             chooser.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
+                busy.set(false);
+                buttons.set_sensitive(true);
+                selected.set_sensitive(true);
+                if active.as_ref().is_some_and(|active| !active()) {
+                    return;
+                }
                 if let Ok(folder) = result
                     && let Some(path) = folder.path()
                 {
-                    save_selection(product_id, Some(path), &status, &buttons, reload);
+                    save(Some(path));
                 }
             });
         }
     });
     refresh.connect_clicked({
         let reload = reload.clone();
-        move |_| reload()
-    });
-    reload();
-    (group, reload)
-}
-
-fn save_selection(
-    product_id: Option<i64>,
-    path: Option<PathBuf>,
-    status: &gtk::Label,
-    buttons: &gtk::Box,
-    reload: Rc<dyn Fn()>,
-) {
-    status.set_label("Validating and saving Proton selection…");
-    buttons.set_sensitive(false);
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = match product_id {
-            Some(id) => compatibility::set_game_proton(id, path.as_deref()),
-            None => compatibility::set_default_proton(
-                path.as_deref().expect("global selection has a path"),
-            ),
-        };
-        sender.send(result.map_err(|error| error.to_string())).ok();
-    });
-    let status = status.clone();
-    let buttons = buttons.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        match receiver.try_recv() {
-            Ok(result) => {
-                buttons.set_sensitive(true);
-                match result {
-                    Ok(()) => reload(),
-                    Err(error) => status.set_label(&error),
-                }
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                status.set_label("Saving Proton selection stopped unexpectedly");
-                buttons.set_sensitive(true);
-                glib::ControlFlow::Break
+        move |_| {
+            if !acquisition_busy.as_ref().is_some_and(|busy| busy.get()) {
+                reload();
             }
         }
     });
+    reload();
+    let selected_path = Rc::new(move || {
+        let path = paths.borrow().get(selected.selected() as usize).cloned();
+        match path {
+            Some(Some(path)) => Ok(Some(path)),
+            Some(None) if product_id.is_some() => Ok(None),
+            _ => anyhow::bail!("Select a Proton version or choose a valid custom directory before continuing."),
+        }
+    });
+    ProtonSelection {
+        group,
+        refresh: reload,
+        busy,
+        detected,
+        selected_path,
+    }
+}
+
+pub(super) enum ComponentScope {
+    All,
+    Proton,
+    Runtime,
+}
+
+pub(super) struct ComponentGroup {
+    pub group: adw::PreferencesGroup,
+    pub busy: Rc<std::cell::Cell<bool>>,
+    pub cancelled: Arc<AtomicBool>,
+    pub runtime_button: gtk::Button,
+    pub status: gtk::Label,
+    pub succeeded: Rc<std::cell::Cell<bool>>,
 }
 
 pub(super) fn acquisition_group(
     product_id: Option<i64>,
     refresh: Rc<dyn Fn()>,
-) -> adw::PreferencesGroup {
+    scope: ComponentScope,
+) -> ComponentGroup {
+    acquisition_group_guarded(
+        product_id,
+        refresh,
+        scope,
+        Rc::new(std::cell::Cell::new(false)),
+        None,
+    )
+}
+
+pub(super) fn acquisition_group_guarded(
+    product_id: Option<i64>,
+    refresh: Rc<dyn Fn()>,
+    scope: ComponentScope,
+    busy: Rc<std::cell::Cell<bool>>,
+    blocked: Option<Rc<std::cell::Cell<bool>>>,
+) -> ComponentGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Download compatibility components");
     group.set_description(Some("Downloads start only when requested. Proton and the Steam Linux Runtime are stored separately from your games. External installations are never removed."));
@@ -280,12 +458,14 @@ pub(super) fn acquisition_group(
     family.set_title("Proton family");
     family.set_model(Some(&gtk::StringList::new(&["GE-Proton", "UMU-Proton"])));
     group.add(&family);
+    family.set_visible(!matches!(scope, ComponentScope::Runtime));
     let versions = gtk::StringList::new(&[]);
     let version = adw::ComboRow::new();
     version.set_title("Stable release");
     version.set_subtitle("Load releases to include current and older versions");
     version.set_model(Some(&versions));
     group.add(&version);
+    version.set_visible(!matches!(scope, ComponentScope::Runtime));
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     controls.set_margin_top(8);
     let catalog = gtk::Button::with_label("Load releases");
@@ -295,7 +475,12 @@ pub(super) fn acquisition_group(
     controls.append(&catalog);
     controls.append(&download);
     controls.append(&runtime);
-    group.add(&controls);
+    catalog.set_visible(!matches!(scope, ComponentScope::Runtime));
+    download.set_visible(!matches!(scope, ComponentScope::Runtime));
+    runtime.set_visible(!matches!(scope, ComponentScope::Proton));
+    if !matches!(scope, ComponentScope::Runtime) {
+        group.add(&controls);
+    }
     let progress = gtk::ProgressBar::new();
     progress.set_visible(false);
     group.add(&progress);
@@ -303,11 +488,23 @@ pub(super) fn acquisition_group(
     status.set_xalign(0.0);
     status.set_wrap(true);
     group.add(&status);
+    if matches!(scope, ComponentScope::Runtime) {
+        group.add(&controls);
+    }
     let cancel = gtk::Button::with_label("Cancel download");
     cancel.set_halign(gtk::Align::Start);
     cancel.set_visible(false);
     group.add(&cancel);
     let cancelled = Arc::new(AtomicBool::new(false));
+    let succeeded = Rc::new(std::cell::Cell::new(false));
+    let component = ComponentGroup {
+        group: group.clone(),
+        busy: busy.clone(),
+        cancelled: cancelled.clone(),
+        runtime_button: runtime.clone(),
+        status: status.clone(),
+        succeeded: succeeded.clone(),
+    };
     group.connect_unrealize({
         let cancelled = cancelled.clone();
         move |_| cancelled.store(true, Ordering::Release)
@@ -341,7 +538,13 @@ pub(super) fn acquisition_group(
         let cancelled = cancelled.clone();
         let cancel = cancel.clone();
         let version = version.clone();
+        let busy = busy.clone();
+        let blocked = blocked.clone();
         move |_| {
+            if busy.get() || blocked.as_ref().is_some_and(|busy| busy.get()) {
+                return;
+            }
+            busy.set(true);
             controls.set_sensitive(false);
             family.set_sensitive(false);
             status.set_label("Loading stable releases…");
@@ -368,9 +571,11 @@ pub(super) fn acquisition_group(
             let download = download.clone();
             let cancel = cancel.clone();
             let version = version.clone();
+            let busy = busy.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
                     Ok(result) => {
+                        busy.set(false);
                         match result {
                             Ok(found) => {
                                 versions.splice(
@@ -401,6 +606,7 @@ pub(super) fn acquisition_group(
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        busy.set(false);
                         status.set_label("Release lookup stopped unexpectedly");
                         controls.set_sensitive(true);
                         family.set_sensitive(true);
@@ -412,6 +618,11 @@ pub(super) fn acquisition_group(
         }
     });
     let transfer: Rc<dyn Fn(Option<acquisition::Release>)> = Rc::new(move |release| {
+        if busy.get() || blocked.as_ref().is_some_and(|busy| busy.get()) {
+            return;
+        }
+        succeeded.set(false);
+        busy.set(true);
         controls.set_sensitive(false);
         family.set_sensitive(false);
         cancelled.store(false, Ordering::Release);
@@ -453,6 +664,8 @@ pub(super) fn acquisition_group(
         let progress = progress.clone();
         let cancel = cancel.clone();
         let refresh = refresh.clone();
+        let busy = busy.clone();
+        let succeeded = succeeded.clone();
         glib::timeout_add_local(Duration::from_millis(100), move || {
             for update in progress_receiver.try_iter().take(32) {
                 let update: acquisition::DownloadProgress = update;
@@ -469,6 +682,8 @@ pub(super) fn acquisition_group(
             }
             match receiver.try_recv() {
                 Ok(result) => {
+                    busy.set(false);
+                    succeeded.set(result.is_ok());
                     if result.is_ok() {
                         refresh();
                     }
@@ -484,6 +699,7 @@ pub(super) fn acquisition_group(
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    busy.set(false);
                     status.set_label("Download worker stopped unexpectedly");
                     controls.set_sensitive(true);
                     family.set_sensitive(true);
@@ -503,7 +719,7 @@ pub(super) fn acquisition_group(
         }
     });
     runtime.connect_clicked(move |_| transfer(None));
-    group
+    component
 }
 
 pub(super) fn compatibility_message(error: &compatibility::CompatibilityFailure) -> String {
@@ -677,6 +893,131 @@ pub(super) fn patch_with_components(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, private D-Bus and Xvfb"]
+    fn wizard_selection_only_saves_user_choices_and_restores_failed_choices() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p166-")
+        );
+        let root = tempfile::tempdir().unwrap();
+        let discovered =
+            PathBuf::from(std::env::var("HOME").unwrap()).join(".steam/root/compatibilitytools.d");
+        let versions = [
+            discovered.join("GE-Proton-first"),
+            discovered.join("GE-Proton-second"),
+        ];
+        for path in &versions {
+            std::fs::create_dir_all(path.join("files/bin")).unwrap();
+            for name in ["proton", "files/bin/wine"] {
+                std::fs::write(path.join(name), "inert; never execute\n").unwrap();
+                std::fs::set_permissions(path.join(name), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            std::fs::write(path.join("toolmanifest.vdf"), "manifest {}").unwrap();
+        }
+        compatibility::set_default_proton(&versions[0]).unwrap();
+        compatibility::set_game_proton(123, Some(&versions[1])).unwrap();
+        let preferences = crate::identity::config_root().join("proton.json");
+        let original = std::fs::read(&preferences).unwrap();
+        let modified = std::fs::metadata(&preferences).unwrap().modified().unwrap();
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.legendarylinux.ludomere.WizardSelectionTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let active = Rc::new(std::cell::Cell::new(true));
+        let selection = proton_selection_group_guarded(
+            &window,
+            None,
+            Some(Rc::new({
+                let active = active.clone();
+                move || active.get()
+            })),
+            None,
+        );
+        window.set_content(Some(&selection.group));
+        window.present();
+        fn settle(busy: &std::cell::Cell<bool>) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while busy.get() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!busy.get());
+        }
+        fn row(widget: &gtk::Widget) -> Option<adw::ComboRow> {
+            if let Ok(row) = widget.clone().downcast() {
+                return Some(row);
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = row(&widget) {
+                    return Some(row);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        settle(&selection.busy);
+        assert_eq!(std::fs::read(&preferences).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&preferences).unwrap().modified().unwrap(),
+            modified
+        );
+        let row = row(selection.group.upcast_ref()).unwrap();
+        let choices = row.model().unwrap().downcast::<gtk::StringList>().unwrap();
+        let index = |path: &std::path::Path| {
+            (0..choices.n_items())
+                .find(|index| {
+                    choices
+                        .string(*index)
+                        .unwrap()
+                        .contains(path.to_str().unwrap())
+                })
+                .unwrap()
+        };
+        let first = index(&versions[0]);
+        let second = index(&versions[1]);
+        row.set_selected(choices.n_items() - 1);
+        assert!(!selection.busy.get());
+        assert_eq!(
+            compatibility::proton_preferences().unwrap().default,
+            Some(versions[0].clone())
+        );
+        row.set_selected(second);
+        assert!(selection.busy.get());
+        assert!(!row.is_sensitive());
+        row.set_selected(first); // a queued notification while saving cannot start another write
+        settle(&selection.busy);
+        assert_eq!(
+            compatibility::proton_preferences().unwrap().default,
+            Some(versions[1].clone())
+        );
+        assert_eq!(row.selected(), second);
+        std::fs::rename(&versions[0], root.path().join("removed")).unwrap();
+        row.set_selected(first);
+        settle(&selection.busy);
+        assert_eq!(
+            compatibility::proton_preferences().unwrap().default,
+            Some(versions[1].clone())
+        );
+        assert!(
+            row.selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .unwrap()
+                .string()
+                .contains("GE-Proton-second")
+        );
+        active.set(false);
+        row.set_selected(choices.n_items() - 1);
+        assert!(!selection.busy.get());
+        window.close();
+    }
 
     #[test]
     #[ignore = "requires private HOME/all XDG, private D-Bus, Xvfb and an inert LUDOMERE_UMU_RUN fixture"]

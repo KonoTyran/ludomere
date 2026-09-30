@@ -10,7 +10,6 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-pub const BUNDLED_VERSION: &str = "0.3.2";
 const GALAXY_CLIENT_ID: &str = "46899977096215655";
 
 #[path = "comet_update.rs"]
@@ -118,10 +117,38 @@ fn ensure_runtime() -> Result<Runtime> {
 }
 
 fn bundled_directory() -> PathBuf {
-    std::env::var_os("LUDOMERE_COMET_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| PathBuf::from("/usr/lib/ludomere/comet"))
+    helper_directory(
+        std::env::var_os("LUDOMERE_COMET_DIR").map(PathBuf::from),
+        PathBuf::from("/usr/lib/ludomere/comet"),
+        std::env::current_exe().ok(),
+        cfg!(debug_assertions),
+    )
+}
+
+fn helper_directory(
+    override_path: Option<PathBuf>,
+    packaged: PathBuf,
+    executable: Option<PathBuf>,
+    development: bool,
+) -> PathBuf {
+    if let Some(path) = override_path.filter(|path| path.is_absolute()) {
+        return path;
+    }
+    match fs::symlink_metadata(&packaged) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return packaged,
+    }
+    if development
+        && let Some(staged) = executable
+            .as_deref()
+            .and_then(|path| path.parent())
+            .and_then(|path| path.parent())
+            .map(|root| root.join("helpers/comet"))
+        && fs::symlink_metadata(&staged).is_ok()
+    {
+        return staged;
+    }
+    packaged
 }
 
 fn verify_build(root: &Path) -> Result<Build> {
@@ -256,6 +283,40 @@ fn install_dummy_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_helper_discovery_preserves_override_package_and_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let packaged = root.path().join("packaged");
+        let executable = root.path().join("target/debug/ludomere");
+        let staged = root.path().join("target/helpers/comet");
+        fs::create_dir_all(&staged).unwrap();
+        assert_eq!(
+            helper_directory(None, packaged.clone(), Some(executable.clone()), true),
+            staged
+        );
+        assert!(verify_build(&staged).is_err());
+        assert_eq!(
+            helper_directory(None, packaged.clone(), Some(executable.clone()), false),
+            packaged
+        );
+        let custom = root.path().join("custom");
+        assert_eq!(
+            helper_directory(
+                Some(custom.clone()),
+                packaged.clone(),
+                Some(executable.clone()),
+                true
+            ),
+            custom
+        );
+        fs::create_dir(&packaged).unwrap();
+        assert_eq!(
+            helper_directory(None, packaged.clone(), Some(executable), true),
+            packaged
+        );
+        assert!(verify_build(&packaged).is_err());
+    }
 
     #[test]
     fn comet_diagnostics_cannot_enter_the_game_log() {

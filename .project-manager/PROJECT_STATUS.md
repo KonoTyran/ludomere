@@ -2,6 +2,76 @@
 
 Last meaningful update: 2026-09-29.
 
+## Current R38 commit request
+
+- User authorized local commit of build/Comet fixes with a helpful message. P115 compatibility
+  prepares seven tracked source/doc/record files; security reviews. Generated binaries/packages,
+  preserved old staging and logs remain outside git. No push or further product change requested.
+- P115 complete: manager and independent reviewer verified seven-file staged inventory/message;
+  local commit succeeded with clean status, and these closure records are included in that commit.
+  No generated assets or private logs committed, no source/test changes since verified package,
+  no push. Final SHA is in the user handoff rather than self-referenced here.
+
+## Current package and Comet failure
+
+- Final disposition: R38/P112–P114 complete with no scoped QA/security finding. Captured intermittent
+  package check failure corrected by serial harness; Comet debug discovery/first-install bootstrap
+  corrected and generated stage repaired with official verified binaries. No Comet recompilation.
+  Manager reviewed all reports, finalchecklogs, source and actual no-override Settings screenshot.
+- Actual unmodified debug Settings reports installed/verified0.3.2. Independent audit verifies
+  current source archive and62-entry package, exact official helper hashes/licenses, no private
+  state/Proton/runtime/peer payloads. Artifact SHA256fe06b1ed6e933793c38b790ec91c0a3f70116cde579964ad3d936b80f7c57403;
+  source SHA2564ebc9da4ec05a84e2a2cc04447198a57bfecb70c392cf9cf9630928653271b47.
+  All scoped GUI processes stopped. Logs /tmp/ludomere-p112-build-final.log and independent
+  /tmp/ludomere-p114-review.md. No host installation or commit. Real-game/account/Comet execution
+  remains unverified; no Prototype ready declaration. Milestone history follows.
+- R38 user reports documented build failure and confusing/unusable Comet availability; exact build
+  output, Settings status and launch method requested. P112 compatibility build diagnosis, P113
+  acquisition Comet diagnosis, P114 security independent review. No source changes yet.
+- Current source lookup requires LUDOMERE_COMET_DIR or /usr/lib/ludomere/comet; plain cargo run does
+  not discover target/helpers/comet automatically. Official pinned0.3.2 asset URLs are configured;
+  current release availability must be verified before considering conditional source build.
+- P113 verified official latestv0.3.2 release exists; no source rebuild indicated. Independently
+  confirmed with P114 that absent helper falls back to bundled-version baseline, blocking first
+  installation of that same official version. Authorize narrow debug executable-relative discovery
+  and missing-only bootstrap, preserving explicit/package precedence, corrupt-helper refusal and
+  downgrade protection. Workspace target/helpers/comet lacks build.json; alternate prior staging
+  exists, requiring verification rather than arbitrary directory discovery or silent overwrite.
+- P112 source shows package check runner lacks isolated HOME/private D-Bus and parallelizes tests;
+  these are possible failure factors, not established user cause. Private full-builder reproduction
+  underway. Exact requested user errors/launch method remain pending.
+- P112 unmodified documented package builder succeeded with privateHOME/allXDG/bus: release,
+  384unit/sixintegration/fivePythonhelper checks and package pass. Captured
+  /tmp/ludomere-p112-build-before.log; no speculative runner changes. Original user failure remains
+  unclassified, not claimed fixed. Corrected final artifact will follow P113 source freeze.
+- User declined copying lengthy output and explicitly requested agent-run captured build, already
+  performed. Exact Comet text is no downloadable release/prepare helpers, run from cargo build;
+  confirms missing-helper branch in source/debug flow. No further log request necessary.
+- P112 may repair generated target/helpers/comet with verified official staged assets, preserving
+  prior incomplete directory by reversible rename, without touching validUMU or realprofile and
+  without executing dependency code. Newempty staging and checksumverification required.
+- P112 prepared fresh target/helpers-p112 from verified pinned cache, replaced only generated
+  target/helpers/comet after digest verification and preserved prior incomplete directory at
+  target/helpers-comet-before-p112. ValidUMU untouched. README now describes automatic debug lookup
+  and custom-stage override. No dependency execution or speculative package-script change.
+- P113 frozen: executable-relative debug discovery and missing-only official bootstrap implemented;
+ 10 inert focused tests pass (/tmp/ludomere-p113-tests.log). Manager reviewed source/report; P114
+  independently confirms staged official digests and corrupt/symlink/equal/downgrade guards.
+  Final private fullpackage+debug build running, log /tmp/ludomere-p112-build-final.log; original
+  userfailure remains unclassified. P114 actual local-readiness GUI and artifactaudit pending.
+- Final makepkg check reproduced concretefailure385pass/1fail: retention regression atcleanup.rs701
+  gets expected production operation_gate busy because other parallel unit tests hold the same
+  process-global gate. P112/P113 independently confirmed shared-resource collision; P114 observed
+  captured failure. This explains a reproducible package failure, not proven identical useroutput.
+- Approved minimal tools/check.sh serialized test-harness execution (--test-threads=1), matching
+  existing private fullverification; internalconcurrency tests unchanged, no weakened production
+  guard or timeout/fixture changes. Failed log retained; corrected exactpackage rerun follows.
+- Corrected exactpackage build passes fmt/all-target Clippy/386unit/sixintegration/fivePythonhelper
+  checks/release, plus fresh debug20:00:18. Manager inspected final logs; failing evidence retained
+  /tmp/ludomere-p112-build-parallel-failure.log. Artifact dist/ludomere-0.1.0-1-x86_64.pkg.tar.zst,
+ 14013157 bytes, SHA256fe06b1ed6e933793c38b790ec91c0a3f70116cde579964ad3d936b80f7c57403.
+  P114 independent artifact/source/helper and actual private Settings readiness closure pending.
+
 ## Current commit request
 
 - User authorized committing accumulated work and enumerating all features/fixes in the message.

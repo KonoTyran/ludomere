@@ -178,18 +178,19 @@ an empty directory. This downloads only build-time helper assets, not Proton or 
 
 ```bash
 python3 tools/prepare-helpers.py --destination target/helpers
-LUDOMERE_UMU_RUN="$PWD/target/helpers/umu/umu-run" \
-LUDOMERE_COMET_DIR="$PWD/target/helpers/comet" cargo run
+cargo run
 ```
 
 The environment overrides must be absolute paths. Use the staged UMU adapter, not a host UMU
 executable, to retain the explicit-download policy. To stage again, choose another empty destination;
 verified downloads are cached in `target/helper-downloads/`. Comet and its Windows service are
 the unchanged official release binaries; helper preparation neither patches nor compiles Comet.
-Debug builds also find the staged UMU adapter under `target/helpers` relative to their executable,
-after explicit and installed helper paths. Plain `cargo run` therefore recognizes staged UMU;
-the Comet override above remains necessary for source runs. Release builds use the packaged helper
-or the explicit override.
+Debug builds also find the staged UMU adapter and Comet under `target/helpers` relative to their
+executable, after explicit and installed helper paths. This works with `cargo run` or the debug
+binary produced by `cargo build`. For custom staging directories, set `LUDOMERE_UMU_RUN` to the
+adapter and `LUDOMERE_COMET_DIR` to the directory containing Comet, its Windows service and
+`build.json`. An incomplete Comet directory is not a verified installation. Release builds use
+the packaged helpers or explicit overrides.
 
 The first run creates `~/.config/ludomere/config.toml`. The default game library and managed
 download location are `$XDG_DATA_HOME/ludomere/games`. The executable is `ludomere`.
@@ -243,6 +244,8 @@ source archive and its SHA-256 file in `dist/`. It does not install the package.
 source archive, add `--source-only`. `PKGBUILD` is a template: this script replaces its source checksum
 placeholder before invoking makepkg. Do not run the template directly or use `git archive HEAD`
 to package an edited checkout. Build caches stay beneath ignored `target/` and `dist/` directories.
+The check script runs Rust tests serially because independent fixtures share process-wide
+operation/account guards; concurrency regressions still exercise their own threads.
 
 For a clean Arch build environment using Docker:
 

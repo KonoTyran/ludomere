@@ -11,5 +11,7 @@ export XDG_RUNTIME_DIR="$task_root/runtime"
 mkdir -m 700 -- "$XDG_RUNTIME_DIR"
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+# Fixtures exercise process-wide operation/account guards; separate tests must
+# not contend for those guards. Individual concurrency tests still spawn threads.
+cargo test --locked -- --test-threads=1
 python3 resources/helpers/test_umu_boundary.py

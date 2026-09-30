@@ -1,5 +1,5 @@
 //! Confirmed official Comet updates, isolated from package-owned helpers.
-use super::{BUNDLED_VERSION, Build};
+use super::Build;
 use anyhow::{Context, Result, ensure};
 use reqwest::{Url, blocking::Client};
 use serde::{Deserialize, Serialize};
@@ -251,13 +251,23 @@ fn validate_candidate(candidate: &CometUpdate) -> Result<()> {
 /// Fetches metadata only; never executes or downloads a helper binary.
 pub fn update_candidate(cancel: &AtomicBool) -> Result<Option<CometUpdate>> {
     let candidate = candidate_from_bytes(&fetch(RELEASE, 1024 * 1024, cancel, |_| {})?)?;
-    let effective = super::effective_directory()?;
-    let version = if effective.exists() {
-        super::verify_build(&effective)?.version
-    } else {
-        BUNDLED_VERSION.into()
+    candidate_for_directory(candidate, &super::effective_directory()?)
+}
+
+fn candidate_for_directory(
+    candidate: CometUpdate,
+    effective: &Path,
+) -> Result<Option<CometUpdate>> {
+    match fs::symlink_metadata(effective) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(candidate)),
+        result => {
+            result?;
+        }
     };
-    if crate::compatibility::components::newer_version(&candidate.version, &version)? {
+    if crate::compatibility::components::newer_version(
+        &candidate.version,
+        &super::verify_build(effective)?.version,
+    )? {
         Ok(Some(candidate))
     } else {
         Ok(None)
@@ -296,11 +306,18 @@ pub fn install_update(
         completed_before += asset.size;
         files.insert(asset.name.clone(), bytes);
     }
-    publish_at(&storage(), candidate, &files, cancel)
+    publish_at(
+        &storage(),
+        &super::bundled_directory(),
+        candidate,
+        &files,
+        cancel,
+    )
 }
 
 fn publish_at(
     root: &Path,
+    bundled: &Path,
     candidate: &CometUpdate,
     files: &BTreeMap<String, Vec<u8>>,
     cancel: &AtomicBool,
@@ -342,11 +359,12 @@ fn publish_at(
     if let Some(path) = active_at(root)? {
         versions.push(super::verify_build(&path)?.version);
     }
-    if super::bundled_directory().exists() {
-        versions.push(super::verify_build(&super::bundled_directory())?.version);
-    }
-    if versions.is_empty() {
-        versions.push(BUNDLED_VERSION.to_owned());
+    match fs::symlink_metadata(bundled) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        result => {
+            result?;
+            versions.push(super::verify_build(bundled)?.version);
+        }
     }
     for installed in versions {
         ensure!(
@@ -447,13 +465,110 @@ mod tests {
     }
 
     #[test]
+    fn missing_helper_bootstraps_current_release_but_existing_helpers_remain_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let bundled = root.path().join("bundled");
+        let storage = root.path().join("updates");
+        let (candidate, files) = fixture("0.3.2");
+        assert!(
+            candidate_for_directory(candidate.clone(), &bundled)
+                .unwrap()
+                .is_some()
+        );
+        publish_at(
+            &storage,
+            &bundled,
+            &candidate,
+            &files,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let active = active_at(&storage).unwrap().unwrap();
+        assert_eq!(
+            super::super::verify_build(&active).unwrap().version,
+            "0.3.2"
+        );
+        assert!(
+            candidate_for_directory(candidate.clone(), &active)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            publish_at(
+                &storage,
+                &bundled,
+                &candidate,
+                &files,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        let (older, old_files) = fixture("0.3.1");
+        assert!(
+            candidate_for_directory(older.clone(), &active)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            publish_at(
+                &storage,
+                &bundled,
+                &older,
+                &old_files,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+
+        fs::create_dir(&bundled).unwrap();
+        assert!(candidate_for_directory(candidate.clone(), &bundled).is_err());
+        assert!(
+            publish_at(
+                &root.path().join("other"),
+                &bundled,
+                &candidate,
+                &files,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        fs::remove_dir(&bundled).unwrap();
+        std::os::unix::fs::symlink(root.path().join("absent"), &bundled).unwrap();
+        assert!(candidate_for_directory(candidate.clone(), &bundled).is_err());
+        assert!(
+            publish_at(
+                &root.path().join("other"),
+                &bundled,
+                &candidate,
+                &files,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn verified_publication_keeps_previous_version_and_rejects_downgrade() {
         let root = tempfile::tempdir().unwrap();
         let (first, files) = fixture("90.0.0");
-        publish_at(root.path(), &first, &files, &AtomicBool::new(false)).unwrap();
+        publish_at(
+            root.path(),
+            &root.path().join("missing"),
+            &first,
+            &files,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let previous = active_at(root.path()).unwrap().unwrap();
         let (second, files) = fixture("91.0.0");
-        publish_at(root.path(), &second, &files, &AtomicBool::new(false)).unwrap();
+        publish_at(
+            root.path(),
+            &root.path().join("missing"),
+            &second,
+            &files,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(previous.join("comet").exists());
         assert_eq!(
             super::super::verify_build(&active_at(root.path()).unwrap().unwrap())
@@ -462,22 +577,56 @@ mod tests {
             "91.0.0"
         );
         let (first, files) = fixture("90.0.0");
-        assert!(publish_at(root.path(), &first, &files, &AtomicBool::new(false)).is_err());
+        assert!(
+            publish_at(
+                root.path(),
+                &root.path().join("missing"),
+                &first,
+                &files,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn failed_and_cancelled_updates_preserve_active_helper() {
         let root = tempfile::tempdir().unwrap();
         let (first, files) = fixture("90.0.0");
-        publish_at(root.path(), &first, &files, &AtomicBool::new(false)).unwrap();
+        publish_at(
+            root.path(),
+            &root.path().join("missing"),
+            &first,
+            &files,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let pointer = fs::read(root.path().join("current.json")).unwrap();
         let (next, mut files) = fixture("91.0.0");
-        assert!(publish_at(root.path(), &next, &files, &AtomicBool::new(true)).is_err());
+        assert!(
+            publish_at(
+                root.path(),
+                &root.path().join("missing"),
+                &next,
+                &files,
+                &AtomicBool::new(true)
+            )
+            .is_err()
+        );
         files
             .get_mut("comet-x86_64-unknown-linux-gnu")
             .unwrap()
             .push(0);
-        assert!(publish_at(root.path(), &next, &files, &AtomicBool::new(false)).is_err());
+        assert!(
+            publish_at(
+                root.path(),
+                &root.path().join("missing"),
+                &next,
+                &files,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(root.path().join("current.json")).unwrap(), pointer);
     }
 
@@ -485,10 +634,24 @@ mod tests {
     fn interrupted_pointer_publication_reuses_complete_directory() {
         let root = tempfile::tempdir().unwrap();
         let (candidate, files) = fixture("90.0.0");
-        publish_at(root.path(), &candidate, &files, &AtomicBool::new(false)).unwrap();
+        publish_at(
+            root.path(),
+            &root.path().join("missing"),
+            &candidate,
+            &files,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         let expected = fs::read(root.path().join("current.json")).unwrap();
         fs::remove_file(root.path().join("current.json")).unwrap();
-        publish_at(root.path(), &candidate, &files, &AtomicBool::new(false)).unwrap();
+        publish_at(
+            root.path(),
+            &root.path().join("missing"),
+            &candidate,
+            &files,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             fs::read(root.path().join("current.json")).unwrap(),
             expected
@@ -531,6 +694,7 @@ mod tests {
         assert!(
             publish_at(
                 &root.path().join("comet/helpers"),
+                &root.path().join("missing"),
                 &candidate,
                 &files,
                 &AtomicBool::new(false)

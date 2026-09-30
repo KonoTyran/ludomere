@@ -1,5 +1,15 @@
 # Project specification
 
+## Package failure and Comet availability — 2026-09-29
+
+> The build failed. Also, based on the settings view, I think the Comet integration isn't functional. It may need to be compiled from source if there is no release available to download.
+
+- R38: Diagnose and correct the failed documented pacman build and Comet availability/integration
+  problem. Obtain exact build and Settings errors; independently inspect helper discovery and
+  official release availability. A source build is conditional on no suitable official release,
+  not authority to patch dependency code. Preserve prior unmodified-Comet policy unless the user
+  approves a specific necessary change. Verify corrected build without installing on the host.
+
 ## Sidebar hiding, notifications and Comet clarity — 2026-09-29
 
 User request:

@@ -1,5 +1,34 @@
 # Project plan
 
+## P115 — Commit package and Comet corrections
+
+- User authorized a local commit with a helpful message. Compatibility owns explicit seven-file
+  staging/message/commit; security independently reviews content. Status complete.
+- Include R38 source, check runner, README and records; exclude generated helpers/packages/logs.
+  No product edits or push. Verify message accuracy, diff checks and clean status after commit;
+  existing exact-final386unit/sixintegration/fivePython/package/debug evidence remains applicable.
+- Independent review cleared exactly seven intended files and message; local commit succeeded
+  with clean status. Coordination closure included in the same commit; no push.
+
+## P112–P114 — Package failure and Comet availability
+
+- R38. P112 compatibility owns build-script/PKGBUILD/documentation diagnosis and necessary fixes;
+  P113 acquisition owns Comet discovery/official-release diagnosis and necessary narrow fixes;
+  P114 security independently verifies confirmed changes and package/helper contents. Complete for
+  scoped local assurance; original uncaptured error not asserted identical to reproduced failure.
+- Acceptance: reproduce/classify actual failure, distinguish source-run lookup from helper failure,
+  verify authoritative release availability, meaningful regressions and final required checks plus
+  corrected local pacman artifact when feasible. No invented live-game/Comet authentication pass.
+- Authorize source reads, official anonymous metadata/assets, scoped edits, private HOME/allXDG/
+  bus/test fixtures and repository/container package builds necessary to reproduce this reported
+  failure. No host package install, real profile/account/credentials/helper/game execution, remote
+  mutation, dependency patch/rebuild without confirmed need under R38, or new commit/push.
+  Root owns records. Owners report findings/paths/tests/risks; stop for new scope/access boundaries.
+- Final package passes fmt/Clippy386unit/sixintegration/fivePython/release; debug builds and actual
+  Settings without override reports verified0.3.2. Independent package/source/helper audit passes.
+  Reports /tmp/ludomere-p112-report.md, -p113-report.md and -p114-review.md. No dependency build,
+  host installation, game execution or new commit. Original stage preserved; private fixtures stopped.
+
 ## P111 — Commit accumulated features and fixes
 
 - User explicitly authorized a local commit of current work with all features/fixes in its message.

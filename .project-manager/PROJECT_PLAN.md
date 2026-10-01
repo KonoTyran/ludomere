@@ -1,5 +1,17 @@
 # Project plan
 
+## P178–P179 — Version 0.2.0
+
+- Metadata implementation/review complete. Locked offline metadata, parsed TOML/XML consistency,
+  full lockfile dependency preservation comparison, fmt/diff checks pass; independent P179 PASS.
+  Manager reviewed four-file diff/reports and approved seven-path commit/message. Records frozen
+  for normal push; final remote/clean-tree evidence in /tmp/ludomere-p178-report.md and handoff.
+
+- R65 in progress: acquisition edits version metadata only and verifies locked offline Cargo
+  metadata/TOML/XML consistency and diff; security independently reviews. Root records only.
+  After review/freeze, commit explicit paths and push normally; verify remote and clean tree.
+  No full tests, binary/package build, tag/release, schema change or dependency updates.
+
 ## P176–P177 — Build failure diagnosis and correction
 
 - Local fix/verification complete. Manager inspected exact before/after makepkg logs, one-line diff,

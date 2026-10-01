@@ -2,6 +2,17 @@
 
 Last meaningful update: 2026-09-30.
 
+## Current version update
+
+- P178/P179 version-only implementation and review complete: Cargo/lockfile/pkgver/AppStream0.2.0
+  consistent, pkgrel1 and prior release retained, dependency entries unchanged. Manager reviewed diff,
+  metadata/consistency/fmt checks and independent PASS. Seven-path commit and normal push approved;
+  records frozen, publication verification recorded in /tmp/ludomere-p178-report.md and handoff.
+  No binary/package build, runtime/full tests, tag or release performed.
+
+- R65/P178/P179: version-only 0.2.0 bump, metadata checks/review, then authorized commit/push.
+  Starting tree clean at cf2991e. No package build, schema/dependency change or tag requested.
+
 ## Current build investigation
 
 - Final local R64 disposition: reproduced and fixed source-archive omission; complete local package

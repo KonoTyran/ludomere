@@ -1,5 +1,10 @@
 # Project specification
 
+## Version 0.2.0 — 2026-09-30
+
+R65 user: "Bump the version to 0.2.0, commit, and push." Keep Cargo, package and AppStream
+metadata consistent; preserve dependencies/schema and prior release history. No package/tag/release.
+
 ## Diagnose and fix failing build — 2026-09-30
 
 R64 user: "The build is failing. Figure out why and correct it." Reproduce from actual build

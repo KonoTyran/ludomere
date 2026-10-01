@@ -1,5 +1,15 @@
 # Project plan
 
+## P187–P188 — Version 0.2.1
+
+- Metadata/checks and independent review complete; manager approves seven-path publication.
+- Acquisition owns four release metadata files, scoped metadata/format checks and approved commit/
+  normal origin-main push after review. Security independently reviews exact diff and consistency;
+  root alone owns records. No source behavior, dependency/schema changes, builds/full suite/package,
+  tag/release or PR mutation. Preserve older AppStream entries; pkgrel resets to 1.
+- Evidence: /tmp/ludomere-p187-report.md and /tmp/ludomere-p188-review.md. Publication must return
+  local/remote SHA and clean tree. Root records freeze before commit; final outcome in handoff.
+
 ## P186 — Publish reviewed library/menu fixes
 
 - Acquisition owns explicit 14-path commit, normal push to origin main and concise new PR6 comment;

@@ -2,6 +2,18 @@
 
 Last meaningful update: 2026-10-01.
 
+## Current version 0.2.1 update
+
+- Metadata implementation and independent P188 review PASS. Manager reviewed four-file diff,
+  parsed version/lock equality, offline locked metadata and fmt evidence. Seven-path commit and
+  normal origin-main push authorized; records frozen. Final SHA/remote/clean-tree evidence in
+  /tmp/ludomere-p187-report.md and handoff. No compilation, runtime tests or package needed/run.
+
+- R69/P187–P188 in progress from clean f88d210. Acquisition changes release metadata; security
+  independently verifies consistency; then authorized commit/push. No full suite or build needed
+  for metadata-only change. Previous P186 publication completed at f88d210 with exact PR6 comment
+  readback (issuecomment-5938096342), matching remote head and clean tree.
+
 ## Current publication
 
 - P186 authorized: commit verified R66–R68 source/docs/records, push origin main and add one short

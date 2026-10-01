@@ -1,5 +1,11 @@
 # Project specification
 
+## Version 0.2.1 — 2026-10-01
+
+R69 user: "Bump the version to 0.2.1, commit, and push". Synchronize Cargo, own lockfile entry,
+Arch package and AppStream metadata; preserve dependencies, schema and historical releases.
+No package/tag/release or PR comment requested.
+
 ## Publish maintainer-feedback fixes — 2026-10-01
 
 User: "Commit and push, then add a new comment to the PR with a short summary of fixes and changes."

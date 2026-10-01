@@ -1,5 +1,39 @@
 # Project plan
 
+## P186 — Publish reviewed library/menu fixes
+
+- Acquisition owns explicit 14-path commit, normal push to origin main and concise new PR6 comment;
+  root reviews inventory/message and final evidence. User authorizes these external mutations.
+- Reuse completed P183–P185 verification; inspect diff/status and confirm PR head/base/remotes before
+  mutation. No force push, new implementation, tests/build/package or PR body replacement. Stop on
+  unexpected changes/divergence. Return commit SHA, remote match, comment URL/readback, clean status
+  in /tmp/ludomere-p186-report.md. Records frozen before publication, outcome recorded in handoff.
+
+## P183–P185 — Library state, update colors, installer recognition and grid menu
+
+- Complete: owner reports, 12 scoped tests, final fmt/Clippy/shipping debug and independent P185
+  scoped PASS reviewed. Actual Add/root/menu/Favorite controls exercised privately; limitations in
+  status/README retained. No full suite/package or publication. Private processes stopped.
+
+- R68 user-approved follow-up: P184 also owns minimal files.rs Favorite dispatch correction using
+  the existing explicit Hide binding pattern and a focused detach regression. P185 rechecks list/
+  grid favorite target, persistence and no-navigation; repeat only affected checks and final build.
+
+- R66/R67 completed. P183 acquisition owns Storage Add/default-installer controls, minimal config/
+  managed/state changes and sections/window rematching integration. P184 compatibility owns sidebar
+  colors, reusable row/tile context menu, collection tiles, README and final combined checks.
+  P185 security independently reviews source and private physical controls; root owns records only.
+- Acceptance: library additions update without click, agreed update/run color precedence, truthful
+  update tooltip, explicit installer root actually used, late metadata rematches affected files
+  without losing unrelated records, grid/list menu parity with no secondary-click navigation.
+- Reuse existing bounded off-GTK workers, validate current account/root/operation lifetime, preserve
+  independent folder settings and durable data. No global scan per metadata event or unapproved
+  import/schema changes. Authorize focused regressions, private inert GTK fixtures, fmt/Clippy/debug
+  for integration; no full suite/package/live profile/account/helper/game/payload/publication.
+- P183 proposes transaction/root guard contract before dependent implementation; owners coordinate
+  shared UI declarations and serial checks. P185 returns findings for owner fixes, never product edits.
+  Evidence /tmp/ludomere-p183-report.md, -p184-report.md, -p185-review.md.
+
 ## P178–P179 — Version 0.2.0
 
 - Metadata implementation/review complete. Locked offline metadata, parsed TOML/XML consistency,

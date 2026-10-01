@@ -534,78 +534,7 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
                 model.borrow().config.show_sidebar_game_icons,
             );
             row.set_widget_name(&game.product_id.to_string());
-            let context_click = gtk::GestureClick::new();
-            context_click.set_button(gtk::gdk::BUTTON_SECONDARY);
-            {
-                let widgets = w.clone_refs();
-                let model = model.clone();
-                let game = game.clone();
-                let row = row.clone();
-                context_click.connect_pressed(move |gesture, _, x, y| {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                    let state = model.borrow();
-                    let Some(game) = state
-                        .games
-                        .iter()
-                        .find(|current| current.product_id == game.product_id)
-                        .cloned()
-                    else {
-                        return;
-                    };
-                    let favorite = state.favorites.contains(&game.product_id);
-                    let detail = DetailPageModel::game(game.clone(), favorite);
-                    let installed = state.installed_games.get(&game.product_id).cloned();
-                    drop(state);
-                    let action_id = game.product_id;
-                    let management = detail_file_management(
-                        &detail,
-                        &widgets.window,
-                        &model,
-                        installed,
-                        {
-                            let widgets = widgets.clone_refs();
-                            let model = model.clone();
-                            Rc::new(move || refresh_local_action_state(&widgets, &model))
-                        },
-                        {
-                            let widgets = widgets.clone_refs();
-                            let model = model.clone();
-                            Rc::new(move || {
-                                let state = model.borrow();
-                                let Some(game) = state
-                                    .games
-                                    .iter()
-                                    .find(|game| game.product_id == action_id)
-                                    .cloned()
-                                else {
-                                    return;
-                                };
-                                let favorite = state.favorites.contains(&action_id);
-                                drop(state);
-                                activate_context_primary_action(
-                                    &widgets,
-                                    &model,
-                                    DetailPageModel::game(game, favorite),
-                                );
-                            })
-                        },
-                    );
-                    let Some(popover) = management.menu.popover() else {
-                        return;
-                    };
-                    management.menu.set_popover(gtk::Popover::NONE);
-                    popover.set_parent(&row);
-                    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                        x.round() as i32,
-                        y.round() as i32,
-                        1,
-                        1,
-                    )));
-                    popover.connect_closed(|popover| popover.unparent());
-                    popover.popup();
-                });
-            }
-            row.add_controller(context_click);
+            attach_game_context_menu(&row, &w, &model, game.product_id);
             w.game_list.append(&row);
             let card = game_card(&game, favorite, card_width);
             apply_card_cover_state(
@@ -616,13 +545,94 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
             let id = game.product_id;
             let w2 = w.clone_refs();
             let model = model.clone();
+            attach_game_context_menu(&card, &w, &model, id);
             let click = gtk::GestureClick::new();
+            click.set_button(gtk::gdk::BUTTON_PRIMARY);
             click.connect_released(move |_, _, _, _| show_game(&w2, &model, id, None));
             card.add_controller(click);
             w.home_grid.insert(&card, -1);
         }
         glib::ControlFlow::Continue
     });
+}
+
+pub(super) fn attach_game_context_menu(
+    widget: &impl IsA<gtk::Widget>,
+    w: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    product_id: i64,
+) {
+    let context_click = gtk::GestureClick::new();
+    context_click.set_button(gtk::gdk::BUTTON_SECONDARY);
+    let widgets = w.clone_refs();
+    let model = model.clone();
+    context_click.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let state = model.borrow();
+        let Some(game) = state
+            .games
+            .iter()
+            .find(|current| current.product_id == product_id)
+            .cloned()
+        else {
+            return;
+        };
+        let favorite = state.favorites.contains(&game.product_id);
+        let detail = DetailPageModel::game(game.clone(), favorite);
+        let installed = state.installed_games.get(&game.product_id).cloned();
+        drop(state);
+        let action_id = game.product_id;
+        let management = detail_file_management(
+            &detail,
+            &widgets.window,
+            &model,
+            installed,
+            {
+                let widgets = widgets.clone_refs();
+                let model = model.clone();
+                Rc::new(move || refresh_local_action_state(&widgets, &model))
+            },
+            {
+                let widgets = widgets.clone_refs();
+                let model = model.clone();
+                Rc::new(move || {
+                    let state = model.borrow();
+                    let Some(game) = state
+                        .games
+                        .iter()
+                        .find(|game| game.product_id == action_id)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    let favorite = state.favorites.contains(&action_id);
+                    drop(state);
+                    activate_context_primary_action(
+                        &widgets,
+                        &model,
+                        DetailPageModel::game(game, favorite),
+                    );
+                })
+            },
+        );
+        let Some(popover) = management.menu.popover() else {
+            return;
+        };
+        management.menu.set_popover(gtk::Popover::NONE);
+        let Some(anchor) = gesture.widget() else {
+            return;
+        };
+        popover.set_parent(&anchor);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+            x.round() as i32,
+            y.round() as i32,
+            1,
+            1,
+        )));
+        popover.connect_closed(|popover| popover.unparent());
+        popover.popup();
+    });
+    widget.add_controller(context_click);
 }
 
 pub(super) fn rebuild_home_grid(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
@@ -643,8 +653,10 @@ pub(super) fn rebuild_home_grid(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
         card.set_widget_name(&game.product_id.to_string());
         let id = game.product_id;
         let widgets = w.clone_refs();
+        attach_game_context_menu(&card, w, model, id);
         let model = model.clone();
         let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_PRIMARY);
         click.connect_released(move |_, _, _, _| show_game(&widgets, &model, id, None));
         card.add_controller(click);
         w.home_grid.insert(&card, -1);
@@ -736,10 +748,15 @@ struct SidebarInstallationSnapshot<'a> {
     downloading: &'a HashSet<i64>,
 }
 
-fn sidebar_state_class(running: bool, downloading: bool, installed: bool) -> &'static str {
+fn sidebar_state_class(
+    running: bool,
+    downloading: bool,
+    installed: bool,
+    update: bool,
+) -> &'static str {
     if running {
         "game-state-running"
-    } else if downloading {
+    } else if downloading || (installed && update) {
         "game-state-downloading"
     } else if installed {
         "game-state-installed"
@@ -752,24 +769,65 @@ fn sidebar_state_class(running: bool, downloading: bool, installed: bool) -> &'s
 fn sidebar_color_priority_tracks_activity_before_installedness() {
     for installed in [false, true] {
         for downloading in [false, true] {
-            assert_eq!(
-                sidebar_state_class(true, downloading, installed),
-                "game-state-running"
-            );
+            for update in [false, true] {
+                assert_eq!(
+                    sidebar_state_class(true, downloading, installed, update),
+                    "game-state-running"
+                );
+                assert_eq!(
+                    sidebar_state_class(false, downloading, installed, update),
+                    if downloading || (installed && update) {
+                        "game-state-downloading"
+                    } else if installed {
+                        "game-state-installed"
+                    } else {
+                        "game-state-unavailable"
+                    }
+                );
+            }
         }
-        assert_eq!(
-            sidebar_state_class(false, true, installed),
-            "game-state-downloading"
-        );
     }
-    assert_eq!(
-        sidebar_state_class(false, false, true),
-        "game-state-installed"
-    );
-    assert_eq!(
-        sidebar_state_class(false, false, false),
-        "game-state-unavailable"
-    );
+}
+
+fn known_installed_update(
+    installed: bool,
+    base_update: bool,
+    installed_dlcs: Option<&HashSet<i64>>,
+    dlc_updates: Option<&HashSet<i64>>,
+) -> bool {
+    installed
+        && (base_update
+            || installed_dlcs.is_some_and(|installed| {
+                dlc_updates.is_some_and(|updates| !installed.is_disjoint(updates))
+            }))
+}
+
+#[test]
+fn sidebar_updates_require_an_installed_base_or_installed_dlc_revision() {
+    let installed = HashSet::from([2]);
+    let updated = HashSet::from([2]);
+    let uninstalled = HashSet::from([3]);
+    assert!(known_installed_update(true, true, None, None));
+    assert!(known_installed_update(
+        true,
+        false,
+        Some(&installed),
+        Some(&updated)
+    ));
+    assert!(!known_installed_update(
+        false,
+        true,
+        Some(&installed),
+        Some(&updated)
+    ));
+    assert!(!known_installed_update(
+        true,
+        false,
+        Some(&installed),
+        Some(&uninstalled)
+    ));
+    assert!(!known_installed_update(true, false, None, Some(&updated)));
+    assert!(!known_installed_update(true, false, Some(&installed), None));
 }
 
 fn apply_sidebar_download_styles(
@@ -817,6 +875,12 @@ fn apply_sidebar_download_styles(
                 && required_dlcs.get(&id).is_some_and(|required| {
                     !required.is_subset(installation_state.dlcs.get(&id).unwrap_or(&HashSet::new()))
                 });
+            let update = known_installed_update(
+                installation.is_some(),
+                installation_state.updates.contains(&id),
+                installation_state.dlcs.get(&id),
+                installation_state.dlc_updates.get(&id),
+            );
             let tooltip = if let Some(operation) = active_operation.as_ref() {
                 if operation.queued {
                     "Installation queued"
@@ -825,15 +889,12 @@ fn apply_sidebar_download_styles(
                 } else {
                     "Installing"
                 }
+            } else if update {
+                "Update available"
             } else {
                 match installation.map(|game| game.state) {
                     Some(crate::domain::InstallationState::Installed) => {
-                        if installation_state.updates.contains(&id)
-                            || missing_installed_dlc
-                            || installation_state
-                                .dlc_updates
-                                .get(&id)
-                                .is_some_and(|updates| !updates.is_empty())
+                        if missing_installed_dlc
                             || (show_backup_status && coverage != InstallerCoverage::Complete)
                         {
                             "Download or installation required"
@@ -863,6 +924,7 @@ fn apply_sidebar_download_styles(
                 running,
                 downloading,
                 installation.is_some(),
+                update,
             ));
             widget.set_opacity(1.0);
             widget.set_tooltip_text(Some(if running {

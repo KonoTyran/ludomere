@@ -497,11 +497,13 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
     let epoch = model.borrow().account_epoch;
     let root = model.borrow().config.download_directory.clone();
     let games = model.borrow().games.clone();
+    let session = online::account_session();
+    let scanned_root = root.clone();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let reconciliation = (|| -> anyhow::Result<Reconciliation> {
             let mut store = StateStore::open()?;
-            let summary = managed::rebuild(&mut store, &root, &games);
+            let summary = managed::rebuild_for_session(&mut store, &root, &games, session);
             let files = store.managed_files()?;
             let jobs = store.download_jobs()?;
             Ok(Reconciliation {
@@ -516,7 +518,9 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if model.borrow().account_epoch != epoch {
+        if model.borrow().account_epoch != epoch
+            || model.borrow().config.download_directory != scanned_root
+        {
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {

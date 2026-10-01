@@ -1,5 +1,34 @@
 # Project specification
 
+## Publish maintainer-feedback fixes — 2026-10-01
+
+User: "Commit and push, then add a new comment to the PR with a short summary of fixes and changes."
+Publish verified R66–R68 changes to origin main and add one concise comment to upstream PR6. Preserve
+the PR description; no new implementation, package, full-suite rerun, merge or release requested.
+
+## Maintainer feedback fixes and grid menu — 2026-10-01
+
+- Follow-up approved by user: "Yes, fix it too" for the inherited Add to Favorites context-menu
+  failure found in both list and grid. R68: preserve the existing favorite action and persistence;
+  make menu activation reach the clicked game before popover dismissal, without navigation.
+
+User: "Fix 1 and fix 2 using your recommendation. Fix three as best as you can for now.
+Additionally, when right clicking on a game in teh library grid, the same context menu should
+appear as when you right click a game in the list view."
+- R66: Apply the assessed fixes: successful existing-library addition refreshes shared local state
+  and sidebar without clicking a game; color priority is running green, active download OR known
+  installed-game/installed-DLC update blue, installed white, otherwise grey. Distinguish update
+  availability in tooltips; missing backups/new DLC/unknown metadata alone are not update evidence.
+  Repair explicit offline-library selection to change the actual download/scan root while preserving
+  independently saved folders, and rematch affected existing files when lazy acquisition metadata
+  becomes available. Preserve valid indexed records, current safety checks and managed layouts.
+- R67: Library grid game tiles expose the same context menu/actions as list rows. Secondary clicks
+  must not activate the primary open-game gesture; actions target the clicked game and update views
+  in place. Reuse existing behavior across normal/rebuilt/collection game grids as applicable.
+- Focused tests and proportionate independent review; no full suite/package, real profile/account/
+  game access, schema/dependency changes or publication requested. Broader arbitrary-folder import,
+  multi-root indexing and policy-independent update discovery remain outside this bounded repair.
+
 ## Version 0.2.0 — 2026-09-30
 
 R65 user: "Bump the version to 0.2.0, commit, and push." Keep Cargo, package and AppStream

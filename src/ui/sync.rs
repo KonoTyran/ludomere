@@ -968,28 +968,6 @@ pub(super) fn start_product_file_refresh(
     }
 }
 
-pub(super) fn render_product_details(w: &Widgets, model: &Rc<RefCell<AppModel>>, product_id: i64) {
-    let product = model.borrow().games.iter().find_map(|game| {
-        if game.product_id == product_id {
-            Some((game.clone(), None))
-        } else {
-            game.dlcs
-                .iter()
-                .find(|dlc| dlc.product_id == product_id)
-                .cloned()
-                .map(|dlc| (game.clone(), Some(dlc)))
-        }
-    });
-    let Some((game, dlc)) = product else {
-        return;
-    };
-    if let Some(dlc) = dlc {
-        show_dlc_page(w, model, game.product_id, &dlc);
-    } else {
-        show_game(w, model, product_id, Some(false));
-    }
-}
-
 pub(super) fn update_account_widgets(w: &Widgets, profile: Option<&auth::Profile>) {
     if let Some(profile) = profile {
         w.account_button_name.set_label(&profile.username);

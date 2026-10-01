@@ -100,7 +100,7 @@ pub(super) fn detail_file_management(
         } else {
             "Hide game locally"
         });
-        bind_hidden_action(&toggle, window, game.product_id);
+        bind_management_action(&toggle, window, "hidden", game.product_id);
         toggle.connect_map({
             let model = model.clone();
             let id = game.product_id;
@@ -123,8 +123,7 @@ pub(super) fn detail_file_management(
         } else {
             "Add to Favorites"
         });
-        favorite_action.set_action_name(Some("win.favorite"));
-        favorite_action.set_action_target_value(Some(&game.product_id.to_variant()));
+        bind_management_action(&favorite_action, window, "favorite", game.product_id);
         actions.append(&favorite_action);
         main_actions.push(favorite_action);
     }
@@ -563,11 +562,16 @@ pub(super) fn detail_file_management(
     }
 }
 
-fn bind_hidden_action(button: &gtk::Button, window: &adw::ApplicationWindow, id: i64) {
+fn bind_management_action(
+    button: &gtk::Button,
+    window: &adw::ApplicationWindow,
+    action: &'static str,
+    id: i64,
+) {
     let window = window.downgrade();
     button.connect_clicked(move |_| {
         if let Some(window) = window.upgrade()
-            && let Some(action) = window.lookup_action("hidden")
+            && let Some(action) = window.lookup_action(action)
         {
             action.activate(Some(&id.to_variant()));
         }
@@ -3249,7 +3253,7 @@ mod unified_row_tests {
         });
         window.add_action(&action);
         let button = gtk::Button::with_label("Hide game locally");
-        bind_hidden_action(&button, &window, 42);
+        bind_management_action(&button, &window, "hidden", 42);
         let popover = gtk::Popover::new();
         popover.set_child(Some(&button));
         popover.set_parent(&row);
@@ -3274,6 +3278,34 @@ mod unified_row_tests {
         if popover.parent().is_some() {
             popover.unparent();
         }
+        let favorite = Rc::new(std::cell::Cell::new(false));
+        let action = gio::SimpleAction::new("favorite", Some(&i64::static_variant_type()));
+        action.connect_activate({
+            let favorite = favorite.clone();
+            move |_, value| {
+                assert_eq!(value.and_then(|value| value.get::<i64>()), Some(73));
+                favorite.set(!favorite.get());
+            }
+        });
+        window.add_action(&action);
+        let button = gtk::Button::with_label("Add to Favorites");
+        bind_management_action(&button, &window, "favorite", 73);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&button));
+        popover.set_parent(&row);
+        popover.connect_closed(|popover| popover.unparent());
+        button.connect_clicked({
+            let popover = popover.clone();
+            move |_| popover.popdown()
+        });
+        popover.popup();
+        while glib::MainContext::default().iteration(false) {}
+        button.emit_clicked();
+        while glib::MainContext::default().iteration(false) {}
+        assert!(favorite.get());
+        assert!(popover.parent().is_none());
+        button.emit_clicked();
+        assert!(!favorite.get());
         window.close();
     }
 

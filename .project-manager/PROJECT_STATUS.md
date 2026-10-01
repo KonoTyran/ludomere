@@ -1,6 +1,42 @@
 # Project status
 
-Last meaningful update: 2026-09-30.
+Last meaningful update: 2026-10-01.
+
+## Current publication
+
+- P186 authorized: commit verified R66–R68 source/docs/records, push origin main and add one short
+  summary comment to upstream PR6. Fourteen-path inventory unchanged since review; prior 12 focused
+  tests, independent scoped QA, fmt/Clippy/debug results apply. Acquisition owns publication; no
+  additional implementation/build/testing requested. Records frozen for commit. Final SHA, remote
+  verification and comment readback belong to /tmp/ludomere-p186-report.md and user handoff.
+
+## Current maintainer-feedback fixes
+
+- R66/R67/R68 implementation complete, starting from clean 5f96cd2. P183 acquisition delivered
+  immediate shared library-state refresh, actual installer-root selection, conservative late-metadata
+  rematching and scoped index replacement preserving other roots. P184 compatibility delivered known
+  update colors, one shared list/home/collection menu and the user-approved inherited Favorite fix.
+  Root reviewed source, README, owner reports, screenshots and P185 independent scoped PASS.
+  R66/R67/R68 and P183–P185 are complete for this bounded task; no material finding remains.
+- Twelve focused tests pass: seven managed-file cases, one existing state reconciliation, one
+  independent-folder persistence, two color-policy cases and one GTK popover/action regression.
+  Final fmt, warnings-denied all-target Clippy and fresh shipping debug build pass. Shared-target
+  fixture artifacts were invalidated for Ludomere only before final build; no fixture markers remain.
+  Evidence: /tmp/ludomere-p183-report.md, /tmp/ludomere-p184-report.md and associated test/build logs.
+- Independent private pointer checks confirm Add library updates installed-white without clicks,
+  keeps page/selection/custom download folder, explicit installer-root choice persists and indexes,
+  known-update blue/tooltip and running-green precedence, grid Hide target/no navigation, and repaired
+  list/grid Favorites. Collection Favorite removal and rebuilt-grid menus also pass with page and
+  unrelated selection preserved. Final fixture input hashes match shipping source; all owned test
+  processes stopped. Evidence: /tmp/ludomere-p185-review.md. Colors used injected fixture state;
+  backend safety used focused fixtures/source review, not a live-account stress test.
+  Official Arch Xvfb was signature-verified and extracted only under /tmp; no host install.
+- Boundaries: existing managed layouts only; already indexed known base/DLC files rematch without a
+  full traversal on each metadata event. Previously unknown DLC directories need an explicit Rebuild
+  once known; arbitrary flat/opaque-filename imports remain unsupported. Other roots retain records
+  but are not freshly scanned. Account/root and conditional-row guards prevent stale associations;
+  matching never grants checksum verification. No schema/dependency changes, actual profile/account/
+  game/helper access, payload downloads, full suite, package, commit, push or PR mutation.
 
 ## Current version update
 

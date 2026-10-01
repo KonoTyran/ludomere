@@ -3011,11 +3011,33 @@ impl StateStore {
     }
 
     pub fn replace_managed_files(&mut self, files: &[ManagedFileRecord]) -> Result<()> {
+        self.replace_managed_files_at(None, files)
+    }
+
+    pub fn replace_managed_files_in_root(
+        &mut self,
+        root: &std::path::Path,
+        files: &[ManagedFileRecord],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            files.iter().all(|file| file.path.starts_with(root)),
+            "Managed file is outside the scanned download directory"
+        );
+        self.replace_managed_files_at(Some(root), files)
+    }
+
+    fn replace_managed_files_at(
+        &mut self,
+        root: Option<&std::path::Path>,
+        files: &[ManagedFileRecord],
+    ) -> Result<()> {
+        let prefix = root.map(|root| format!("{}/", root.to_string_lossy().trim_end_matches('/')));
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "UPDATE managed_files
-             SET present = 0, artifact_id = NULL, updated_at = unixepoch()",
-            [],
+             SET present = 0, artifact_id = NULL, updated_at = unixepoch()
+             WHERE ?1 IS NULL OR substr(path, 1, length(?1)) = ?1",
+            [&prefix],
         )?;
         {
             let mut statement = transaction.prepare(
@@ -3036,7 +3058,10 @@ impl StateStore {
                     gog_checksum=COALESCE(managed_files.gog_checksum, excluded.gog_checksum),
                     verified_at=COALESCE(managed_files.verified_at, excluded.verified_at)",
             )?;
-            let mut assigned_artifacts = HashSet::new();
+            let mut assigned_artifacts = transaction
+                .prepare("SELECT artifact_id FROM managed_files WHERE artifact_id IS NOT NULL")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
             for file in files {
                 let artifact_id = file
                     .artifact_id
@@ -3065,7 +3090,7 @@ impl StateStore {
                 ])?;
             }
         }
-        transaction.execute_batch(
+        transaction.execute(
             "UPDATE managed_files
              SET revision_id = (
                     SELECT r.revision_id FROM download_parts p
@@ -3094,10 +3119,87 @@ impl StateStore {
                            OR p.expected_size = managed_files.expected_size)
                     ORDER BY r.currently_offered DESC, r.last_seen_at DESC LIMIT 1
                  )
-             WHERE present = 1 AND artifact_path IS NOT NULL;",
+             WHERE present = 1 AND artifact_path IS NOT NULL
+               AND (?1 IS NULL OR substr(path, 1, length(?1)) = ?1)",
+            [&prefix],
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Attach a newly observed manifest only to unchanged, previously unassociated files.
+    pub fn match_managed_files(
+        &self,
+        matches: &[(ManagedFileRecord, RemoteArtifact)],
+    ) -> Result<usize> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut changed = 0;
+        for (file, artifact) in matches {
+            anyhow::ensure!(
+                file.product_id == artifact.product_id
+                    && file.kind == artifact.kind
+                    && artifact.size_bytes.is_none_or(|size| size == file.size),
+                "Download metadata does not match the indexed file"
+            );
+            let identity = catalog_artifact_id(artifact);
+            let mut parts = transaction.prepare(
+                "SELECT r.revision_id, p.part_id, p.provider_file_id
+                 FROM download_parts p JOIN download_revisions r USING(revision_id)
+                 JOIN download_slots s USING(slot_id)
+                 WHERE s.product_id=?1 AND r.currently_offered=1
+                   AND p.downlink=?2 AND r.version IS ?3 AND p.expected_size IS ?4",
+            )?;
+            let parts = parts
+                .query_map(
+                    params![
+                        file.product_id,
+                        artifact.download_path,
+                        artifact.version,
+                        artifact.size_bytes.map(|size| size as i64)
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let [(revision, part, provider)] = parts.as_slice() else {
+                continue;
+            };
+            changed += transaction.execute(
+                "UPDATE managed_files SET matched=1, artifact_path=?9, artifact_id=?10,
+                    version=?11, expected_size=?12, revision_id=?13, part_id=?14,
+                    provider_file_id=?15, updated_at=unixepoch()
+                 WHERE path=?1 AND product_id=?2 AND product_slug=?3 AND artifact_kind=?4
+                   AND operating_system IS ?5 AND language IS ?6 AND filename=?7 AND size=?8
+                   AND present=1 AND matched=0 AND artifact_path IS NULL AND artifact_id IS NULL
+                   AND version IS NULL AND revision_id IS NULL AND part_id IS NULL
+                   AND job_id IS NULL AND gog_checksum IS NULL AND verified_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM managed_files WHERE artifact_id=?10)",
+                params![
+                    file.path.to_string_lossy(),
+                    file.product_id,
+                    file.product_slug,
+                    file.kind.as_str(),
+                    file.operating_system,
+                    file.language,
+                    file.filename,
+                    file.size as i64,
+                    artifact.download_path,
+                    identity,
+                    artifact.version,
+                    artifact.size_bytes.map(|size| size as i64),
+                    revision,
+                    part,
+                    provider
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn managed_files(&self) -> Result<Vec<ManagedFileRecord>> {

@@ -487,9 +487,11 @@ pub(super) fn show_settings_page(
                 )
             };
             let (sender, receiver) = mpsc::channel();
+            let session = online::account_session();
+            let scanned_root = root.clone();
             std::thread::spawn(move || {
                 let result = StateStore::open().and_then(|mut store| {
-                    let summary = managed::rebuild(&mut store, &root, &games)?;
+                    let summary = managed::rebuild_for_session(&mut store, &root, &games, session)?;
                     Ok((summary, store.managed_files()?, store.download_jobs()?))
                 });
                 let _ = sender.send(result);
@@ -499,7 +501,9 @@ pub(super) fn show_settings_page(
             let row = rebuild_row.clone();
             let button = button.clone();
             glib::timeout_add_local(Duration::from_millis(50), move || {
-                if model.borrow().account_epoch != epoch {
+                if model.borrow().account_epoch != epoch
+                    || model.borrow().config.download_directory != scanned_root
+                {
                     button.set_sensitive(true);
                     return glib::ControlFlow::Break;
                 }
@@ -891,40 +895,7 @@ pub(super) fn refresh_installed_state_after_library_change(
     w: &Rc<Widgets>,
     model: &Rc<RefCell<AppModel>>,
 ) {
-    let libraries = model.borrow().config.game_libraries.clone();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = StateStore::open()
-            .and_then(|store| crate::installation::reconcile_installed_games(&store, &libraries));
-        let _ = sender.send(result);
-    });
-    let w = w.clone_refs();
-    let model = model.clone();
-    glib::timeout_add_local(Duration::from_millis(16), move || {
-        let installed = match receiver.try_recv() {
-            Ok(Ok(installed)) => installed,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "could not scan configured game libraries");
-                return glib::ControlFlow::Break;
-            }
-            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
-        };
-        let selected = {
-            let mut state = model.borrow_mut();
-            state.installed_products = installed.into_iter().map(|game| game.product_id).collect();
-            state.selected
-        };
-        {
-            let state = model.borrow();
-            update_sidebar_download_styles(&w, &state);
-            refresh_filters(&w, &state);
-        }
-        if let Some(selected) = selected {
-            render_product_details(&w, &model, selected);
-        }
-        glib::ControlFlow::Break
-    });
+    refresh_local_action_state(w, model);
 }
 
 fn clear_replaceable_images_at(cache_root: &std::path::Path) -> std::io::Result<()> {

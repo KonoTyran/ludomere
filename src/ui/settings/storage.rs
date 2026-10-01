@@ -43,6 +43,60 @@ impl StorageBreakdown {
     }
 }
 
+fn save_storage_config(
+    page: &gtk::Box,
+    status: &gtk::Label,
+    model: &Rc<RefCell<AppModel>>,
+    config: Config,
+    saved: impl FnOnce(Config) + 'static,
+) {
+    let epoch = model.borrow().account_epoch;
+    let session = online::account_session();
+    let previous = status.label();
+    status.set_label("Saving library settings…");
+    let window = page.root().and_downcast::<gtk::Window>();
+    if let Some(window) = &window {
+        window.set_sensitive(false);
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let _activity = crate::profile_reset::begin_activity("saving library settings")?;
+            online::with_account_session(session, || config.save())?;
+            Ok::<_, anyhow::Error>(config)
+        })();
+        let _ = sender.send(result);
+    });
+    let status = status.clone();
+    let model = model.clone();
+    let mut saved = Some(saved);
+    glib::timeout_add_local(Duration::from_millis(32), move || {
+        if model.borrow().account_epoch != epoch {
+            if let Some(window) = &window {
+                window.set_sensitive(true);
+            }
+            status.set_label("Account changed; reopen Settings to review library folders.");
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!("Saving stopped; try again")),
+        };
+        if let Some(window) = &window {
+            window.set_sensitive(true);
+        }
+        match result {
+            Ok(config) => {
+                status.set_label(&previous);
+                saved.take().unwrap()(config);
+            }
+            Err(error) => status.set_label(&format!("Could not save library settings: {error}")),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 pub(super) fn build_storage_page(
     window: &adw::ApplicationWindow,
     w: &Rc<Widgets>,
@@ -452,22 +506,33 @@ pub(super) fn build_storage_page(
         let library = library.clone();
         let rebuild = rebuild_library_choices.clone();
         let popover = manage_popover.clone();
+        let root = root.clone();
+        let status = path_label.clone();
+        let w = w.clone();
         move |_| {
             let Some(selected) = libraries.borrow().get(library.selected() as usize).cloned()
             else {
                 return;
             };
-            {
-                let mut state = model.borrow_mut();
-                state.config.installer_library_id = Some(selected.id);
-                state.config.normalize_game_libraries();
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save installer storage library");
-                    return;
+            let mut config = model.borrow().config.clone();
+            config.installer_library_id = Some(selected.id);
+            config.download_directory = selected.path;
+            config.normalize_game_libraries();
+            let model = model.clone();
+            let libraries = libraries.clone();
+            let rebuild = rebuild.clone();
+            let w = w.clone();
+            save_storage_config(&root, &status, &model.clone(), config, move |config| {
+                {
+                    let mut state = model.borrow_mut();
+                    state.config.installer_library_id = config.installer_library_id;
+                    state.config.download_directory = config.download_directory;
+                    *libraries.borrow_mut() = state.config.game_libraries.clone();
                 }
-                *libraries.borrow_mut() = state.config.game_libraries.clone();
-            }
-            rebuild();
+                rebuild();
+                super::super::window::start_managed_reconciliation(&w, &model);
+                super::refresh_installed_state_after_library_change(&w, &model);
+            });
             popover.popdown();
         }
     });
@@ -581,6 +646,9 @@ pub(super) fn build_storage_page(
         let library_names = library_names.clone();
         let library = library.clone();
         let rebuild_library_choices = rebuild_library_choices.clone();
+        let root = root.clone();
+        let status = path_label.clone();
+        let w = w.clone();
         move |_| {
             let picker = gtk::FileDialog::builder()
                 .title("Add game library")
@@ -591,32 +659,35 @@ pub(super) fn build_storage_page(
             let library_names = library_names.clone();
             let library = library.clone();
             let rebuild_library_choices = rebuild_library_choices.clone();
+            let root = root.clone();
+            let status = status.clone();
+            let w = w.clone();
             picker.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
                 let Ok(folder) = result else { return };
                 let Some(path) = folder.path() else { return };
                 if libraries.borrow().iter().any(|entry| entry.path == path) {
                     return;
                 }
-                let mount = filesystem_mount_point(&path);
                 let entry = GameLibrary {
                     id: crate::config::game_library_id(&path),
-                    name: mount,
+                    name: path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Games".into()),
                     path,
                     default: false,
                 };
-                {
-                    let mut state = model.borrow_mut();
-                    state.config.game_libraries.push(entry.clone());
-                    state.config.normalize_game_libraries();
-                    if let Err(error) = state.config.save() {
-                        tracing::warn!(%error, "could not save game library");
-                        return;
-                    }
-                }
-                libraries.borrow_mut().push(entry.clone());
-                library_names.append(&filesystem_mount_point(&entry.path));
-                rebuild_library_choices();
-                library.set_selected((libraries.borrow().len() - 1) as u32);
+                let mut config = model.borrow().config.clone();
+                config.game_libraries.push(entry.clone());
+                config.normalize_game_libraries();
+                save_storage_config(&root, &status, &model.clone(), config, move |config| {
+                    model.borrow_mut().config.game_libraries = config.game_libraries.clone();
+                    *libraries.borrow_mut() = config.game_libraries;
+                    library_names.append(&entry.path.to_string_lossy());
+                    rebuild_library_choices();
+                    library.set_selected((libraries.borrow().len() - 1) as u32);
+                    super::refresh_installed_state_after_library_change(&w, &model);
+                });
             });
         }
     });

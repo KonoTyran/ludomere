@@ -26,8 +26,12 @@ Transfer progress does not rescan downloaded files. If local-state inspection fa
 keeps the previous state and reports the error; use **Manage → Refresh local state** to retry. Uninstall checks the
 current downloaded files before offering optional cleanup, with a separate retry control.
 Displayed sizes and rates use decimal byte units (1 MB = 1,000,000 bytes).
-Sidebar game names are green while running, blue while downloading, white when installed, and grey
-otherwise, in that priority order. File-operation completion updates the open game's action in place.
+Sidebar game names are green while running, blue while downloading or when an installed game/DLC
+has a known update, white when installed, and grey otherwise, in that priority order. Idle known
+updates show “Update available”; missing backups or newly owned DLC do not imply an update.
+Right-click a library or collection game tile for the same actions as its sidebar context menu,
+without opening the game's page. Favorite and Hide actions apply to the clicked game before the
+menu closes. File-operation completion updates the open game's action in place.
 Installation and launch failures retain their full diagnostic text in Notifications, with sensitive
 URLs/credential fields redacted. **View error** expands the current game's failure, including a
 recovered installation failure, without switching to Downloads; Resume remains a separate action.
@@ -70,6 +74,13 @@ Failures keep the operation retryable and do not mark the game successfully inst
 If interrupted setup cannot be proven stopped, Resume and recovery refuse to change its files.
 An interrupted launch with no saved process identity requires a reboot, not just restarting Ludomere.
 An unreadable operation journal requires repair before recovery; it is not discarded to bypass this check.
+
+Adding a game library refreshes installed state and sidebar colors without opening each game.
+**Default for installer storage** changes the actual download folder and refreshes its index.
+Already indexed files in the configured download folder are rematched as game/DLC metadata arrives,
+using unambiguous filename, OS, language and known-size matches. Arbitrary flat folders are not
+imported; previously unknown directories need an explicit index rebuild after their games are known.
+Changing folders does not move files or erase other download roots' records and receipts.
 
 Settings → Downloads includes automatic Depot updates (on), offline installer backups (off),
 and superseded-installer cleanup (off). Checks run after library synchronization and every six

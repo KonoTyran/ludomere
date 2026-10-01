@@ -148,8 +148,10 @@ pub(super) fn refresh_collection_metadata(w: &Widgets, model: &Rc<RefCell<AppMod
             card.set_widget_name(&game.product_id.to_string());
             let id = game.product_id;
             let widgets = w.clone_refs();
+            attach_game_context_menu(&card, w, model, id);
             let model = model.clone();
             let click = gtk::GestureClick::new();
+            click.set_button(gtk::gdk::BUTTON_PRIMARY);
             click.connect_released(move |_, _, _, _| show_game(&widgets, &model, id, None));
             card.add_controller(click);
             grid.insert(&card, -1);

@@ -444,11 +444,23 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                         .chain(game.dlcs.iter().map(|dlc| dlc.product_id))
                 })
                 .collect::<Vec<_>>();
-            let files = if targeted {
+            let mut files = if targeted {
                 store.managed_files_for_products(&product_ids)?
             } else {
                 store.managed_files()?
             };
+            let matches = managed::pending_matches(&config.download_directory, &games, &files)?;
+            if !matches.is_empty() {
+                online::with_account_session(session, || {
+                    managed::ensure_download_root(&config.download_directory)?;
+                    store.match_managed_files(&matches)
+                })?;
+                files = if targeted {
+                    store.managed_files_for_products(&product_ids)?
+                } else {
+                    store.managed_files()?
+                };
+            }
             let managed_paths = files
                 .iter()
                 .filter(|file| file.present && file.matched)

@@ -29,6 +29,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | 7fd0c7f | P268 | Show explicit archive patch progress and terminal details in the existing row. |
 | e326e21 | P267 | Bind manual cloud actions and confirmations to the originating account. |
 | 4ed3ee3 | P269 | Batch catalog evidence used to classify stored files without changing validation. |
+| b2a7c99 | P264 | Load Compatibility preferences asynchronously with error details and Retry. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -45,6 +46,11 @@ hidden/tag writes are source-ready under independent review and coordinated priv
 - P264 owner and independent private GTK1 each PASS, including error/Retry/stored overrides,
   no initial autosaves, uninstalled/stale controls and group release. Review
   `/tmp/ludomere-p264-independent-review.md`; committing as set15.
+  Commitb2a7c99 exact post-commit build PASS.
+- P270 hidden/tag writes now register profile activity and the original account commit guard,
+  show immediate visibility-save feedback, preserve pending behavior and retain sanitized errors.
+  Owner and independent private GTK1+pure1 each PASS; independent security review PASS
+  `/tmp/ludomere-p271-organization-review.md`. Committing as set16.
 
 ## Completed sets
 

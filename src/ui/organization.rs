@@ -23,18 +23,33 @@ pub(super) fn initialize(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
             }
             (!model.hidden_products.contains(&id), model.account_epoch)
         };
+        let session = online::account_session();
+        show_progress(
+            &widgets,
+            "Saving this game's visibility. Try again when it finishes.",
+        );
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(StateStore::open().and_then(|store| store.set_hidden(id, hidden)));
+            let _ = sender.send(save_hidden(session, id, hidden));
         });
         let widgets = widgets.clone();
         let state = state.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
-            if state.borrow().account_epoch != epoch || state.borrow().logout_pending {
+            if state.borrow().account_epoch != epoch
+                || state.borrow().logout_pending
+                || online::account_session() != session
+            {
                 return glib::ControlFlow::Break;
             }
-            match receiver.try_recv() {
-                Ok(Ok(())) => {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(anyhow::anyhow!("Visibility worker stopped unexpectedly"))
+                }
+            };
+            match result {
+                Ok(()) => {
                     if widgets.live_status.label()
                         == "Saving this game's visibility. Try again when it finishes."
                     {
@@ -61,21 +76,31 @@ pub(super) fn initialize(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                     );
                     glib::ControlFlow::Break
                 }
-                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                Err(error) => {
                     if widgets.live_status.label()
                         == "Saving this game's visibility. Try again when it finishes."
                     {
                         show_progress(&widgets, "");
                     }
                     state.borrow_mut().hidden_pending.remove(&id);
-                    show_status(&widgets, "Could not save hidden state. Try again.");
+                    show_status(
+                        &widgets,
+                        &super::notifications::failure_message(
+                            "Could not save hidden state. Try again.",
+                            &format!("{error:#}"),
+                        ),
+                    );
                     glib::ControlFlow::Break
                 }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             }
         });
     });
     w.window.add_action(&action);
+}
+
+fn save_hidden(session: u64, id: i64, hidden: bool) -> anyhow::Result<()> {
+    let _activity = crate::profile_reset::begin_activity("saving game visibility")?;
+    online::with_account_session(session, || StateStore::open()?.set_hidden(id, hidden))
 }
 
 pub(super) fn matches_tags(
@@ -159,6 +184,20 @@ enum Change {
     Remove(String),
     Rename(String, String),
     Delete(String),
+}
+
+fn save_tags(session: u64, id: i64, change: Change) -> anyhow::Result<HashMap<i64, Vec<String>>> {
+    let _activity = crate::profile_reset::begin_activity("saving personal tags")?;
+    online::with_account_session(session, || {
+        let store = StateStore::open()?;
+        match change {
+            Change::Add(tag) => store.add_tag(id, &tag)?,
+            Change::Remove(tag) => store.remove_tag(id, &tag)?,
+            Change::Rename(old, new) => store.rename_tag(&old, &new)?,
+            Change::Delete(tag) => store.delete_tag(&tag)?,
+        };
+        store.tags()
+    })
 }
 
 pub(super) fn tag_editor(w: &Widgets, model: &Rc<RefCell<AppModel>>, id: i64) -> gtk::Box {
@@ -298,29 +337,30 @@ fn change(
     }
     let (sender, receiver) = mpsc::channel();
     let operation = change.clone();
+    let session = online::account_session();
     std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<_> {
-            let store = StateStore::open()?;
-            match operation {
-                Change::Add(tag) => store.add_tag(id, &tag)?,
-                Change::Remove(tag) => store.remove_tag(id, &tag)?,
-                Change::Rename(old, new) => store.rename_tag(&old, &new)?,
-                Change::Delete(tag) => store.delete_tag(&tag)?,
-            };
-            store.tags()
-        })();
-        let _ = sender.send(result);
+        let _ = sender.send(save_tags(session, id, operation));
     });
     let w = w.clone_refs();
     let model = model.clone();
     let chips = chips.downgrade();
     let status = status.downgrade();
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+        if model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+            || online::account_session() != session
+        {
             return glib::ControlFlow::Break;
         }
-        match receiver.try_recv() {
-            Ok(Ok(tags)) => {
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("Tag worker stopped unexpectedly"))
+            }
+        };
+        match result {
+            Ok(tags) => {
                 {
                     let mut state = model.borrow_mut();
                     state.organization_pending = false;
@@ -348,7 +388,7 @@ fn change(
                 }
                 glib::ControlFlow::Break
             }
-            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+            Err(error) => {
                 model.borrow_mut().organization_pending = false;
                 if let Some(chips) = chips.upgrade()
                     && let Some(editor) = chips.parent()
@@ -356,11 +396,13 @@ fn change(
                     editor.set_sensitive(true);
                 }
                 if let Some(status) = status.upgrade() {
-                    status.set_label("Could not save tags. Try again.");
+                    status.set_label(&super::notifications::failure_message(
+                        "Could not save tags. Try again.",
+                        &format!("{error:#}"),
+                    ));
                 }
                 glib::ControlFlow::Break
             }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
         }
     });
 }
@@ -368,6 +410,148 @@ fn change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG and private GTK; only synthetic profile data and in-memory reset reservation"]
+    fn organization_writes_reject_stale_sessions_and_reset_then_restore_controls() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p270-")
+        );
+        let session = online::account_session();
+        let stale = session.wrapping_add(1);
+        assert!(
+            save_hidden(stale, 9270001, true)
+                .unwrap_err()
+                .to_string()
+                .contains("account changed")
+        );
+        assert!(
+            save_tags(stale, 9270001, Change::Add("Synthetic".into()))
+                .unwrap_err()
+                .to_string()
+                .contains("account changed")
+        );
+        assert!(
+            !crate::identity::database().exists(),
+            "rejected workers must not create a profile"
+        );
+        let reservation = crate::profile_reset::reserve().unwrap();
+        assert!(save_hidden(session, 9270001, true).is_err());
+        assert!(save_tags(session, 9270001, Change::Add("Synthetic".into())).is_err());
+        assert!(!crate::identity::database().exists());
+        drop(reservation);
+        save_hidden(session, 9270001, true).unwrap();
+        assert!(
+            StateStore::open()
+                .unwrap()
+                .hidden_product_ids()
+                .unwrap()
+                .contains(&9270001)
+        );
+        save_hidden(session, 9270001, false).unwrap();
+        assert!(
+            !StateStore::open()
+                .unwrap()
+                .hidden_product_ids()
+                .unwrap()
+                .contains(&9270001)
+        );
+        assert_eq!(
+            save_tags(session, 9270001, Change::Add("Synthetic".into())).unwrap()[&9270001],
+            ["Synthetic"]
+        );
+        assert_eq!(
+            save_tags(
+                session,
+                9270001,
+                Change::Rename("Synthetic".into(), "Renamed".into())
+            )
+            .unwrap()[&9270001],
+            ["Renamed"]
+        );
+        assert!(
+            save_tags(session, 9270001, Change::Remove("Renamed".into()))
+                .unwrap()
+                .is_empty()
+        );
+        save_tags(session, 9270001, Change::Add("Synthetic".into())).unwrap();
+        assert!(
+            save_tags(session, 9270001, Change::Delete("Synthetic".into()))
+                .unwrap()
+                .is_empty()
+        );
+
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.OrganizationTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let config = Config::default();
+        let widgets = Rc::new(super::super::window::create_widgets(&app, &config));
+        let model = Rc::new(RefCell::new(AppModel {
+            config,
+            ..AppModel::default()
+        }));
+        initialize(&widgets, &model);
+        widgets.window.present();
+        let hidden = widgets.window.lookup_action("hidden").unwrap();
+        let reservation = crate::profile_reset::reserve().unwrap();
+        hidden.activate(Some(&9270001i64.to_variant()));
+        assert!(
+            widgets
+                .live_status
+                .label()
+                .contains("Saving this game's visibility")
+        );
+        wait_until(|| model.borrow().hidden_pending.is_empty());
+        assert!(!model.borrow().hidden_products.contains(&9270001));
+        assert!(widgets.live_status.label().is_empty());
+        let editor = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let chips = gtk::FlowBox::new();
+        let status = gtk::Label::new(None);
+        editor.append(&chips);
+        editor.append(&status);
+        change(
+            &widgets,
+            &model,
+            9270001,
+            Change::Add("Synthetic".into()),
+            &chips,
+            &status,
+        );
+        assert_eq!(status.label(), "Saving tags…");
+        assert!(!editor.is_sensitive());
+        wait_until(|| !model.borrow().organization_pending);
+        assert!(editor.is_sensitive());
+        assert!(status.label().contains("Profile reset"));
+        drop(reservation);
+        change(
+            &widgets,
+            &model,
+            9270001,
+            Change::Add("Synthetic".into()),
+            &chips,
+            &status,
+        );
+        wait_until(|| status.label() == "Tags saved");
+        assert_eq!(model.borrow().tags[&9270001], ["Synthetic"]);
+        assert!(editor.is_sensitive());
+        hidden.activate(Some(&9270001i64.to_variant()));
+        wait_until(|| model.borrow().hidden_products.contains(&9270001));
+        widgets.window.close();
+    }
+
     #[test]
     fn any_all_filters_are_case_insensitive_and_missing_tags_do_not_match() {
         let tags = vec!["RPG".into(), "Co-op".into()];

@@ -32,6 +32,11 @@ fn generation_two() -> u32 {
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationTwoRepository {
+    /// Cache-only parser revision: older cached records discarded setup fields.
+    #[serde(default)]
+    pub setup_metadata_version: u8,
+    #[serde(default)]
+    pub script_interpreter: bool,
     #[serde(rename = "version")]
     pub generation: u32,
     #[serde(rename = "baseProductId")]
@@ -53,7 +58,9 @@ pub struct RepositoryProduct {
     pub product_id: String,
     pub name: Option<String>,
     pub script: Option<String>,
+    #[serde(alias = "temp_arguments")]
     pub temp_arguments: Option<String>,
+    #[serde(alias = "temp_executable")]
     pub temp_executable: Option<String>,
     #[serde(default, alias = "play_tasks")]
     pub play_tasks: Vec<RepositoryTask>,

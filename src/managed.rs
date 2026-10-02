@@ -22,6 +22,49 @@ struct Product {
 
 /// Rebuilds the downloaded-file index using read-only inspection of `root`.
 pub fn rebuild(store: &mut StateStore, root: &Path, games: &[Game]) -> Result<RebuildSummary> {
+    rebuild_guarded(store, root, games, None)
+}
+
+pub fn rebuild_for_session(
+    store: &mut StateStore,
+    root: &Path,
+    games: &[Game],
+    session: u64,
+) -> Result<RebuildSummary> {
+    rebuild_guarded(store, root, games, Some(session))
+}
+
+pub fn ensure_download_root(root: &Path) -> Result<()> {
+    let config = crate::storage::read_config()?;
+    let kind = [
+        crate::config::LibraryKind::OfflineInstallers,
+        crate::config::LibraryKind::Extras,
+    ]
+    .into_iter()
+    .find(|kind| {
+        config
+            .libraries(*kind)
+            .iter()
+            .any(|library| library.path == root)
+    })
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "Archive library changed; select a compatible typed library and refresh again"
+        )
+    })?;
+    crate::storage::validate_path(&config, kind, root)?;
+    Ok(())
+}
+
+fn rebuild_guarded(
+    store: &mut StateStore,
+    root: &Path,
+    games: &[Game],
+    session: Option<u64>,
+) -> Result<RebuildSummary> {
+    if session.is_some() {
+        ensure_download_root(root)?;
+    }
     let jobs = store.download_jobs()?;
     let games_by_slug = games
         .iter()
@@ -71,8 +114,119 @@ pub fn rebuild(store: &mut StateStore, root: &Path, games: &[Game]) -> Result<Re
             }
         }
     }
-    store.replace_managed_files(&records)?;
+    if let Some(session) = session {
+        crate::online::with_account_session(session, || {
+            ensure_download_root(root)?;
+            store.replace_managed_files_in_root(root, &records)
+        })?;
+    } else {
+        store.replace_managed_files_in_root(root, &records)?;
+    }
     Ok(summary)
+}
+
+/// Reassociate only known cold-import records; this never discovers or verifies new files.
+pub fn pending_matches(
+    root: &Path,
+    games: &[Game],
+    files: &[ManagedFileRecord],
+) -> Result<Vec<(ManagedFileRecord, RemoteArtifact)>> {
+    let mut matches = Vec::new();
+    for game in games {
+        for (id, directory, artifacts) in std::iter::once((
+            game.product_id,
+            root.join(&game.slug),
+            game.remote_artifacts.as_slice(),
+        ))
+        .chain(game.dlcs.iter().map(|dlc| {
+            (
+                dlc.product_id,
+                root.join(&game.slug).join("dlc").join(&dlc.slug),
+                dlc.remote_artifacts.as_slice(),
+            )
+        })) {
+            for file in files.iter().filter(|file| {
+                file.product_id == id
+                    && file.present
+                    && !file.matched
+                    && file.artifact_path.is_none()
+                    && file.artifact_id.is_none()
+                    && file.version.is_none()
+                    && file.job_id.is_none()
+                    && file.revision_id.is_none()
+                    && file.part_id.is_none()
+                    && file.gog_checksum.is_none()
+                    && file.verified_at.is_none()
+            }) {
+                let mut expected = directory.join(file.kind.as_str());
+                for component in [&file.operating_system, &file.language]
+                    .into_iter()
+                    .flatten()
+                {
+                    expected.push(component);
+                }
+                expected.push(&file.filename);
+                if expected != file.path {
+                    continue;
+                }
+                let Ok(relative) = file.path.strip_prefix(root) else {
+                    continue;
+                };
+                if !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                {
+                    continue;
+                }
+                let candidates = artifacts
+                    .iter()
+                    .filter(|artifact| {
+                        artifact.product_id == id
+                            && artifact.kind == file.kind
+                            && filename_of(artifact) == file.filename
+                            && artifact.size_bytes.is_none_or(|size| size == file.size)
+                            && path_matches(
+                                artifact,
+                                file.operating_system.as_deref(),
+                                file.language.as_deref(),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                let [artifact] = candidates.as_slice() else {
+                    continue;
+                };
+                let mut path = root.to_path_buf();
+                let mut safe = true;
+                for component in std::iter::once(None).chain(relative.components().map(Some)) {
+                    if let Some(component) = component {
+                        path.push(component);
+                    }
+                    let metadata = match fs::symlink_metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            safe = false;
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    if metadata.file_type().is_symlink()
+                        || if path == file.path {
+                            !metadata.is_file() || metadata.len() != file.size
+                        } else {
+                            !metadata.is_dir()
+                        }
+                    {
+                        safe = false;
+                        break;
+                    }
+                }
+                if safe {
+                    matches.push((file.clone(), (*artifact).clone()));
+                }
+            }
+        }
+    }
+    Ok(matches)
 }
 
 fn visit_dlc_root(
@@ -342,9 +496,12 @@ pub fn apply_to_games(games: &mut [Game], records: &[ManagedFileRecord]) {
     }
 }
 
-pub fn set_locations(games: &mut [Game], root: &Path) {
+pub fn set_library_locations(games: &mut [Game], config: &crate::config::Config) {
+    let root = config
+        .default_library(crate::config::LibraryKind::OfflineInstallers)
+        .map(|library| library.path.as_path());
     for game in games {
-        game.location = root.join(&game.slug);
+        game.location = root.map_or_else(std::path::PathBuf::new, |root| root.join(&game.slug));
         for dlc in &mut game.dlcs {
             dlc.location = game.location.join("dlc").join(&dlc.slug);
         }
@@ -526,6 +683,163 @@ mod tests {
         let second = artifact("/current-64-bit");
 
         assert!(current_equivalent(&retained, &[&first, &second]).is_none());
+    }
+
+    #[test]
+    fn cold_import_rematches_base_and_dlc_without_losing_other_roots_or_receipts() {
+        let (root, mut store, games) = fixture();
+        let mut cold = games.clone();
+        cold[0].remote_artifacts.clear();
+        cold[0].dlcs[0].remote_artifacts.clear();
+        for path in [
+            "base-game/installer/linux/en/setup.sh",
+            "base-game/dlc/bonus-pack/installer/linux/en/bonus.sh",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"data").unwrap();
+        }
+        assert_eq!(rebuild(&mut store, &root, &cold).unwrap().unmatched, 2);
+        let mut rows = store.managed_files().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut retained = rows[0].clone();
+        retained.path = outside.path().join("retained.sh");
+        fs::write(&retained.path, b"kept").unwrap();
+        retained.product_id = 99;
+        retained.product_slug = "unrelated".into();
+        retained.job_id = Some("completed-job".into());
+        retained.gog_checksum = Some("verified-checksum".into());
+        retained.verified_at = Some(123);
+        rows.push(retained.clone());
+        store.replace_managed_files(&rows).unwrap();
+        for (id, artifacts) in [
+            (1, &games[0].remote_artifacts),
+            (2, &games[0].dlcs[0].remote_artifacts),
+        ] {
+            store.observe_download_manifest(id, artifacts).unwrap();
+        }
+        let matches = pending_matches(&root, &games, &store.managed_files().unwrap()).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(store.match_managed_files(&matches).unwrap(), 2);
+        assert_eq!(store.match_managed_files(&matches).unwrap(), 0);
+        let files = store.managed_files().unwrap();
+        assert_eq!(
+            files.iter().find(|file| file.product_id == 99).unwrap(),
+            &retained
+        );
+        for id in [1, 2] {
+            let file = files.iter().find(|file| file.product_id == id).unwrap();
+            assert!(file.matched && file.present && file.part_id.is_some());
+            assert!(file.gog_checksum.is_none() && file.verified_at.is_none());
+            let candidates = crate::installation::detect_installer_candidates(
+                id,
+                &store.load_all_download_revisions(id).unwrap(),
+                &files,
+                &crate::config::Config::default(),
+            );
+            assert_eq!(candidates.usable.len(), 1);
+            assert!(candidates.usable[0].complete);
+        }
+        // Scanning an empty, separate download root must not make retained files absent.
+        assert_eq!(
+            rebuild(&mut store, outside.path(), &games).unwrap().files,
+            0
+        );
+        assert_eq!(
+            store
+                .managed_files()
+                .unwrap()
+                .iter()
+                .filter(|file| file.product_id != 99)
+                .cloned()
+                .collect::<Vec<_>>(),
+            files
+                .iter()
+                .filter(|file| file.product_id != 99)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fs::read(root.join("base-game/installer/linux/en/setup.sh")).unwrap(),
+            b"data"
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rematching_refuses_size_ambiguity_symlinks_and_changed_records() {
+        let (root, mut store, mut games) = fixture();
+        let path = root.join("base-game/installer/linux/en/setup.sh");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"data").unwrap();
+        let mut cold = games.clone();
+        cold[0].remote_artifacts.clear();
+        rebuild(&mut store, &root, &cold).unwrap();
+        let files = store.managed_files().unwrap();
+        games[0].remote_artifacts[0].size_bytes = Some(5);
+        assert!(pending_matches(&root, &games, &files).unwrap().is_empty());
+        games[0].remote_artifacts[0].size_bytes = Some(4);
+        let duplicate = games[0].remote_artifacts[0].clone();
+        games[0].remote_artifacts.push(duplicate);
+        assert!(pending_matches(&root, &games, &files).unwrap().is_empty());
+        games[0].remote_artifacts.pop();
+        store
+            .observe_download_manifest(1, &games[0].remote_artifacts)
+            .unwrap();
+        let matches = pending_matches(&root, &games, &files).unwrap();
+        assert_eq!(matches.len(), 1);
+        let mut changed_manifest = games[0].remote_artifacts.clone();
+        changed_manifest[0].size_bytes = Some(5);
+        store
+            .observe_download_manifest(1, &changed_manifest)
+            .unwrap();
+        assert_eq!(store.match_managed_files(&matches).unwrap(), 0);
+        store
+            .observe_download_manifest(1, &games[0].remote_artifacts)
+            .unwrap();
+        store.mark_managed_file_absent(&path).unwrap();
+        assert_eq!(store.match_managed_files(&matches).unwrap(), 0);
+        fs::write(&path, b"changed-size").unwrap();
+        assert!(pending_matches(&root, &games, &files).unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            let target = root.join("outside-sentinel");
+            fs::write(&target, b"data").unwrap();
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(pending_matches(&root, &games, &files).unwrap().is_empty());
+            assert_eq!(fs::read(&target).unwrap(), b"data");
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_scoped_rebuild_preserves_duplicate_identity_in_another_root() {
+        let (root, mut store, games) = fixture();
+        let other = tempfile::tempdir().unwrap();
+        for directory in [&root, &other.path().to_path_buf()] {
+            let path = directory.join("base-game/installer/linux/en/setup.sh");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"data").unwrap();
+        }
+        rebuild(&mut store, &root, &games).unwrap();
+        let original = store.managed_files().unwrap()[0].clone();
+        rebuild(&mut store, other.path(), &games).unwrap();
+        let files = store.managed_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.path == original.path)
+                .unwrap(),
+            &original
+        );
+        assert!(files.iter().all(|file| file.present));
+        assert_eq!(files.iter().filter(|file| file.matched).count(), 2);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

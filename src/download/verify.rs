@@ -14,6 +14,7 @@ pub struct GogChecksum {
 pub fn gog_checksum(artifact: &RemoteArtifact, access_token: &str) -> Result<GogChecksum> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(45))
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent(crate::identity::USER_AGENT)
         .build()?;
@@ -32,11 +33,13 @@ pub fn gog_checksum(artifact: &RemoteArtifact, access_token: &str) -> Result<Gog
         url.set_path(&format!("{}.xml", url.path()));
         url.into()
     };
-    let xml = client
-        .get(metadata_url)
-        .send()?
-        .error_for_status()?
-        .text()?;
+    let response = client.get(metadata_url).send()?.error_for_status()?;
+    let mut xml = String::new();
+    response.take(1024 * 1024 + 1).read_to_string(&mut xml)?;
+    anyhow::ensure!(
+        xml.len() <= 1024 * 1024,
+        "GOG checksum metadata exceeded its size limit"
+    );
     parse_gog_checksum(&xml, fallback_name.as_deref())
 }
 

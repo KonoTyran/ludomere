@@ -44,6 +44,9 @@ pub struct DepotInstallPlan<'a> {
     pub target_manifest: &'a DepotManifest,
     pub current_manifest: Option<&'a DepotManifest>,
     pub target_marker: InstallationMarker,
+    // Windows setup publishes its marker only after all required setup succeeds.
+    pub publish_marker: bool,
+    pub retained_paths: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,6 +60,9 @@ enum CommitFailure {
 
 impl DepotInstallPlan<'_> {
     pub fn validate(&self) -> Result<()> {
+        for path in &self.retained_paths {
+            checked_join(&self.target, path)?;
+        }
         self.target_marker.validate()?;
         reject_marker_symlink(&self.target)?;
         if fs::symlink_metadata(&self.target)
@@ -151,7 +157,7 @@ where
             }
             Ok(())
         },
-        cancelled,
+        (cancelled, |_| {}),
         || Ok(()),
         if fail_before_marker {
             CommitFailure::BeforeMarker
@@ -161,13 +167,13 @@ where
     )
 }
 
-pub(crate) fn execute_streamed_forward<F, C, P>(
+pub(crate) fn execute_streamed_forward<F, C, P, E>(
     plan: &DepotInstallPlan<'_>,
     staging: &Path,
     forced_remove_paths: &BTreeSet<String>,
     trusted_files: &std::collections::HashSet<String>,
     fetch: F,
-    cancelled: C,
+    callbacks: (C, E),
     before_commit: P,
 ) -> Result<()>
 where
@@ -177,6 +183,7 @@ where
         &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<()>,
     C: FnMut() -> bool,
+    E: FnMut(crate::download::depot::ExtractionProgress),
     P: FnMut() -> Result<()>,
 {
     for path in forced_remove_paths {
@@ -187,7 +194,7 @@ where
         Some(staging),
         (forced_remove_paths, trusted_files),
         fetch,
-        cancelled,
+        callbacks,
         before_commit,
         CommitFailure::None,
     )
@@ -218,18 +225,18 @@ where
             }
             Ok(())
         },
-        cancelled,
+        (cancelled, |_| {}),
         || Ok(()),
     )?;
     crate::download::depot::finish_journal(staging)
 }
 
-fn execute_streamed_inner<F, C, P>(
+fn execute_streamed_inner<F, C, P, E>(
     plan: &DepotInstallPlan<'_>,
     supplied_staging: Option<&Path>,
     paths: (&BTreeSet<String>, &std::collections::HashSet<String>),
     fetch: F,
-    mut cancelled: C,
+    callbacks: (C, E),
     mut before_commit: P,
     failure: CommitFailure,
 ) -> Result<()>
@@ -240,8 +247,10 @@ where
         &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<()>,
     C: FnMut() -> bool,
+    E: FnMut(crate::download::depot::ExtractionProgress),
     P: FnMut() -> Result<()>,
 {
+    let (mut cancelled, extracted) = callbacks;
     let (forced_remove_paths, trusted_files) = paths;
     plan.validate()?;
     let generated = plan.target.with_extension("ludomere-depot.json");
@@ -261,13 +270,14 @@ where
     };
     let result = (|| {
         preflight_live_tree(plan, forced_remove_paths)?;
-        crate::download::depot::materialize_streamed_controlled(
+        crate::download::depot::materialize_streamed_with_progress(
             plan.target_manifest,
             &plan.target,
             journal,
             trusted_files,
             fetch,
             &mut cancelled,
+            extracted,
         )
         .context("materializing depot build")?;
         if cancelled() {
@@ -377,6 +387,7 @@ pub fn delete_abandoned_depot_staging(
     slug: &str,
     operation_id: &str,
 ) -> Result<bool> {
+    let _activity = crate::profile_reset::begin_activity("staging deletion")?;
     let path = operation_staging_path(library, destination, slug, operation_id)?;
     if !path.exists() {
         return Ok(false);
@@ -490,7 +501,8 @@ fn commit(
         .current_manifest
         .map(managed_leaves)
         .unwrap_or_default();
-    let target = managed_leaves(plan.target_manifest);
+    let mut target = managed_leaves(plan.target_manifest);
+    target.extend(plan.retained_paths.iter().cloned());
     let removed = current
         .difference(&target)
         .cloned()
@@ -520,7 +532,9 @@ fn commit(
     if failure == CommitFailure::BeforeMarker {
         bail!("injected depot commit failure");
     }
-    marker::write(&plan.target_marker, &plan.target).context("publishing depot marker")?;
+    if plan.publish_marker {
+        marker::write(&plan.target_marker, &plan.target).context("publishing depot marker")?;
+    }
     cleanup_removed_dirs(plan.current_manifest, plan.target_manifest, &plan.target);
     Ok(())
 }
@@ -760,6 +774,8 @@ mod tests {
                 target_manifest: target,
                 current_manifest: current,
                 target_marker: marker(build, target),
+                publish_marker: true,
+                retained_paths: BTreeSet::new(),
             },
             fetch(target_files),
         )
@@ -797,6 +813,47 @@ mod tests {
         assert_eq!(fs::read(collision.join("mod.txt")).unwrap(), b"keep");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(collision);
+    }
+
+    #[test]
+    fn setup_defers_fresh_marker_and_preserves_update_marker_and_dependency_paths() {
+        let root = temp("deferred-setup");
+        let files = [("game.exe", b"old".as_slice())];
+        let old = manifest(&files);
+        let new_files = [("game.exe", b"new".as_slice())];
+        let new = manifest(&new_files);
+        let mut plan = DepotInstallPlan {
+            operation: DepotOperationKind::Install,
+            target: root.clone(),
+            current_manifest: None,
+            target_manifest: &old,
+            target_marker: marker("1", &old),
+            publish_marker: false,
+            retained_paths: BTreeSet::new(),
+        };
+        execute(&plan, fetch(&files)).unwrap();
+        assert_eq!(fs::read(root.join("game.exe")).unwrap(), b"old");
+        assert!(marker::load(&root).unwrap().is_none());
+        marker::write(&plan.target_marker, &root).unwrap();
+        fs::write(root.join("required.dat"), b"dependency").unwrap();
+        plan.operation = DepotOperationKind::Update;
+        plan.current_manifest = Some(&old);
+        plan.target_manifest = &new;
+        plan.target_marker = marker("2", &new);
+        plan.retained_paths.insert("required.dat".into());
+        execute(&plan, fetch(&new_files)).unwrap();
+        assert_eq!(
+            marker::load(&root)
+                .unwrap()
+                .unwrap()
+                .galaxy_depot
+                .unwrap()
+                .build_id,
+            "1"
+        );
+        assert_eq!(fs::read(root.join("required.dat")).unwrap(), b"dependency");
+        assert_eq!(fs::read(root.join("game.exe")).unwrap(), b"new");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -934,6 +991,8 @@ mod tests {
                     target_manifest: &target,
                     current_manifest: Some(&current),
                     target_marker: marker("2", &target),
+                    publish_marker: true,
+                    retained_paths: BTreeSet::new(),
                 },
                 |_| bail!("fetch failed")
             )
@@ -966,6 +1025,8 @@ mod tests {
             target_manifest: &new,
             current_manifest: Some(&old),
             target_marker: marker("2", &new),
+            publish_marker: true,
+            retained_paths: BTreeSet::new(),
         };
         assert!(execute_inner(&plan, None, fetch(&new_files), || false, true).is_err());
         assert_eq!(fs::read(root.join("game.dat")).unwrap(), b"new");
@@ -1024,6 +1085,8 @@ mod tests {
                 target_manifest: &unsafe_manifest,
                 current_manifest: None,
                 target_marker: marker("1", &unsafe_manifest),
+                publish_marker: true,
+                retained_paths: BTreeSet::new(),
             }
             .validate()
             .is_err()
@@ -1044,6 +1107,8 @@ mod tests {
                     target_manifest: &unsafe_link,
                     current_manifest: None,
                     target_marker: marker("1", &unsafe_link),
+                    publish_marker: true,
+                    retained_paths: BTreeSet::new(),
                 }
                 .validate()
                 .is_err(),
@@ -1074,6 +1139,8 @@ mod tests {
                 target_manifest: &old,
                 current_manifest: None,
                 target_marker: wrong_target,
+                publish_marker: true,
+                retained_paths: BTreeSet::new(),
             }
             .validate()
             .is_err()
@@ -1113,6 +1180,8 @@ mod tests {
                     target_manifest: target,
                     current_manifest: Some(&old),
                     target_marker: marker("2", target),
+                    publish_marker: true,
+                    retained_paths: BTreeSet::new(),
                 }
                 .validate()
                 .is_err()
@@ -1173,6 +1242,8 @@ mod tests {
             target_manifest: &target,
             current_manifest: None,
             target_marker: marker("1", &target),
+            publish_marker: true,
+            retained_paths: BTreeSet::new(),
         };
         let mut checks = 0;
         let error = execute_controlled(&plan, &staging, fetch(&files), || {
@@ -1203,6 +1274,8 @@ mod tests {
             target_manifest: &target,
             current_manifest: None,
             target_marker: marker("1", &target),
+            publish_marker: true,
+            retained_paths: BTreeSet::new(),
         };
         assert!(execute_controlled(&plan, &outside, fetch(&[]), || false).is_err());
         let staging = operation_staging_path(&library, &root, "game", "op1").unwrap();
@@ -1384,6 +1457,8 @@ mod tests {
                 target_manifest: &new,
                 current_manifest: Some(&old),
                 target_marker: marker("2", &new),
+                publish_marker: true,
+                retained_paths: BTreeSet::new(),
             };
             let mut first_fetch = fetch(&new_files);
             assert!(
@@ -1402,7 +1477,7 @@ mod tests {
                         }
                         Ok(())
                     },
-                    || false,
+                    (|| false, |_| {}),
                     || Ok(()),
                     failure,
                 )

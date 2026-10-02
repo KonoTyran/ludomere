@@ -1,10 +1,167 @@
 use super::*;
 
+/// A read-only recovery affordance: damaged metadata must not prevent inspecting the folder.
+pub(super) fn browse_game_files(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    game: &DetailPageModel,
+) {
+    let config = model.borrow().config.clone();
+    let slug = game.slug.clone();
+    let title = format!("{} — Local Files", game.title);
+    show_recovery_folders(window, model, &title, move || {
+        crate::storage::game_directories_for_browsing(&config, &slug)
+    });
+}
+
+pub(super) fn browse_recovery_directory(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    directory: std::path::PathBuf,
+) {
+    let config = model.borrow().config.clone();
+    show_recovery_folders(window, model, "Inspect local files", move || {
+        let library = config
+            .game_libraries
+            .iter()
+            .find(|library| directory.parent() == Some(library.path.as_path()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("This item is no longer in a configured Game Files library.")
+            })?;
+        crate::storage::validate_library(
+            &config,
+            crate::config::LibraryKind::GameFiles,
+            &library.id,
+        )?;
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            crate::storage::validate_game_directory_location(&config, &directory)?;
+            Ok(vec![directory])
+        } else {
+            // Inspect loose files and links from the safe parent, without following the entry.
+            Ok(vec![library.path.clone()])
+        }
+    });
+}
+
+fn show_recovery_folders(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    title: &str,
+    inspect: impl FnOnce() -> anyhow::Result<Vec<std::path::PathBuf>> + Send + 'static,
+) {
+    let dialog = adw::AlertDialog::builder().heading(title).build();
+    dialog.add_response("close", "Close");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let status = gtk::Label::new(Some("Checking game folder locations…"));
+    status.set_wrap(true);
+    status.set_selectable(true);
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    content.append(&spinner);
+    content.append(&status);
+    dialog.set_extra_child(Some(&content));
+    let closed = Rc::new(std::cell::Cell::new(false));
+    dialog.connect_closed({
+        let closed = closed.clone();
+        move |_| closed.set(true)
+    });
+    dialog.present(Some(window));
+    let epoch = model.borrow().account_epoch;
+    let model = model.clone();
+    let window = window.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(inspect());
+    });
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+            dialog.close();
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!(
+                "Folder inspection stopped. Close this dialog and try again."
+            )),
+        };
+        spinner.stop();
+        spinner.set_visible(false);
+        match result {
+            Ok(paths) => {
+                status.set_label(if paths.is_empty() { "No game files were found in the configured Game Files libraries. Download or install the game to create them." } else { "Open a folder to inspect or back up its contents. Browsing does not change files or make this installation ready to play." });
+                for path in paths {
+                    let open = gtk::Button::new();
+                    let label = gtk::Label::new(Some(&path.display().to_string()));
+                    label.set_wrap(true);
+                    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                    open.set_child(Some(&label));
+                    let window = window.clone();
+                    let model = model.clone();
+                    let status = status.clone();
+                    open.connect_clicked(move |button| {
+                        if model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
+                        button.set_sensitive(false);
+                        status.set_label("Checking and opening the folder…");
+                        let path = path.clone();
+                        let (sender, receiver) = mpsc::channel();
+                        std::thread::spawn(move || {
+                            let result = crate::storage::read_config().and_then(|config| {
+                                if let Some(library) = config.game_libraries.iter().find(|library| library.path == path) {
+                                    crate::storage::validate_library(&config, crate::config::LibraryKind::GameFiles, &library.id)?;
+                                } else {
+                                    crate::storage::validate_game_directory_location(&config, &path)?;
+                                }
+                                Ok(path)
+                            });
+                            let _ = sender.send(result);
+                        });
+                        let window = window.clone();
+                        let model = model.clone();
+                        let status = status.clone();
+                        let button = button.downgrade();
+                        glib::timeout_add_local(Duration::from_millis(50), move || {
+                            if model.borrow().account_epoch != epoch || model.borrow().logout_pending || !status.is_mapped() { return glib::ControlFlow::Break; }
+                            let result = match receiver.try_recv() {
+                                Ok(result) => result,
+                                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                                Err(_) => Err(anyhow::anyhow!("Folder inspection stopped. Try again.")),
+                            };
+                            if let Some(button) = button.upgrade() { button.set_sensitive(true); }
+                            match result {
+                                Ok(path) => {
+                                    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+                                    let window = window.clone();
+                                    status.set_label("Requested the file manager. You can inspect or back up these files before resetting the game.");
+                                    launcher.launch(Some(&window.clone()), gio::Cancellable::NONE, move |result| {
+                                        super::widgets::file_open::report_launch_result(&window, "game folder", result);
+                                    });
+                                }
+                                Err(error) => status.set_label(&format!("Could not open this folder: {error:#}")),
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    });
+                    content.append(&open);
+                }
+            }
+            Err(error) => status.set_label(&format!(
+                "Could not inspect game files: {error:#}. No files were changed."
+            )),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 pub(super) fn detail_file_management(
     game: &DetailPageModel,
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
-    installed: Option<crate::domain::InstalledGame>,
+    _installed: Option<crate::domain::InstalledGame>,
     refresh_after_change: Rc<dyn Fn()>,
     activate_primary_action: Rc<dyn Fn()>,
 ) -> DetailFileManagement {
@@ -14,6 +171,13 @@ pub(super) fn detail_file_management(
     menu.set_widget_name("game-management-menu");
     menu.add_css_class("square-action");
     menu.add_css_class("steam-utility-action");
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("dim-label");
+    status.set_visible(false);
+    let cleanup_notice = find_named_descendant(window.upcast_ref(), "application-status-message")
+        .and_downcast::<gtk::Label>();
 
     let actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
     actions.set_margin_start(6);
@@ -23,7 +187,7 @@ pub(super) fn detail_file_management(
     let mut main_actions = Vec::<gtk::Button>::new();
     let mut manage_submenu_actions = Vec::<gtk::Button>::new();
 
-    let primary_action = context_primary_action(game, installed.as_ref(), &model.borrow().config);
+    let primary_action = current_primary_action(&model.borrow(), game.product_id, game.parent_id);
     let active_operation = crate::installation::installation_operation_snapshot(game.product_id)
         .filter(|snapshot| {
             snapshot.queued
@@ -62,8 +226,10 @@ pub(super) fn detail_file_management(
             ("process-stop-symbolic", "Cancel")
         },
     );
-    proxy_content.append(&gtk::Image::from_icon_name(proxy_icon));
-    proxy_content.append(&gtk::Label::new(Some(proxy_label)));
+    let proxy_image = gtk::Image::from_icon_name(proxy_icon);
+    let proxy_text = gtk::Label::new(Some(proxy_label));
+    proxy_content.append(&proxy_image);
+    proxy_content.append(&proxy_text);
     proxy_action.set_child(Some(&proxy_content));
     proxy_action.add_css_class("steam-primary-action");
     proxy_action.add_css_class("context-primary-action");
@@ -84,14 +250,45 @@ pub(super) fn detail_file_management(
     actions.append(&proxy_action);
     main_actions.push(proxy_action);
 
+    if game.parent_id.is_none() {
+        let hidden = model.borrow().hidden_products.contains(&game.product_id);
+        let toggle = management_menu_button(if hidden {
+            "Unhide game"
+        } else {
+            "Hide game locally"
+        });
+        bind_management_action(&toggle, window, "hidden", game.product_id);
+        toggle.connect_map({
+            let model = model.clone();
+            let id = game.product_id;
+            move |button| {
+                // Sidebar reparenting maps this button while AppModel is still borrowed.
+                let button = button.downgrade();
+                let model = model.clone();
+                glib::idle_add_local_once(move || {
+                    let Some(button) = button.upgrade() else {
+                        return;
+                    };
+                    let hidden = model.borrow().hidden_products.contains(&id);
+                    button.set_label(if hidden {
+                        "Unhide game"
+                    } else {
+                        "Hide game locally"
+                    });
+                });
+            }
+        });
+        actions.append(&toggle);
+        main_actions.push(toggle);
+    }
+
     if let Some(favorite) = game.favorite {
         let favorite_action = management_menu_button(if favorite {
             "Remove from Favorites"
         } else {
             "Add to Favorites"
         });
-        favorite_action.set_action_name(Some("win.favorite"));
-        favorite_action.set_action_target_value(Some(&game.product_id.to_variant()));
+        bind_management_action(&favorite_action, window, "favorite", game.product_id);
         actions.append(&favorite_action);
         main_actions.push(favorite_action);
     }
@@ -116,115 +313,152 @@ pub(super) fn detail_file_management(
     manage_actions.set_margin_bottom(6);
     manage_actions.append(&check_updates);
     manage_actions.append(&verify);
+    let refresh_local = management_menu_button("Refresh local state");
+    {
+        let refresh = refresh_after_change.clone();
+        refresh_local.connect_clicked(move |_| refresh());
+    }
+    manage_actions.append(&refresh_local);
+    manage_submenu_actions.push(refresh_local);
     manage_submenu_actions.push(check_updates.clone());
     manage_submenu_actions.push(verify.clone());
 
-    if let Some(installed) = installed.clone() {
-        manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let browse = management_menu_button("Browse Local Files");
-        {
-            let path = installed.installation_directory.clone();
-            let window = window.clone();
-            browse.connect_clicked(move |_| {
-                super::widgets::file_open::open_directory(
-                    &path,
-                    &window,
-                    "installed-game directory",
-                );
-            });
-        }
-        manage_actions.append(&browse);
-        manage_submenu_actions.push(browse);
-
-        let repair = management_menu_button("Repair Installation");
-        repair.set_tooltip_text(Some(
-            "Rerun the current full game installer and all available DLC installers",
-        ));
-        {
-            let window = window.clone();
-            let game = game.clone();
+    let downloaded = Rc::new(RefCell::new(
+        None::<Result<download::ManagedDownloads, String>>,
+    ));
+    let delete_downloads = management_menu_button("Delete Downloaded Files…");
+    delete_downloads.add_css_class("destructive-action");
+    delete_downloads.set_visible(false);
+    manage_actions.append(&delete_downloads);
+    manage_submenu_actions.push(delete_downloads.clone());
+    let preview_busy = Rc::new(std::cell::Cell::new(false));
+    let preview_pending = Rc::new(std::cell::Cell::new(false));
+    let refresh_preview: Rc<dyn Fn()> = {
+        let product_id = game.product_id;
+        let downloaded = downloaded.clone();
+        let delete = delete_downloads.clone();
+        let model = model.clone();
+        let busy = preview_busy.clone();
+        let status = status.clone();
+        let pending = preview_pending.clone();
+        let notice = cleanup_notice.clone();
+        Rc::new(move || {
+            *downloaded.borrow_mut() = None;
+            if busy.replace(true) {
+                pending.set(true);
+                return;
+            }
+            let epoch = model.borrow().account_epoch;
+            delete.set_sensitive(false);
+            let mut receiver = inspect_downloaded_files(product_id);
+            let downloaded = downloaded.clone();
+            let delete = delete.clone();
             let model = model.clone();
-            repair.connect_clicked(move |_| show_repair_dialog(&window, &model, &game));
-        }
-        manage_actions.append(&repair);
-        manage_submenu_actions.push(repair);
-        manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-        let uninstall = management_menu_button("Uninstall");
-        uninstall.add_css_class("destructive-action");
+            let busy = busy.clone();
+            let status = status.clone();
+            let pending = pending.clone();
+            let notice = notice.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                    busy.set(false);
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        if pending.replace(false) {
+                            receiver = inspect_downloaded_files(product_id);
+                            return glib::ControlFlow::Continue;
+                        }
+                        busy.set(false);
+                        if let Err(error) = &result {
+                            status.set_label(&format!("Could not inspect downloaded files: {error}. Reopen Manage or retry in Uninstall."));
+                            status.set_visible(true);
+                            hold_status_notice(notice.as_ref(), &status.label());
+                        }
+                        delete.set_visible(result.as_ref().is_ok_and(|files| files.count() > 0));
+                        delete.set_sensitive(true);
+                        *downloaded.borrow_mut() = Some(result);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(_) => {
+                        busy.set(false);
+                        *downloaded.borrow_mut() =
+                            Some(Err("Could not inspect downloaded files".into()));
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        })
+    };
+    {
+        let downloaded = downloaded.clone();
         let window = window.clone();
-        let title = game.title.clone();
-        let refresh_after_uninstall = refresh_after_change.clone();
-        uninstall.connect_clicked(move |button| {
+        let status = status.clone();
+        let model = model.clone();
+        let refresh = refresh_after_change.clone();
+        let cleanup_notice = cleanup_notice.clone();
+        delete_downloads.connect_clicked(move |button| {
+            let Some(Ok(files)) = downloaded.borrow().clone() else {
+                return;
+            };
+            let epoch = model.borrow().account_epoch;
             let confirmation = adw::AlertDialog::builder()
-                .heading(format!("Uninstall {title}?"))
-                .body(format!(
-                    "Remove the installed game from {}? Downloaded installers, patches, extras, and DLC backups will be kept.",
-                    installed.installation_directory.display()
-                ))
+                .heading("Delete downloaded files?")
+                .body(format!("Permanently delete {} managed downloaded files ({}) for this game and its recorded DLC? Installed games, saves and preferences are preserved.", files.count(), human_size(files.bytes())))
                 .build();
-            confirmation.add_responses(&[("cancel", "Cancel"), ("uninstall", "Uninstall")]);
+            confirmation.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
             confirmation.set_default_response(Some("cancel"));
             confirmation.set_close_response("cancel");
-            confirmation
-                .set_response_appearance("uninstall", adw::ResponseAppearance::Destructive);
-            let installed = installed.clone();
+            confirmation.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
             let button = button.clone();
-            let response_window = window.clone();
-            let refresh_after_change = refresh_after_uninstall.clone();
+            let model = model.clone();
+            let status = status.clone();
+            let refresh = refresh.clone();
+            let cleanup_notice = cleanup_notice.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "uninstall" {
+                if response != "delete"
+                    || model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                {
                     return;
                 }
                 button.set_sensitive(false);
-                let receiver = crate::installation::subscribe_installation_events();
-                let product_id = installed.product_id;
-                if !crate::installation::enqueue_uninstallation(installed) {
-                    button.set_sensitive(true);
-                    return;
-                }
-                let button = button.clone();
-                let window = response_window.clone();
-                let refresh_after_change = refresh_after_change.clone();
+                status.set_label("Deleting downloaded files…");
+                status.set_visible(true);
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(download::delete_managed_downloads(files));
+                });
                 glib::timeout_add_local(Duration::from_millis(100), move || {
+                    if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                        return glib::ControlFlow::Break;
+                    }
                     match receiver.try_recv() {
-                        Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                            product_id: event_product_id,
-                            event: crate::installation::UninstallationEvent::Started,
-                        }) if event_product_id == product_id => {
-                            refresh_after_change();
+                        Ok(result) => {
+                            match result {
+                                Ok(result) if result.failures.is_empty() => {
+                                    status.set_label(&format!("Deleted {} downloaded files", result.deleted));
+                                    button.set_visible(false);
+                                }
+                                Ok(result) => {
+                                    status.set_label(&format!("Deleted {} files; some files could not be deleted: {}", result.deleted, result.failures.join("; ")));
+                                    button.set_sensitive(true);
+                                }
+                                Err(error) => {
+                                    status.set_label(&format!("Downloaded files were not deleted: {error}"));
+                                    button.set_sensitive(true);
+                                }
+                            }
+                            status.set_visible(true);
+                            hold_status_notice(cleanup_notice.as_ref(), &status.label());
+                            refresh();
                             glib::ControlFlow::Break
                         }
-                        Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                            product_id: event_product_id,
-                            event: crate::installation::UninstallationEvent::Complete,
-                        }) if event_product_id == product_id => {
-                            refresh_after_change();
-                            glib::ControlFlow::Break
-                        }
-                        Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                            product_id: event_product_id,
-                            event: crate::installation::UninstallationEvent::Cancelled,
-                        }) if event_product_id == product_id => {
-                            button.set_sensitive(true);
-                            refresh_after_change();
-                            glib::ControlFlow::Break
-                        }
-                        Ok(crate::installation::InstallationManagerEvent::Uninstallation {
-                            product_id: event_product_id,
-                            event: crate::installation::UninstallationEvent::Failed(error),
-                        }) if event_product_id == product_id => {
-                            button.set_sensitive(true);
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("Could not uninstall game")
-                                .body(error)
-                                .build();
-                            dialog.add_response("close", "Close");
-                            dialog.present(Some(&window));
-                            glib::ControlFlow::Break
-                        }
-                        Ok(_) | Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => {
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(_) => {
+                            status.set_label("Downloaded-file cleanup stopped. Check the files and try again.");
+                            hold_status_notice(cleanup_notice.as_ref(), &status.label());
                             button.set_sensitive(true);
                             glib::ControlFlow::Break
                         }
@@ -232,12 +466,78 @@ pub(super) fn detail_file_management(
                 });
             });
         });
+    }
+
+    if game.parent_id.is_none() {
+        manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let browse = management_menu_button("Browse Local Files");
+        {
+            let game = game.clone();
+            let model = model.clone();
+            let window = window.clone();
+            browse.connect_clicked(move |_| {
+                browse_game_files(&window, &model, &game);
+            });
+        }
+        manage_actions.append(&browse);
+        manage_submenu_actions.push(browse.clone());
+
+        let repair = management_menu_button("Repair Installation");
+        repair.set_tooltip_text(Some(
+            "Check whether the current installation can be repaired; otherwise review reinstall or reset options",
+        ));
+        {
+            let window = window.clone();
+            let game = game.clone();
+            let model = model.clone();
+            repair.connect_clicked(move |_| {
+                let current = current_detail(&model.borrow(), game.product_id, game.parent_id);
+                if let Some(current) = current {
+                    show_repair_dialog(&window, &model, &current);
+                }
+            });
+        }
+        manage_actions.append(&repair);
+        manage_submenu_actions.push(repair.clone());
+        manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let uninstall = management_menu_button("Uninstall");
+        uninstall.set_widget_name("game-uninstall");
+        uninstall.add_css_class("destructive-action");
+        {
+            let window = window.clone();
+            let model = model.clone();
+            let game = game.clone();
+            let refresh = refresh_after_change.clone();
+            uninstall.connect_clicked(move |button| {
+                if model.borrow().logout_pending {
+                    return;
+                }
+                button.set_sensitive(false);
+                let dialog = super::uninstall::show_uninstall_dialog(
+                    &window,
+                    &model,
+                    &game,
+                    refresh.clone(),
+                );
+                let button = button.downgrade();
+                dialog.connect_closed(move |_| {
+                    if let Some(button) = button.upgrade() {
+                        button.set_sensitive(true);
+                    }
+                });
+            });
+        }
         manage_actions.append(&uninstall);
         manage_submenu_actions.push(uninstall);
     }
     let manage_popover = gtk::Popover::new();
     manage_popover.add_css_class("game-management-popover");
     manage_popover.set_child(Some(&manage_actions));
+    {
+        let refresh = refresh_preview.clone();
+        manage_popover.connect_show(move |_| refresh());
+    }
     manage.set_popover(Some(&manage_popover));
     let hover = gtk::EventControllerMotion::new();
     {
@@ -252,10 +552,18 @@ pub(super) fn detail_file_management(
     {
         let window = window.clone();
         let game = game.clone();
-        let installed = installed.clone();
         let model = model.clone();
         let refresh_after_change = refresh_after_change.clone();
         game_settings.connect_clicked(move |_| {
+            let current = current_detail(&model.borrow(), game.product_id, game.parent_id);
+            let Some(game) = current else {
+                return;
+            };
+            let installed = model
+                .borrow()
+                .installed_games
+                .get(&game.product_id)
+                .cloned();
             show_game_settings(
                 &window,
                 &model,
@@ -272,6 +580,42 @@ pub(super) fn detail_file_management(
     popover.add_css_class("game-management-popover");
     popover.set_child(Some(&actions));
     menu.set_popover(Some(&popover));
+    {
+        let model = model.clone();
+        let id = game.product_id;
+        let parent = game.parent_id;
+        popover.connect_show(move |_| {
+            let action = current_primary_action(&model.borrow(), id, parent);
+            let active =
+                crate::installation::installation_operation_snapshot(id).is_some_and(|snapshot| {
+                    snapshot.queued
+                        || matches!(
+                            snapshot.state,
+                            crate::domain::InstallationState::Installing
+                                | crate::domain::InstallationState::Uninstalling
+                        )
+                });
+            let running = crate::installation::is_game_running(id);
+            let downloading = model.borrow().download_jobs.iter().any(|job| {
+                job.product_id == id
+                    && matches!(
+                        job.state,
+                        DownloadState::Queued | DownloadState::Downloading
+                    )
+            });
+            let (icon, text) = if active {
+                ("process-stop-symbolic", "Cancel")
+            } else if running {
+                ("media-playback-stop-symbolic", "Stop")
+            } else if downloading {
+                ("media-playback-pause-symbolic", "Pause")
+            } else {
+                (action.icon(), action.label())
+            };
+            proxy_image.set_icon_name(Some(icon));
+            proxy_text.set_label(text);
+        });
+    }
     for action in main_actions {
         let popover = popover.clone();
         action.connect_clicked(move |_| popover.popdown());
@@ -285,10 +629,6 @@ pub(super) fn detail_file_management(
         });
     }
 
-    let status = gtk::Label::new(None);
-    status.set_xalign(0.0);
-    status.add_css_class("dim-label");
-    status.set_visible(false);
     let progress = gtk::ProgressBar::new();
     progress.set_hexpand(true);
     progress.set_visible(false);
@@ -347,6 +687,22 @@ pub(super) fn detail_file_management(
     }
 }
 
+fn bind_management_action(
+    button: &gtk::Button,
+    window: &adw::ApplicationWindow,
+    action: &'static str,
+    id: i64,
+) {
+    let window = window.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(window) = window.upgrade()
+            && let Some(action) = window.lookup_action(action)
+        {
+            action.activate(Some(&id.to_variant()));
+        }
+    });
+}
+
 fn management_menu_button(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.add_css_class("flat");
@@ -356,11 +712,243 @@ fn management_menu_button(label: &str) -> gtk::Button {
     button
 }
 
+fn inspect_downloaded_files(
+    product_id: i64,
+) -> mpsc::Receiver<Result<download::ManagedDownloads, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ =
+            sender.send(download::managed_downloads(product_id).map_err(|error| error.to_string()));
+    });
+    receiver
+}
+
+pub(super) fn archive_deletion_group(
+    window: &adw::ApplicationWindow,
+    product_id: i64,
+    refresh: Rc<dyn Fn()>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Downloaded archives");
+    group.set_description(Some("Delete listed archives from compatible configured libraries independently of the installed game. Incompatible or unavailable libraries are excluded. Installed payloads, saves and preferences are preserved."));
+    let session = online::account_session();
+    for kind in [
+        crate::config::LibraryKind::OfflineInstallers,
+        crate::config::LibraryKind::Extras,
+    ] {
+        let row = adw::ActionRow::new();
+        row.set_use_markup(false);
+        row.set_title(kind.label());
+        row.set_subtitle("Inspecting managed files…");
+        let button = gtk::Button::with_label(&format!("Delete {}…", kind.label()));
+        button.add_css_class("destructive-action");
+        button.set_valign(gtk::Align::Center);
+        button.set_sensitive(false);
+        row.add_suffix(&button);
+        group.add(&row);
+        let snapshot = Rc::new(RefCell::new(None::<download::ManagedDownloads>));
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(
+                download::managed_downloads_for_kind(product_id, kind)
+                    .map_err(|error| error.to_string()),
+            );
+        });
+        {
+            let row = row.clone();
+            let button = button.clone();
+            let snapshot = snapshot.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if online::account_session() != session || button.root().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(Ok(files)) => {
+                        if files.count() == 0 {
+                            row.set_subtitle(&if files.blocked_libraries().is_empty() {
+                                "No managed downloaded files in this category.".into()
+                            } else {
+                                format!(
+                                    "Blocked libraries: {}. Correct them in Storage settings.",
+                                    files.blocked_libraries().join("; ")
+                                )
+                            });
+                        } else {
+                            row.set_subtitle(&format!(
+                                "{} files · {}{}",
+                                files.count(),
+                                human_size(files.bytes()),
+                                if files.blocked_libraries().is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        ". Excluded libraries: {}",
+                                        files.blocked_libraries().join("; ")
+                                    )
+                                }
+                            ));
+                            button.set_sensitive(true);
+                            *snapshot.borrow_mut() = Some(files);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        row.set_subtitle(&error);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        row.set_subtitle("Could not inspect downloaded files");
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        }
+        let window = window.clone();
+        let refresh = refresh.clone();
+        button.connect_clicked(move |button| {
+            if online::account_session() != session {
+                return;
+            }
+            let Some(files) = snapshot.borrow().clone() else {
+                return;
+            };
+            let dialog = adw::Dialog::builder()
+                .title(format!("Delete {}?", kind.label()))
+                .content_width(680)
+                .content_height(460)
+                .build();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            content.set_margin_start(18);
+            content.set_margin_end(18);
+            content.set_margin_top(18);
+            content.set_margin_bottom(18);
+            content.append(&adw::HeaderBar::new());
+            let summary = gtk::Label::new(Some(&format!(
+                "Permanently delete the {} files listed below ({}) for this game and its recorded DLC? Incompatible and unavailable libraries are excluded.",
+                files.count(),
+                human_size(files.bytes())
+            )));
+            summary.set_wrap(true);
+            content.append(&summary);
+            let paths = gtk::Label::new(Some(
+                &files
+                    .paths()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ));
+            paths.set_wrap(true);
+            paths.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            paths.set_selectable(true);
+            paths.set_xalign(0.0);
+            let scroll = gtk::ScrolledWindow::builder()
+                .vexpand(true)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(&paths)
+                .build();
+            content.append(&scroll);
+            let status = gtk::Label::new(None);
+            status.set_wrap(true);
+            content.append(&status);
+            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            let cancel = gtk::Button::with_label("Cancel");
+            let confirm = gtk::Button::with_label("Delete Permanently");
+            confirm.add_css_class("destructive-action");
+            actions.append(&cancel);
+            actions.append(&confirm);
+            content.append(&actions);
+            dialog.set_child(Some(&content));
+            let active = Rc::new(std::cell::Cell::new(true));
+            {
+                let active = active.clone();
+                dialog.connect_closed(move |_| active.set(false));
+            }
+            {
+                let dialog = dialog.clone();
+                cancel.connect_clicked(move |_| { dialog.close(); });
+            }
+            let button = button.clone();
+            let row = row.clone();
+            let snapshot = snapshot.clone();
+            let refresh = refresh.clone();
+            confirm.connect_clicked(move |confirm| {
+                if online::account_session() != session {
+                    return;
+                }
+                confirm.set_sensitive(false);
+                status.set_label("Deleting selected files…");
+                let files = files.clone();
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = if online::account_session() == session {
+                        download::delete_managed_downloads(files).map_err(|error| error.to_string())
+                    } else {
+                        Err("The account changed; reopen Properties.".into())
+                    };
+                    let _ = sender.send(result);
+                });
+                let status = status.clone();
+                let button = button.clone();
+                let row = row.clone();
+                let snapshot = snapshot.clone();
+                let refresh = refresh.clone();
+                let active = active.clone();
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    if !active.get() || online::account_session() != session {
+                        return glib::ControlFlow::Break;
+                    }
+                    match receiver.try_recv() {
+                        Ok(Ok(result)) => {
+                            status.set_label(&format!(
+                                "Deleted {} files. {}",
+                                result.deleted,
+                                result.failures.join("; ")
+                            ));
+                            button.set_sensitive(false);
+                            snapshot.borrow_mut().take();
+                            row.set_subtitle(
+                                "Reopen Properties to inspect the remaining downloaded files.",
+                            );
+                            refresh();
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&error);
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            status.set_label(
+                                "Deletion did not complete; reopen Properties to inspect files.",
+                            );
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+            });
+            dialog.present(Some(&window));
+        });
+    }
+    group
+}
+
+pub(super) fn hold_status_notice(label: Option<&gtk::Label>, message: &str) {
+    let Some(label) = label else {
+        return;
+    };
+    label.set_label(message);
+}
+
 pub(super) fn activate_context_primary_action(
     widgets: &Rc<Widgets>,
     model: &Rc<RefCell<AppModel>>,
     game: DetailPageModel,
 ) {
+    let current = current_detail(&model.borrow(), game.product_id, game.parent_id);
+    let Some(game) = current else {
+        return;
+    };
     if crate::installation::installation_operation_snapshot(game.product_id).is_some_and(
         |snapshot| {
             snapshot.queued
@@ -397,14 +985,13 @@ pub(super) fn activate_context_primary_action(
         crate::installation::stop_game(game.product_id);
         return;
     }
-    let libraries = model.borrow().config.game_libraries.clone();
-    let installed = StateStore::open().ok().and_then(|store| {
-        crate::installation::reconcile_installed_games(&store, &libraries)
-            .ok()?
-            .into_iter()
-            .find(|installed| installed.product_id == game.product_id)
-    });
-    match context_primary_action(&game, installed.as_ref(), &model.borrow().config) {
+    let installed = model
+        .borrow()
+        .installed_games
+        .get(&game.product_id)
+        .cloned();
+    let action = current_primary_action(&model.borrow(), game.product_id, game.parent_id);
+    match action {
         GamePrimaryAction::Install => show_install_dialog(&widgets.window, model, &game),
         GamePrimaryAction::InstallUpdate => {
             if model.borrow().config.prefer_patch_updates
@@ -437,9 +1024,22 @@ pub(super) fn activate_context_primary_action(
                     return;
                 }
             }
-            let receiver = crate::installation::launch_game(installed);
+            let session = online::account_session();
+            let auth_session = auth::session();
+            let epoch = model.borrow().account_epoch;
+            let receiver = launch_with_components(&widgets.window, installed);
+            let launch_generation = model.borrow().detail_generation;
+            let model = model.clone();
             let window = widgets.window.clone();
+            let widgets = widgets.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                if online::account_session() != session
+                    || auth::session() != auth_session
+                    || model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                {
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(
                         event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
@@ -459,13 +1059,30 @@ pub(super) fn activate_context_primary_action(
                         glib::ControlFlow::Continue
                     }
                     Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
+                    Ok(crate::installation::LaunchEvent::PrefixRecoveryRequired {
+                        message,
+                        game: installed,
+                        setup_required,
+                    }) => {
+                        offer_prefix_recovery(
+                            &window,
+                            &model,
+                            *installed,
+                            &game.title,
+                            &message,
+                            setup_required,
+                            launch_generation,
+                        );
+                        glib::ControlFlow::Break
+                    }
                     Ok(crate::installation::LaunchEvent::Failed(error)) => {
-                        let dialog = adw::AlertDialog::builder()
-                            .heading("Could not run game")
-                            .body(error)
-                            .build();
-                        dialog.add_response("close", "Close");
-                        dialog.present(Some(&window));
+                        show_status(
+                            &widgets,
+                            &notifications::failure_message(
+                                &format!("{}: Could not run game", game.title),
+                                &error,
+                            ),
+                        );
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -474,11 +1091,7 @@ pub(super) fn activate_context_primary_action(
             });
         }
         GamePrimaryAction::Download | GamePrimaryAction::DownloadUpdate => {
-            if model.borrow().account_token.is_none() {
-                widgets.reconnect.emit_clicked();
-            } else {
-                show_download_selector(widgets, model, &game);
-            }
+            show_primary_download(widgets, model, &game);
         }
     }
 }
@@ -535,7 +1148,8 @@ fn try_run_preferred_patch(
     let installed = installed.clone();
     confirmation.choose(Some(window), gio::Cancellable::NONE, move |response| {
         if response != "run" { return; }
-        let receiver = crate::installation::run_patch(
+        let receiver = patch_with_components(
+            &window_for_response,
             installed.clone(),
             patch.path.clone(),
             target_version.clone(),
@@ -568,38 +1182,10 @@ fn try_run_preferred_patch(
     true
 }
 
-fn context_primary_action(
-    game: &DetailPageModel,
-    installed: Option<&crate::domain::InstalledGame>,
-    config: &Config,
-) -> GamePrimaryAction {
-    let store = StateStore::open().ok();
-    let installed_update = installed.is_some_and(|installed| {
-        store.as_ref().is_some_and(|store| {
-            store
-                .installation_update_available(installed)
-                .unwrap_or(false)
-        })
-    });
-    let backup_update = store.is_some_and(|store| {
-        store
-            .installer_backup_update_available(game.product_id)
-            .unwrap_or(false)
-    });
-    let dlc_action = owned_dlc_action_state(game, config, installed.is_some());
-    let current_installer_downloaded = default_installers_are_downloaded(game, config);
-    primary_action_for_state(
-        installed.is_some(),
-        installed_update,
-        backup_update,
-        current_installer_downloaded,
-        dlc_action,
-    )
-}
-
 pub(super) struct FilesPageOptions<'a> {
     pub access_token: Option<&'a str>,
-    pub download_directory: &'a std::path::Path,
+    pub config: &'a Config,
+    pub library_statuses: &'a [crate::storage::LibraryStatus],
     pub installer_defaults: &'a InstallerFilterDefaults,
     pub show_retired_artifacts: bool,
     pub management: Option<&'a DetailFileManagement>,
@@ -613,7 +1199,8 @@ pub(super) fn build_files_page(
 ) -> gtk::Box {
     let FilesPageOptions {
         access_token,
-        download_directory,
+        config,
+        library_statuses,
         installer_defaults,
         show_retired_artifacts,
         management,
@@ -621,6 +1208,51 @@ pub(super) fn build_files_page(
     } = options;
     let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
     page.set_margin_top(12);
+    for kind in [
+        crate::config::LibraryKind::OfflineInstallers,
+        crate::config::LibraryKind::Extras,
+    ] {
+        let usable = library_statuses.iter().any(|status| {
+            status.kind == kind
+                && matches!(
+                    status.compatibility,
+                    crate::storage::LibraryCompatibility::Compatible
+                )
+        });
+        if !usable {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let label = gtk::Label::new(Some(&format!(
+                "{}: {}",
+                kind.label(),
+                if config.libraries(kind).is_empty() {
+                    "No directory configured."
+                } else {
+                    "No usable directory. Correct unavailable or incompatible libraries in Storage settings."
+                }
+            )));
+            label.set_wrap(true);
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            row.append(&label);
+            let settings = gtk::Button::with_label("Storage settings");
+            settings.connect_clicked({
+                let window = window.clone();
+                move |_| {
+                    let _ = gtk::prelude::WidgetExt::activate_action(
+                        &window,
+                        "win.settings-page",
+                        Some(&"storage".to_variant()),
+                    );
+                }
+            });
+            row.append(&settings);
+            page.append(&row);
+        }
+    }
+    let download_directory = config
+        .default_library(crate::config::LibraryKind::OfflineInstallers)
+        .map(|library| library.path.as_path())
+        .unwrap_or_else(|| std::path::Path::new(""));
 
     let managed = StateStore::open()
         .and_then(|store| store.managed_files())
@@ -699,6 +1331,8 @@ pub(super) fn build_files_page(
         window,
         access_token,
         download_directory,
+        config,
+        library_statuses,
         installer_filters: Some(installer_defaults),
         show_retired_artifacts,
         installed: None,
@@ -721,6 +1355,8 @@ pub(super) fn build_files_page(
             window,
             access_token,
             download_directory,
+            config,
+            library_statuses,
             installer_filters: None,
             show_retired_artifacts,
             installed,
@@ -744,12 +1380,14 @@ pub(super) fn build_files_page(
             window,
             access_token,
             download_directory,
+            config,
+            library_statuses,
             installer_filters: None,
             show_retired_artifacts,
             installed: None,
         };
         page.append(&remote_file_collection(
-            "Extras",
+            "Goodies & Extras",
             "folder-documents-symbolic",
             &remote_extras,
             &extras,
@@ -767,7 +1405,7 @@ pub(super) fn build_files_page(
     }
     if remote_extras.is_empty() && !extras.is_empty() {
         page.append(&file_collection(
-            "Extras",
+            "Goodies & Extras",
             "folder-documents-symbolic",
             &extras,
             &game.location.join("extras"),
@@ -788,6 +1426,8 @@ pub(super) fn build_files_page(
                 window,
                 access_token,
                 download_directory,
+                config,
+                library_statuses,
                 installer_defaults,
                 show_retired_artifacts,
             ));
@@ -796,12 +1436,15 @@ pub(super) fn build_files_page(
     page
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dlc_file_section(
     dlc: &Dlc,
     parent_slug: &str,
     window: &adw::ApplicationWindow,
     access_token: Option<&str>,
     download_directory: &std::path::Path,
+    config: &Config,
+    library_statuses: &[crate::storage::LibraryStatus],
     installer_defaults: &InstallerFilterDefaults,
     show_retired_artifacts: bool,
 ) -> gtk::Box {
@@ -857,6 +1500,8 @@ fn dlc_file_section(
                 window,
                 access_token,
                 download_directory,
+                config,
+                library_statuses,
                 installer_filters: filters,
                 show_retired_artifacts,
                 installed: None,
@@ -887,7 +1532,7 @@ fn dlc_file_section(
     );
     append_collection(
         &section,
-        "Extras",
+        "Goodies & Extras",
         "folder-documents-symbolic",
         ArtifactKind::Extra,
         &extras,
@@ -914,6 +1559,8 @@ struct RemoteFileContext<'a> {
     window: &'a adw::ApplicationWindow,
     access_token: Option<&'a str>,
     download_directory: &'a std::path::Path,
+    config: &'a Config,
+    library_statuses: &'a [crate::storage::LibraryStatus],
     installer_filters: Option<&'a InstallerFilterDefaults>,
     show_retired_artifacts: bool,
     installed: Option<&'a crate::domain::InstalledGame>,
@@ -1149,18 +1796,35 @@ fn remote_file_collection(
     local_files: &[LibraryFile],
     context: &RemoteFileContext<'_>,
 ) -> gtk::Box {
-    let grouped = download_selection::group_artifacts(files);
     let state_store = StateStore::open().ok();
-    let managed_group_paths = grouped
-        .iter()
-        .map(|group| {
-            let artifacts = group.artifacts.iter().collect::<Vec<_>>();
-            state_store
-                .as_ref()
-                .and_then(|store| store.current_managed_paths(&artifacts).ok())
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>();
+    let (grouped, managed_group_paths): (Vec<_>, Vec<_>) =
+        download_selection::group_artifacts(files)
+            .into_iter()
+            .flat_map(|group| {
+                let artifacts = group.artifacts.iter().collect::<Vec<_>>();
+                let paths = state_store
+                    .as_ref()
+                    .and_then(|store| store.current_managed_paths(&artifacts).ok())
+                    .unwrap_or_default();
+                let mut copies =
+                    std::collections::BTreeMap::<std::path::PathBuf, Vec<std::path::PathBuf>>::new(
+                    );
+                for path in paths {
+                    copies
+                        .entry(path.parent().unwrap_or(&path).to_path_buf())
+                        .or_default()
+                        .push(path);
+                }
+                if copies.is_empty() {
+                    vec![(group, Vec::new())]
+                } else {
+                    copies
+                        .into_values()
+                        .map(|paths| (group.clone(), paths))
+                        .collect()
+                }
+            })
+            .unzip();
     let filter_rows: InstallerFilterRows = Rc::new(RefCell::new(Vec::new()));
     let collection = gtk::Box::new(gtk::Orientation::Vertical, 0);
     collection.add_css_class("file-collection");
@@ -1217,10 +1881,20 @@ fn remote_file_collection(
         .filter(|(group, managed_paths)| {
             let refs = group.artifacts.iter().collect::<Vec<_>>();
             if !managed_paths.is_empty() {
-                return artifact_download_is_plausible(&refs, managed_paths);
+                return managed_paths.iter().all(|path| {
+                    matches!(
+                        crate::storage::path_status(context.library_statuses, path),
+                        Some(crate::storage::LibraryCompatibility::Compatible)
+                    )
+                }) && artifact_download_is_plausible(&refs, managed_paths);
             }
             matching_download_job(&refs).is_some_and(|job| {
-                download_job_is_complete(&job)
+                job.completed_files.iter().all(|path| {
+                    matches!(
+                        crate::storage::path_status(context.library_statuses, path),
+                        Some(crate::storage::LibraryCompatibility::Compatible)
+                    )
+                }) && download_job_is_complete(&job)
                     && artifact_download_is_plausible(&refs, &job.completed_files)
             })
         })
@@ -1266,6 +1940,9 @@ fn remote_file_collection(
         .collect::<Vec<_>>();
         if let Some(part_count) = file.part_count {
             metadata_parts.push(format!("{part_count} parts"));
+        }
+        if let Some(path) = managed_paths.first().and_then(|path| path.parent()) {
+            metadata_parts.push(path.display().to_string());
         }
         let total_size = group.total_size;
         let size_text = total_size.map_or_else(
@@ -1405,7 +2082,13 @@ fn remote_file_collection(
             }
             metadata.join(" · ")
         } else if historical {
-            let path_metadata = historical_path_metadata(file, context.download_directory);
+            let root = crate::config::LibraryKind::ALL
+                .into_iter()
+                .flat_map(|kind| context.config.libraries(kind))
+                .find(|library| file.path.starts_with(&library.path))
+                .map(|library| library.path.as_path())
+                .unwrap_or(context.download_directory);
+            let path_metadata = historical_path_metadata(file, root);
             if files.len() > 1 {
                 format!(
                     "{}{} parts",
@@ -1442,7 +2125,13 @@ fn remote_file_collection(
             .map(|file| file.path.clone())
             .collect::<Vec<_>>();
         let path = file.path.clone();
-        let root = context.download_directory.to_path_buf();
+        let total_size = files.iter().map(|file| file.size).sum::<u64>();
+        row.set_sensitive(paths.iter().all(|path| {
+            matches!(
+                crate::storage::path_status(context.library_statuses, path),
+                Some(crate::storage::LibraryCompatibility::Compatible)
+            )
+        }));
         let row_for_delete = row.clone();
         let window = context.window.clone();
         let product_id = context.product_id;
@@ -1452,11 +2141,6 @@ fn remote_file_collection(
             "This local content is not matched to the current GOG manifest and may not be downloadable again."
         };
         delete.connect_clicked(move |button| {
-            let total_size = paths
-                .iter()
-                .filter_map(|path| path.metadata().ok())
-                .map(|metadata| metadata.len())
-                .sum::<u64>();
             let confirmation = adw::AlertDialog::builder()
                 .heading("Permanently delete local files?")
                 .body(format!(
@@ -1472,7 +2156,6 @@ fn remote_file_collection(
             confirmation.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
             let paths = paths.clone();
             let path = path.clone();
-            let root = root.clone();
             let row = row_for_delete.clone();
             let button = button.clone();
             let response_window = window.clone();
@@ -1481,14 +2164,8 @@ fn remote_file_collection(
                     return;
                 }
                 button.set_sensitive(false);
-                match download::delete_completed_files(path.parent().unwrap_or(&root), &paths) {
+                delete_downloaded_files(paths, move |result| match result {
                     Ok(()) => {
-                        if let Ok(store) = StateStore::open() {
-                            for path in &paths {
-                                let _ = store.mark_managed_file_absent(path);
-                            }
-                        }
-                        let _ = download::prune_empty_directories(&root);
                         row.set_visible(false);
                         refresh_managed_detail_labels(&response_window, product_id);
                     }
@@ -1496,7 +2173,7 @@ fn remote_file_collection(
                         tracing::warn!(%error, path = %path.display(), "could not delete managed file");
                         button.set_sensitive(true);
                     }
-                }
+                });
             });
         });
         let menu_actions = file_action_box();
@@ -1599,17 +2276,7 @@ fn artifact_download_action(
         .as_ref()
         .map(|job| job.job_id.clone())
         .unwrap_or(requested_job_id);
-    let refs = artifacts.to_vec();
-    let preferred_destination = download::destination(
-        context.download_directory,
-        context.parent_slug.unwrap_or(context.product_slug),
-        context.parent_slug.map(|_| context.product_slug),
-        &refs,
-    );
-    let job_destination = saved_job
-        .as_ref()
-        .map(|job| job.destination.clone())
-        .unwrap_or(preferred_destination);
+    let active_job_id = Rc::new(RefCell::new(job_id.clone()));
     let existing_files = if managed_paths.is_empty() {
         saved_job
             .as_ref()
@@ -1619,8 +2286,23 @@ fn artifact_download_action(
     } else {
         managed_paths.to_vec()
     };
-    let invalid_download =
-        !existing_files.is_empty() && !artifact_download_is_plausible(artifacts, &existing_files);
+    let has_existing_files = !existing_files.is_empty();
+    let library_kind = crate::storage::artifact_library_kind(artifacts[0]);
+    let local_usable = existing_files.iter().all(|path| {
+        matches!(
+            crate::storage::path_status(context.library_statuses, path),
+            Some(crate::storage::LibraryCompatibility::Compatible)
+        )
+    });
+    let destination_usable = context.library_statuses.iter().any(|status| {
+        status.kind == library_kind
+            && matches!(
+                status.compatibility,
+                crate::storage::LibraryCompatibility::Compatible
+            )
+    });
+    let invalid_download = !existing_files.is_empty()
+        && (!local_usable || !artifact_download_is_plausible(artifacts, &existing_files));
     let completed_folder = (!invalid_download)
         .then(|| {
             managed_paths
@@ -1699,6 +2381,10 @@ fn artifact_download_action(
     }));
     let menu_actions = file_action_box();
     menu_actions.append(&button);
+    let download_copy = gtk::Button::with_label("Download to another library");
+    download_copy.set_visible(completed_folder.is_some());
+    download_copy.set_sensitive(context.access_token.is_some() && destination_usable);
+    menu_actions.append(&download_copy);
     let can_run_patch = artifacts[0].kind == ArtifactKind::Patch
         && artifacts[0]
             .operating_system
@@ -1739,7 +2425,6 @@ fn artifact_download_action(
         .collect::<Vec<_>>();
     let title = artifact_display_title(&artifacts[0], context.product_title);
     let token = context.access_token.map(str::to_owned);
-    let job_destination = job_destination.clone();
     let downloaded_files = Rc::new(RefCell::new(existing_files));
     let running = Rc::new(RefCell::new(
         None::<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1793,7 +2478,8 @@ fn artifact_download_action(
                 run_patch_button.set_sensitive(false);
                 download_button.set_sensitive(false);
                 delete_button.set_sensitive(false);
-                let receiver = crate::installation::run_patch(
+                let receiver = patch_with_components(
+                    &window_for_response,
                     installed.clone(),
                     patch.clone(),
                     target_version.clone(),
@@ -1844,7 +2530,13 @@ fn artifact_download_action(
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            status_for_event.set_label("Patch cancelled");
+                            run_button_for_event.set_sensitive(true);
+                            download_for_event.set_sensitive(true);
+                            delete_for_event.set_sensitive(true);
+                            glib::ControlFlow::Break
+                        }
                     }
                 });
             });
@@ -1852,7 +2544,7 @@ fn artifact_download_action(
     }
     {
         let window = context.window.clone();
-        let job_id = job_id.clone();
+        let job_id = active_job_id.clone();
         let status = status.clone();
         let progress = progress.clone();
         let download_button = button.clone();
@@ -1879,7 +2571,7 @@ fn artifact_download_action(
                 if response != "discard" {
                     return;
                 }
-                if download::remove(&job_id) {
+                if download::remove(&job_id.borrow()) {
                     status.set_visible(false);
                     progress.set_visible(false);
                     download_button.set_icon_name("folder-download-symbolic");
@@ -1898,18 +2590,36 @@ fn artifact_download_action(
     let run_patch_button_for_download = run_patch_button.clone();
     let status_for_download = status.clone();
     let progress_for_download = progress.clone();
-    let job_destination_for_download = job_destination.clone();
     let window_for_download = context.window.clone();
     let count_for_download = collection_count.clone();
-    let job_id_for_download = job_id.clone();
+    let product_slug = context
+        .parent_slug
+        .unwrap_or(context.product_slug)
+        .to_string();
+    let child_slug = context
+        .parent_slug
+        .map(|_| context.product_slug.to_string());
+    let session = online::account_session();
+    let copy_requested = Rc::new(std::cell::Cell::new(false));
+    {
+        let copy_requested = copy_requested.clone();
+        let button = button.clone();
+        download_copy.connect_clicked(move |_| {
+            copy_requested.set(true);
+            button.emit_clicked();
+            copy_requested.set(false);
+        });
+    }
     button.connect_clicked(move |button| {
-        if running_for_download.borrow().is_some() {
-            download::cancel(&job_id_for_download);
+        if let Some(cancellation) = running_for_download.borrow().as_ref() {
+            cancellation.store(true, std::sync::atomic::Ordering::Release);
             status_for_download.set_label("Cancelling…");
             button.set_sensitive(false);
             return;
         }
-        if let Some(path) = folder_for_download.borrow().clone() {
+        if !copy_requested.get()
+            && let Some(path) = folder_for_download.borrow().clone()
+        {
             super::widgets::file_open::open_directory(
                 &path,
                 &window_for_download,
@@ -1920,127 +2630,216 @@ fn artifact_download_action(
         let Some(token) = token.clone() else {
             return;
         };
-        let (sender, receiver) = mpsc::channel();
-        *running_for_download.borrow_mut() = Some(download::enqueue(download::DownloadRequest {
-            artifacts: artifacts.clone(),
-            title: title.clone(),
-            access_token: token,
-            destination: job_destination_for_download.clone(),
-            events: sender,
-        }));
-        status_for_download.remove_css_class("success");
-        status_for_download.add_css_class("dim-label");
-        status_for_download.set_label("Starting…");
-        status_for_download.set_visible(true);
-        progress_for_download.set_visible(true);
-        button.set_icon_name("process-stop-symbolic");
-        button.set_tooltip_text(Some("Cancel download"));
-        let running = running_for_download.clone();
-        let folder = folder_for_download.clone();
-        let status = status_for_download.clone();
-        let progress = progress_for_download.clone();
+        if online::account_session() != session {
+            return;
+        }
         let button = button.clone();
-        let delete_button = delete_button_for_download.clone();
-        let run_patch_button = run_patch_button_for_download.clone();
-        let downloaded_files = downloaded_files_for_download.clone();
-        let count_for_response = count_for_download.clone();
+        let running_for_download = running_for_download.clone();
+        let folder_for_download = folder_for_download.clone();
+        let downloaded_files_for_download = downloaded_files_for_download.clone();
+        let delete_button_for_download = delete_button_for_download.clone();
+        let run_patch_button_for_download = run_patch_button_for_download.clone();
+        let status_for_download = status_for_download.clone();
+        let progress_for_download = progress_for_download.clone();
+        let count_for_download = count_for_download.clone();
         let window_for_response = window_for_download.clone();
-        let artifacts_for_validation = artifacts.clone();
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            match receiver.try_recv() {
-                Ok(download::DownloadEvent::Progress { downloaded, total }) => {
-                    status.set_label(&match total {
-                        Some(total) if total > 0 => format!(
-                            "Downloading {} / {}",
-                            human_size(downloaded),
-                            human_size(total)
-                        ),
-                        _ => format!("Downloading {}", human_size(downloaded)),
-                    });
-                    if let Some(total) = total.filter(|total| *total > 0) {
-                        progress.set_fraction((downloaded as f64 / total as f64).min(1.0));
-                    } else {
-                        progress.pulse();
+        let artifacts = artifacts.clone();
+        let title = title.clone();
+        let product_slug = product_slug.clone();
+        let child_slug = child_slug.clone();
+        let active_job_id = active_job_id.clone();
+        choose_download_libraries(&window_for_download, vec![library_kind], move |libraries| {
+            if online::account_session() != session || button.root().is_none() {
+                return;
+            }
+            let library = &libraries[0].1;
+            let destination = download::destination(
+                &library.path,
+                &product_slug,
+                child_slug.as_deref(),
+                &artifacts.iter().collect::<Vec<_>>(),
+            );
+            if folder_for_download.borrow().as_ref() == Some(&destination) {
+                status_for_download
+                    .set_label("These files are already in this library. Choose another library.");
+                status_for_download.set_visible(true);
+                return;
+            }
+            let (sender, receiver) = mpsc::channel();
+            let (prepared_sender, prepared_receiver) = mpsc::channel();
+            let prepared_artifacts = artifacts.clone();
+            let library_id = library.id.clone();
+            std::thread::spawn(move || {
+                let prepared = download::resolve_job_id(
+                    &prepared_artifacts.iter().collect::<Vec<_>>(),
+                    &destination,
+                )
+                .map(|id| {
+                    (
+                        id,
+                        download::DownloadRequest {
+                            artifacts: prepared_artifacts,
+                            title,
+                            access_token: token,
+                            destination,
+                            library_id,
+                            events: sender,
+                        },
+                    )
+                })
+                .map_err(|error| error.to_string());
+                let _ = prepared_sender.send(prepared);
+            });
+            status_for_download.remove_css_class("success");
+            status_for_download.add_css_class("dim-label");
+            status_for_download.set_label("Preparing download…");
+            status_for_download.set_visible(true);
+            progress_for_download.set_visible(true);
+            button.set_sensitive(false);
+            let running = running_for_download.clone();
+            let folder = folder_for_download.clone();
+            let status = status_for_download.clone();
+            let progress = progress_for_download.clone();
+            let button = button.clone();
+            let delete_button = delete_button_for_download.clone();
+            let run_patch_button = run_patch_button_for_download.clone();
+            let downloaded_files = downloaded_files_for_download.clone();
+            let count_for_response = count_for_download.clone();
+            let artifacts_for_validation = artifacts.clone();
+            let mut prepared = false;
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if online::account_session() != session || button.root().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                if !prepared {
+                    match prepared_receiver.try_recv() {
+                        Ok(Ok((id, request))) => {
+                            *active_job_id.borrow_mut() = id;
+                            *running.borrow_mut() = Some(download::enqueue(request));
+                            prepared = true;
+                            button.set_sensitive(true);
+                            button.set_icon_name("process-stop-symbolic");
+                            button.set_tooltip_text(Some("Cancel download"));
+                            status.set_label("Starting…");
+                        }
+                        Ok(Err(error)) => {
+                            status.set_label(&format!("Cannot prepare this download: {error}"));
+                            progress.set_visible(false);
+                            button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            progress.pulse();
+                            return glib::ControlFlow::Continue;
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            status.set_label("Download preparation stopped. Retry the download.");
+                            progress.set_visible(false);
+                            button.set_sensitive(true);
+                            return glib::ControlFlow::Break;
+                        }
                     }
-                    glib::ControlFlow::Continue
                 }
-                Ok(download::DownloadEvent::Finalizing) => {
-                    status.set_label("Finalizing…");
-                    progress.set_fraction(1.0);
-                    progress.set_text(Some("Finalizing…"));
-                    progress.set_show_text(true);
-                    glib::ControlFlow::Continue
-                }
-                Ok(download::DownloadEvent::Complete { files }) => {
-                    *running.borrow_mut() = None;
-                    *downloaded_files.borrow_mut() = files.clone();
-                    let artifact_refs = artifacts_for_validation.iter().collect::<Vec<_>>();
-                    if !artifact_download_is_plausible(&artifact_refs, &files) {
-                        *folder.borrow_mut() = None;
-                        status.remove_css_class("dim-label");
-                        status.remove_css_class("success");
-                        status.add_css_class("error");
-                        status.set_label("✕");
-                        status.set_tooltip_text(Some(
-                            "Download files are missing or their file sizes do not match.",
-                        ));
+                match receiver.try_recv() {
+                    Ok(download::DownloadEvent::Progress { downloaded, total }) => {
+                        status.set_label(&match total {
+                            Some(total) if total > 0 => format!(
+                                "Downloading {} / {}",
+                                human_size(downloaded),
+                                human_size(total)
+                            ),
+                            _ => format!("Downloading {}", human_size(downloaded)),
+                        });
+                        if let Some(total) = total.filter(|total| *total > 0) {
+                            progress.set_fraction((downloaded as f64 / total as f64).min(1.0));
+                        } else {
+                            progress.pulse();
+                        }
+                        glib::ControlFlow::Continue
+                    }
+                    Ok(download::DownloadEvent::Finalizing) => {
+                        status.set_label("Finalizing…");
+                        progress.set_fraction(1.0);
+                        progress.set_text(Some("Finalizing…"));
+                        progress.set_show_text(true);
+                        glib::ControlFlow::Continue
+                    }
+                    Ok(download::DownloadEvent::Complete { files }) => {
+                        *running.borrow_mut() = None;
+                        *downloaded_files.borrow_mut() = files.clone();
+                        let artifact_refs = artifacts_for_validation.iter().collect::<Vec<_>>();
+                        if !artifact_download_is_plausible(&artifact_refs, &files) {
+                            *folder.borrow_mut() = None;
+                            status.remove_css_class("dim-label");
+                            status.remove_css_class("success");
+                            status.add_css_class("error");
+                            status.set_label("✕");
+                            status.set_tooltip_text(Some(
+                                "Download files are missing or their file sizes do not match.",
+                            ));
+                            progress.set_visible(false);
+                            button.set_icon_name("folder-download-symbolic");
+                            button.set_tooltip_text(Some("Download all required parts again"));
+                            button.set_sensitive(true);
+                            delete_button.set_visible(true);
+                            run_patch_button.set_visible(false);
+                            glib::ControlFlow::Break
+                        } else {
+                            *folder.borrow_mut() = files
+                                .first()
+                                .and_then(|path| path.parent())
+                                .map(std::path::Path::to_owned);
+                            status.remove_css_class("dim-label");
+                            status.add_css_class("success");
+                            status.set_label("✓");
+                            status.set_tooltip_text(Some("Downloaded"));
+                            progress.set_fraction(1.0);
+                            progress.set_visible(false);
+                            button.set_icon_name("folder-open-symbolic");
+                            button.set_tooltip_text(Some("Show downloaded files"));
+                            button.set_sensitive(true);
+                            delete_button.set_visible(true);
+                            run_patch_button.set_visible(can_run_patch);
+                            adjust_downloaded_collection_count(&count_for_response, 1);
+                            refresh_managed_detail_labels(&window_for_response, product_id);
+                            glib::ControlFlow::Break
+                        }
+                    }
+                    Ok(download::DownloadEvent::Cancelled) => {
+                        *running.borrow_mut() = None;
+                        status.set_label("Paused — resume");
                         progress.set_visible(false);
                         button.set_icon_name("folder-download-symbolic");
-                        button.set_tooltip_text(Some("Download all required parts again"));
+                        button.set_tooltip_text(Some("Resume download"));
                         button.set_sensitive(true);
-                        delete_button.set_visible(true);
-                        run_patch_button.set_visible(false);
                         glib::ControlFlow::Break
-                    } else {
-                        *folder.borrow_mut() = files
-                            .first()
-                            .and_then(|path| path.parent())
-                            .map(std::path::Path::to_owned);
-                        status.remove_css_class("dim-label");
-                        status.add_css_class("success");
-                        status.set_label("✓");
-                        status.set_tooltip_text(Some("Downloaded"));
-                        progress.set_fraction(1.0);
+                    }
+                    Ok(download::DownloadEvent::Failed(error)) => {
+                        *running.borrow_mut() = None;
+                        status.set_label("Failed — retry");
+                        status.set_tooltip_text(Some(&error.message));
                         progress.set_visible(false);
-                        button.set_icon_name("folder-open-symbolic");
-                        button.set_tooltip_text(Some("Show downloaded files"));
+                        button.set_icon_name("folder-download-symbolic");
+                        button.set_tooltip_text(Some("Retry download"));
                         button.set_sensitive(true);
-                        delete_button.set_visible(true);
-                        run_patch_button.set_visible(can_run_patch);
-                        adjust_downloaded_collection_count(&count_for_response, 1);
-                        refresh_managed_detail_labels(&window_for_response, product_id);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        *running.borrow_mut() = None;
+                        status.set_label("Download stopped unexpectedly — retry");
+                        progress.set_visible(false);
+                        button.set_icon_name("folder-download-symbolic");
+                        button.set_tooltip_text(Some("Retry download"));
+                        button.set_sensitive(true);
                         glib::ControlFlow::Break
                     }
                 }
-                Ok(download::DownloadEvent::Cancelled) => {
-                    *running.borrow_mut() = None;
-                    status.set_label("Paused — resume");
-                    progress.set_visible(false);
-                    button.set_icon_name("folder-download-symbolic");
-                    button.set_tooltip_text(Some("Resume download"));
-                    button.set_sensitive(true);
-                    glib::ControlFlow::Break
-                }
-                Ok(download::DownloadEvent::Failed(error)) => {
-                    *running.borrow_mut() = None;
-                    status.set_label("Failed — retry");
-                    status.set_tooltip_text(Some(&error.message));
-                    progress.set_visible(false);
-                    button.set_icon_name("folder-download-symbolic");
-                    button.set_tooltip_text(Some("Retry download"));
-                    button.set_sensitive(true);
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            }
+            });
         });
     });
     {
         let window = context.window.clone();
-        let job_id = job_id.clone();
-        let job_destination = job_destination.clone();
-        let download_directory = context.download_directory.to_path_buf();
         let downloaded_files = downloaded_files.clone();
         let folder = folder.clone();
         let status = status.clone();
@@ -2051,27 +2850,18 @@ fn artifact_download_action(
         let collection_count = collection_count.clone();
         delete_button.connect_clicked(move |_| {
             let files = downloaded_files.borrow().clone();
-            let total_size = files
-                .iter()
-                .filter_map(|path| path.metadata().ok())
-                .map(|metadata| metadata.len())
-                .sum::<u64>();
             let confirmation = adw::AlertDialog::builder()
                 .heading("Delete downloaded files?")
                 .body(format!(
-                    "This permanently removes {} file{} ({}). It can be downloaded again later.",
+                    "This permanently removes {} file{}. It can be downloaded again later.",
                     files.len(),
                     if files.len() == 1 { "" } else { "s" },
-                    human_size(total_size),
                 ))
                 .build();
             confirmation.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
             confirmation.set_default_response(Some("cancel"));
             confirmation.set_close_response("cancel");
             confirmation.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-            let job_id = job_id.clone();
-            let job_destination = job_destination.clone();
-            let download_directory = download_directory.clone();
             let downloaded_files = downloaded_files.clone();
             let folder = folder.clone();
             let status = status.clone();
@@ -2086,17 +2876,8 @@ fn artifact_download_action(
                     return;
                 }
                 let files = downloaded_files.borrow().clone();
-                match download::delete_completed_files(&job_destination, &files) {
+                delete_downloaded_files(files, move |result| match result {
                     Ok(()) => {
-                        if let Ok(store) = StateStore::open() {
-                            let _ = store.delete_download_job(&job_id);
-                            for path in &files {
-                                let _ = store.mark_managed_file_absent(path);
-                            }
-                        }
-                        if let Err(error) = download::prune_empty_directories(&download_directory) {
-                            tracing::warn!(%error, "could not remove empty download directories");
-                        }
                         downloaded_files.borrow_mut().clear();
                         *folder.borrow_mut() = None;
                         status.set_visible(false);
@@ -2116,11 +2897,87 @@ fn artifact_download_action(
                         status.set_tooltip_text(Some(&format!("{error:#}")));
                         status.set_visible(true);
                     }
-                }
+                });
             });
         });
     }
+    if !local_usable || (!has_existing_files && !destination_usable) {
+        action.set_sensitive(false);
+        action.set_tooltip_text(Some("This library is missing, unavailable, or incompatible. Correct it in Storage settings before use."));
+    }
     action
+}
+
+fn delete_downloaded_files(
+    paths: Vec<std::path::PathBuf>,
+    done: impl FnOnce(anyhow::Result<()>) + 'static,
+) {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<()> {
+            let config = crate::storage::read_config()?;
+            let mut roots = HashSet::new();
+            for path in &paths {
+                let kind = [
+                    crate::config::LibraryKind::OfflineInstallers,
+                    crate::config::LibraryKind::Extras,
+                ]
+                .into_iter()
+                .find(|kind| {
+                    config
+                        .libraries(*kind)
+                        .iter()
+                        .any(|library| path.starts_with(&library.path))
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "The downloaded file is no longer in a configured download library"
+                    )
+                })?;
+                roots.insert(crate::storage::validate_path(&config, kind, path)?.path);
+            }
+            for path in &paths {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid downloaded file path"))?;
+                download::delete_completed_files(parent, std::slice::from_ref(path))?;
+            }
+            let store = StateStore::open()?;
+            for job in store.download_jobs()? {
+                if !job.completed_files.is_empty()
+                    && job.completed_files.iter().all(|path| paths.contains(path))
+                {
+                    store.delete_download_job(&job.job_id)?;
+                }
+            }
+            for path in &paths {
+                store.mark_managed_file_absent(path)?;
+            }
+            for root in roots {
+                download::prune_empty_directories(&root)?;
+            }
+            Ok(())
+        })();
+        let _ = sender.send(result);
+    });
+    let mut done = Some(done);
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                if let Some(done) = done.take() {
+                    done(result);
+                }
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(_) => {
+                if let Some(done) = done.take() {
+                    done(Err(anyhow::anyhow!("File deletion stopped unexpectedly")));
+                }
+                glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn artifact_download_is_plausible(
@@ -2288,7 +3145,12 @@ pub(super) fn historical_path_metadata(
 pub(super) fn matching_download_job(artifacts: &[&RemoteArtifact]) -> Option<DownloadJobRecord> {
     let requested_id = download::job_id(artifacts);
     let store = StateStore::open().ok()?;
-    store.download_job(&requested_id).ok().flatten()
+    store
+        .download_jobs()
+        .ok()?
+        .into_iter()
+        .filter(|job| download::job_id(&job.artifacts.iter().collect::<Vec<_>>()) == requested_id)
+        .max_by_key(|job| job.updated_at)
 }
 
 pub(super) fn optional_text_matches(left: Option<&str>, right: Option<&str>) -> bool {
@@ -2431,57 +3293,6 @@ pub(super) fn language_flag(language: Option<&str>) -> &'static str {
     } else {
         "🌐"
     }
-}
-
-#[cfg(any())]
-pub(super) fn build_dlc_files_page(dlc: &Dlc, window: &adw::ApplicationWindow) -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
-    page.set_margin_top(12);
-    let management = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    management.add_css_class("file-management-card");
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    copy.set_hexpand(true);
-    let title = gtk::Label::new(Some("Manage DLC local copy"));
-    title.set_xalign(0.0);
-    title.add_css_class("section-title");
-    let summary = gtk::Label::new(Some(&format!(
-        "{} installers  ·  {} extras  ·  {} on disk",
-        dlc.installers.len(),
-        dlc.extras.len(),
-        human_size(dlc.disk_usage)
-    )));
-    summary.set_xalign(0.0);
-    summary.add_css_class("dim-label");
-    copy.append(&title);
-    copy.append(&summary);
-    heading.append(&copy);
-    heading.append(&folder_button("Open DLC folder", &dlc.location, window));
-    management.append(&heading);
-    page.append(&management);
-    page.append(&file_collection(
-        "Installers",
-        "application-x-executable-symbolic",
-        &dlc.installers,
-        &dlc.location,
-        window,
-    ));
-    if !dlc.extras.is_empty() {
-        page.append(&file_collection(
-            "Extras",
-            "folder-documents-symbolic",
-            &dlc.extras,
-            &dlc.location.join("extras"),
-            window,
-        ));
-    }
-    if !dlc.changelog.is_empty() {
-        let changelog_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        changelog_card.add_css_class("file-collection");
-        changelog_card.append(&lazy_html_section("Changelog", dlc.changelog.clone()));
-        page.append(&changelog_card);
-    }
-    page
 }
 
 pub(super) fn verification_state(product_id: i64) -> Option<VerificationDisplayState> {
@@ -2752,7 +3563,7 @@ fn verify_product_files(
         let requested_id = download::job_id(group);
         let job = completed
             .iter()
-            .find(|job| job.job_id == requested_id)
+            .find(|job| download::job_id(&job.artifacts.iter().collect::<Vec<_>>()) == requested_id)
             .or_else(|| {
                 completed.iter().find(|job| {
                     !used_jobs.contains(&job.job_id)
@@ -2774,7 +3585,21 @@ fn verify_product_files(
         let Some(job) = job else {
             continue;
         };
-        let is_current_download = job.job_id == requested_id;
+        let config = crate::storage::read_config()?;
+        let library = crate::storage::validate_path(
+            &config,
+            crate::storage::artifact_library_kind(group[0]),
+            &job.destination,
+        )?;
+        for path in &job.completed_files {
+            crate::storage::validate_path(
+                &config,
+                crate::storage::artifact_library_kind(group[0]),
+                path,
+            )?;
+        }
+        let is_current_download =
+            download::job_id(&job.artifacts.iter().collect::<Vec<_>>()) == requested_id;
         let mut corrupt = Vec::new();
         let mut matched = true;
         for artifact in group.iter() {
@@ -2860,6 +3685,7 @@ fn verify_product_files(
                 title: title.to_owned(),
                 access_token: access_token.to_owned(),
                 destination: job.destination.clone(),
+                library_id: library.id,
                 events: sender,
             });
             report.repair_groups += 1;
@@ -2985,6 +3811,96 @@ fn inferred_local_artifact(file: &LibraryFile) -> Option<RemoteArtifact> {
 #[cfg(test)]
 mod unified_row_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, Xvfb and private D-Bus; exercises GTK action dispatch while sidebar popover detaches"]
+    fn sidebar_visibility_action_precedes_popover_detachment() {
+        adw::init().expect("private display required");
+        let app = adw::Application::builder()
+            .application_id("io.github.legendarylinux.Ludomere.HideTest")
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let list = gtk::ListBox::new();
+        let row = gtk::ListBoxRow::new();
+        row.set_child(Some(&gtk::Label::new(Some("Fixture game"))));
+        list.append(&row);
+        window.set_content(Some(&list));
+        let hidden = Rc::new(std::cell::Cell::new(false));
+        let calls = Rc::new(std::cell::Cell::new(0));
+        list.set_filter_func({
+            let hidden = hidden.clone();
+            move |_| !hidden.get()
+        });
+        let action = gio::SimpleAction::new("hidden", Some(&i64::static_variant_type()));
+        action.connect_activate({
+            let hidden = hidden.clone();
+            let calls = calls.clone();
+            let list = list.clone();
+            move |_, value| {
+                assert_eq!(value.and_then(|value| value.get::<i64>()), Some(42));
+                hidden.set(!hidden.get());
+                calls.set(calls.get() + 1);
+                list.invalidate_filter();
+            }
+        });
+        window.add_action(&action);
+        let button = gtk::Button::with_label("Hide game locally");
+        bind_management_action(&button, &window, "hidden", 42);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&button));
+        popover.set_parent(&row);
+        popover.connect_closed(|popover| popover.unparent());
+        button.connect_clicked({
+            let popover = popover.clone();
+            move |_| popover.popdown()
+        });
+        window.present();
+        while glib::MainContext::default().iteration(false) {}
+        popover.popup();
+        while glib::MainContext::default().iteration(false) {}
+        button.emit_clicked();
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(calls.get(), 1);
+        assert!(hidden.get());
+        assert!(!row.is_child_visible());
+        button.emit_clicked();
+        assert_eq!(calls.get(), 2);
+        assert!(!hidden.get());
+        assert!(row.is_child_visible());
+        if popover.parent().is_some() {
+            popover.unparent();
+        }
+        let favorite = Rc::new(std::cell::Cell::new(false));
+        let action = gio::SimpleAction::new("favorite", Some(&i64::static_variant_type()));
+        action.connect_activate({
+            let favorite = favorite.clone();
+            move |_, value| {
+                assert_eq!(value.and_then(|value| value.get::<i64>()), Some(73));
+                favorite.set(!favorite.get());
+            }
+        });
+        window.add_action(&action);
+        let button = gtk::Button::with_label("Add to Favorites");
+        bind_management_action(&button, &window, "favorite", 73);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&button));
+        popover.set_parent(&row);
+        popover.connect_closed(|popover| popover.unparent());
+        button.connect_clicked({
+            let popover = popover.clone();
+            move |_| popover.popdown()
+        });
+        popover.popup();
+        while glib::MainContext::default().iteration(false) {}
+        button.emit_clicked();
+        while glib::MainContext::default().iteration(false) {}
+        assert!(favorite.get());
+        assert!(popover.parent().is_none());
+        button.emit_clicked();
+        assert!(!favorite.get());
+        window.close();
+    }
 
     #[test]
     fn local_identity_uses_managed_path_os_and_language() {

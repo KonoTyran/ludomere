@@ -1,0 +1,10 @@
+FROM docker.io/library/archlinux@sha256:b21322c663be387c0ed9cbc7bbbfe18e41633ad4e7b7c77cfad45f128be20040
+ARG BUILD_UID=1000
+# Dated package repositories constrain the build environment as well as its base.
+RUN printf 'Server = https://archive.archlinux.org/repos/2026/09/27/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist \
+    && pacman -Syyuu --noconfirm --needed base-devel rust gtk4 libadwaita gdk-pixbuf2 webkitgtk-6.0 libsecret dbus pkgconf xz python python-xlib python-urllib3 git curl \
+    && pacman -Scc --noconfirm \
+    && useradd --create-home --uid "$BUILD_UID" builder
+USER builder
+WORKDIR /workspace
+CMD ["bash", "tools/check.sh"]

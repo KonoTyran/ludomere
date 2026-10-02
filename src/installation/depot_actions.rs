@@ -99,6 +99,7 @@ fn support_journal(operation_staging: &Path) -> Result<PathBuf> {
 
 #[derive(Clone)]
 pub struct ActionContext {
+    pub operation_id: Option<String>,
     pub product_id: i64,
     pub app: PathBuf,
     pub support: PathBuf,
@@ -106,6 +107,16 @@ pub struct ActionContext {
     pub windows_app: String,
     pub profile: UmuProfile,
     pub log_path: PathBuf,
+    pub galaxy_setup: Option<GalaxySetup>,
+}
+
+#[derive(Clone)]
+pub struct GalaxySetup {
+    pub executable: String,
+    pub arguments: String,
+    pub language: String,
+    pub build_id: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,10 +184,21 @@ pub fn execute_actions(
     actions: &[DepotScriptAction],
     uninstall: bool,
 ) -> Result<()> {
+    execute_actions_controlled(backend, context, actions, uninstall, &|| false)
+}
+
+pub(crate) fn execute_actions_controlled(
+    backend: &dyn CompatibilityBackend,
+    context: &ActionContext,
+    actions: &[DepotScriptAction],
+    uninstall: bool,
+    stopped: &impl Fn() -> bool,
+) -> Result<()> {
     for action in actions
         .iter()
         .filter(|action| action.uninstall == uninstall)
     {
+        anyhow::ensure!(!stopped(), "GOG setup cancelled");
         crate::compatibility::append_step_log(
             &context.log_path,
             &format!(
@@ -187,19 +209,22 @@ pub fn execute_actions(
             ),
         )?;
         let result = match action.kind {
-            DepotScriptActionKind::SetRegistry => execute_registry(backend, context, action),
+            DepotScriptActionKind::SetRegistry => {
+                execute_registry(backend, context, action, stopped)
+            }
             DepotScriptActionKind::SetIni => execute_ini(context, action),
             DepotScriptActionKind::SupportData => execute_support(context, action),
             DepotScriptActionKind::SavePath => validate_save_path(context, action),
-            DepotScriptActionKind::InstallSdb => execute_sdb(backend, context, action),
-            DepotScriptActionKind::Execute => execute_program(backend, context, action),
+            DepotScriptActionKind::InstallSdb => execute_sdb(backend, context, action, stopped),
+            DepotScriptActionKind::Execute => execute_program(backend, context, action, stopped),
         };
         if let Err(error) = result {
             crate::compatibility::append_step_log(
                 &context.log_path,
                 &format!("GOG script action failed: {}: {error:#}", action.name),
             )?;
-            return Err(error);
+            return Err(error)
+                .with_context(|| format!("Required GOG setup action {:?} failed", action.name));
         }
         crate::compatibility::append_step_log(
             &context.log_path,
@@ -264,6 +289,7 @@ fn execute_registry(
     backend: &dyn CompatibilityBackend,
     context: &ActionContext,
     action: &DepotScriptAction,
+    stopped: &impl Fn() -> bool,
 ) -> Result<()> {
     let command = registry_command(context, action)?;
     let script = context.prefix.join("drive_c/ludomere-registry.reg");
@@ -275,6 +301,7 @@ fn execute_registry(
         command.executable,
         command.arguments,
         None,
+        stopped,
     );
     let _ = fs::remove_file(script);
     result
@@ -431,6 +458,7 @@ fn execute_sdb(
     backend: &dyn CompatibilityBackend,
     context: &ActionContext,
     action: &DepotScriptAction,
+    stopped: &impl Fn() -> bool,
 ) -> Result<()> {
     let value: SdbArguments =
         serde_json::from_value(action.arguments.clone()).context("parsing GOG SDB action")?;
@@ -443,6 +471,7 @@ fn execute_sdb(
         executable,
         vec![file.to_string_lossy().into_owned()],
         None,
+        stopped,
     )
 }
 
@@ -450,23 +479,155 @@ fn execute_program(
     backend: &dyn CompatibilityBackend,
     context: &ActionContext,
     action: &DepotScriptAction,
+    stopped: &impl Fn() -> bool,
 ) -> Result<()> {
     let value: ExecuteArguments =
         serde_json::from_value(action.arguments.clone()).context("parsing GOG execute action")?;
     let executable = resolve_executable_path(context, &value.executable)?;
-    let working = value
+    let mut working = value
         .working_dir
         .as_deref()
         .filter(|path| !path.is_empty())
         .map(|path| resolve_path(context, path))
         .transpose()?;
+    let arguments = if let Some(setup) = context.galaxy_setup.as_ref().filter(|setup| {
+        !action.uninstall
+            && value.executable.replace('\\', "/") == setup.executable.replace('\\', "/")
+    }) {
+        working.get_or_insert_with(|| context.app.clone());
+        galaxy_setup_arguments(context, setup, &value.arguments)?
+    } else {
+        shell_words::split(&value.arguments).context("parsing GOG execute arguments")?
+    };
     log_path(context, "executable", &executable)?;
     if let Some(path) = &working {
         log_path(context, "working directory", path)?;
     }
-    let arguments =
-        shell_words::split(&value.arguments).context("parsing GOG execute arguments")?;
-    run(backend, context, executable, arguments, working)
+    run(backend, context, executable, arguments, working, stopped)
+}
+
+pub(crate) fn galaxy_setup_arguments(
+    context: &ActionContext,
+    setup: &GalaxySetup,
+    explicit: &str,
+) -> Result<Vec<String>> {
+    if !explicit.is_empty() && !setup.arguments.is_empty() && explicit != setup.arguments {
+        bail!("GOG setup script and repository specify conflicting wrapper arguments");
+    }
+    let mut arguments = windows_arguments(if explicit.is_empty() {
+        &setup.arguments
+    } else {
+        explicit
+    })?;
+    for argument in &mut arguments {
+        *argument = expand_text(context, argument);
+        if argument.contains('{') || argument.contains('}') {
+            bail!("Unsupported GOG wrapper argument variable");
+        }
+        if [
+            "/dir=",
+            "/lang=",
+            "/language=",
+            "/lang-code=",
+            "/productid=",
+            "/buildid=",
+            "/versionname=",
+        ]
+        .iter()
+        .any(|prefix| argument.to_ascii_lowercase().starts_with(prefix))
+        {
+            bail!("GOG wrapper arguments conflict with the selected installation context");
+        }
+    }
+    let defaults = crate::compatibility::inno_setup_arguments(
+        Some(&setup.language),
+        &context.windows_app,
+        false,
+    );
+    if let Some(language) = defaults
+        .iter()
+        .find_map(|argument| argument.strip_prefix("/LANG="))
+    {
+        arguments.push(format!("/Language={language}"));
+    }
+    arguments.extend(defaults);
+    arguments.extend([
+        format!("/lang-code={}", setup.language),
+        format!("/ProductId={}", context.product_id),
+        "/galaxyclient".into(),
+        format!("/buildId={}", setup.build_id),
+        format!("/versionName={}", setup.version),
+        "/nodesktopshorctut".into(),
+        "/nodesktopshortcut".into(),
+    ]);
+    Ok(arguments)
+}
+
+// Windows command-line backslashes are literal except immediately before a
+// double quote. Never interpret these publisher-supplied arguments as a shell.
+pub(crate) fn windows_arguments(value: &str) -> Result<Vec<String>> {
+    if value.contains(['\0', '\r', '\n']) {
+        bail!("Invalid control character in GOG wrapper arguments");
+    }
+    let mut chars = value.chars().peekable();
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                let mut count = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    count += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    current.extend(std::iter::repeat_n('\\', count / 2));
+                    chars.next();
+                    if count % 2 == 0 {
+                        if quoted && chars.peek() == Some(&'"') {
+                            chars.next();
+                            current.push('"');
+                        } else {
+                            quoted = !quoted;
+                        }
+                    } else {
+                        current.push('"');
+                    }
+                } else {
+                    current.extend(std::iter::repeat_n('\\', count));
+                }
+                started = true;
+            }
+            '"' => {
+                if quoted && chars.peek() == Some(&'"') {
+                    chars.next();
+                    current.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+                started = true;
+            }
+            ' ' | '\t' if !quoted => {
+                if started {
+                    arguments.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            _ => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        bail!("Unclosed quote in GOG wrapper arguments");
+    }
+    if started {
+        arguments.push(current);
+    }
+    Ok(arguments)
 }
 
 fn resolve_executable_path(context: &ActionContext, value: &str) -> Result<PathBuf> {
@@ -483,7 +644,41 @@ fn resolve_executable_path(context: &ActionContext, value: &str) -> Result<PathB
     {
         bail!("unsafe GOG executable path: {value:?}");
     }
-    Ok(context.app.join(normalized))
+    // Bare setup executables may be supplied by the support depot. Explicit
+    // path variables above retain their declared root.
+    for root in [&context.app, &context.support] {
+        let candidate = root.join(&normalized);
+        let mut cursor = PathBuf::new();
+        let mut missing = false;
+        for component in candidate.components() {
+            cursor.push(component.as_os_str());
+            let metadata = match fs::symlink_metadata(&cursor) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                Err(error) => {
+                    return Err(error).context("inspecting GOG setup executable path");
+                }
+            };
+            if metadata.file_type().is_symlink()
+                || if cursor == candidate {
+                    !metadata.is_file()
+                } else {
+                    !metadata.is_dir()
+                }
+            {
+                bail!("GOG setup executable path contains a link or unexpected file type");
+            }
+        }
+        if !missing {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "Required GOG setup executable {value:?} is missing from both the game directory and downloaded support files. Resume the Depot operation to restore required files."
+    )
 }
 
 fn run(
@@ -492,8 +687,9 @@ fn run(
     executable: PathBuf,
     arguments: Vec<String>,
     working_directory: Option<PathBuf>,
+    stopped: &impl Fn() -> bool,
 ) -> Result<()> {
-    let mut process = backend.run_executable(CompatibilityRunRequest {
+    let request = CompatibilityRunRequest {
         prefix: context.prefix.clone(),
         profile: context.profile.clone(),
         executable,
@@ -501,11 +697,24 @@ fn run(
         working_directory,
         log_path: context.log_path.clone(),
         background: true,
-    })?;
-    if !process.wait()?.success() {
-        bail!("GOG setup action failed");
-    }
-    Ok(())
+    };
+    super::dependency_setup::run_tracked(
+        context.operation_id.as_deref(),
+        stopped,
+        "GOG game setup",
+        &context.log_path,
+        || backend.run_executable(request).map_err(Into::into),
+    )
+}
+
+#[cfg(test)]
+fn setup_exit_error(context: &ActionContext, status: std::process::ExitStatus) -> anyhow::Error {
+    let detail = super::runtime_logs::installation_tail(&context.log_path)
+        .unwrap_or_else(|_| "The installation log could not be read.".into());
+    anyhow::anyhow!(
+        "Required GOG setup process failed ({status}). Log: {}\n{detail}",
+        context.log_path.display()
+    )
 }
 
 fn resolve_path(context: &ActionContext, value: &str) -> Result<PathBuf> {
@@ -704,8 +913,170 @@ fn registry_type(value: &str) -> Result<&'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[derive(Default)]
+    struct CaptureBackend(std::sync::Mutex<Vec<CompatibilityRunRequest>>);
+    impl CompatibilityBackend for CaptureBackend {
+        fn status(
+            &self,
+        ) -> crate::compatibility::Result<crate::compatibility::CompatibilityBackendStatus>
+        {
+            panic!("not an invocation probe")
+        }
+        fn initialize_prefix(
+            &self,
+            _: crate::compatibility::InitializePrefixRequest,
+        ) -> crate::compatibility::Result<crate::compatibility::CompatibilityPrefix> {
+            panic!("no prefix creation")
+        }
+        fn run_executable(
+            &self,
+            request: CompatibilityRunRequest,
+        ) -> crate::compatibility::Result<crate::compatibility::CompatibilityProcess> {
+            self.0.lock().unwrap().push(request);
+            Err(crate::compatibility::CompatibilityFailure::GameLaunchRejected)
+        }
+        fn stop(
+            &self,
+            _: &mut crate::compatibility::CompatibilityProcess,
+        ) -> crate::compatibility::Result<()> {
+            panic!("no process exists")
+        }
+    }
+
+    #[test]
+    fn captured_gungeon_wrapper_uses_selected_context_without_affecting_other_execute_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = context(directory.path(), &UmuProfile::fallback());
+        context.product_id = 1456912569;
+        context.windows_app = r"L:\Game With Spaces".into();
+        fs::create_dir_all(&context.support).unwrap();
+        fs::create_dir_all(&context.app).unwrap();
+        let name = "galaxy_enter_the_gungeon_2.11.0.13.exe";
+        fs::write(context.support.join(name), b"inert").unwrap();
+        context.galaxy_setup = Some(GalaxySetup {
+            executable: name.into(),
+            arguments: String::new(),
+            language: "en-US".into(),
+            build_id: "52278062065653360".into(),
+            version: "2.1.9".into(),
+        });
+        let actions = super::super::depot_metadata::script_actions(
+            br#"{"productId":"1456912569","actions":[{"name":"Install the game","languages":["*"],"install":{"action":"Execute","arguments":{"executable":"galaxy_enter_the_gungeon_2.11.0.13.exe","runAsAdmin":true}}}]}"#,
+            context.product_id, "en-US",
+        ).unwrap();
+        let backend = CaptureBackend::default();
+        let error = execute_actions(&backend, &context, &actions, false).unwrap_err();
+        assert!(error.to_string().contains("Install the game"));
+        let request = backend.0.lock().unwrap().pop().unwrap();
+        assert_eq!(request.executable, context.support.join(name));
+        assert_eq!(request.working_directory, Some(context.app.clone()));
+        for flag in [
+            "/VERYSILENT",
+            "/SP-",
+            r"/DIR=L:\Game With Spaces",
+            "/LANG=english",
+            "/Language=english",
+            "/lang-code=en-US",
+            "/ProductId=1456912569",
+            "/galaxyclient",
+            "/buildId=52278062065653360",
+            "/versionName=2.1.9",
+        ] {
+            assert!(
+                request.arguments.iter().any(|argument| argument == flag),
+                "{flag}"
+            );
+        }
+        assert!(
+            fs::read_to_string(&context.log_path)
+                .unwrap()
+                .contains("GOG setup working directory:")
+        );
+        for field in ["arguments", "argument", "parameters"] {
+            let mut ordinary = actions[0].clone();
+            ordinary.arguments = json!({"executable":"other.exe","workingDir":"{app}"});
+            ordinary.arguments[field] = json!("--custom \"two words\"");
+            fs::write(context.app.join("other.exe"), b"inert").unwrap();
+            execute_actions(&backend, &context, &[ordinary], false).unwrap_err();
+            let request = backend.0.lock().unwrap().pop().unwrap();
+            assert_eq!(request.arguments, ["--custom", "two words"]);
+            assert_eq!(request.working_directory, Some(context.app.clone()));
+        }
+        let mut uninstall = actions[0].clone();
+        uninstall.uninstall = true;
+        execute_actions(&backend, &context, &[uninstall], true).unwrap_err();
+        assert!(
+            backend
+                .0
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .arguments
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn wrapper_arguments_preserve_windows_quotes_paths_and_validate_context() {
+        assert_eq!(
+            windows_arguments(r#""a b c" d e"#).unwrap(),
+            ["a b c", "d", "e"]
+        );
+        assert_eq!(
+            windows_arguments(r#""ab\"c" "\\" d"#).unwrap(),
+            ["ab\"c", r"\", "d"]
+        );
+        assert_eq!(
+            windows_arguments(r#""a""b" "" C:\path\file.exe"#).unwrap(),
+            ["a\"b", "", r"C:\path\file.exe"]
+        );
+        assert_eq!(
+            windows_arguments(r#"a\\\"b c d"#).unwrap(),
+            [r#"a\"b"#, "c", "d"]
+        );
+        assert!(windows_arguments("\"unterminated").is_err());
+        assert!(windows_arguments("a\0b").is_err());
+        let mut context = context(Path::new("/library"), &UmuProfile::fallback());
+        context.windows_app = r"L:\Game With Spaces".into();
+        let mut setup = GalaxySetup {
+            executable: "setup.exe".into(),
+            arguments: r#"/custom="{app}\file.ini" /id={productID}"#.into(),
+            language: "en-US".into(),
+            build_id: "build".into(),
+            version: "1".into(),
+        };
+        let args = galaxy_setup_arguments(&context, &setup, "").unwrap();
+        assert_eq!(
+            &args[..2],
+            &[r"/custom=L:\Game With Spaces\file.ini", "/id=1812959072"]
+        );
+        assert!(galaxy_setup_arguments(&context, &setup, "/different").is_err());
+        for invalid in ["/DIR=Z:\\escape", "/custom={unknown}"] {
+            setup.arguments = invalid.into();
+            assert!(galaxy_setup_arguments(&context, &setup, "").is_err());
+        }
+    }
+
+    #[test]
+    fn setup_failure_retains_exit_status_and_sanitized_log_details() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path(), &UmuProfile::fallback());
+        fs::write(&context.log_path, b"setup: required data missing\nAuthorization: secret-canary\nhttps://example.test/file?token=secret-canary\n").unwrap();
+        let error =
+            setup_exit_error(&context, std::process::ExitStatus::from_raw(7 << 8)).to_string();
+        assert!(error.contains("exit status: 7"));
+        assert!(error.contains("required data missing"));
+        assert!(error.contains(&context.log_path.to_string_lossy().to_string()));
+        assert!(!error.contains("secret-canary"));
+        assert!(!error.contains("https://"));
+    }
+
     fn context(root: &Path, profile: &UmuProfile) -> ActionContext {
         ActionContext {
+            operation_id: None,
             product_id: 1812959072,
             app: root.join("game"),
             support: root.join("support"),
@@ -713,6 +1084,7 @@ mod tests {
             windows_app: r"L:\grim_dawn".into(),
             profile: profile.clone(),
             log_path: root.join("log"),
+            galaxy_setup: None,
         }
     }
     fn action(uninstall: bool) -> DepotScriptAction {
@@ -789,9 +1161,12 @@ mod tests {
 
     #[test]
     fn accepts_observed_legacy_registry_and_execute_shapes() {
-        let root = Path::new("/library");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
         let profile = UmuProfile::fallback();
         let context = context(root, &profile);
+        fs::create_dir_all(&context.app).unwrap();
+        fs::write(context.app.join("legacy_setup.exe"), b"inert").unwrap();
         let mut registry = action(false);
         registry.arguments = json!({
             "root": "HKLM",
@@ -830,6 +1205,134 @@ mod tests {
     }
 
     #[test]
+    fn resolves_materialized_support_executable_after_cleanup_and_resume() {
+        use crate::gog::depot_manifest::{DepotChunk, DepotEntry, DepotFile, DepotManifest};
+        use std::os::unix::fs::FileExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let operation = directory.path().join(".ludomere/staging/game.json");
+        let mut context = context(directory.path(), &UmuProfile::fallback());
+        context.support = support_staging(&operation).unwrap();
+        let name = "galaxy_enter_the_gungeon_2.11.0.13.exe";
+        let bytes = b"inert support executable fixture";
+        let digest = format!("{:x}", md5::compute(bytes));
+        let manifest = DepotManifest {
+            generation: 2,
+            small_files_containers: Vec::new(),
+            entries: vec![DepotEntry::File(DepotFile {
+                path: name.into(),
+                size: bytes.len() as u64,
+                executable: true,
+                support: true,
+                md5: Some(digest.clone()),
+                sha256: None,
+                small_file: None,
+                chunks: vec![DepotChunk {
+                    compressed_md5: digest.clone(),
+                    compressed_size: bytes.len() as u64,
+                    md5: digest,
+                    size: bytes.len() as u64,
+                }],
+            })],
+        };
+        let mut fetched = 0;
+        for attempt in 0..3 {
+            assert!(resolve_executable_path(&context, name).is_err());
+            assert_eq!(
+                pending_support_chunks(&manifest, &operation).unwrap().len(),
+                1
+            );
+            materialize_support(
+                &manifest,
+                &operation,
+                |jobs, file, progress| {
+                    for (index, job) in jobs.iter().enumerate() {
+                        file.write_all_at(bytes, job.offset)?;
+                        progress(index)?;
+                        fetched += 1;
+                    }
+                    Ok(())
+                },
+                || false,
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_executable_path(&context, name).unwrap(),
+                context.support.join(name)
+            );
+            assert_eq!(fs::read(context.support.join(name)).unwrap(), bytes);
+            if attempt == 1 {
+                // Manual deletion leaves the completion journal behind.
+                fs::remove_file(context.support.join(name)).unwrap();
+                assert!(support_journal(&operation).unwrap().is_file());
+            } else {
+                // Failed finalization removes support staging; Resume must restore it.
+                remove_support_staging(&operation).unwrap();
+            }
+        }
+        assert_eq!(fetched, 3);
+    }
+
+    #[test]
+    fn executable_fallback_preserves_roots_and_rejects_unsafe_candidates() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let context = context(directory.path(), &UmuProfile::fallback());
+        fs::create_dir_all(&context.app).unwrap();
+        fs::create_dir_all(&context.support).unwrap();
+        fs::write(context.support.join("setup.exe"), b"support").unwrap();
+        assert_eq!(
+            resolve_executable_path(&context, "setup.exe").unwrap(),
+            context.support.join("setup.exe")
+        );
+        assert_eq!(
+            resolve_executable_path(&context, "{app}/setup.exe").unwrap(),
+            context.app.join("setup.exe")
+        );
+        if unsafe { libc::geteuid() } != 0 {
+            fs::set_permissions(&context.app, fs::Permissions::from_mode(0o000)).unwrap();
+            let inaccessible = resolve_executable_path(&context, "setup.exe");
+            fs::set_permissions(&context.app, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                inaccessible
+                    .unwrap_err()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        fs::write(context.app.join("setup.exe"), b"app").unwrap();
+        assert_eq!(
+            resolve_executable_path(&context, "setup.exe").unwrap(),
+            context.app.join("setup.exe")
+        );
+        fs::remove_file(context.app.join("setup.exe")).unwrap();
+        symlink(
+            context.support.join("setup.exe"),
+            context.app.join("setup.exe"),
+        )
+        .unwrap();
+        assert!(resolve_executable_path(&context, "setup.exe").is_err());
+        fs::remove_file(context.app.join("setup.exe")).unwrap();
+        fs::create_dir(context.app.join("setup.exe")).unwrap();
+        assert!(resolve_executable_path(&context, "setup.exe").is_err());
+        for unsafe_path in ["../setup.exe", "/setup.exe", r"C:\setup.exe", "SETUP.EXE"] {
+            assert!(resolve_executable_path(&context, unsafe_path).is_err());
+        }
+        symlink(&context.support, context.app.join("linked")).unwrap();
+        assert!(resolve_executable_path(&context, "linked/setup.exe").is_err());
+        fs::remove_file(context.support.join("setup.exe")).unwrap();
+        symlink(
+            context.app.join("absent.exe"),
+            context.support.join("missing.exe"),
+        )
+        .unwrap();
+        assert!(resolve_executable_path(&context, "missing.exe").is_err());
+    }
+
+    #[test]
     fn logs_resolved_paths_and_action_failures() {
         let root =
             std::env::temp_dir().join(format!("ludomere-depot-action-log-{}", std::process::id()));
@@ -852,7 +1355,13 @@ mod tests {
             },
         ];
         assert!(
-            execute_actions(&crate::compatibility::UmuBackend, &context, &actions, false).is_err()
+            execute_actions(
+                &crate::compatibility::UmuBackend::default(),
+                &context,
+                &actions,
+                false
+            )
+            .is_err()
         );
         let log = fs::read_to_string(&context.log_path).unwrap();
         assert!(log.contains(&format!(

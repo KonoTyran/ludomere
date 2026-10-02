@@ -22,6 +22,7 @@ pub(super) fn show_settings_page(
     {
         if let Some(stack) = find_settings_stack(&existing.clone().upcast()) {
             stack.set_visible_child_name(initial_page);
+            stack.notify("visible-child-name");
         }
         existing.present();
         return;
@@ -41,17 +42,24 @@ pub(super) fn show_settings_page(
         "Account and application preferences",
     )));
     root.append(&header);
+    let preference_status = gtk::Label::new(None);
+    preference_status.set_wrap(true);
+    preference_status.set_selectable(true);
+    preference_status.set_margin_start(12);
+    preference_status.set_margin_end(12);
+    preference_status.add_css_class("error");
+    preference_status.set_visible(false);
+    root.append(&preference_status);
 
     let account_page = settings_account_page(w, model);
     let downloads_page = adw::PreferencesPage::new();
     downloads_page.set_title("Downloads");
     downloads_page.set_icon_name(Some("folder-download-symbolic"));
     let library_page = adw::PreferencesPage::new();
-    library_page.set_title("Library");
+    library_page.set_title("Game Display");
     library_page.set_icon_name(Some("view-grid-symbolic"));
     let library_display = adw::PreferencesGroup::new();
     library_display.set_title("Library display");
-    let storage_page = build_storage_page(&settings_window, w, model);
     let appearance_page = adw::PreferencesPage::new();
     appearance_page.set_title("Appearance");
     appearance_page.set_icon_name(Some("applications-graphics-symbolic"));
@@ -70,8 +78,9 @@ pub(super) fn show_settings_page(
     downloads.add(&concurrency_row);
 
     let rebuild_row = adw::ActionRow::new();
+    rebuild_row.set_use_markup(false);
     rebuild_row.set_title("Rebuild downloaded-file index");
-    rebuild_row.set_subtitle("Inspect the managed download directory without changing any files");
+    rebuild_row.set_subtitle("Inspect compatible Offline Installers and Goodies & Extras libraries without changing files");
     let rebuild_button = gtk::Button::with_label("Rebuild");
     rebuild_button.set_valign(gtk::Align::Center);
     rebuild_row.add_suffix(&rebuild_button);
@@ -156,13 +165,14 @@ pub(super) fn show_settings_page(
     downloads.add(&retired_artifacts);
     downloads_page.add(&downloads);
 
-    let source_order = installation_source_order_group(model);
+    let source_order = installation_source_order_group(model, &preference_status);
     downloads_page.add(&source_order);
+    downloads_page.add(&update_policies::global_group(w, model));
 
     let maintenance = adw::PreferencesGroup::new();
     maintenance.set_title("Storage and synchronization");
     let open_downloads = adw::ActionRow::new();
-    open_downloads.set_title("Open download directory");
+    open_downloads.set_title("Open a downloaded-file library");
     let open_downloads_button = gtk::Button::with_label("Open");
     open_downloads_button.set_valign(gtk::Align::Center);
     open_downloads.add_suffix(&open_downloads_button);
@@ -176,7 +186,8 @@ pub(super) fn show_settings_page(
     maintenance.add(&clear_images);
     let refresh_metadata = adw::ActionRow::new();
     refresh_metadata.set_title("Refresh all online metadata");
-    refresh_metadata.set_subtitle("Synchronize owned games, manifests, and artwork");
+    refresh_metadata
+        .set_subtitle("Refresh names and covers; reload other metadata when next opened");
     let refresh_metadata_button = gtk::Button::with_label("Refresh");
     refresh_metadata_button.set_valign(gtk::Align::Center);
     refresh_metadata.add_suffix(&refresh_metadata_button);
@@ -264,6 +275,19 @@ pub(super) fn show_settings_page(
     let stack = gtk::Stack::new();
     stack.set_widget_name("ludomere-settings-stack");
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    let storage_header =
+        settings_navigation_row("storage-section", "Storage", "drive-harddisk-symbolic");
+    let storage_expanded = gtk::ToggleButton::new();
+    storage_expanded.set_icon_name("pan-end-symbolic");
+    storage_expanded.set_tooltip_text(Some("Expand Storage sections"));
+    storage_expanded.add_css_class("flat");
+    storage_header
+        .child()
+        .and_downcast::<gtk::Box>()
+        .expect("navigation row content")
+        .append(&storage_expanded);
+    let mut storage_rows = Vec::new();
+    let mut navigation_rows = Vec::new();
     for (name, title, icon, page) in [
         (
             "account",
@@ -279,15 +303,48 @@ pub(super) fn show_settings_page(
         ),
         (
             "library",
-            "Library",
+            "Game Display",
             "view-grid-symbolic",
             library_page.upcast::<gtk::Widget>(),
         ),
         (
             "storage",
-            "Storage",
+            "Game Library",
             "drive-harddisk-symbolic",
-            storage_page.upcast::<gtk::Widget>(),
+            build_storage_page(
+                &settings_window,
+                w,
+                model,
+                crate::config::LibraryKind::GameFiles,
+                "Game Library",
+            )
+            .upcast::<gtk::Widget>(),
+        ),
+        (
+            "storage-offline",
+            "Offline Installers",
+            "folder-download-symbolic",
+            build_storage_page(
+                &settings_window,
+                w,
+                model,
+                crate::config::LibraryKind::OfflineInstallers,
+                "Offline Installers",
+            )
+            .upcast::<gtk::Widget>(),
+        ),
+        (
+            "storage-extras",
+            "Goodies & Extras",
+            "folder-symbolic",
+            build_storage_page(
+                &settings_window,
+                w,
+                model,
+                crate::config::LibraryKind::Extras,
+                "Goodies & Extras",
+            )
+            .upcast::<gtk::Widget>(),
         ),
         (
             "maintenance",
@@ -296,14 +353,37 @@ pub(super) fn show_settings_page(
             storage_maintenance_page.upcast::<gtk::Widget>(),
         ),
         (
+            "proton",
+            "Proton",
+            "applications-games-symbolic",
+            proton_page(&settings_window).upcast::<gtk::Widget>(),
+        ),
+        (
             "appearance",
             "Appearance",
             "applications-graphics-symbolic",
             appearance_page.upcast::<gtk::Widget>(),
         ),
+        (
+            "comet",
+            "GOG Online Services",
+            "network-server-symbolic",
+            comet::comet_page(&settings_window).upcast::<gtk::Widget>(),
+        ),
     ] {
+        if name == "storage" {
+            navigation.append(&storage_header);
+        }
         let row = settings_navigation_row(name, title, icon);
+        if name == "storage" || name.starts_with("storage-") {
+            row.child()
+                .expect("navigation row content")
+                .set_margin_start(24);
+            row.set_visible(false);
+            storage_rows.push(row.clone());
+        }
         navigation.append(&row);
+        navigation_rows.push(row);
         stack.add_named(&page, Some(name));
     }
     navigation_shell.append(&navigation);
@@ -318,52 +398,174 @@ pub(super) fn show_settings_page(
     stack.set_vexpand(true);
     content.set_vexpand(true);
     root.append(&content);
-    navigation.connect_row_selected({
+    let syncing_navigation = Rc::new(std::cell::Cell::new(false));
+    storage_expanded.connect_toggled({
+        let navigation = navigation.clone();
+        let storage_header = storage_header.clone();
+        let storage_rows = storage_rows.clone();
         let stack = stack.clone();
-        move |_, row| {
-            if let Some(row) = row {
-                stack.set_visible_child_name(row.widget_name().as_str());
+        let syncing = syncing_navigation.clone();
+        move |expanded| {
+            for row in &storage_rows {
+                row.set_visible(expanded.is_active());
+            }
+            expanded.set_icon_name(if expanded.is_active() {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            });
+            expanded.set_tooltip_text(Some(if expanded.is_active() {
+                "Collapse Storage sections"
+            } else {
+                "Expand Storage sections"
+            }));
+            if expanded.is_active() && !syncing.get() {
+                navigation.select_row(Some(&storage_rows[0]));
+            }
+            if !expanded.is_active()
+                && navigation
+                    .selected_row()
+                    .is_some_and(|row| storage_rows.contains(&row))
+            {
+                syncing.set(true);
+                navigation.select_row(Some(&storage_header));
+                stack.set_visible_child_name("storage");
+                syncing.set(false);
             }
         }
     });
-    let initial_index = [
-        "account",
-        "downloads",
-        "library",
-        "storage",
-        "maintenance",
-        "appearance",
-    ]
-    .iter()
-    .position(|page| *page == initial_page)
-    .unwrap_or(0) as i32;
-    navigation.select_row(navigation.row_at_index(initial_index).as_ref());
+    navigation.connect_row_selected({
+        let stack = stack.clone();
+        let storage_expanded = storage_expanded.clone();
+        let storage_header = storage_header.clone();
+        let storage_default = storage_rows[0].clone();
+        let syncing = syncing_navigation.clone();
+        move |navigation, row| {
+            if syncing.get() {
+                return;
+            }
+            if let Some(row) = row {
+                syncing.set(true);
+                if row == &storage_header {
+                    storage_expanded.set_active(true);
+                    stack.set_visible_child_name("storage");
+                    navigation.select_row(Some(&storage_default));
+                } else {
+                    stack.set_visible_child_name(row.widget_name().as_str());
+                }
+                syncing.set(false);
+            }
+        }
+    });
+    navigation.connect_row_activated({
+        let storage_header = storage_header.clone();
+        let storage_default = storage_rows[0].clone();
+        let storage_expanded = storage_expanded.clone();
+        move |navigation, row| {
+            if row == &storage_header {
+                storage_expanded.set_active(true);
+                navigation.select_row(Some(&storage_default));
+            }
+        }
+    });
+    stack.connect_visible_child_name_notify({
+        let navigation = navigation.clone();
+        let storage_expanded = storage_expanded.clone();
+        let syncing = syncing_navigation.clone();
+        move |stack| {
+            if syncing.get() {
+                return;
+            }
+            let Some(name) = stack.visible_child_name() else {
+                return;
+            };
+            let Some(row) = navigation_rows.iter().find(|row| row.widget_name() == name) else {
+                return;
+            };
+            syncing.set(true);
+            if storage_rows.contains(row) {
+                storage_expanded.set_active(true);
+            }
+            navigation.select_row(Some(row));
+            syncing.set(false);
+        }
+    });
+    stack.set_visible_child_name(if stack.child_by_name(initial_page).is_some() {
+        initial_page
+    } else {
+        "account"
+    });
+    stack.notify("visible-child-name");
     settings_window.set_content(Some(&root));
 
     {
         let window = settings_window.clone();
         let model = model.clone();
-        open_downloads_button.connect_clicked(move |_| {
-            let path = model.borrow().config.download_directory.clone();
-            super::widgets::file_open::open_directory(&path, &window, "download directory");
+        let row = open_downloads.clone();
+        open_downloads_button.connect_clicked(move |button| {
+            let config = model.borrow().config.clone();
+            let dialog = adw::AlertDialog::builder().heading("Open a library").body("Choose a configured Offline Installers or Goodies & Extras directory. Incompatible libraries cannot be opened here.").build();
+            dialog.add_response("cancel", "Cancel");
+            let libraries = [crate::config::LibraryKind::OfflineInstallers, crate::config::LibraryKind::Extras].into_iter()
+                .flat_map(|kind| config.libraries(kind).iter().cloned().map(move |library| (kind, library))).collect::<Vec<_>>();
+            if libraries.is_empty() {
+                dialog.set_body("No Offline Installers or Goodies & Extras directory is configured. Add a directory in Settings → Storage first.");
+            }
+            for (index, (kind, library)) in libraries.iter().enumerate() {
+                dialog.add_response(&index.to_string(), &format!("{} — {}", kind.label(), library.path.display()));
+            }
+            let window = window.clone(); let epoch = model.borrow().account_epoch; let model = model.clone();
+            let row = row.clone(); let button = button.clone();
+            dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
+                if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
+                let Some((kind, library)) = response.parse::<usize>().ok().and_then(|index| libraries.get(index)).cloned() else { return; };
+                row.set_subtitle("Checking library access…");
+                button.set_sensitive(false);
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || { let _ = sender.send(crate::storage::read_config().and_then(|current| {
+                    let found = crate::storage::validate_library(&current, kind, &library.id)?;
+                    anyhow::ensure!(found.path == library.path, "Library changed; choose it again."); Ok(found)
+                })); });
+                let window = window.clone();
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { button.set_sensitive(true); return glib::ControlFlow::Break; }
+                    match receiver.try_recv() {
+                        Ok(Ok(library)) => { row.set_subtitle("Opening library in your file manager…"); super::widgets::file_open::open_directory(&library.path, &window, "library directory"); },
+                        Ok(Err(error)) => { row.set_subtitle(&format!("Could not open library: {error:#}")); },
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(_) => row.set_subtitle("Library inspection stopped unexpectedly. Try again."),
+                    } button.set_sensitive(true); glib::ControlFlow::Break
+                });
+            });
         });
     }
     {
         let row = clear_images.clone();
+        let model = model.clone();
         clear_images_button.connect_clicked(move |button| {
             button.set_sensitive(false);
             row.set_subtitle("Clearing replaceable images…");
             let cache = crate::identity::cache_root();
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = clear_replaceable_images_at(&cache);
+                let result = clear_replaceable_images_at(&cache)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|()| {
+                        online::invalidate_all_section_cache(online::DetailSection::Artwork)
+                    });
                 let _ = sender.send(result);
             });
             let button = button.clone();
             let row = row.clone();
+            let model = model.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
                     Ok(Ok(())) => {
+                        model
+                            .borrow_mut()
+                            .section_states
+                            .retain(|(_, scope), _| *scope != online::DetailSection::Artwork);
+                        widgets::media::clear_card_texture_cache();
                         row.set_subtitle(
                             "Image cache cleared; artwork will return on the next refresh",
                         );
@@ -376,24 +578,34 @@ pub(super) fn show_settings_page(
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        row.set_subtitle("Image cache cleanup stopped unexpectedly. Try again.");
+                        button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
                 }
             });
         });
     }
     {
         let window = w.window.clone();
+        let status = preference_status.clone();
         refresh_metadata_button.connect_clicked(move |_| {
             if let Err(error) =
                 gtk::prelude::WidgetExt::activate_action(&window, "win.refresh", None)
             {
                 tracing::warn!(%error, "could not activate metadata refresh");
+                status.set_label(&format!(
+                    "Could not start synchronization: {error}. Close Settings and try again."
+                ));
+                status.set_visible(true);
             }
         });
     }
     for (index, button) in tile_size_buttons.into_iter().enumerate() {
         let w = w.clone();
         let model = model.clone();
+        let status = preference_status.clone();
         button.connect_toggled(move |button| {
             if !button.is_active() {
                 return;
@@ -407,9 +619,7 @@ pub(super) fn show_settings_page(
                 let mut state = model.borrow_mut();
                 state.card_width = width;
                 state.config.library_card_size = index as u8;
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save library card size");
-                }
+                save_preferences(&state.config, &status);
             }
             rebuild_home_grid(&w, &model);
         });
@@ -417,14 +627,13 @@ pub(super) fn show_settings_page(
     {
         let w = w.clone();
         let model = model.clone();
+        let status = preference_status.clone();
         sidebar_icons.connect_active_notify(move |row| {
             let visible = row.is_active();
             {
                 let mut state = model.borrow_mut();
                 state.config.show_sidebar_game_icons = visible;
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save sidebar icon preference");
-                }
+                save_preferences(&state.config, &status);
             }
             set_sidebar_icons_visible(&w, visible);
         });
@@ -432,13 +641,12 @@ pub(super) fn show_settings_page(
     {
         let w = w.clone();
         let model = model.clone();
+        let status = preference_status.clone();
         backup_status.connect_active_notify(move |row| {
             {
                 let mut state = model.borrow_mut();
                 state.config.show_backup_status = row.is_active();
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save backup status preference");
-                }
+                save_preferences(&state.config, &status);
             }
             update_sidebar_download_styles(&w, &model.borrow());
         });
@@ -447,17 +655,77 @@ pub(super) fn show_settings_page(
     {
         let model = model.clone();
         let rebuild_row = rebuild_row.clone();
+        let w = w.clone();
         rebuild_button.connect_clicked(move |button| {
             button.set_sensitive(false);
             rebuild_row.set_subtitle("Inspecting managed files…");
-            let summary = reconcile_managed_directory(&mut model.borrow_mut());
-            rebuild_row.set_subtitle(&summary);
-            button.set_sensitive(true);
+            let (config, games, epoch) = {
+                let state = model.borrow();
+                (
+                    state.config.clone(),
+                    state.games.clone(),
+                    state.account_epoch,
+                )
+            };
+            let (sender, receiver) = mpsc::channel();
+            let session = online::account_session();
+            let scanned_roots = [config.offline_libraries.clone(), config.extras_libraries.clone()];
+            std::thread::spawn(move || {
+                let result = StateStore::open().and_then(|mut store| {
+                    let mut summary = managed::RebuildSummary::default();
+                    let statuses = crate::storage::inspect_libraries(&config)?;
+                    let mut skipped = 0usize;
+                    for kind in [crate::config::LibraryKind::OfflineInstallers, crate::config::LibraryKind::Extras] {
+                        for library in config.libraries(kind) {
+                            if !statuses.iter().any(|status| status.kind == kind && status.library_id == library.id && status.compatibility == crate::storage::LibraryCompatibility::Compatible) { skipped += 1; continue; }
+                            let found = managed::rebuild_for_session(&mut store, &library.path, &games, session)?;
+                            summary.files += found.files; summary.matched += found.matched; summary.unmatched += found.unmatched;
+                            summary.partials += found.partials; summary.ignored += found.ignored;
+                        }
+                    }
+                    Ok((summary, skipped, store.managed_files()?, store.download_jobs()?))
+                });
+                let _ = sender.send(result);
+            });
+            let model = model.clone();
+            let w = w.clone();
+            let row = rebuild_row.clone();
+            let button = button.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if model.borrow().account_epoch != epoch
+                    || [model.borrow().config.offline_libraries.clone(), model.borrow().config.extras_libraries.clone()] != scanned_roots
+                {
+                    button.set_sensitive(true);
+                    row.set_subtitle("Account or library folders changed. Click Rebuild to inspect the current libraries.");
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(Ok((summary, skipped, files, jobs))) => {
+                        let mut state = model.borrow_mut();
+                        managed::apply_to_games(&mut state.games, &files);
+                        state.download_jobs = jobs;
+                        drop(state);
+                        row.set_subtitle(&format!(
+                            "Indexed {} files ({} matched, {} unmatched); {} incompatible or unavailable libraries skipped",
+                            summary.files, summary.matched, summary.unmatched, skipped
+                        ));
+                        refresh_local_action_state(&w, &model);
+                    }
+                    Ok(Err(error)) => {
+                        row.set_subtitle(&format!("Could not inspect files: {error}. Try again."))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => row.set_subtitle("File inspection stopped. Try again."),
+                }
+                button.set_sensitive(true);
+                glib::ControlFlow::Break
+            });
         });
     }
     {
         let model = model.clone();
         let language_list = language_list.clone();
+        let status = preference_status.clone();
         language.connect_selected_notify(move |selector| {
             let selected = selector.selected();
             let mut state = model.borrow_mut();
@@ -468,13 +736,12 @@ pub(super) fn show_settings_page(
                     .string(selected)
                     .map(|value| value.to_string())
             };
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default installer language");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     for (button, update) in [(windows, 0_u8), (linux, 1_u8), (macos, 2_u8)] {
         let model = model.clone();
+        let status = preference_status.clone();
         button.connect_toggled(move |button| {
             let mut state = model.borrow_mut();
             match update {
@@ -482,75 +749,68 @@ pub(super) fn show_settings_page(
                 1 => state.config.installer_linux = button.is_active(),
                 _ => state.config.installer_macos = button.is_active(),
             }
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default installer platforms");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         concurrency.connect_value_changed(move |selector| {
             let limit = selector.value_as_int().clamp(1, 4) as usize;
             let mut state = model.borrow_mut();
             state.config.max_concurrent_downloads = limit;
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save simultaneous download limit");
-            }
+            save_preferences(&state.config, &status);
             download::set_concurrency(limit);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         extras_default.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.download_extras_by_default = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default extras preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         patches_default.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.download_patches_by_default = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default patches preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         prefer_patch_updates.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.prefer_patch_updates = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save patch update preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         interactive_prompts.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.interactive_installer_prompts = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save interactive installer preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         retired_artifacts.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.show_retired_artifacts = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save previous-version visibility preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         theme.connect_selected_notify(move |selector| {
             let selected = match selector.selected() {
                 1 => crate::config::Theme::Light,
@@ -560,12 +820,20 @@ pub(super) fn show_settings_page(
             apply_theme(selected);
             let mut state = model.borrow_mut();
             state.config.theme = selected;
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save color scheme");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     settings_window.present();
+}
+
+fn save_preferences(config: &Config, status: &gtk::Label) {
+    match config.save() {
+        Ok(()) => status.set_visible(false),
+        Err(error) => {
+            status.set_label(&format!("These changes apply for this session, but could not be saved: {error}. Change the option again to retry."));
+            status.set_visible(true);
+        }
+    }
 }
 
 fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
@@ -582,7 +850,10 @@ fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
     None
 }
 
-fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::PreferencesGroup {
+fn installation_source_order_group(
+    model: &Rc<RefCell<AppModel>>,
+    status: &gtk::Label,
+) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Preferred installation order");
     group.set_description(Some(
@@ -617,11 +888,12 @@ fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::Prefer
         {
             let model = model.clone();
             let labels = labels.clone();
+            let status = status.clone();
             drop_target.connect_drop(move |_, value, _, _| {
                 let Ok(from) = value.get::<u32>() else {
                     return false;
                 };
-                reorder_installation_sources(&model, from as usize, index);
+                reorder_installation_sources(&model, from as usize, index, &status);
                 refresh_installation_source_labels(&model, &labels.borrow());
                 true
             });
@@ -630,16 +902,18 @@ fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::Prefer
         {
             let model = model.clone();
             let labels = labels.clone();
+            let status = status.clone();
             up.connect_clicked(move |_| {
-                reorder_installation_sources(&model, index, index - 1);
+                reorder_installation_sources(&model, index, index - 1, &status);
                 refresh_installation_source_labels(&model, &labels.borrow());
             });
         }
         {
             let model = model.clone();
             let labels = labels.clone();
+            let status = status.clone();
             down.connect_clicked(move |_| {
-                reorder_installation_sources(&model, index, index + 1);
+                reorder_installation_sources(&model, index, index + 1, &status);
                 refresh_installation_source_labels(&model, &labels.borrow());
             });
         }
@@ -650,16 +924,19 @@ fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::Prefer
     group
 }
 
-fn reorder_installation_sources(model: &Rc<RefCell<AppModel>>, from: usize, to: usize) {
+fn reorder_installation_sources(
+    model: &Rc<RefCell<AppModel>>,
+    from: usize,
+    to: usize,
+    status: &gtk::Label,
+) {
     if from >= 3 || to >= 3 || from == to {
         return;
     }
     let mut state = model.borrow_mut();
     let source = state.config.installation_source_order.remove(from);
     state.config.installation_source_order.insert(to, source);
-    if let Err(error) = state.config.save() {
-        tracing::warn!(%error, "could not save preferred installation order");
-    }
+    save_preferences(&state.config, status);
 }
 
 fn refresh_installation_source_labels(model: &Rc<RefCell<AppModel>>, rows: &[adw::ActionRow]) {
@@ -757,6 +1034,64 @@ fn settings_account_page(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) -> adw:
     }
     page.add(&profile_group);
 
+    let privacy = adw::PreferencesGroup::new();
+    privacy.set_title("Factory Reset");
+    let reset_row = adw::ActionRow::builder()
+        .title("Reset Ludomere")
+        .subtitle("Delete this application's profile and cache, then close Ludomere. Library files are kept.")
+        .build();
+    let reset = gtk::Button::with_label("Factory Reset…");
+    reset.add_css_class("destructive-action");
+    reset.set_valign(gtk::Align::Center);
+    let reset_status = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    reset_status.set_widget_name("factory-reset-status");
+    let reset_status_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .max_content_height(160)
+        .propagate_natural_height(true)
+        .child(&reset_status)
+        .build();
+    reset.connect_clicked({
+        let w = w.clone();
+        let model = model.clone();
+        let reset_status = reset_status.clone();
+        move |button| {
+            if model.borrow().logout_pending { return; }
+            let Some(parent) = button.root().and_downcast::<gtk::Window>() else { return; };
+            let epoch = model.borrow().account_epoch;
+            let confirmation = adw::AlertDialog::builder()
+                .heading("Factory reset Ludomere?")
+                .body("This deletes Ludomere's database, settings, favorites, tags, playtime, queue and automatic-resume records, local login data, cached metadata, images and logs. Ludomere will close. If the system credential store is unavailable, its saved entry may remain; automatic login stays disabled.\n\nGames, downloaded files, game prefixes and their saves, Proton versions, runtimes and cloud recovery copies are kept. Running games continue; background downloads and setup are stopped safely. Custom library folders must be added again afterward.")
+                .build();
+            confirmation.add_responses(&[("cancel", "Cancel"), ("reset", "Factory Reset")]);
+            confirmation.set_default_response(Some("cancel"));
+            confirmation.set_close_response("cancel");
+            confirmation.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            let w = w.clone();
+            let model = model.clone();
+            let reset_status = reset_status.clone();
+            let parent_lifetime = parent.downgrade();
+            confirmation.choose(Some(&parent), gio::Cancellable::NONE, move |response| {
+                if response == "reset" && parent_lifetime.upgrade().is_some_and(|window| window.is_visible())
+                    && model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
+                    super::window::sign_out(&w, &model, true, Some(reset_status));
+                }
+            });
+        }
+    });
+    reset_row.add_suffix(&reset);
+    reset_row.set_activatable_widget(Some(&reset));
+    privacy.add(&reset_row);
+    privacy.add(&reset_status_scroll);
+    page.add(&privacy);
+
     let connection = adw::PreferencesGroup::new();
     connection.set_title("Connection");
     let status = adw::ActionRow::new();
@@ -786,40 +1121,7 @@ pub(super) fn refresh_installed_state_after_library_change(
     w: &Rc<Widgets>,
     model: &Rc<RefCell<AppModel>>,
 ) {
-    let libraries = model.borrow().config.game_libraries.clone();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = StateStore::open()
-            .and_then(|store| crate::installation::reconcile_installed_games(&store, &libraries));
-        let _ = sender.send(result);
-    });
-    let w = w.clone_refs();
-    let model = model.clone();
-    glib::timeout_add_local(Duration::from_millis(16), move || {
-        let installed = match receiver.try_recv() {
-            Ok(Ok(installed)) => installed,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "could not scan configured game libraries");
-                return glib::ControlFlow::Break;
-            }
-            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
-        };
-        let selected = {
-            let mut state = model.borrow_mut();
-            state.installed_products = installed.into_iter().map(|game| game.product_id).collect();
-            state.selected
-        };
-        {
-            let state = model.borrow();
-            update_sidebar_download_styles(&w, &state);
-            refresh_filters(&w, &state);
-        }
-        if let Some(selected) = selected {
-            render_product_details(&w, &model, selected);
-        }
-        glib::ControlFlow::Break
-    });
+    refresh_local_action_state(w, model);
 }
 
 fn clear_replaceable_images_at(cache_root: &std::path::Path) -> std::io::Result<()> {

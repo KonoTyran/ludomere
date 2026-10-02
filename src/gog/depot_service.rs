@@ -146,6 +146,8 @@ pub fn prepare_operation(
     client: &reqwest::blocking::Client,
     request: PrepareOperationRequest,
 ) -> Result<crate::installation::DepotOperationRequest> {
+    let account_session = crate::online::account_session();
+    let recovery_generation = crate::installation::recovery::generation(request.build.product_id);
     let token = crate::auth::load_saved_token()?
         .ok_or_else(|| anyhow::anyhow!("sign in to GOG to prepare a Galaxy depot operation"))?;
     let acquisition = crate::installation::depot_planner::load_cached_acquisition(
@@ -164,6 +166,8 @@ pub fn prepare_operation(
     })?;
     crate::installation::depot_planner::prepare(
         crate::installation::depot_planner::PrepareDepotRequest {
+            account_session,
+            recovery_generation,
             store,
             acquisition: &acquisition,
             build: &request.build,

@@ -12,18 +12,30 @@ use crate::{
     text,
 };
 mod account;
+mod achievements;
+mod cloud_management;
 mod collections;
+mod comet;
 mod details;
+mod dll_overrides;
 mod download_chooser;
 mod downloads;
 mod executable_chooser;
 mod files;
 mod game_settings;
 mod library;
+mod logs;
+mod notifications;
+mod organization;
+mod proton;
+mod sections;
 mod settings;
+mod setup;
 mod style;
 mod sync;
 mod tray;
+mod uninstall;
+mod update_policies;
 mod widgets;
 mod window;
 
@@ -99,6 +111,8 @@ use gdk_pixbuf::InterpType;
 use gdk_pixbuf::prelude::PixbufLoaderExt;
 use gtk::{gdk, gio, glib};
 use library::*;
+use proton::*;
+use sections::*;
 use settings::*;
 use std::{
     cell::RefCell,
@@ -112,7 +126,8 @@ pub(crate) use tray::shutdown_tray;
 use widgets::content::{empty_dash, expandable_section, section, text_excerpt};
 use widgets::gallery::screenshot_strip;
 use widgets::media::{
-    card_picture, install_smooth_wheel_scroll, parallax_detail_hero, picture, scaled_card_texture,
+    card_picture, install_smooth_wheel_scroll, parallax_detail_hero, picture, set_card_picture,
+    set_picture_status,
 };
 pub use window::build_window;
 
@@ -126,12 +141,45 @@ struct VerificationDisplayState {
     running: bool,
 }
 
+#[cfg_attr(test, derive(Default))]
 struct AppModel {
     config: Config,
+    library_statuses: Vec<crate::storage::LibraryStatus>,
     games: Vec<Game>,
+    section_states: HashMap<(i64, online::DetailSection), SectionState>,
+    section_queue: VecDeque<(i64, online::DetailSection)>,
+    section_active: HashSet<(i64, online::DetailSection)>,
+    section_forced: HashSet<(i64, online::DetailSection)>,
+    account_epoch: u64,
+    logout_pending: bool,
+    sync_generation: u64,
+    sync_session: Option<u64>,
+    dismissed_sync_error: Option<String>,
+    detail_generation: u64,
+    detail_target: Option<(i64, Option<i64>)>,
+    installed_games: HashMap<i64, crate::domain::InstalledGame>,
+    local_actions: HashMap<i64, LocalActionState>,
+    local_refresh_running: bool,
+    local_refresh_pending: bool,
+    local_priority_running: bool,
+    local_priority_pending: HashSet<i64>,
+    local_versions: HashMap<i64, u64>,
+    local_revision: u64,
+    core_loading: bool,
+    sync_running: bool,
+    sync_message: Option<String>,
+    sync_failed: bool,
+    cover_states: HashMap<i64, CoverState>,
+    icon_states: HashMap<i64, CoverState>,
     patch_notes: HashMap<i64, Rc<Vec<PatchNote>>>,
     favorites: HashSet<i64>,
     tags: HashMap<i64, Vec<String>>,
+    hidden_products: HashSet<i64>,
+    hidden_pending: HashSet<i64>,
+    show_hidden: bool,
+    tag_filters: BTreeSet<String>,
+    tag_match_all: bool,
+    organization_pending: bool,
     favorites_only: bool,
     downloaded_only: bool,
     installed_only: bool,
@@ -142,6 +190,7 @@ struct AppModel {
     downloaded_products: HashSet<i64>,
     downloaded_installer_products: HashSet<i64>,
     download_jobs: Vec<DownloadJobRecord>,
+    blocked_auto_installs: HashMap<String, i64>,
     depot_operations: Vec<crate::installation::DepotOperationSnapshot>,
     transfer_history: Rc<RefCell<VecDeque<TransferHistorySample>>>,
     transfer_totals: Option<(std::time::Instant, u64, u64)>,
@@ -291,18 +340,15 @@ fn primary_action_for_state(
     current_installer_downloaded: bool,
     dlc_action: DlcActionState,
 ) -> GamePrimaryAction {
+    if installed {
+        return GamePrimaryAction::Play;
+    }
     let needs_download = backup_update
         || dlc_action.missing_download
         || (installed_update && !current_installer_downloaded);
-    let needs_install =
-        dlc_action.missing_install || (installed_update && current_installer_downloaded);
 
     if needs_download {
         GamePrimaryAction::DownloadUpdate
-    } else if installed && needs_install {
-        GamePrimaryAction::InstallUpdate
-    } else if installed {
-        GamePrimaryAction::Play
     } else if current_installer_downloaded {
         GamePrimaryAction::Install
     } else {
@@ -341,7 +387,8 @@ struct DownloadDialogWidgets {
     confirm: gtk::Button,
     authenticated: bool,
     online: bool,
-    download_directory: std::path::PathBuf,
+    artifact_states: RefCell<HashMap<String, DialogArtifactState>>,
+    libraries_available: RefCell<Vec<crate::config::LibraryKind>>,
 }
 
 impl DetailPageModel {
@@ -425,10 +472,16 @@ impl DetailPageModel {
 struct Widgets {
     window: adw::ApplicationWindow,
     status: gtk::Label,
-    status_bar: gtk::Button,
+    live_status: gtk::Label,
+    notifications: notifications::Notifications,
+    status_bar: gtk::Box,
     sync_spinner: gtk::Spinner,
     sync_status: gtk::Label,
     sync_progress: gtk::ProgressBar,
+    sync_retry: gtk::Button,
+    sync_dismiss: gtk::Button,
+    sync_options: gtk::Button,
+    finish_setup: gtk::Button,
     download_artwork: gtk::Image,
     download_percent: gtk::Label,
     download_status_progress: gtk::ProgressBar,
@@ -447,6 +500,7 @@ struct Widgets {
     playable_toggle: gtk::ToggleButton,
     filter_count: gtk::Label,
     filter_button: gtk::MenuButton,
+    organization_filters: gtk::Box,
     clear_filters: gtk::Button,
     favorite_filter: gtk::CheckButton,
     downloaded_filter: gtk::CheckButton,
@@ -591,10 +645,16 @@ impl Widgets {
         Rc::new(Self {
             window: self.window.clone(),
             status: self.status.clone(),
+            live_status: self.live_status.clone(),
+            notifications: self.notifications.clone(),
             status_bar: self.status_bar.clone(),
             sync_spinner: self.sync_spinner.clone(),
             sync_status: self.sync_status.clone(),
             sync_progress: self.sync_progress.clone(),
+            sync_retry: self.sync_retry.clone(),
+            sync_dismiss: self.sync_dismiss.clone(),
+            sync_options: self.sync_options.clone(),
+            finish_setup: self.finish_setup.clone(),
             download_artwork: self.download_artwork.clone(),
             download_percent: self.download_percent.clone(),
             download_status_progress: self.download_status_progress.clone(),
@@ -613,6 +673,7 @@ impl Widgets {
             playable_toggle: self.playable_toggle.clone(),
             filter_count: self.filter_count.clone(),
             filter_button: self.filter_button.clone(),
+            organization_filters: self.organization_filters.clone(),
             clear_filters: self.clear_filters.clone(),
             favorite_filter: self.favorite_filter.clone(),
             downloaded_filter: self.downloaded_filter.clone(),
@@ -698,10 +759,10 @@ const CSS: &str = r#"
 .game-grid flowboxchild:hover,
 .game-grid flowboxchild:active,
 .game-grid flowboxchild:selected { background: transparent; box-shadow: none; outline: none; padding: 0; }
-.game-state-update label { color: #62a8e5; }
-.game-state-partial-backup label { color: #d98b45; }
-.game-state-backup label { color: #d5b36a; }
-.game-state-pending label { color: #78aeed; }
+.game-state-running label { color: #71d28b; }
+.game-state-downloading label { color: #62a8e5; }
+.game-state-installed label { color: #ffffff; }
+.game-state-unavailable label { color: #909090; }
 .portrait-frame, .hero-card { border-radius: 10px; background: #20242b; }
 .game-card .hero-card { border-radius: 8px 8px 0 0; }
 .card-caption { background: #303030; color: white; border-radius: 0 0 8px 8px; padding: 9px 10px; }
@@ -906,7 +967,6 @@ const CSS: &str = r#"
 .gallery-controls { background: alpha(#111820, .90); border-radius: 999px; padding: 7px 10px; color: white; }
 .gallery-close { margin: 16px; min-width: 38px; min-height: 38px; border-radius: 999px; background: alpha(#111820, .90); color: white; }
 .application-status-bar { border-radius: 0; border: 0; border-top: 1px solid alpha(@borders, .55); padding: 4px 14px; min-height: 38px; background: @headerbar_bg_color; }
-.application-status-bar:hover { background: alpha(@accent_bg_color, .10); }
 .download-status-icon { min-width: 24px; min-height: 24px; }
 .downloads-title { font-size: 1.8em; font-weight: 800; }
 .download-section-heading { margin-top: 8px; }
@@ -991,14 +1051,14 @@ mod primary_action_tests {
     }
 
     #[test]
-    fn downloaded_update_is_installed_while_missing_update_is_downloaded() {
+    fn available_updates_keep_the_installed_game_playable() {
         assert_eq!(
             primary_action_for_state(true, true, false, true, DlcActionState::default()),
-            GamePrimaryAction::InstallUpdate
+            GamePrimaryAction::Play
         );
         assert_eq!(
             primary_action_for_state(true, true, false, false, DlcActionState::default()),
-            GamePrimaryAction::DownloadUpdate
+            GamePrimaryAction::Play
         );
     }
 
@@ -1024,7 +1084,7 @@ mod primary_action_tests {
     }
 
     #[test]
-    fn missing_dlc_files_take_priority_over_installing_downloaded_content() {
+    fn missing_dlc_files_do_not_replace_play() {
         assert_eq!(
             primary_action_for_state(
                 true,
@@ -1036,7 +1096,7 @@ mod primary_action_tests {
                     missing_install: true,
                 },
             ),
-            GamePrimaryAction::DownloadUpdate
+            GamePrimaryAction::Play
         );
     }
 }

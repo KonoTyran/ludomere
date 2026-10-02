@@ -108,6 +108,18 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TRAY_HANDLE: LazyLock<Mutex<Option<ksni::blocking::Handle<LudomereTray>>>> =
     LazyLock::new(|| Mutex::new(None));
 
+thread_local! {
+    static PENDING_LAUNCHES: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
+}
+
+struct PendingLaunch(i64);
+
+impl Drop for PendingLaunch {
+    fn drop(&mut self) {
+        PENDING_LAUNCHES.with(|pending| pending.borrow_mut().remove(&self.0));
+    }
+}
+
 pub(super) fn start_tray(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     if TRAY_ACTIVE.load(Ordering::Acquire) {
         return;
@@ -115,7 +127,8 @@ pub(super) fn start_tray(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     let (sender, receiver) = mpsc::channel();
     let tray = LudomereTray {
         commands: sender,
-        recent_games: recent_played_games(),
+        // ksni refreshes the menu via menu_about_to_show on its service thread.
+        recent_games: Vec::new(),
     };
     let handle = match tray.spawn() {
         Ok(handle) => handle,
@@ -187,25 +200,111 @@ fn recent_played_games() -> Vec<RecentGame> {
 }
 
 fn launch_recent_game(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id: i64) {
-    let libraries = model.borrow().config.game_libraries.clone();
-    let installed = StateStore::open().ok().and_then(|store| {
-        crate::installation::reconcile_installed_games(&store, &libraries)
-            .ok()?
-            .into_iter()
-            .find(|game| game.product_id == product_id)
-    });
-    let Some(game) = installed else {
-        show_main_window(w);
-        show_status(w, "That game is no longer installed");
-        return;
-    };
-    if crate::installation::is_game_running(product_id) {
+    show_main_window(w);
+    if model.borrow().logout_pending {
+        show_status(
+            w,
+            "Sign-out is in progress. Wait for it to finish before launching a game.",
+        );
         return;
     }
-    let receiver = crate::installation::launch_game(game);
+    if crate::installation::is_game_running(product_id) {
+        show_status(w, "That game is already running.");
+        return;
+    }
+    if !PENDING_LAUNCHES.with(|pending| pending.borrow_mut().insert(product_id)) {
+        show_status(w, "That game is already being prepared for launch.");
+        return;
+    }
+    let mut pending = Some(PendingLaunch(product_id));
+    let libraries = model.borrow().config.game_libraries.clone();
+    let epoch = model.borrow().account_epoch;
+    let launch_generation = model.borrow().detail_generation;
+    let session = online::account_session();
+    let auth_session = auth::session();
+    show_status(w, "Preparing game launch — checking installed files…");
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = StateStore::open()
+            .and_then(|store| crate::installation::reconcile_installed_games(&store, &libraries))
+            .map(|games| games.into_iter().find(|game| game.product_id == product_id));
+        let _ = sender.send(result);
+    });
+    let widgets = w.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        if online::account_session() != session
+            || auth::session() != auth_session
+            || model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+        {
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Ok(Ok(Some(game))) => {
+                if crate::installation::is_game_running(product_id) {
+                    show_status(&widgets, "That game is already running.");
+                } else if game.installer_operating_system.as_deref() != Some("linux")
+                    && (model.borrow().detail_generation != launch_generation
+                        || !widgets.window.is_visible()
+                        || !widgets.window.is_active())
+                {
+                    show_status(
+                        &widgets,
+                        "Launch preparation finished. Select the game again when you are ready to continue Windows setup.",
+                    );
+                } else {
+                    show_status(&widgets, "Starting game…");
+                    start_recent_game(
+                        &widgets,
+                        &model,
+                        game,
+                        launch_generation,
+                        pending.take().unwrap(),
+                    );
+                }
+            }
+            Ok(Ok(None)) => show_status(&widgets, "That game is no longer installed."),
+            Ok(Err(error)) => show_status(
+                &widgets,
+                &notifications::failure_message(
+                    "Could not inspect installed game files. Try launching again.",
+                    &format!("{error:#}"),
+                ),
+            ),
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => show_status(
+                &widgets,
+                "Game preparation stopped unexpectedly. Try launching again.",
+            ),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn start_recent_game(
+    w: &Rc<Widgets>,
+    model: &Rc<RefCell<AppModel>>,
+    game: crate::domain::InstalledGame,
+    launch_generation: u64,
+    pending: PendingLaunch,
+) {
+    let product_id = game.product_id;
+    let session = online::account_session();
+    let auth_session = auth::session();
+    let epoch = model.borrow().account_epoch;
+    let receiver = launch_with_components(&w.window, game);
+    let mut pending = Some(pending);
     let widgets = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if online::account_session() != session
+            || auth::session() != auth_session
+            || model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+        {
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(
                 event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
@@ -219,6 +318,11 @@ fn launch_recent_game(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id
                 glib::ControlFlow::Continue
             }
             Ok(crate::installation::LaunchEvent::Started) => {
+                pending.take();
+                show_status(
+                    &widgets,
+                    "Game started. Launch output is available in the game's Logs tab.",
+                );
                 let now = chrono::Utc::now().timestamp();
                 model
                     .borrow_mut()
@@ -233,18 +337,55 @@ fn launch_recent_game(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id
                 glib::ControlFlow::Continue
             }
             Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
+            Ok(crate::installation::LaunchEvent::PrefixRecoveryRequired {
+                message,
+                game,
+                setup_required,
+            }) => {
+                let title = model
+                    .borrow()
+                    .games
+                    .iter()
+                    .find(|entry| entry.product_id == product_id)
+                    .map(|game| game.title.clone())
+                    .unwrap_or_else(|| format!("Game {product_id}"));
+                offer_prefix_recovery(
+                    &widgets.window,
+                    &model,
+                    *game,
+                    &title,
+                    &message,
+                    setup_required,
+                    launch_generation,
+                );
+                glib::ControlFlow::Break
+            }
             Ok(crate::installation::LaunchEvent::Failed(error)) => {
-                show_main_window(&widgets);
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Could not run game")
-                    .body(error)
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&widgets.window));
+                let message = notifications::failure_message("Could not run game", &error);
+                show_status(&widgets, &message);
+                if model.borrow().detail_generation == launch_generation
+                    && widgets.window.is_visible()
+                    && widgets.window.is_active()
+                {
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Could not run game")
+                        .body(message)
+                        .build();
+                    dialog.add_response("close", "Close");
+                    dialog.present(Some(&widgets.window));
+                }
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if pending.is_some() {
+                    show_status(
+                        &widgets,
+                        "Game launch ended before the game started. Select it again to retry.",
+                    );
+                }
+                glib::ControlFlow::Break
+            }
         }
     });
 }

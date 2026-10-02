@@ -188,7 +188,7 @@ pub fn select_depots<'a>(
     Ok(selected)
 }
 
-fn language_matches(depot: &str, selected: &str) -> bool {
+pub(crate) fn language_matches(depot: &str, selected: &str) -> bool {
     if depot == "*" || depot.eq_ignore_ascii_case(selected) {
         return true;
     }
@@ -244,6 +244,14 @@ fn manifest_meta_url_at(base: &str, reference: &str) -> Result<String> {
         "{}{path}",
         base.trim_end_matches('/').to_owned() + "/"
     ))
+}
+
+pub(crate) fn fetch_repository(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    identity: &str,
+) -> Result<GenerationTwoRepository> {
+    crate::gog::repository::parse(&fetch_bytes(client, token, &manifest_meta_url(identity)?)?)
 }
 
 fn fetch_bytes(client: &reqwest::blocking::Client, token: &str, url: &str) -> Result<Vec<u8>> {

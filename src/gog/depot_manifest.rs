@@ -2,31 +2,36 @@ use std::{collections::HashMap, io::Read};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::ZlibDecoder;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 const MAX_EXPANDED: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepotManifest {
     pub generation: u64,
     pub entries: Vec<DepotEntry>,
     pub small_files_containers: Vec<SmallFilesContainer>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SmallFilesContainer {
     pub chunks: Vec<DepotChunk>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DepotEntry {
     Directory { path: String },
     File(DepotFile),
     Link { path: String, target: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepotFile {
     pub path: String,
     pub size: u64,
@@ -38,14 +43,16 @@ pub struct DepotFile {
     pub small_file: Option<SmallFileRef>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SmallFileRef {
     pub container_index: usize,
     pub offset: u64,
     pub size: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepotChunk {
     pub compressed_md5: String,
     pub compressed_size: u64,
@@ -60,6 +67,54 @@ pub struct DepotTotals {
 }
 
 impl DepotManifest {
+    /// Internal merged state keeps indices that a single GOG wire depot cannot encode.
+    pub fn snapshot_json(&self) -> Result<String> {
+        self.validate()?;
+        let json = serde_json::to_string(&serde_json::json!({
+            "ludomereManifestVersion": 1, "manifest": self,
+        }))?;
+        anyhow::ensure!(
+            json.len() as u64 <= MAX_EXPANDED,
+            "Installed manifest snapshot exceeds the size limit"
+        );
+        Ok(json)
+    }
+
+    /// Reuse all wire path/hash/chunk rules without pretending merged indices are wire data.
+    pub fn validate(&self) -> Result<()> {
+        let mut files = self.clone();
+        files.small_files_containers.clear();
+        for entry in &mut files.entries {
+            if let DepotEntry::File(file) = entry
+                && let Some(reference) = file.small_file.take()
+            {
+                anyhow::ensure!(
+                    reference.size != 0 && reference.size == file.size,
+                    "sfcRef size does not match file size"
+                );
+            }
+        }
+        let wire = serde_json::from_str(&files.canonical_json()?)?;
+        anyhow::ensure!(
+            parse_value(&wire)? == files,
+            "Merged manifest has noncanonical paths, hashes or file sizes"
+        );
+        for container in &self.small_files_containers {
+            let single = Self {
+                generation: self.generation,
+                entries: Vec::new(),
+                small_files_containers: vec![container.clone()],
+            };
+            anyhow::ensure!(
+                parse(single.canonical_json()?.as_bytes())? == single,
+                "Merged manifest has noncanonical container metadata"
+            );
+        }
+        validate_small_file_refs(&self.entries, &self.small_files_containers)?;
+        self.totals()?;
+        Ok(())
+    }
+
     pub fn canonical_json(&self) -> Result<String> {
         let chunks = |chunks: &[DepotChunk]| {
             chunks
@@ -229,6 +284,15 @@ impl DepotManifest {
     }
 
     pub fn identity(&self) -> String {
+        self.identity_with_container_indices(true)
+    }
+
+    /// Only for old installed markers reconstructed from their original wire source set.
+    pub(crate) fn legacy_payload_identity(&self) -> String {
+        self.identity_with_container_indices(false)
+    }
+
+    fn identity_with_container_indices(&self, bind_indices: bool) -> String {
         fn field(hash: &mut Sha256, bytes: &[u8]) {
             hash.update((bytes.len() as u64).to_be_bytes());
             hash.update(bytes);
@@ -290,6 +354,18 @@ impl DepotManifest {
                 hash.update(chunk.size.to_be_bytes());
             }
         }
+        // A wire manifest has at most one container (index zero). Preserve those
+        // established identities; merged manifests must also bind file→container edges.
+        if bind_indices && self.small_files_containers.len() > 1 {
+            hash.update(b"ludomere:small-file-container-indices:v1");
+            for entry in &self.entries {
+                if let DepotEntry::File(file) = entry
+                    && let Some(reference) = file.small_file
+                {
+                    hash.update((reference.container_index as u64).to_be_bytes());
+                }
+            }
+        }
         format!("sha256:{:x}", hash.finalize())
     }
 }
@@ -318,7 +394,10 @@ fn add_network_chunk<'a>(
 pub fn parse(bytes: &[u8]) -> Result<DepotManifest> {
     let json = if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{') {
         if bytes.len() as u64 > MAX_EXPANDED {
-            bail!("depot manifest exceeds 64 MiB");
+            bail!(
+                "depot manifest exceeds {}",
+                crate::domain::human_size(MAX_EXPANDED)
+            );
         }
         bytes.to_vec()
     } else {
@@ -328,7 +407,10 @@ pub fn parse(bytes: &[u8]) -> Result<DepotManifest> {
             .read_to_end(&mut out)
             .context("decompress depot manifest")?;
         if out.len() as u64 > MAX_EXPANDED {
-            bail!("expanded depot manifest exceeds 64 MiB");
+            bail!(
+                "expanded depot manifest exceeds {}",
+                crate::domain::human_size(MAX_EXPANDED)
+            );
         }
         out
     };
@@ -336,6 +418,35 @@ pub fn parse(bytes: &[u8]) -> Result<DepotManifest> {
     let manifest = parse_value(&root)?;
     manifest.totals()?;
     Ok(manifest)
+}
+
+/// Only local installed/current snapshots use this decoder; network depots use `parse`.
+pub fn parse_snapshot(bytes: &[u8]) -> Result<DepotManifest> {
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_EXPANDED,
+        "Installed manifest snapshot exceeds the size limit"
+    );
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return parse(bytes);
+    }
+    let root: Value = serde_json::from_slice(bytes).context("parse installed manifest snapshot")?;
+    if root.get("ludomereManifestVersion").is_none() {
+        return parse(bytes);
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Snapshot {
+        #[serde(rename = "ludomereManifestVersion")]
+        version: u64,
+        manifest: DepotManifest,
+    }
+    let snapshot: Snapshot = serde_json::from_value(root)?;
+    anyhow::ensure!(
+        snapshot.version == 1,
+        "Unsupported installed manifest snapshot version"
+    );
+    snapshot.manifest.validate()?;
+    Ok(snapshot.manifest)
 }
 
 fn parse_value(root: &Value) -> Result<DepotManifest> {
@@ -597,6 +708,165 @@ mod tests {
 
     const MD5: &str = "0123456789abcdef0123456789abcdef";
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn merged_small_files() -> DepotManifest {
+        let mut combined = DepotManifest {
+            generation: 2,
+            entries: Vec::new(),
+            small_files_containers: Vec::new(),
+        };
+        for index in 0..2 {
+            let chunks = chunk(index + 1);
+            let raw = format!(
+                r#"{{"version":2,"depot":{{"items":[{{"type":"DepotFile","path":"file{index}","chunks":[{chunks}],"sfcRef":{{"offset":0,"size":{}}}}}],"smallFilesContainer":{{"chunks":[{chunks}]}}}}}}"#,
+                index + 1
+            );
+            let mut single = parse(raw.as_bytes()).unwrap();
+            for entry in &mut single.entries {
+                if let DepotEntry::File(file) = entry {
+                    file.small_file.as_mut().unwrap().container_index = index as usize;
+                }
+            }
+            combined.entries.extend(single.entries);
+            combined
+                .small_files_containers
+                .extend(single.small_files_containers);
+        }
+        combined
+    }
+
+    #[test]
+    fn merged_snapshot_preserves_containers_and_rejects_wire_encoding() {
+        let merged = merged_small_files();
+        // This is the exact former preparation/final-persistence boundary failure.
+        assert!(
+            merged
+                .canonical_json()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid small-files container index")
+        );
+        let snapshot = merged.snapshot_json().unwrap();
+        assert!(
+            parse(snapshot.as_bytes()).is_err(),
+            "network parser must not accept the local format"
+        );
+        let restored = parse_snapshot(snapshot.as_bytes()).unwrap();
+        assert_eq!(restored, merged);
+        assert_eq!(restored.identity(), merged.identity());
+        let single = parse(&manifest(&file("normal", &chunk(1)))).unwrap();
+        assert_eq!(
+            parse_snapshot(single.canonical_json().unwrap().as_bytes()).unwrap(),
+            single
+        );
+        assert!(
+            parse_snapshot(
+                snapshot
+                    .replace("ludomereManifestVersion\":1", "ludomereManifestVersion\":2")
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        assert!(parse_snapshot(&vec![b' '; MAX_EXPANDED as usize + 1]).is_err());
+        let mut swapped = merged.clone();
+        if let DepotEntry::File(file) = &mut swapped.entries[0] {
+            file.small_file.as_mut().unwrap().container_index = 1;
+        }
+        swapped.validate().unwrap();
+        assert_ne!(
+            swapped.identity(),
+            merged.identity(),
+            "container association must bind the fingerprint"
+        );
+    }
+
+    #[test]
+    fn merged_snapshot_retains_all_wire_validation_and_reference_checks() {
+        let valid = merged_small_files();
+        let mut invalid = Vec::new();
+        for reference in [
+            SmallFileRef {
+                container_index: 9,
+                offset: 0,
+                size: 1,
+            },
+            SmallFileRef {
+                container_index: 0,
+                offset: u64::MAX,
+                size: 1,
+            },
+            SmallFileRef {
+                container_index: 0,
+                offset: 1,
+                size: 1,
+            },
+            SmallFileRef {
+                container_index: 0,
+                offset: 0,
+                size: 0,
+            },
+            SmallFileRef {
+                container_index: 0,
+                offset: 0,
+                size: 2,
+            },
+        ] {
+            let mut altered = valid.clone();
+            if let DepotEntry::File(file) = &mut altered.entries[0] {
+                file.small_file = Some(reference);
+            }
+            invalid.push(altered);
+        }
+        for change in 0..5 {
+            let mut altered = valid.clone();
+            if let DepotEntry::File(file) = &mut altered.entries[0] {
+                match change {
+                    0 => file.path = "../escape".into(),
+                    1 => file.path = "folder\\noncanonical".into(),
+                    2 => file.md5 = Some("bad".into()),
+                    3 => file.size = 99,
+                    _ => file.chunks[0].md5 = "bad".into(),
+                }
+            }
+            invalid.push(altered);
+        }
+        let mut duplicate = valid.clone();
+        duplicate.entries.push(DepotEntry::Directory {
+            path: "FILE0".into(),
+        });
+        invalid.push(duplicate);
+        let mut link = valid.clone();
+        link.entries.push(DepotEntry::Link {
+            path: "link".into(),
+            target: "../outside".into(),
+        });
+        invalid.push(link);
+        for change in 0..3 {
+            let mut altered = valid.clone();
+            match change {
+                0 => altered.small_files_containers[0].chunks.clear(),
+                1 => altered.small_files_containers[0].chunks[0].compressed_md5 = "bad".into(),
+                _ => {
+                    altered.small_files_containers[1].chunks[0].compressed_md5 =
+                        altered.small_files_containers[0].chunks[0]
+                            .compressed_md5
+                            .clone()
+                }
+            }
+            invalid.push(altered);
+        }
+        for altered in invalid {
+            assert!(altered.snapshot_json().is_err());
+            let raw = serde_json::to_vec(
+                &serde_json::json!({"ludomereManifestVersion":1,"manifest":altered}),
+            )
+            .unwrap();
+            assert!(
+                parse_snapshot(&raw).is_err(),
+                "local snapshot validation must not trust typed JSON"
+            );
+        }
+    }
 
     fn manifest(entries: &str) -> Vec<u8> {
         format!(r#"{{"version":2,"depot":{{"items":[{entries}]}}}}"#).into_bytes()

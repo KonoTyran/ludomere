@@ -96,6 +96,16 @@ pub struct DownloadJobUpdate<'a> {
     pub error: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DownloadInstallIntent {
+    pub product_id: i64,
+    pub intent_id: String,
+    pub job_ids: Vec<String>,
+    pub plan_json: String,
+    pub state: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallationOperationRecord {
     pub product_id: i64,
@@ -186,6 +196,19 @@ pub struct DepotOperationRecord {
 
 pub type GalaxyBranchCredential = (u8, Vec<u8>, Vec<u8>);
 
+pub struct CachedAchievements {
+    pub achievements: Vec<crate::gog::achievements::Achievement>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSaveTombstone {
+    pub namespace: String,
+    pub path: String,
+    pub remote_etag: String,
+    pub local_etag: Option<String>,
+}
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -227,7 +250,10 @@ pub struct CloudSaveRecord {
 
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
-const CURRENT_DEVELOPMENT_REVISION: i64 = 5;
+// Revision 6: install-after-download intents. Revision 7: local organization, update policies,
+// account-scoped achievements and cloud deletion suppression. Revision 8: per-path archive copies.
+// Public target remains 25.
+const CURRENT_DEVELOPMENT_REVISION: i64 = 8;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -250,41 +276,26 @@ impl StateStore {
         Self::initialize(Connection::open(path)?)
     }
 
-    fn initialize(connection: Connection) -> Result<Self> {
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if !matches!(
-            version,
-            0 | BASELINE_SCHEMA_VERSION | CURRENT_SCHEMA_VERSION | TRANSIENT_SCHEMA_VERSION
-        ) {
-            bail!(
-                "database schema version {version} is unsupported; expected {CURRENT_SCHEMA_VERSION}"
-            );
-        }
-
-        let target_table_exists = table_exists(&connection, "cloud_save_settings")?;
-        if version == CURRENT_SCHEMA_VERSION && !target_table_exists {
-            bail!("database schema version 25 has an unidentified development revision");
-        }
-        let initial_development_revision = if version == CURRENT_SCHEMA_VERSION {
-            development_revision(&connection)?
-        } else {
-            None
-        };
-        if version == CURRENT_SCHEMA_VERSION && initial_development_revision.is_none() {
-            bail!(
-                "database schema version 25 has no supported development revision; restore a backup or reset the application database"
-            );
-        }
-        if let Some(revision) = initial_development_revision
-            && !(1..=CURRENT_DEVELOPMENT_REVISION).contains(&revision)
-        {
-            bail!("database schema version 25 has unsupported development revision {revision}");
-        }
-
+    fn initialize(mut connection: Connection) -> Result<Self> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        // A consistent read snapshot must not reserve the writer merely to open current data.
+        let current = {
+            let snapshot = connection.transaction()?;
+            let current = checked_schema_revision(&snapshot)? == Some(CURRENT_DEVELOPMENT_REVISION);
+            snapshot.commit()?;
+            current
+        };
+        if current {
+            return Ok(Self { connection });
+        }
         connection.execute_batch("BEGIN IMMEDIATE")?;
 
         let initialized = (|| -> Result<()> {
+            // Another process may have completed initialization while this one awaited the lock.
+            let initial_development_revision = checked_schema_revision(&connection)?;
+            if initial_development_revision == Some(CURRENT_DEVELOPMENT_REVISION) {
+                return Ok(());
+            }
             connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS user_game_state (product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS custom_tags (product_id INTEGER NOT NULL, tag TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (product_id, tag));
@@ -302,6 +313,11 @@ impl StateStore {
                 queue_position INTEGER, retry_started_at INTEGER, next_retry_at INTEGER,
                 created_at INTEGER NOT NULL DEFAULT 0, completed_at INTEGER
              );
+             CREATE TABLE IF NOT EXISTS download_install_intents (
+                product_id INTEGER PRIMARY KEY, intent_id TEXT NOT NULL UNIQUE,
+                job_ids_json TEXT NOT NULL, plan_json TEXT NOT NULL,
+                state TEXT NOT NULL, error TEXT
+             );
              CREATE TABLE IF NOT EXISTS managed_files (
                 path TEXT PRIMARY KEY, product_id INTEGER NOT NULL, product_slug TEXT NOT NULL,
                 artifact_kind TEXT NOT NULL, operating_system TEXT, language TEXT,
@@ -313,7 +329,7 @@ impl StateStore {
                 provider_file_id TEXT
              );
              CREATE INDEX IF NOT EXISTS managed_files_product ON managed_files(product_id, present);
-             CREATE UNIQUE INDEX IF NOT EXISTS managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;
              CREATE TABLE IF NOT EXISTS download_artifact_catalog (
                 artifact_id TEXT PRIMARY KEY, product_id INTEGER NOT NULL, artifact_json TEXT NOT NULL,
                 currently_offered INTEGER NOT NULL DEFAULT 1, first_seen_at INTEGER NOT NULL,
@@ -437,9 +453,41 @@ impl StateStore {
              );"
             )?;
             ensure_cloud_save_target_columns(&connection)?;
+            if !column_exists(&connection, "user_game_state", "hidden")? {
+                connection.execute_batch(
+                    "ALTER TABLE user_game_state ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            for (column, kind) in [
+                ("auto_update_galaxy", "INTEGER"),
+                ("auto_download_offline_installer", "INTEGER"),
+                ("prune_superseded_installers", "INTEGER"),
+                ("galaxy_language", "TEXT"),
+            ] {
+                if !column_exists(&connection, "game_preferences", column)? {
+                    connection.execute_batch(&format!(
+                        "ALTER TABLE game_preferences ADD COLUMN {column} {kind}"
+                    ))?;
+                }
+            }
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS achievement_cache (
+                account_id TEXT NOT NULL, product_id INTEGER NOT NULL,
+                achievements_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, product_id)
+            );
+            CREATE TABLE IF NOT EXISTS cloud_save_tombstones (
+                account_id TEXT NOT NULL, product_id INTEGER NOT NULL,
+                namespace TEXT NOT NULL, path TEXT NOT NULL, remote_etag TEXT NOT NULL,
+                local_etag TEXT, deleted_at INTEGER NOT NULL,
+                PRIMARY KEY(account_id, product_id, namespace, path)
+            );",
+            )?;
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
+            connection.execute_batch("DROP INDEX IF EXISTS managed_files_artifact_id;
+                CREATE INDEX managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;")?;
             connection.execute(
                 "INSERT INTO schema_state(state_key, development_revision) VALUES (1, ?1)
                  ON CONFLICT(state_key) DO UPDATE SET development_revision = excluded.development_revision",
@@ -977,7 +1025,8 @@ impl StateStore {
         self.connection
             .query_row(
                 "SELECT product_id, executable_path, launch_arguments_json, compatibility_json,
-                        created_at, updated_at
+                        created_at, updated_at, auto_update_galaxy, auto_download_offline_installer,
+                        prune_superseded_installers, galaxy_language
                  FROM game_preferences WHERE product_id = ?1",
                 params![product_id],
                 |row| {
@@ -991,6 +1040,10 @@ impl StateStore {
                             .and_then(|value| serde_json::from_str(&value).ok()),
                         created_at: row.get(4)?,
                         updated_at: row.get(5)?,
+                        auto_update_galaxy: row.get(6)?,
+                        auto_download_offline_installer: row.get(7)?,
+                        prune_superseded_installers: row.get(8)?,
+                        galaxy_language: row.get(9)?,
                     })
                 },
             )
@@ -1024,6 +1077,27 @@ impl StateStore {
                 preferences.created_at,
                 preferences.updated_at,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_game_update_preferences(
+        &self,
+        product_id: i64,
+        galaxy: Option<bool>,
+        offline: Option<bool>,
+        prune: Option<bool>,
+        language: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO game_preferences(product_id, auto_update_galaxy,
+             auto_download_offline_installer, prune_superseded_installers, galaxy_language,
+             created_at, updated_at) VALUES(?1,?2,?3,?4,?5,unixepoch(),unixepoch())
+             ON CONFLICT(product_id) DO UPDATE SET auto_update_galaxy=excluded.auto_update_galaxy,
+             auto_download_offline_installer=excluded.auto_download_offline_installer,
+             prune_superseded_installers=excluded.prune_superseded_installers,
+             galaxy_language=excluded.galaxy_language, updated_at=unixepoch()",
+            params![product_id, galaxy, offline, prune, language],
         )?;
         Ok(())
     }
@@ -1377,10 +1451,151 @@ impl StateStore {
     }
 
     pub fn add_tag(&self, product_id: i64, tag: &str) -> Result<()> {
+        anyhow::ensure!(!tag.trim().is_empty(), "A tag needs a name");
         self.connection.execute(
             "INSERT OR IGNORE INTO custom_tags(product_id, tag) VALUES (?1, ?2)",
+            params![product_id, tag.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn hidden_product_ids(&self) -> Result<HashSet<i64>> {
+        let mut query = self
+            .connection
+            .prepare("SELECT product_id FROM user_game_state WHERE hidden=1")?;
+        Ok(query
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_hidden(&self, product_id: i64, hidden: bool) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO user_game_state(product_id,hidden) VALUES(?1,?2)
+            ON CONFLICT(product_id) DO UPDATE SET hidden=excluded.hidden",
+            params![product_id, hidden],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_tag(&self, product_id: i64, tag: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM custom_tags WHERE product_id=?1 AND tag=?2 COLLATE NOCASE",
             params![product_id, tag],
         )?;
+        Ok(())
+    }
+
+    pub fn rename_tag(&self, old: &str, new: &str) -> Result<()> {
+        anyhow::ensure!(!new.trim().is_empty(), "A tag needs a name");
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let ids = {
+            let mut query = transaction
+                .prepare("SELECT product_id FROM custom_tags WHERE tag=?1 COLLATE NOCASE")?;
+            query
+                .query_map([old], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        transaction.execute("DELETE FROM custom_tags WHERE tag=?1 COLLATE NOCASE", [old])?;
+        for id in ids {
+            transaction.execute(
+                "INSERT OR IGNORE INTO custom_tags(product_id,tag) VALUES(?1,?2)",
+                params![id, new.trim()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_tag(&self, tag: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM custom_tags WHERE tag=?1 COLLATE NOCASE", [tag])?;
+        Ok(())
+    }
+
+    pub fn cached_achievements(
+        &self,
+        account: &str,
+        product_id: i64,
+    ) -> Result<Option<CachedAchievements>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT achievements_json,updated_at FROM achievement_cache
+            WHERE account_id=?1 AND product_id=?2",
+                params![account, product_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        row.map(|(json, updated_at)| {
+            Ok(CachedAchievements {
+                achievements: serde_json::from_str(&json)?,
+                updated_at,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn replace_achievements(
+        &self,
+        account: &str,
+        product_id: i64,
+        achievements: &[crate::gog::achievements::Achievement],
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO achievement_cache(account_id,product_id,achievements_json,updated_at)
+            VALUES(?1,?2,?3,unixepoch()) ON CONFLICT(account_id,product_id) DO UPDATE SET
+            achievements_json=excluded.achievements_json,updated_at=excluded.updated_at",
+            params![account, product_id, serde_json::to_string(achievements)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn cloud_save_tombstones(
+        &self,
+        account: &str,
+        product_id: i64,
+    ) -> Result<Vec<CloudSaveTombstone>> {
+        let mut query = self.connection.prepare("SELECT namespace,path,remote_etag,local_etag FROM cloud_save_tombstones WHERE account_id=?1 AND product_id=?2 ORDER BY namespace,path")?;
+        Ok(query
+            .query_map(params![account, product_id], |row| {
+                Ok(CloudSaveTombstone {
+                    namespace: row.get(0)?,
+                    path: row.get(1)?,
+                    remote_etag: row.get(2)?,
+                    local_etag: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn record_cloud_save_tombstones(
+        &self,
+        account: &str,
+        product_id: i64,
+        entries: &[CloudSaveTombstone],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        for entry in entries {
+            transaction.execute("INSERT INTO cloud_save_tombstones(account_id,product_id,namespace,path,remote_etag,local_etag,deleted_at)
+                VALUES(?1,?2,?3,?4,?5,?6,unixepoch()) ON CONFLICT(account_id,product_id,namespace,path) DO UPDATE SET
+                remote_etag=excluded.remote_etag,local_etag=excluded.local_etag,deleted_at=excluded.deleted_at",
+                params![account,product_id,entry.namespace,entry.path,entry.remote_etag,entry.local_etag])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_cloud_save_tombstone(
+        &self,
+        account: &str,
+        product_id: i64,
+        namespace: &str,
+        path: &str,
+    ) -> Result<()> {
+        self.connection.execute("DELETE FROM cloud_save_tombstones WHERE account_id=?1 AND product_id=?2 AND namespace=?3 AND path=?4", params![account,product_id,namespace,path])?;
         Ok(())
     }
 
@@ -1529,6 +1744,22 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn clear_enrichment_observation(&self, product_id: i64, source: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM enrichment_observations WHERE product_id = ?1 AND source = ?2",
+            params![product_id, source],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_enrichment_source(&self, source: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM enrichment_observations WHERE source = ?1",
+            [source],
+        )?;
+        Ok(())
+    }
+
     pub fn cached_product_metadata(&self, product_id: i64) -> Result<Option<ProductMetadata>> {
         let result = self.connection.query_row(
             "SELECT metadata_json FROM products WHERE product_id = ?1",
@@ -1543,11 +1774,31 @@ impl StateStore {
     }
 
     pub fn normalized_games(&self) -> Result<Vec<Game>> {
+        self.normalized_games_for(None)
+    }
+
+    pub fn cached_product_game(&self, product_id: i64) -> Result<Option<Game>> {
+        for game in self.normalized_games_for(Some(product_id))? {
+            if game.product_id == product_id {
+                return Ok(Some(game));
+            }
+            if let Some(dlc) = game
+                .dlcs
+                .into_iter()
+                .find(|dlc| dlc.product_id == product_id)
+            {
+                return Ok(Some(dlc.into()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn normalized_games_for(&self, product_id: Option<i64>) -> Result<Vec<Game>> {
         let mut statement = self.connection.prepare(
             "SELECT product_id, parent_product_id, product_type, slug, title, release_date,
                     description, changelog, metadata_json, links_json, media_json, currently_owned
              FROM products
-             WHERE (product_type = 'game' AND currently_owned = 1)
+             WHERE ((product_type = 'game' AND currently_owned = 1)
                 OR (product_type = 'dlc' AND EXISTS (
                     SELECT 1 FROM product_relationships relationship
                     JOIN products parent
@@ -1556,10 +1807,13 @@ impl StateStore {
                       AND relationship.relationship = 'dlc'
                       AND parent.product_type = 'game'
                       AND parent.currently_owned = 1
-                ))
+                )))
+             AND (?1 IS NULL OR product_id = ?1 OR parent_product_id = ?1
+                  OR product_id IN (SELECT parent_product_id FROM product_relationships WHERE child_product_id = ?1 AND relationship = 'dlc')
+                  OR parent_product_id IN (SELECT parent_product_id FROM product_relationships WHERE child_product_id = ?1 AND relationship = 'dlc'))
              ORDER BY title COLLATE NOCASE",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([product_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Option<i64>>(1)?,
@@ -1592,7 +1846,8 @@ impl StateStore {
                 media_json,
                 currently_owned,
             ) = row?;
-            let metadata: crate::domain::ProductMetadata = serde_json::from_str(&metadata_json)?;
+            let mut metadata: crate::domain::ProductMetadata =
+                serde_json::from_str(&metadata_json)?;
             let description = if description.trim().is_empty() {
                 metadata.store_description.clone().unwrap_or_default()
             } else {
@@ -1600,9 +1855,31 @@ impl StateStore {
             };
             let links = serde_json::from_str(&links_json)?;
             let media: serde_json::Value = serde_json::from_str(&media_json)?;
+            if metadata.localizations.is_empty() {
+                metadata.localizations = media
+                    .get("core_localizations")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+            }
             let revisions = self.load_current_download_revisions(id)?;
             let artifacts = revisions_to_artifacts(&revisions);
-            let platforms = platforms_from_artifacts(&artifacts);
+            let platforms = media
+                .get("platforms")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| platforms_from_artifacts(&artifacts));
+            let languages: Vec<String> = media
+                .get("languages")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_else(|| {
+                    metadata
+                        .localizations
+                        .iter()
+                        .map(|value| value.name.clone())
+                        .collect()
+                });
             let release_date = release_date
                 .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
                 .map(|value| value.fixed_offset());
@@ -1628,11 +1905,7 @@ impl StateStore {
                         description,
                         changelog,
                         platforms,
-                        languages: metadata
-                            .localizations
-                            .iter()
-                            .map(|value| value.name.clone())
-                            .collect(),
+                        languages,
                         metadata,
                         galaxy_builds: builds,
                         location: PathBuf::new(),
@@ -1662,11 +1935,7 @@ impl StateStore {
                         .iter()
                         .map(|value| value.name.clone())
                         .collect(),
-                    languages: metadata
-                        .localizations
-                        .iter()
-                        .map(|value| value.name.clone())
-                        .collect(),
+                    languages,
                     metadata,
                     galaxy_builds: builds,
                     location: PathBuf::new(),
@@ -1732,6 +2001,194 @@ impl StateStore {
             }
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commit a complete entitlement snapshot without replacing rich product caches.
+    pub fn cache_core_library(
+        &self,
+        games: &[Game],
+        owned: &[i64],
+        entitled: &[i64],
+        packs: &[(i64, Vec<i64>)],
+    ) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM owned_products", [])?;
+        for id in owned {
+            transaction.execute("INSERT INTO owned_products VALUES (?1, unixepoch())", [id])?;
+        }
+        for game in games {
+            upsert_core_product(&transaction, game, None)?;
+            for dlc in &game.dlcs {
+                upsert_core_dlc(&transaction, dlc, game.product_id)?;
+            }
+        }
+        transaction.execute("UPDATE products SET currently_owned = 0", [])?;
+        for id in entitled {
+            transaction.execute(
+                "UPDATE products SET currently_owned = 1 WHERE product_id = ?1",
+                [id],
+            )?;
+        }
+        for (pack, children) in packs {
+            transaction.execute("DELETE FROM product_relationships WHERE parent_product_id = ?1 AND relationship = 'pack_entitlement'", [pack])?;
+            for child in children {
+                transaction.execute("INSERT INTO product_relationships VALUES (?1, ?2, 'pack_entitlement', 'product_api')", params![pack, child])?;
+            }
+        }
+        transaction.execute("INSERT INTO online_sync_state(sync_key, completed_at) VALUES ('owned_library', unixepoch()) ON CONFLICT(sync_key) DO UPDATE SET completed_at = excluded.completed_at", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cached_pack_entitlements(&self, packs: &[i64]) -> Result<Vec<i64>> {
+        let mut statement = self.connection.prepare(
+            "SELECT child_product_id FROM product_relationships
+             WHERE relationship = 'pack_entitlement'
+               AND parent_product_id IN (SELECT value FROM json_each(?1))
+             ORDER BY parent_product_id, child_product_id",
+        )?;
+        Ok(statement
+            .query_map([serde_json::to_string(packs)?], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Scoped writes never change entitlement or replace another product's relationships.
+    pub fn cache_product_section(
+        &self,
+        game: &Game,
+        section: crate::online::DetailSection,
+    ) -> Result<()> {
+        use crate::online::DetailSection;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM products WHERE product_id = ?1)",
+            [game.product_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            upsert_core_product(&transaction, game, None)?;
+        }
+        match section {
+            DetailSection::Product => {
+                transaction.execute("UPDATE products SET description = ?2, changelog = ?3, media_json = json_patch(media_json, ?4), updated_at = unixepoch() WHERE product_id = ?1", params![game.product_id, game.description, game.changelog, serde_json::json!({"screenshots": game.screenshots}).to_string()])?;
+                for dlc in &game.dlcs {
+                    upsert_core_dlc(&transaction, dlc, game.product_id)?;
+                    transaction.execute("UPDATE products SET description = ?2, changelog = ?3, media_json = json_patch(media_json, ?4) WHERE product_id = ?1", params![dlc.product_id, dlc.description, dlc.changelog, serde_json::json!({"screenshots":dlc.screenshots}).to_string()])?;
+                }
+            }
+            DetailSection::Metadata => {
+                transaction.execute("UPDATE products SET metadata_json = ?2, updated_at = unixepoch() WHERE product_id = ?1", params![game.product_id, serde_json::to_string(&game.metadata)?])?;
+                insert_edition_relationships(
+                    &transaction,
+                    game.product_id,
+                    &game.metadata.editions,
+                )?;
+            }
+            DetailSection::Artwork => {
+                let mut media = serde_json::Map::new();
+                for (key, path) in [
+                    ("detail_artwork", &game.detail_artwork),
+                    ("hero_logo", &game.hero_logo),
+                    ("icon", &game.icon),
+                ] {
+                    if let Some(path) = path {
+                        media.insert(key.into(), serde_json::to_value(path)?);
+                    }
+                }
+                transaction.execute("UPDATE products SET media_json = json_patch(media_json, ?2), updated_at = unixepoch() WHERE product_id = ?1", params![game.product_id, serde_json::to_string(&media)?])?;
+            }
+            DetailSection::Acquisition | DetailSection::Builds => {}
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cache_product_cover(&self, product_id: i64, path: &std::path::Path) -> Result<()> {
+        self.connection.execute(
+            "UPDATE products SET media_json = json_patch(media_json, ?2) WHERE product_id = ?1",
+            params![product_id, serde_json::json!({"artwork":path}).to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn cache_product_icon(&self, product_id: i64, path: &std::path::Path) -> Result<()> {
+        self.connection.execute(
+            "UPDATE products SET media_json = json_patch(media_json, ?2) WHERE product_id = ?1",
+            params![product_id, serde_json::json!({"icon":path}).to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_download_install_intent(&self, intent: &DownloadInstallIntent) -> Result<()> {
+        self.connection.execute("INSERT INTO download_install_intents(product_id,intent_id,job_ids_json,plan_json,state,error) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(product_id) DO UPDATE SET intent_id=excluded.intent_id,job_ids_json=excluded.job_ids_json,plan_json=excluded.plan_json,state=excluded.state,error=excluded.error",params![intent.product_id,intent.intent_id,serde_json::to_string(&intent.job_ids)?,intent.plan_json,intent.state,intent.error])?;
+        Ok(())
+    }
+
+    pub fn download_install_intents(&self) -> Result<Vec<DownloadInstallIntent>> {
+        let mut query=self.connection.prepare("SELECT product_id,intent_id,job_ids_json,plan_json,state,error FROM download_install_intents ORDER BY product_id")?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (product_id, intent_id, job_ids, plan_json, state, error) = row?;
+            Ok(DownloadInstallIntent {
+                product_id,
+                intent_id,
+                job_ids: serde_json::from_str(&job_ids)?,
+                plan_json,
+                state,
+                error,
+            })
+        })
+        .collect()
+    }
+
+    pub fn set_download_install_state(
+        &self,
+        intent_id: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE download_install_intents SET state=?2,error=?3 WHERE intent_id=?1",
+            params![intent_id, state, error],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "The automatic installation request was removed or replaced"
+        );
+        Ok(())
+    }
+
+    pub fn clear_download_install_intent(&self, product_id: i64) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM download_install_intents WHERE product_id=?1",
+            [product_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_download_install_intent(&self, product_id: i64, intent_id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE download_install_intents SET state='complete',error=NULL
+            WHERE product_id=?1 AND intent_id=?2 AND state='handed_off'",
+            params![product_id, intent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_download_install_intent_for_job(&self, job_id: &str) -> Result<()> {
+        self.connection.execute("DELETE FROM download_install_intents WHERE EXISTS (SELECT 1 FROM json_each(download_install_intents.job_ids_json) WHERE value=?1)",[job_id])?;
         Ok(())
     }
 
@@ -2114,7 +2571,6 @@ impl StateStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    #[allow(dead_code)]
     pub fn load_current_download_revisions(
         &self,
         product_id: i64,
@@ -2140,7 +2596,7 @@ impl StateStore {
              WHERE s.product_id = ?1 AND (?2 = 0 OR r.currently_offered = 1)
              ORDER BY s.provider_category, s.slot_id",
         )?;
-        let rows = statement.query_map(params![product_id, current_only], |row| {
+        let mut rows = statement.query_map(params![product_id, current_only], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -2159,8 +2615,40 @@ impl StateStore {
                 row.get::<_, Option<i64>>(14)?,
             ))
         })?;
+        let Some(first) = rows.next().transpose()? else {
+            return Ok(Vec::new());
+        };
+        // Keep the revision cursor active while reading parts so both queries share
+        // the same SQLite read snapshot, even during a manifest refresh.
+        let mut parts_statement = self.connection.prepare(
+            "SELECT p.part_id, p.revision_id, p.provider_file_id, p.part_index,
+                    p.expected_size, p.downlink, p.checksum, p.checksum_fetched_at
+             FROM download_parts p
+             JOIN download_revisions r USING(revision_id)
+             JOIN download_slots s USING(slot_id)
+             WHERE s.product_id = ?1 AND (?2 = 0 OR r.currently_offered = 1)
+             ORDER BY p.revision_id, p.part_index",
+        )?;
+        let mut parts = HashMap::<i64, Vec<crate::domain::DownloadPart>>::new();
+        for part in parts_statement
+            .query_map(params![product_id, current_only], |row| {
+                Ok(crate::domain::DownloadPart {
+                    part_id: row.get(0)?,
+                    revision_id: row.get(1)?,
+                    provider_file_id: row.get(2)?,
+                    part_index: row.get::<_, i64>(3)? as u32,
+                    expected_size: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    downlink: row.get(5)?,
+                    checksum: row.get(6)?,
+                    checksum_fetched_at: row.get(7)?,
+                })
+            })?
+            .filter_map(Result::ok)
+        {
+            parts.entry(part.revision_id).or_default().push(part);
+        }
         let mut revisions = Vec::new();
-        for row in rows {
+        for row in std::iter::once(Ok(first)).chain(rows) {
             let (
                 revision_id,
                 slot_id,
@@ -2178,26 +2666,6 @@ impl StateStore {
                 last_seen,
                 retired_at,
             ) = row?;
-            let mut parts_statement = self.connection.prepare(
-                "SELECT part_id, provider_file_id, part_index, expected_size, downlink,
-                        checksum, checksum_fetched_at
-                 FROM download_parts WHERE revision_id = ?1 ORDER BY part_index",
-            )?;
-            let parts = parts_statement
-                .query_map(params![revision_id], |row| {
-                    Ok(crate::domain::DownloadPart {
-                        part_id: row.get(0)?,
-                        revision_id,
-                        provider_file_id: row.get(1)?,
-                        part_index: row.get::<_, i64>(2)? as u32,
-                        expected_size: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                        downlink: row.get(4)?,
-                        checksum: row.get(5)?,
-                        checksum_fetched_at: row.get(6)?,
-                    })
-                })?
-                .filter_map(Result::ok)
-                .collect();
             revisions.push(DownloadRevision {
                 revision_id,
                 slot_id,
@@ -2215,7 +2683,7 @@ impl StateStore {
                 first_seen_at: first_seen,
                 last_seen_at: last_seen,
                 retired_at,
-                parts,
+                parts: parts.remove(&revision_id).unwrap_or_default(),
             });
         }
         Ok(revisions)
@@ -2321,6 +2789,90 @@ impl StateStore {
             ],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn complete_download_job(
+        &self,
+        job: &DownloadJobUpdate<'_>,
+        product_slug: &str,
+        session: u64,
+        validate_files: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        // Account -> database is the enqueue lock order. Never wait for SQLite while holding
+        // the account lock: bounded whole-transaction retries release both locks between attempts.
+        let timeout: u64 = self
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        self.connection.busy_timeout(std::time::Duration::ZERO)?;
+        let result = (|| {
+            for attempt in 0..10 {
+                let result = crate::online::with_account_session(session, || {
+                    let transaction = rusqlite::Transaction::new_unchecked(
+                        &self.connection,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )?;
+                    anyhow::ensure!(
+                        job.state == DownloadState::Complete
+                            && job.artifacts.len() == job.completed_files.len(),
+                        "Incomplete download registration"
+                    );
+                    anyhow::ensure!(transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM download_jobs WHERE job_id=?1 AND artifacts_json=?2 AND destination=?3)",
+                params![job.job_id, serde_json::to_string(job.artifacts)?, job.destination.display().to_string()],
+                |row| row.get::<_, bool>(0),
+            )?, "The queued download was removed or replaced; its files were preserved");
+                    validate_files()?;
+                    self.save_download_job(job)?;
+                    self.record_completed_artifacts(
+                        job.job_id,
+                        product_slug,
+                        job.artifacts,
+                        job.completed_files,
+                    )?;
+                    transaction.commit()?;
+                    Ok(())
+                });
+                let busy = result.as_ref().err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<rusqlite::Error>()
+                        .is_some_and(|error| {
+                            matches!(
+                                error.sqlite_error_code(),
+                                Some(
+                                    rusqlite::ErrorCode::DatabaseBusy
+                                        | rusqlite::ErrorCode::DatabaseLocked
+                                )
+                            )
+                        })
+                });
+                if !busy || attempt == 9 {
+                    return result;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            unreachable!()
+        })();
+        self.connection
+            .busy_timeout(std::time::Duration::from_millis(timeout))?;
+        result
+    }
+
+    pub(crate) fn try_record_bookkeeping_failure(
+        &self,
+        job: &str,
+        session: u64,
+        message: &str,
+    ) -> Result<()> {
+        let timeout: u64 = self
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        self.connection.busy_timeout(std::time::Duration::ZERO)?;
+        let result = crate::online::with_account_session(session, || {
+            self.set_download_job_failure(job, message)
+        });
+        self.connection
+            .busy_timeout(std::time::Duration::from_millis(timeout))?;
+        result
     }
 
     pub fn download_job(&self, job_id: &str) -> Result<Option<DownloadJobRecord>> {
@@ -2474,11 +3026,33 @@ impl StateStore {
     }
 
     pub fn replace_managed_files(&mut self, files: &[ManagedFileRecord]) -> Result<()> {
+        self.replace_managed_files_at(None, files)
+    }
+
+    pub fn replace_managed_files_in_root(
+        &mut self,
+        root: &std::path::Path,
+        files: &[ManagedFileRecord],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            files.iter().all(|file| file.path.starts_with(root)),
+            "Managed file is outside the scanned download directory"
+        );
+        self.replace_managed_files_at(Some(root), files)
+    }
+
+    fn replace_managed_files_at(
+        &mut self,
+        root: Option<&std::path::Path>,
+        files: &[ManagedFileRecord],
+    ) -> Result<()> {
+        let prefix = root.map(|root| format!("{}/", root.to_string_lossy().trim_end_matches('/')));
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "UPDATE managed_files
-             SET present = 0, artifact_id = NULL, updated_at = unixepoch()",
-            [],
+             SET present = 0, artifact_id = NULL, updated_at = unixepoch()
+             WHERE ?1 IS NULL OR substr(path, 1, length(?1)) = ?1",
+            [&prefix],
         )?;
         {
             let mut statement = transaction.prepare(
@@ -2499,13 +3073,7 @@ impl StateStore {
                     gog_checksum=COALESCE(managed_files.gog_checksum, excluded.gog_checksum),
                     verified_at=COALESCE(managed_files.verified_at, excluded.verified_at)",
             )?;
-            let mut assigned_artifacts = HashSet::new();
             for file in files {
-                let artifact_id = file
-                    .artifact_id
-                    .as_deref()
-                    .filter(|id| assigned_artifacts.insert((*id).to_owned()));
-                let unique_match = file.artifact_id.is_none() || artifact_id.is_some();
                 statement.execute(params![
                     file.path.display().to_string(),
                     file.product_id,
@@ -2515,11 +3083,9 @@ impl StateStore {
                     file.language,
                     file.filename,
                     file.size as i64,
-                    unique_match
-                        .then_some(file.artifact_path.as_deref())
-                        .flatten(),
-                    file.matched && unique_match,
-                    artifact_id,
+                    file.artifact_path,
+                    file.matched,
+                    file.artifact_id,
                     file.job_id,
                     file.version,
                     file.expected_size.map(|size| size as i64),
@@ -2528,7 +3094,7 @@ impl StateStore {
                 ])?;
             }
         }
-        transaction.execute_batch(
+        transaction.execute(
             "UPDATE managed_files
              SET revision_id = (
                     SELECT r.revision_id FROM download_parts p
@@ -2557,51 +3123,159 @@ impl StateStore {
                            OR p.expected_size = managed_files.expected_size)
                     ORDER BY r.currently_offered DESC, r.last_seen_at DESC LIMIT 1
                  )
-             WHERE present = 1 AND artifact_path IS NOT NULL;",
+             WHERE present = 1 AND artifact_path IS NOT NULL
+               AND (?1 IS NULL OR substr(path, 1, length(?1)) = ?1)",
+            [&prefix],
         )?;
         transaction.commit()?;
         Ok(())
     }
 
+    /// Attach a newly observed manifest only to unchanged, previously unassociated files.
+    pub fn match_managed_files(
+        &self,
+        matches: &[(ManagedFileRecord, RemoteArtifact)],
+    ) -> Result<usize> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut changed = 0;
+        for (file, artifact) in matches {
+            anyhow::ensure!(
+                file.product_id == artifact.product_id
+                    && file.kind == artifact.kind
+                    && artifact.size_bytes.is_none_or(|size| size == file.size),
+                "Download metadata does not match the indexed file"
+            );
+            let identity = catalog_artifact_id(artifact);
+            let mut parts = transaction.prepare(
+                "SELECT r.revision_id, p.part_id, p.provider_file_id
+                 FROM download_parts p JOIN download_revisions r USING(revision_id)
+                 JOIN download_slots s USING(slot_id)
+                 WHERE s.product_id=?1 AND r.currently_offered=1
+                   AND p.downlink=?2 AND r.version IS ?3 AND p.expected_size IS ?4",
+            )?;
+            let parts = parts
+                .query_map(
+                    params![
+                        file.product_id,
+                        artifact.download_path,
+                        artifact.version,
+                        artifact.size_bytes.map(|size| size as i64)
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let [(revision, part, provider)] = parts.as_slice() else {
+                continue;
+            };
+            changed += transaction.execute(
+                "UPDATE managed_files SET matched=1, artifact_path=?9, artifact_id=?10,
+                    version=?11, expected_size=?12, revision_id=?13, part_id=?14,
+                    provider_file_id=?15, updated_at=unixepoch()
+                 WHERE path=?1 AND product_id=?2 AND product_slug=?3 AND artifact_kind=?4
+                   AND operating_system IS ?5 AND language IS ?6 AND filename=?7 AND size=?8
+                   AND present=1 AND matched=0 AND artifact_path IS NULL AND artifact_id IS NULL
+                   AND version IS NULL AND revision_id IS NULL AND part_id IS NULL
+                   AND job_id IS NULL AND gog_checksum IS NULL AND verified_at IS NULL",
+                params![
+                    file.path.to_string_lossy(),
+                    file.product_id,
+                    file.product_slug,
+                    file.kind.as_str(),
+                    file.operating_system,
+                    file.language,
+                    file.filename,
+                    file.size as i64,
+                    artifact.download_path,
+                    identity,
+                    artifact.version,
+                    artifact.size_bytes.map(|size| size as i64),
+                    revision,
+                    part,
+                    provider
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
     pub fn managed_files(&self) -> Result<Vec<ManagedFileRecord>> {
-        let mut statement = self.connection.prepare(
+        self.query_managed_files(None)
+    }
+
+    pub fn managed_files_for_products(&self, products: &[i64]) -> Result<Vec<ManagedFileRecord>> {
+        self.query_managed_files(Some(products))
+    }
+
+    pub fn managed_download_summary(&self) -> Result<(HashSet<i64>, HashSet<i64>)> {
+        let mut query = self.connection.prepare(
+            "SELECT product_id, MAX(artifact_kind='installer') FROM managed_files WHERE present=1 GROUP BY product_id",
+        )?;
+        let mut products = HashSet::new();
+        let mut installers = HashSet::new();
+        for row in query.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })? {
+            let (product, installer) = row?;
+            products.insert(product);
+            if installer {
+                installers.insert(product);
+            }
+        }
+        Ok((products, installers))
+    }
+
+    fn query_managed_files(&self, products: Option<&[i64]>) -> Result<Vec<ManagedFileRecord>> {
+        let filter = if products.is_some() {
+            "WHERE product_id IN (SELECT value FROM json_each(?1))"
+        } else {
+            "WHERE ?1 IS NULL"
+        };
+        let mut statement = self.connection.prepare(&format!(
             "SELECT path, product_id, product_slug, artifact_kind, operating_system, language,
                     filename, size, artifact_path, matched, present, artifact_id, job_id, version,
                     expected_size, gog_checksum, verified_at, revision_id, part_id,
                     provider_file_id
-             FROM managed_files ORDER BY path",
-        )?;
-        let rows = statement.query_map([], |row| {
-            let kind: String = row.get(3)?;
-            let kind = match kind.as_str() {
-                "installer" => ArtifactKind::Installer,
-                "patch" => ArtifactKind::Patch,
-                _ => ArtifactKind::Extra,
-            };
-            Ok(ManagedFileRecord {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                product_id: row.get(1)?,
-                product_slug: row.get(2)?,
-                kind,
-                operating_system: row.get(4)?,
-                language: row.get(5)?,
-                filename: row.get(6)?,
-                size: row.get::<_, i64>(7)? as u64,
-                artifact_path: row.get(8)?,
-                matched: row.get(9)?,
-                present: row.get(10)?,
-                artifact_id: row.get(11)?,
-                job_id: row.get(12)?,
-                version: row.get(13)?,
-                expected_size: row.get::<_, Option<i64>>(14)?.map(|size| size as u64),
-                gog_checksum: row.get(15)?,
-                verified_at: row.get(16)?,
-                revision_id: row.get(17)?,
-                part_id: row.get(18)?,
-                provider_file_id: row.get(19)?,
-            })
-        })?;
-        Ok(rows.filter_map(Result::ok).collect())
+             FROM managed_files {filter} ORDER BY path",
+        ))?;
+        let rows =
+            statement.query_map([products.map(serde_json::to_string).transpose()?], |row| {
+                let kind: String = row.get(3)?;
+                let kind = match kind.as_str() {
+                    "installer" => ArtifactKind::Installer,
+                    "patch" => ArtifactKind::Patch,
+                    _ => ArtifactKind::Extra,
+                };
+                Ok(ManagedFileRecord {
+                    path: PathBuf::from(row.get::<_, String>(0)?),
+                    product_id: row.get(1)?,
+                    product_slug: row.get(2)?,
+                    kind,
+                    operating_system: row.get(4)?,
+                    language: row.get(5)?,
+                    filename: row.get(6)?,
+                    size: row.get::<_, i64>(7)? as u64,
+                    artifact_path: row.get(8)?,
+                    matched: row.get(9)?,
+                    present: row.get(10)?,
+                    artifact_id: row.get(11)?,
+                    job_id: row.get(12)?,
+                    version: row.get(13)?,
+                    expected_size: row.get::<_, Option<i64>>(14)?.map(|size| size as u64),
+                    gog_checksum: row.get(15)?,
+                    verified_at: row.get(16)?,
+                    revision_id: row.get(17)?,
+                    part_id: row.get(18)?,
+                    provider_file_id: row.get(19)?,
+                })
+            })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn mark_managed_file_absent(&self, path: &std::path::Path) -> Result<()> {
@@ -2610,6 +3284,43 @@ impl StateStore {
             params![path.display().to_string()],
         )?;
         Ok(())
+    }
+
+    pub fn verified_installer_revision_for_job(&self, job_id: &str) -> Result<Option<i64>> {
+        Ok(self.connection.query_row(
+            "SELECT r.revision_id FROM managed_files f JOIN download_revisions r USING(revision_id)
+             WHERE f.job_id=?1 AND f.present=1 AND f.artifact_kind='installer' AND r.currently_offered=1
+             GROUP BY r.revision_id HAVING COUNT(DISTINCT f.part_id)=
+                (SELECT COUNT(*) FROM download_parts p WHERE p.revision_id=r.revision_id)
+             AND SUM(f.verified_at IS NULL)=0", [job_id], |row| row.get(0)).optional()?)
+    }
+
+    pub fn offered_installer_job(&self, job_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_files f
+            JOIN download_revisions r USING(revision_id) WHERE f.job_id=?1 AND f.present=1
+            AND f.artifact_kind='installer' AND r.currently_offered=1)",
+            [job_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn superseded_installer_files(
+        &self,
+        product_id: i64,
+        replacement: i64,
+    ) -> Result<Vec<PathBuf>> {
+        let mut query = self.connection.prepare(
+            "SELECT f.path FROM managed_files f JOIN download_revisions old USING(revision_id)
+             JOIN download_revisions replacement ON replacement.slot_id=old.slot_id AND replacement.revision_id=?2
+             WHERE f.product_id=?1 AND f.present=1 AND f.matched=1 AND f.artifact_kind='installer'
+             AND old.revision_id<>replacement.revision_id AND old.currently_offered=0
+             AND old.first_seen_at<=replacement.first_seen_at ORDER BY f.path")?;
+        Ok(query
+            .query_map(params![product_id, replacement], |row| {
+                Ok(PathBuf::from(row.get::<_, String>(0)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn record_completed_artifacts(
@@ -2724,6 +3435,164 @@ fn depot_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DepotOp
     })
 }
 
+fn checked_schema_revision(connection: &Connection) -> Result<Option<i64>> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if !matches!(
+        version,
+        0 | BASELINE_SCHEMA_VERSION | CURRENT_SCHEMA_VERSION | TRANSIENT_SCHEMA_VERSION
+    ) {
+        bail!(
+            "database schema version {version} is unsupported; expected {CURRENT_SCHEMA_VERSION}"
+        );
+    }
+    if version != CURRENT_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    let revision = development_revision(connection)?.ok_or_else(|| anyhow::anyhow!(
+        "database schema version 25 has no supported development revision; restore a backup or reset the application database"
+    ))?;
+    if !(1..=CURRENT_DEVELOPMENT_REVISION).contains(&revision) {
+        bail!("database schema version 25 has unsupported development revision {revision}");
+    }
+    if !table_exists(connection, "cloud_save_settings")?
+        || revision >= 6
+            && (!table_exists(connection, "download_install_intents")?
+                || table_exists(connection, "work_queue")?)
+    {
+        bail!(
+            "database schema 25 has an unidentified development layout; restore a compatible backup or explicitly reset this profile"
+        );
+    }
+    if revision == CURRENT_DEVELOPMENT_REVISION {
+        let index: Option<(i64, i64)> = connection.query_row(
+            "SELECT \"unique\", partial FROM pragma_index_list('managed_files') WHERE name='managed_files_artifact_id'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let columns = connection
+            .prepare(
+                "SELECT name FROM pragma_index_info('managed_files_artifact_id') ORDER BY seqno",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            index == Some((0, 1)) && columns == ["artifact_id"],
+            "Database archive-copy index is not the supported development layout; restore a compatible backup or reset this profile"
+        );
+        // Validate required columns without repairing a database claiming to be current.
+        for (table, columns) in [
+            ("user_game_state", "product_id,favorite,hidden"),
+            ("custom_tags", "product_id,tag"),
+            ("account_cache", "cache_key,profile_json,updated_at"),
+            ("owned_products", "product_id,synchronized_at"),
+            ("online_sync_state", "sync_key,completed_at"),
+            ("online_library_cache", "cache_key,games_json,updated_at"),
+            (
+                "download_manifest_cache",
+                "product_id,artifacts_json,updated_at",
+            ),
+            (
+                "download_jobs",
+                "job_id,product_id,title,artifacts_json,destination,state,bytes_downloaded,total_bytes,completed_files_json,error,updated_at,status_message,queue_position,retry_started_at,next_retry_at,created_at,completed_at",
+            ),
+            (
+                "download_install_intents",
+                "product_id,intent_id,job_ids_json,plan_json,state,error",
+            ),
+            (
+                "managed_files",
+                "path,product_id,product_slug,artifact_kind,operating_system,language,filename,size,artifact_path,matched,present,updated_at,artifact_id,job_id,version,expected_size,gog_checksum,verified_at,created_at,revision_id,part_id,provider_file_id",
+            ),
+            (
+                "download_artifact_catalog",
+                "artifact_id,product_id,artifact_json,currently_offered,first_seen_at,last_seen_at,retired_at",
+            ),
+            (
+                "products",
+                "product_id,parent_product_id,product_type,slug,title,release_date,gog_release_date,description,changelog,metadata_json,links_json,media_json,currently_owned,first_seen_at,last_seen_at,updated_at",
+            ),
+            (
+                "product_relationships",
+                "parent_product_id,child_product_id,relationship,source",
+            ),
+            (
+                "download_slots",
+                "slot_id,product_id,provider_group_id,provider_category,name,operating_system,language_code,language_name,first_seen_at,last_seen_at",
+            ),
+            (
+                "download_revisions",
+                "revision_id,slot_id,version,total_size,manifest_fingerprint,currently_offered,first_seen_at,last_seen_at,retired_at",
+            ),
+            (
+                "download_parts",
+                "part_id,revision_id,provider_file_id,part_index,expected_size,downlink,checksum,checksum_fetched_at",
+            ),
+            (
+                "galaxy_builds",
+                "build_id,product_id,operating_system,version,branch,tags_json,public,generation,repository_url,repository_id,published_at,currently_returned,first_seen_at,last_seen_at",
+            ),
+            (
+                "enrichment_observations",
+                "product_id,source,status,checked_at",
+            ),
+            (
+                "sync_stage_outcomes",
+                "stage,status,started_at,completed_at,error",
+            ),
+            (
+                "installation_operations",
+                "product_id,operation,state,plan_json,message,percentage,created_at,updated_at,completed_at,queue_position",
+            ),
+            (
+                "product_activity",
+                "product_id,last_played_at,playtime_seconds,updated_at,last_activity_at",
+            ),
+            (
+                "game_preferences",
+                "product_id,executable_path,launch_arguments_json,compatibility_json,created_at,updated_at,auto_update_galaxy,auto_download_offline_installer,prune_superseded_installers,galaxy_language",
+            ),
+            (
+                "game_compatibility_fix_overrides",
+                "product_id,fix_id,enabled",
+            ),
+            (
+                "cloud_save_settings",
+                "product_id,preference,availability,metadata_build_id,metadata_checked_at,metadata_error,locations_json,last_successful_sync,status,error,updated_at",
+            ),
+            ("cloud_save_baselines", "product_id,files_json"),
+            ("cloud_save_conflicts", "product_id,conflicts_json"),
+            (
+                "galaxy_branch_credentials",
+                "user_id,product_id,branch,format_version,nonce,ciphertext,created_at,updated_at",
+            ),
+            (
+                "galaxy_depot_repositories",
+                "product_id,operating_system,build_id,branch,manifest_identity,repository_json,first_seen_at,last_seen_at",
+            ),
+            (
+                "galaxy_depot_manifests",
+                "manifest_identity,product_id,build_id,depot_id,manifest_json,first_seen_at,last_seen_at",
+            ),
+            (
+                "galaxy_depot_operations",
+                "operation_id,product_id,build_id,branch,kind,state,destination,staging_path,plan_json,bytes_completed,total_bytes,error,created_at,updated_at,completed_at",
+            ),
+            ("schema_state", "state_key,development_revision"),
+            (
+                "achievement_cache",
+                "account_id,product_id,achievements_json,updated_at",
+            ),
+            (
+                "cloud_save_tombstones",
+                "account_id,product_id,namespace,path,remote_etag,local_etag,deleted_at",
+            ),
+        ] {
+            connection.prepare(&format!("SELECT {columns} FROM {table} LIMIT 0"))
+                .map_err(|_| anyhow::anyhow!("database schema 25 has an unidentified current layout ({table}); restore a compatible backup or explicitly reset this profile"))?;
+        }
+    }
+    Ok(Some(revision))
+}
+
 fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
     connection
         .query_row(
@@ -2809,7 +3678,6 @@ fn language_code(name: &str) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn parse_download_category(value: &str) -> DownloadCategory {
     match value {
         "patch" => DownloadCategory::Patch,
@@ -2875,6 +3743,52 @@ fn media_path(media: &serde_json::Value, field: &str) -> Option<PathBuf> {
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .flatten()
+}
+
+fn upsert_core_dlc(
+    transaction: &rusqlite::Transaction<'_>,
+    dlc: &crate::domain::Dlc,
+    parent: i64,
+) -> Result<()> {
+    upsert_core_product(
+        transaction,
+        &Game {
+            product_id: dlc.product_id,
+            title: dlc.title.clone(),
+            slug: dlc.slug.clone(),
+            release_date: dlc.release_date,
+            platforms: dlc.platforms.clone(),
+            languages: dlc.languages.clone(),
+            links: dlc.links.clone(),
+            ..Game::default()
+        },
+        Some(parent),
+    )
+}
+
+fn upsert_core_product(
+    transaction: &rusqlite::Transaction<'_>,
+    game: &Game,
+    parent: Option<i64>,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO products(product_id, parent_product_id, product_type, slug, title, release_date,
+         description, changelog, metadata_json, links_json, media_json, currently_owned, first_seen_at, last_seen_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', '', ?9, ?7, ?8,
+         EXISTS(SELECT 1 FROM owned_products WHERE product_id = ?1), unixepoch(), unixepoch(), unixepoch())
+         ON CONFLICT(product_id) DO UPDATE SET slug = excluded.slug, title = excluded.title,
+         release_date = COALESCE(excluded.release_date, products.release_date),
+         links_json = excluded.links_json, media_json = json_patch(products.media_json, excluded.media_json),
+         last_seen_at = unixepoch(), updated_at = unixepoch()",
+        params![game.product_id, parent, if parent.is_some() { "dlc" } else { "game" }, game.slug, game.title,
+            game.release_date.as_ref().map(chrono::DateTime::timestamp), serde_json::to_string(&game.links)?,
+            serde_json::json!({"platforms":game.platforms,"languages":game.languages,"core_localizations":game.metadata.localizations}).to_string(),
+            serde_json::to_string(&crate::domain::ProductMetadata::default())?],
+    )?;
+    if let Some(parent) = parent {
+        transaction.execute("INSERT INTO product_relationships(parent_product_id, child_product_id, relationship, source) VALUES (?1, ?2, 'dlc', 'product_api') ON CONFLICT DO NOTHING", params![parent, game.product_id])?;
+    }
+    Ok(())
 }
 
 fn upsert_product_row(
@@ -3015,6 +3929,322 @@ fn manifest_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revision_six_advances_without_losing_intents_and_new_state_is_isolated() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let store = StateStore::open_at(&path).unwrap();
+        store.set_favorite(7, true).unwrap();
+        store.add_tag(7, "Keep").unwrap();
+        store.preserve_product_activity(7, Some(123), 456).unwrap();
+        store
+            .save_download_install_intent(&DownloadInstallIntent {
+                product_id: 7,
+                intent_id: "consent".into(),
+                job_ids: vec!["job".into()],
+                plan_json: "{}".into(),
+                state: "waiting".into(),
+                error: None,
+            })
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE achievement_cache; DROP TABLE cloud_save_tombstones;
+            ALTER TABLE user_game_state DROP COLUMN hidden;
+            ALTER TABLE game_preferences DROP COLUMN auto_update_galaxy;
+            ALTER TABLE game_preferences DROP COLUMN auto_download_offline_installer;
+            ALTER TABLE game_preferences DROP COLUMN prune_superseded_installers;
+            ALTER TABLE game_preferences DROP COLUMN galaxy_language;
+            UPDATE schema_state SET development_revision=6;",
+            )
+            .unwrap();
+        drop(store);
+        let store = StateStore::open_at(&path).unwrap();
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
+        assert!(store.favorites().unwrap().contains(&7));
+        assert_eq!(store.tags().unwrap()[&7], vec!["Keep"]);
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].intent_id,
+            "consent"
+        );
+        let played: u64 = store
+            .connection
+            .query_row(
+                "SELECT playtime_seconds FROM product_activity WHERE product_id=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(played, 456);
+        store.set_hidden(7, true).unwrap();
+        store.set_favorite(7, false).unwrap();
+        assert!(store.hidden_product_ids().unwrap().contains(&7));
+        store
+            .set_game_update_preferences(7, Some(false), Some(true), None, Some("fr"))
+            .unwrap();
+        store
+            .upsert_game_preferences(&GamePreferences {
+                product_id: 7,
+                launch_arguments: vec!["--keep".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let preferences = store.game_preferences(7).unwrap().unwrap();
+        assert_eq!(preferences.auto_update_galaxy, Some(false));
+        assert_eq!(preferences.auto_download_offline_installer, Some(true));
+        assert_eq!(preferences.galaxy_language.as_deref(), Some("fr"));
+        store.replace_achievements("account-a", 7, &[]).unwrap();
+        assert!(
+            store
+                .cached_achievements("account-a", 7)
+                .unwrap()
+                .unwrap()
+                .achievements
+                .is_empty()
+        );
+        assert!(store.cached_achievements("account-b", 7).unwrap().is_none());
+        let entry = CloudSaveTombstone {
+            namespace: "saves".into(),
+            path: "save.dat".into(),
+            remote_etag: "remote".into(),
+            local_etag: Some("local".into()),
+        };
+        store
+            .record_cloud_save_tombstones("account-a", 7, std::slice::from_ref(&entry))
+            .unwrap();
+        assert_eq!(
+            store.cloud_save_tombstones("account-a", 7).unwrap(),
+            vec![entry]
+        );
+        assert!(
+            store
+                .cloud_save_tombstones("account-b", 7)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .remove_cloud_save_tombstone("account-b", 7, "saves", "save.dat")
+            .unwrap();
+        assert_eq!(
+            store.cloud_save_tombstones("account-a", 7).unwrap().len(),
+            1
+        );
+        store.connection.execute_batch("CREATE TRIGGER fail_tombstone BEFORE INSERT ON cloud_save_tombstones WHEN NEW.path='fail' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        let entries = [
+            CloudSaveTombstone {
+                namespace: "saves".into(),
+                path: "first".into(),
+                remote_etag: "a".into(),
+                local_etag: None,
+            },
+            CloudSaveTombstone {
+                namespace: "saves".into(),
+                path: "fail".into(),
+                remote_etag: "b".into(),
+                local_etag: None,
+            },
+        ];
+        assert!(
+            store
+                .record_cloud_save_tombstones("account-a", 7, &entries)
+                .is_err()
+        );
+        assert_eq!(
+            store.cloud_save_tombstones("account-a", 7).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn foreign_same_revision_is_rejected_without_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("foreign.db");
+        let store = StateStore::open_at(&path).unwrap();
+        store.connection.execute_batch("DROP TABLE download_install_intents; CREATE TABLE work_queue(work_id TEXT); UPDATE schema_state SET development_revision=6;").unwrap();
+        drop(store);
+        assert!(StateStore::open_at(&path).is_err());
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(development_revision(&connection).unwrap(), Some(6));
+        assert!(!table_exists(&connection, "download_install_intents").unwrap());
+    }
+
+    #[test]
+    fn tags_merge_case_insensitively_and_completed_intent_cannot_consume_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        store.add_tag(1, "Old").unwrap();
+        store.add_tag(1, "new").unwrap();
+        store.add_tag(2, "OLD").unwrap();
+        store.rename_tag("old", "New").unwrap();
+        assert_eq!(store.tags().unwrap()[&1].len(), 1);
+        assert_eq!(store.tags().unwrap()[&2], vec!["New"]);
+        store.rename_tag("new", "NEW").unwrap();
+        assert_eq!(store.tags().unwrap()[&1], vec!["NEW"]);
+        store.remove_tag(1, "new").unwrap();
+        assert!(!store.tags().unwrap().contains_key(&1));
+        store.delete_tag("nEw").unwrap();
+        assert!(store.tags().unwrap().is_empty());
+        store
+            .save_download_install_intent(&DownloadInstallIntent {
+                product_id: 1,
+                intent_id: "new-choice".into(),
+                job_ids: vec!["job".into()],
+                plan_json: "{}".into(),
+                state: "handed_off".into(),
+                error: None,
+            })
+            .unwrap();
+        store
+            .complete_download_install_intent(1, "old-choice")
+            .unwrap();
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "handed_off"
+        );
+        store
+            .complete_download_install_intent(1, "new-choice")
+            .unwrap();
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "complete"
+        );
+    }
+    #[test]
+    fn progressive_core_preserves_omitted_owned_products_rich_cache_and_pack_entitlement() {
+        let path = temp_database_path("progressive-core");
+        let store = StateStore::open_at(&path).unwrap();
+        let mut original = (1..=501)
+            .map(|id| Game {
+                product_id: id,
+                title: format!("Game {id}"),
+                slug: format!("game-{id}"),
+                description: format!("Rich {id}"),
+                ..Game::default()
+            })
+            .collect::<Vec<_>>();
+        original[0].detail_artwork = Some(PathBuf::from("cached-hero.png"));
+        original[0].dlcs.push(crate::domain::Dlc {
+            product_id: 9000,
+            title: "Pack DLC".into(),
+            owned: true,
+            description: "Cached DLC details".into(),
+            ..Default::default()
+        });
+        store.upsert_normalized_library(&original).unwrap();
+        let mut core = original[0].clone();
+        core.description.clear();
+        core.metadata = Default::default();
+        core.detail_artwork = None;
+        core.platforms.linux = true;
+        core.languages = vec!["French".into()];
+        store
+            .cache_core_library(&[core], &[1, 2, 9999], &[1, 2, 9000], &[(9999, vec![9000])])
+            .unwrap();
+        let games = store.normalized_games().unwrap();
+        assert_eq!(games.len(), 2);
+        let game = games.iter().find(|game| game.product_id == 1).unwrap();
+        assert_eq!(game.description, "Rich 1");
+        assert_eq!(
+            game.detail_artwork.as_deref(),
+            Some(std::path::Path::new("cached-hero.png"))
+        );
+        assert!(game.platforms.linux);
+        assert_eq!(game.languages, ["French"]);
+        assert!(game.dlcs[0].owned);
+        assert_eq!(game.dlcs[0].description, "Cached DLC details");
+        assert_eq!(store.cached_pack_entitlements(&[9999]).unwrap(), [9000]);
+        assert!(store.cached_pack_entitlements(&[]).unwrap().is_empty());
+        assert_eq!(
+            store
+                .cached_product_game(9000)
+                .unwrap()
+                .unwrap()
+                .description,
+            "Cached DLC details"
+        );
+        drop(store);
+        let reopened = StateStore::open_at(&path).unwrap();
+        assert!(
+            reopened
+                .cached_product_game(1)
+                .unwrap()
+                .unwrap()
+                .platforms
+                .linux
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn section_and_cover_writes_never_replace_other_fields_or_grant_entitlement() {
+        let path = temp_database_path("section-persistence");
+        let store = StateStore::open_at(&path).unwrap();
+        let original = Game {
+            product_id: 1,
+            title: "One".into(),
+            description: "Before".into(),
+            ..Default::default()
+        };
+        store
+            .cache_core_library(
+                &[
+                    original.clone(),
+                    Game {
+                        product_id: 2,
+                        title: "Two".into(),
+                        ..Default::default()
+                    },
+                ],
+                &[1, 2],
+                &[1, 2],
+                &[],
+            )
+            .unwrap();
+        let mut fetched = original.clone();
+        fetched.description = "After".into();
+        fetched.dlcs.push(crate::domain::Dlc {
+            product_id: 3,
+            title: "Not owned".into(),
+            owned: true,
+            ..Default::default()
+        });
+        store
+            .cache_product_section(&fetched, crate::online::DetailSection::Product)
+            .unwrap();
+        fetched.hero_logo = Some(PathBuf::from("new-logo.png"));
+        store
+            .cache_product_section(&fetched, crate::online::DetailSection::Artwork)
+            .unwrap();
+        store
+            .cache_product_cover(1, std::path::Path::new("tile.png"))
+            .unwrap();
+        store
+            .cache_product_icon(1, std::path::Path::new("sidebar.png"))
+            .unwrap();
+        let games = store.normalized_games().unwrap();
+        assert_eq!(games.len(), 2);
+        let game = games.iter().find(|game| game.product_id == 1).unwrap();
+        assert_eq!(game.description, "After");
+        assert_eq!(
+            game.hero_logo.as_deref(),
+            Some(std::path::Path::new("new-logo.png"))
+        );
+        assert_eq!(
+            game.artwork.as_deref(),
+            Some(std::path::Path::new("tile.png"))
+        );
+        assert!(!game.dlcs[0].owned);
+        assert_eq!(
+            game.icon.as_deref(),
+            Some(std::path::Path::new("sidebar.png"))
+        );
+        std::fs::remove_file(path).unwrap();
+    }
     use crate::domain::InstallationState;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3089,10 +4319,183 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         drop(store);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn current_read_open_never_reserves_writer_or_changes_database() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let store = StateStore::open_at(&path).unwrap();
+        store.set_favorite(7, true).unwrap();
+        store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before = std::time::Instant::now();
+        let reader = StateStore::open_at(&path).unwrap();
+        assert!(before.elapsed() < std::time::Duration::from_secs(1));
+        assert!(reader.favorites().unwrap().contains(&7));
+        assert_eq!(reader.connection.total_changes(), 0);
+        assert!(reader.managed_download_summary().unwrap().0.is_empty());
+        store.connection.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn completion_retries_whole_transactions_without_holding_account_lock_while_busy() {
+        for hold_reader in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("state.db");
+            let store = StateStore::open_at(&path).unwrap();
+            let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+                {"product_id":7,"kind":"installer","name":"Fixture","size_bytes":4,"download_path":"/not-requested"}
+            ])).unwrap();
+            let files = vec![root.path().join("fixture.bin")];
+            fs::write(&files[0], b"data").unwrap();
+            let mut job = DownloadJobUpdate {
+                job_id: "fixture",
+                product_id: 7,
+                title: "Fixture",
+                artifacts: &artifacts,
+                destination: root.path(),
+                state: DownloadState::Downloading,
+                bytes_downloaded: 4,
+                total_bytes: Some(4),
+                completed_files: &files,
+                error: None,
+            };
+            store.save_download_job(&job).unwrap();
+            job.state = DownloadState::Complete;
+            let blocker = Connection::open(&path).unwrap();
+            blocker
+                .execute_batch(if hold_reader {
+                    "BEGIN; SELECT * FROM download_jobs"
+                } else {
+                    "BEGIN IMMEDIATE"
+                })
+                .unwrap();
+            let validations = std::sync::atomic::AtomicUsize::new(0);
+            let session = crate::online::account_session();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let store = StateStore::open_at(&path).unwrap();
+                    store
+                        .complete_download_job(&job, "fixture", session, || {
+                            validations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Ok(())
+                        })
+                        .unwrap();
+                    let timeout: i64 = store
+                        .connection
+                        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(timeout, 5000);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                let before = std::time::Instant::now();
+                crate::online::with_account_session(session, || Ok(())).unwrap();
+                assert!(before.elapsed() < std::time::Duration::from_millis(500));
+                blocker.execute_batch("ROLLBACK").unwrap();
+                worker.join().unwrap();
+            });
+            if hold_reader {
+                assert!(validations.load(std::sync::atomic::Ordering::Relaxed) > 1);
+            }
+            assert_eq!(
+                store.download_job("fixture").unwrap().unwrap().state,
+                DownloadState::Complete
+            );
+            assert_eq!(store.managed_files().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_initialization_and_destructive_development_migration_recheck_revision() {
+        for revision_four in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("state.db");
+            if revision_four {
+                let store = StateStore::open_at(&path).unwrap();
+                store.set_favorite(71, true).unwrap();
+                store.connection.execute_batch("CREATE TABLE galaxy_depot_chunks (id TEXT); UPDATE schema_state SET development_revision=4").unwrap();
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            std::thread::scope(|scope| {
+                let workers = (0..4)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        let path = &path;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            let store = StateStore::open_at(path).unwrap();
+                            assert_eq!(
+                                development_revision(&store.connection).unwrap(),
+                                Some(CURRENT_DEVELOPMENT_REVISION)
+                            );
+                            assert!(
+                                !table_exists(&store.connection, "galaxy_depot_chunks").unwrap()
+                            );
+                            if revision_four {
+                                assert!(store.favorites().unwrap().contains(&71));
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn current_layout_damage_is_rejected_instead_of_silently_repaired() {
+        for damage in [
+            "DROP TABLE achievement_cache",
+            "ALTER TABLE user_game_state DROP COLUMN hidden",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("state.db");
+            let store = StateStore::open_at(&path).unwrap();
+            store.set_favorite(7, true).unwrap();
+            store.connection.execute_batch(damage).unwrap();
+            let before = fs::read(&path).unwrap();
+            assert!(
+                StateStore::open_at(&path)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("unidentified current layout")
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(store.favorites().unwrap().contains(&7));
+        }
+    }
+
+    #[test]
+    fn product_inventory_is_scoped_and_uses_the_existing_product_index() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        store.connection.execute_batch("INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,present) VALUES ('a',1,'one','installer','a',1,1),('b',2,'two','extra','b',1,1),('c',3,'three','installer','c',1,0)").unwrap();
+        assert_eq!(
+            store
+                .managed_files_for_products(&[2])
+                .unwrap()
+                .iter()
+                .map(|file| file.product_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(store.managed_files_for_products(&[]).unwrap().is_empty());
+        assert_eq!(
+            store.managed_download_summary().unwrap(),
+            (HashSet::from([1, 2]), HashSet::from([1]))
+        );
+        let plan = store.connection.prepare("EXPLAIN QUERY PLAN SELECT * FROM managed_files WHERE product_id IN (SELECT value FROM json_each(?1)) ORDER BY path").unwrap().query_map(["[2]"], |row| row.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join("\n");
+        assert!(plan.contains("managed_files_product"), "{plan}");
     }
 
     #[test]
@@ -3110,7 +4513,7 @@ mod tests {
                 "CREATE TABLE user_game_state (
                     product_id INTEGER PRIMARY KEY, favorite INTEGER NOT NULL DEFAULT 0
                  );
-                 INSERT INTO user_game_state VALUES (42, 1);
+                 INSERT INTO user_game_state(product_id,favorite) VALUES (42, 1);
                  PRAGMA user_version = 24;",
             )
             .unwrap();
@@ -3383,7 +4786,10 @@ mod tests {
             .unwrap();
         store
             .connection
-            .execute("INSERT INTO user_game_state VALUES (42, 1)", [])
+            .execute(
+                "INSERT INTO user_game_state(product_id,favorite) VALUES (42, 1)",
+                [],
+            )
             .unwrap();
         store
             .connection
@@ -3397,7 +4803,10 @@ mod tests {
         drop(store);
 
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert_eq!(store.favorites().unwrap(), HashSet::from([42]));
         assert_eq!(
             store.galaxy_branch_credential("user", 42, "beta").unwrap(),
@@ -3416,10 +4825,11 @@ mod tests {
     }
 
     #[test]
-    fn retained_development_revisions_one_through_three_advance() {
-        for revision in 1..=3 {
+    fn retained_development_revisions_one_through_five_advance() {
+        for revision in [1, 2, 3, 5] {
             let path = temp_database_path(&format!("depot-revision-{revision}"));
             let store = StateStore::open_at(&path).unwrap();
+            store.connection.execute_batch("DROP TABLE download_install_intents; INSERT INTO user_game_state(product_id, favorite) VALUES(71, 1)").unwrap();
             store
                 .connection
                 .execute(
@@ -3429,7 +4839,12 @@ mod tests {
                 .unwrap();
             drop(store);
             let store = StateStore::open_at(&path).unwrap();
-            assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+            assert_eq!(
+                development_revision(&store.connection).unwrap(),
+                Some(CURRENT_DEVELOPMENT_REVISION)
+            );
+            assert!(store.download_install_intents().unwrap().is_empty());
+            assert!(store.favorites().unwrap().contains(&71));
             assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
             drop(store);
             fs::remove_file(path).unwrap();
@@ -3464,7 +4879,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "INSERT INTO user_game_state VALUES (42, 1);
+                "INSERT INTO user_game_state(product_id,favorite) VALUES (42, 1);
                  INSERT INTO product_activity(product_id, playtime_seconds, updated_at)
                     VALUES (42, 60, 1);
                  INSERT INTO download_jobs(
@@ -3481,13 +4896,17 @@ mod tests {
                  INSERT INTO galaxy_depot_chunks VALUES (
                     'operation-1', 'compressed', 'manifest', 10, 20, 'uncompressed',
                     'verified', '/stage/chunk', 10, 2);
+                 DROP TABLE download_install_intents;
                  UPDATE schema_state SET development_revision = 4;",
             )
             .unwrap();
         drop(store);
 
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(5));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert!(!table_exists(&store.connection, "galaxy_depot_chunks").unwrap());
         assert_eq!(
             store.depot_operation("operation-1").unwrap(),
@@ -3727,6 +5146,7 @@ mod tests {
             }),
             created_at: 50,
             updated_at: 200,
+            ..Default::default()
         };
         store.upsert_game_preferences(&preferences).unwrap();
         assert_eq!(
@@ -3969,8 +5389,122 @@ mod tests {
                 .map(|file| file.path.as_path()),
             Some(current.as_path())
         );
+        store.connection.execute_batch("DROP INDEX managed_files_artifact_id;
+            CREATE UNIQUE INDEX managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;
+            UPDATE schema_state SET development_revision=7;").unwrap();
+        store.set_favorite(42, true).unwrap();
+        drop(store);
+        let mut store = StateStore::open_at(&root.join("state.sqlite3")).unwrap();
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(8));
+        assert!(store.favorites().unwrap().contains(&42));
+        let second = root.join("second/setup.exe");
+        let mut copy = record(second.clone());
+        copy.verified_at = Some(123);
+        copy.gog_checksum = Some("keep-checksum".into());
+        store
+            .replace_managed_files_in_root(&root.join("second"), &[copy])
+            .unwrap();
+        let files = store.managed_files().unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.present && file.matched && file.artifact_id.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == current && file.present)
+        );
+        assert!(files.iter().any(|file| file.path == second
+            && file.verified_at == Some(123)
+            && file.gog_checksum.as_deref() == Some("keep-checksum")));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pack_entitlements_preserve_filtered_order_and_shared_children() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        for (pack, child, kind) in [
+            (30, 300, "pack_entitlement"),
+            (10, 200, "pack_entitlement"),
+            (20, 100, "pack_entitlement"),
+            (10, 100, "pack_entitlement"),
+            (10, 400, "dlc"),
+        ] {
+            store.connection.execute("INSERT INTO product_relationships(parent_product_id,child_product_id,relationship,source) VALUES(?1,?2,?3,'fixture')", params![pack, child, kind]).unwrap();
+        }
+        let requested = [20, 10, 10, 999];
+        let expected = store.connection.prepare("SELECT parent_product_id,child_product_id FROM product_relationships WHERE relationship='pack_entitlement'").unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap().into_iter()
+            .filter_map(|(pack, child)| requested.contains(&pack).then_some(child)).collect::<Vec<_>>();
+        assert_eq!(expected, vec![100, 200, 100]);
+        assert_eq!(
+            store.cached_pack_entitlements(&requested).unwrap(),
+            expected
+        );
+        assert!(store.cached_pack_entitlements(&[]).unwrap().is_empty());
+        assert_eq!(store.cached_pack_entitlements(&[30]).unwrap(), vec![300]);
+    }
+
+    #[test]
+    fn revision_loading_preserves_parts_history_and_product_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for slot in 1..=129 {
+            transaction.execute("INSERT INTO download_slots(slot_id,product_id,provider_group_id,provider_category,name,first_seen_at,last_seen_at) VALUES(?1,?2,?3,'installer','Fixture',1,1)", params![slot, if slot == 129 {43} else {42}, format!("slot-{slot}")]).unwrap();
+            for current in [false, true] {
+                let revision = slot * 2 + i64::from(current);
+                transaction.execute("INSERT INTO download_revisions(revision_id,slot_id,version,total_size,manifest_fingerprint,currently_offered,first_seen_at,last_seen_at,retired_at) VALUES(?1,?2,?3,40,?3,?4,1,1,CASE WHEN ?4 THEN NULL ELSE 2 END)", params![revision, slot, format!("version-{revision}"), current]).unwrap();
+                // One revision deliberately has no parts; reverse insertion checks part ordering.
+                if slot != 128 {
+                    for part in (0..4).rev() {
+                        transaction.execute("INSERT INTO download_parts(revision_id,provider_file_id,part_index,expected_size,downlink,checksum,checksum_fetched_at) VALUES(?1,?2,?3,10,?4,'checksum',3)", params![revision, format!("part-{revision}-{part}"), part, format!("/file/{revision}/{part}")]).unwrap();
+                    }
+                }
+            }
+        }
+        transaction.commit().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(store.load_all_download_revisions(42).unwrap().len(), 256);
+        }
+        eprintln!(
+            "20 loads of 256 revisions/1016 parts: {:?}",
+            started.elapsed()
+        );
+        let current = store.load_current_download_revisions(42).unwrap();
+        assert_eq!(current.len(), 128);
+        assert!(
+            current
+                .iter()
+                .all(|revision| revision.currently_offered && revision.product_id == 42)
+        );
+        assert!(
+            current
+                .windows(2)
+                .all(|pair| pair[0].slot_id < pair[1].slot_id)
+        );
+        for revision in store.load_all_download_revisions(42).unwrap() {
+            assert_eq!(
+                revision.parts.len(),
+                if revision.slot_id == 128 { 0 } else { 4 }
+            );
+            for (index, part) in revision.parts.iter().enumerate() {
+                assert_eq!(part.revision_id, revision.revision_id);
+                assert_eq!(part.part_index, index as u32);
+                assert_eq!(part.expected_size, Some(10));
+                assert_eq!(part.checksum.as_deref(), Some("checksum"));
+                assert_eq!(part.checksum_fetched_at, Some(3));
+            }
+        }
+        assert!(store.load_all_download_revisions(404).unwrap().is_empty());
+        assert_eq!(store.load_all_download_revisions(43).unwrap().len(), 2);
     }
 
     #[test]

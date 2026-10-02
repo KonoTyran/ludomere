@@ -62,6 +62,7 @@ pub fn begin_backup(
     slug: &str,
     locations: &[SaveLocation],
 ) -> Result<MigrationJournal> {
+    let _activity = crate::profile_reset::begin_activity("save backup")?;
     let root = migration_root(library, slug, operation_id)?;
     reject_symlink_ancestors(&root)?;
     if root.exists() {
@@ -115,6 +116,7 @@ pub fn restore(
     journal: &mut MigrationJournal,
     destinations: &[SaveLocation],
 ) -> Result<()> {
+    let _activity = crate::profile_reset::begin_activity("save restore")?;
     if !matches!(
         journal.phase,
         MigrationPhase::Installed | MigrationPhase::Restoring
@@ -333,14 +335,61 @@ fn run(
     destinations: &[SaveLocation],
     events: &std::sync::mpsc::Sender<MigrationEvent>,
 ) -> Result<()> {
+    let _activity = crate::profile_reset::begin_activity("installation migration")?;
     let old = journal
         .old_game
         .clone()
         .context("save migration has no existing installation plan")?;
+    let config = crate::storage::read_config()?;
+    super::validate_game_library(&config, &old.library_id, &old.installation_directory)?;
     let target = journal
         .target
         .clone()
         .context("save migration has no target installation plan")?;
+    if let MigrationTarget::Offline {
+        game,
+        additional_installers,
+        ..
+    } = &target
+    {
+        super::validate_game_library(&config, &game.library_id, &game.installation_directory)?;
+        super::validate_offline_sources(
+            &config,
+            &game
+                .installer_files
+                .iter()
+                .cloned()
+                .chain(
+                    additional_installers
+                        .iter()
+                        .flat_map(|installer| installer.files.clone()),
+                )
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    let target_windows = match &target {
+        MigrationTarget::Offline { game, .. } => game
+            .installer_operating_system
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case("windows")),
+        MigrationTarget::Galaxy(request) => request
+            .build
+            .operating_system
+            .eq_ignore_ascii_case("windows"),
+    };
+    if matches!(
+        journal.phase,
+        MigrationPhase::BackedUp | MigrationPhase::Uninstalled
+    ) && (target_windows
+        || (journal.phase == MigrationPhase::BackedUp
+            && old.compatibility.is_some()
+            && super::marker::load(&old.installation_directory)?.is_some_and(|marker| {
+                marker.source == crate::domain::InstallationSource::OfflineInstaller
+            })))
+    {
+        // Do not remove the current installation before its replacement can run.
+        crate::compatibility::preflight_windows(Some(journal.product_id))?;
+    }
     if journal.phase == MigrationPhase::BackedUp {
         uninstall(&old, library)?;
         set_phase(library, journal, MigrationPhase::Uninstalled)?;
@@ -365,6 +414,11 @@ fn run(
 }
 
 fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> {
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &game.library_id,
+        &game.installation_directory,
+    )?;
     if game.installation_directory.parent() != Some(library) {
         bail!("source migration installation is outside its library");
     }
@@ -393,6 +447,12 @@ fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> 
             }
         }
     }
+    let _permit = crate::operation_gate::try_acquire()?;
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &game.library_id,
+        &game.installation_directory,
+    )?;
     if game.installation_directory.exists() {
         fs::remove_dir_all(&game.installation_directory)?;
     }

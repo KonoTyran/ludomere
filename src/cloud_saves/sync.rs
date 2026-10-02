@@ -38,8 +38,10 @@ pub fn synchronize(
     mode: CloudSyncMode,
     cloud: &dyn Storage,
 ) -> Result<CloudSyncResult> {
+    cloud.ensure_current()?;
     store.set_cloud_save_status(product_id, crate::domain::CloudSaveStatus::Syncing, None)?;
     let result = run(store, product_id, locations, mode, cloud);
+    cloud.ensure_current()?;
     if let Err(error) = &result {
         store.set_cloud_save_status(
             product_id,
@@ -58,7 +60,9 @@ fn run(
     cloud: &dyn Storage,
 ) -> Result<CloudSyncResult> {
     let local = scan(locations)?;
+    cloud.ensure_current()?;
     let remote = remote_map(cloud.list()?)?;
+    cloud.ensure_current()?;
     let baseline: BTreeMap<String, Baseline> = store
         .cloud_save_baseline(product_id)?
         .and_then(|value| serde_json::from_str(&value).ok())
@@ -72,11 +76,42 @@ fn run(
     keys.dedup();
     let mut result = CloudSyncResult::default();
     let mut next = baseline.clone();
+    let tombstones = cloud
+        .account_id()
+        .map(|account| store.cloud_save_tombstones(account, product_id))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| (format!("{}/{}", entry.namespace, entry.path), entry))
+        .collect::<HashMap<_, _>>();
 
     for key in keys {
+        cloud.ensure_current()?;
         let local_file = local.get(&key);
         let remote_file = remote.get(&key);
         let previous = baseline.get(&key);
+        if let Some(tombstone) = tombstones.get(&key) {
+            if mode != CloudSyncMode::ForceUpload
+                && remote_file.is_none()
+                && local_file.map(|file| &file.metadata.etag) == tombstone.local_etag.as_ref()
+            {
+                // The local copy was explicitly retained when its remote revision was deleted.
+                // Preserve the intent even if a DELETE response or the application was lost.
+                next.remove(&key);
+                continue;
+            }
+            if (mode == CloudSyncMode::ForceUpload
+                || local_file.map(|file| &file.metadata.etag) != tombstone.local_etag.as_ref())
+                && let Some(account) = cloud.account_id()
+            {
+                store.remove_cloud_save_tombstone(
+                    account,
+                    product_id,
+                    &tombstone.namespace,
+                    &tombstone.path,
+                )?;
+            }
+        }
         let local_changed =
             local_file.map(|f| Some(&f.metadata.etag)) != previous.map(|b| b.local_etag.as_ref());
         let remote_changed =
@@ -91,15 +126,17 @@ fn run(
             (Some(local), _, CloudSyncMode::ForceUpload)
             | (Some(local), None, _)
             | (Some(local), Some(_), CloudSyncMode::Normal)
-                if local_changed =>
+                if local_changed || mode == CloudSyncMode::ForceUpload =>
             {
                 let bytes = read_file(&local.path)?;
+                cloud.ensure_current()?;
                 let uploaded = cloud.upload(
                     &local.metadata.location,
                     &remote_path(&local.metadata),
                     &bytes,
                     local.metadata.modified_at,
                 )?;
+                cloud.ensure_current()?;
                 next.insert(
                     key,
                     Baseline {
@@ -114,6 +151,7 @@ fn run(
             | (Some(local), Some(remote), CloudSyncMode::Normal)
                 if remote_changed =>
             {
+                cloud.ensure_current()?;
                 backup(product_id, local)?;
                 write_download(cloud, remote, &local.path)?;
                 let refreshed = local_metadata(
@@ -172,6 +210,7 @@ fn run(
             }
         }
     }
+    cloud.ensure_current()?;
     if !result.conflicts.is_empty() {
         store.record_cloud_save_conflicts(product_id, &result.conflicts)?;
         return Ok(result);
@@ -282,7 +321,9 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(Into::into)
 }
 fn write_download(cloud: &dyn Storage, remote: &RemoteObject, destination: &Path) -> Result<()> {
+    cloud.ensure_current()?;
     let bytes = cloud.download(&remote.namespace, &remote.path)?;
+    cloud.ensure_current()?;
     if bytes.len() > MAX_FILE_SIZE as usize {
         bail!("cloud-save file exceeds the safety limit");
     }
@@ -291,6 +332,10 @@ fn write_download(cloud: &dyn Storage, remote: &RemoteObject, destination: &Path
     }
     let temporary = destination.with_extension("ludomere-cloud-part");
     fs::write(&temporary, bytes)?;
+    if let Err(error) = cloud.ensure_current() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     fs::rename(temporary, destination)?;
     Ok(())
 }
@@ -408,6 +453,82 @@ mod tests {
             user_override: false,
         };
         (root, store, location)
+    }
+
+    struct RevokedCloud {
+        inner: MemoryCloud,
+        current: std::cell::Cell<bool>,
+        revoke_on: &'static str,
+        uploads: std::cell::Cell<usize>,
+    }
+
+    impl Storage for RevokedCloud {
+        fn ensure_current(&self) -> Result<()> {
+            anyhow::ensure!(self.current.get(), "fixture session revoked");
+            Ok(())
+        }
+
+        fn list(&self) -> Result<Vec<RemoteObject>> {
+            let result = self.inner.list();
+            if self.revoke_on == "list" {
+                self.current.set(false);
+            }
+            result
+        }
+
+        fn download(&self, namespace: &str, path: &str) -> Result<Vec<u8>> {
+            let result = self.inner.download(namespace, path);
+            if self.revoke_on == "download" {
+                self.current.set(false);
+            }
+            result
+        }
+
+        fn upload(
+            &self,
+            namespace: &str,
+            path: &str,
+            data: &[u8],
+            modified_at: i64,
+        ) -> Result<RemoteObject> {
+            self.uploads.set(self.uploads.get() + 1);
+            let result = self.inner.upload(namespace, path, data, modified_at);
+            if self.revoke_on == "upload" {
+                self.current.set(false);
+            }
+            result
+        }
+    }
+
+    #[test]
+    fn revoked_sync_stops_followup_transfers_and_preserves_baseline_and_local_saves() {
+        for phase in ["list", "upload", "download"] {
+            let (root, store, location) = fixture(&format!("revoked-{phase}"));
+            fs::write(location.path.join("a.sav"), b"local-a").unwrap();
+            fs::write(location.path.join("b.sav"), b"local-b").unwrap();
+            store.complete_cloud_save_sync(1, "{}").unwrap();
+            let cloud = RevokedCloud {
+                inner: MemoryCloud::default(),
+                current: std::cell::Cell::new(true),
+                revoke_on: phase,
+                uploads: std::cell::Cell::new(0),
+            };
+            cloud.inner.upload("main", "a.sav", b"remote-a", 1).unwrap();
+            let mode = if phase == "download" {
+                CloudSyncMode::ForceDownload
+            } else {
+                CloudSyncMode::ForceUpload
+            };
+            let error =
+                synchronize(&store, 1, std::slice::from_ref(&location), mode, &cloud).unwrap_err();
+            assert!(error.to_string().contains("revoked"));
+            assert_eq!(cloud.uploads.get(), usize::from(phase == "upload"));
+            assert_eq!(store.cloud_save_baseline(1).unwrap().as_deref(), Some("{}"));
+            assert_eq!(fs::read(location.path.join("a.sav")).unwrap(), b"local-a");
+            assert_eq!(fs::read(location.path.join("b.sav")).unwrap(), b"local-b");
+            assert!(!location.path.join("a.ludomere-cloud-part").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

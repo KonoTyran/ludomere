@@ -1,5 +1,5 @@
 use super::{
-    DownloadEvent, DownloadFailure, DownloadFailureKind, job_id,
+    DownloadEvent, DownloadFailure, DownloadFailureKind,
     transfer::{DownloadSnapshot, downloaded_on_disk, persist, run},
 };
 use crate::{domain::RemoteArtifact, state::DownloadState};
@@ -16,17 +16,18 @@ use std::{
 
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start_worker(
+    active_job_id: String,
     artifacts: Vec<RemoteArtifact>,
     title: String,
     access_token: String,
     destination: PathBuf,
     part_concurrency: usize,
+    session: u64,
     sender: mpsc::Sender<DownloadEvent>,
 ) -> Arc<AtomicBool> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let refs = artifacts.iter().collect::<Vec<_>>();
-    let active_job_id = job_id(&refs);
     {
         let mut downloads = ACTIVE_DOWNLOADS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -41,15 +42,22 @@ pub(super) fn start_worker(
     std::thread::spawn(move || {
         let permit = crate::operation_gate::acquire(|| worker_cancelled.load(Ordering::Relaxed));
         let result = match permit {
-            Some(_permit) => Some(run(
-                &artifacts,
-                &title,
-                &access_token,
-                &destination,
-                &worker_cancelled,
-                &sender,
-                part_concurrency,
-            )),
+            Some(_permit) => Some(
+                super::manager::validate_destination(&artifacts, &destination, None).and_then(
+                    |()| {
+                        run(
+                            &artifacts,
+                            &title,
+                            &access_token,
+                            &destination,
+                            &worker_cancelled,
+                            &sender,
+                            part_concurrency,
+                            session,
+                        )
+                    },
+                ),
+            ),
             None => {
                 let _ = sender.send(DownloadEvent::Cancelled);
                 None
@@ -64,18 +72,25 @@ pub(super) fn start_worker(
                 .map(|artifact| artifact.size_bytes)
                 .collect::<Option<Vec<_>>>()
                 .map(|sizes| sizes.into_iter().sum());
-            persist(
-                &artifacts,
-                &title,
-                DownloadSnapshot {
-                    destination: &destination,
-                    state: DownloadState::Failed,
-                    downloaded,
-                    total,
-                    files: &[],
-                    error: Some(&message),
-                },
-            );
+            if error.is::<super::transfer::BookkeepingError>() {
+                // The receipt survives even when SQLite cannot record this failure.
+                let _ = crate::state::StateStore::open().and_then(|store| {
+                    store.try_record_bookkeeping_failure(&active_job_id, session, &message)
+                });
+            } else {
+                persist(
+                    &artifacts,
+                    &title,
+                    DownloadSnapshot {
+                        destination: &destination,
+                        state: DownloadState::Failed,
+                        downloaded,
+                        total,
+                        files: &[],
+                        error: Some(&message),
+                    },
+                );
+            }
             let _ = sender.send(DownloadEvent::Failed(failure));
         }
         if let Some(downloads) = ACTIVE_DOWNLOADS.get() {
@@ -106,6 +121,16 @@ pub(super) fn worker_is_active(job_id: &str) -> bool {
 }
 
 pub(super) fn classify_download_error(error: &anyhow::Error) -> DownloadFailure {
+    if let Some(bookkeeping) = error.downcast_ref::<super::transfer::BookkeepingError>() {
+        return DownloadFailure {
+            kind: DownloadFailureKind::Bookkeeping,
+            message: if bookkeeping.files.is_empty() {
+                "Downloaded-file registration failed. Existing files were preserved; check the download destination and retry.".into()
+            } else {
+                bookkeeping.to_string()
+            },
+        };
+    }
     let mut kind = DownloadFailureKind::Other;
     for cause in error.chain() {
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {

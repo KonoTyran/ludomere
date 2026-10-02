@@ -2,10 +2,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub theme: Theme,
+    pub setup_seen: bool,
+    pub setup_completed: bool,
+    pub windows_setup_deferred: bool,
     #[serde(default = "default_download_directory")]
     pub download_directory: PathBuf,
     #[serde(default)]
@@ -18,7 +21,9 @@ pub struct Config {
     pub installer_macos: bool,
     #[serde(default = "default_installation_source_order")]
     pub installation_source_order: Vec<PreferredInstallationSource>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
+    pub depot_default_migrated: bool,
+    #[serde(default)]
     pub download_extras_by_default: bool,
     #[serde(default)]
     pub download_patches_by_default: bool,
@@ -34,8 +39,14 @@ pub struct Config {
     pub show_retired_artifacts: bool,
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
+    pub auto_update_galaxy_installations: bool,
+    pub auto_download_offline_installers: bool,
+    pub auto_download_extras: bool,
+    pub prune_superseded_offline_installers: bool,
     #[serde(default = "default_game_libraries")]
     pub game_libraries: Vec<GameLibrary>,
+    pub offline_libraries: Vec<GameLibrary>,
+    pub extras_libraries: Vec<GameLibrary>,
     #[serde(default)]
     pub installer_library_id: Option<String>,
     #[serde(default = "default_library_card_size")]
@@ -72,8 +83,8 @@ pub enum PreferredInstallationSource {
 
 pub fn default_installation_source_order() -> Vec<PreferredInstallationSource> {
     vec![
-        PreferredInstallationSource::LinuxOffline,
         PreferredInstallationSource::WindowsGalaxy,
+        PreferredInstallationSource::LinuxOffline,
         PreferredInstallationSource::WindowsOffline,
     ]
 }
@@ -87,7 +98,27 @@ pub struct GameLibrary {
     pub default: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryKind {
+    GameFiles,
+    OfflineInstallers,
+    Extras,
+}
+
+impl LibraryKind {
+    pub const ALL: [Self; 3] = [Self::GameFiles, Self::OfflineInstallers, Self::Extras];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GameFiles => "Game Files",
+            Self::OfflineInstallers => "Offline Installers",
+            Self::Extras => "Goodies & Extras",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
     #[default]
@@ -106,20 +137,30 @@ impl Default for Config {
             .unwrap_or_else(default_download_directory);
         Self {
             theme: Theme::System,
+            setup_completed: false,
+            setup_seen: false,
+            windows_setup_deferred: false,
             download_directory,
             installer_language: None,
             installer_windows: true,
             installer_linux: true,
             installer_macos: true,
             installation_source_order: default_installation_source_order(),
-            download_extras_by_default: true,
+            depot_default_migrated: true,
+            download_extras_by_default: false,
             download_patches_by_default: false,
             prefer_patch_updates: false,
             interactive_installer_prompts: false,
             interactive_installer_explanation_dismissed: false,
             show_retired_artifacts: false,
             max_concurrent_downloads: default_max_concurrent_downloads(),
+            auto_update_galaxy_installations: true,
+            auto_download_offline_installers: false,
+            auto_download_extras: false,
+            prune_superseded_offline_installers: false,
             game_libraries,
+            offline_libraries: Vec::new(),
+            extras_libraries: Vec::new(),
             installer_library_id,
             library_card_size: default_library_card_size(),
             show_sidebar_game_icons: true,
@@ -145,6 +186,58 @@ const fn default_window_height() -> i32 {
 }
 
 impl Config {
+    pub fn libraries(&self, kind: LibraryKind) -> &[GameLibrary] {
+        match kind {
+            LibraryKind::GameFiles => &self.game_libraries,
+            LibraryKind::OfflineInstallers => &self.offline_libraries,
+            LibraryKind::Extras => &self.extras_libraries,
+        }
+    }
+
+    pub fn libraries_mut(&mut self, kind: LibraryKind) -> &mut Vec<GameLibrary> {
+        match kind {
+            LibraryKind::GameFiles => &mut self.game_libraries,
+            LibraryKind::OfflineInstallers => &mut self.offline_libraries,
+            LibraryKind::Extras => &mut self.extras_libraries,
+        }
+    }
+
+    pub fn default_library(&self, kind: LibraryKind) -> Option<&GameLibrary> {
+        self.libraries(kind)
+            .iter()
+            .find(|library| library.default)
+            .or_else(|| self.libraries(kind).first())
+    }
+
+    pub fn normalize_libraries(&mut self) {
+        for kind in LibraryKind::ALL {
+            let libraries = self.libraries_mut(kind);
+            if kind == LibraryKind::GameFiles && libraries.is_empty() {
+                *libraries = default_game_libraries();
+            }
+            let mut paths = std::collections::HashSet::new();
+            libraries.retain(|library| paths.insert(library.path.clone()));
+            let default = libraries
+                .iter()
+                .position(|library| library.default)
+                .unwrap_or(0);
+            for (index, library) in libraries.iter_mut().enumerate() {
+                library.default = index == default;
+                if library.id.trim().is_empty() {
+                    library.id = game_library_id(&library.path);
+                }
+                if library.name.trim().is_empty() {
+                    library.name = library
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(kind.label())
+                        .to_owned();
+                }
+            }
+        }
+    }
+
     pub fn path() -> PathBuf {
         crate::identity::config_file()
     }
@@ -156,11 +249,15 @@ impl Config {
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let mut config: Self =
                 toml::from_str(&text).context("parsing Ludomere configuration")?;
+            let stored = config.clone();
             config.max_concurrent_downloads = config.max_concurrent_downloads.clamp(1, 4);
             config.library_card_size = config.library_card_size.min(3);
-            config.normalize_game_libraries();
+            config.normalize_libraries();
+            config.migrate_source_default();
             config.normalize_installation_source_order();
-            write_config(&path, &config)?;
+            if config != stored {
+                write_config(&path, &config)?;
+            }
             return Ok(config);
         }
 
@@ -226,9 +323,6 @@ impl Config {
                 .default_game_library()
                 .map(|library| library.id.clone());
         }
-        if let Some(library) = self.installer_library() {
-            self.download_directory = library.path.clone();
-        }
     }
 
     pub fn normalize_installation_source_order(&mut self) {
@@ -244,6 +338,20 @@ impl Config {
             }
         }
         self.installation_source_order = normalized;
+    }
+
+    fn migrate_source_default(&mut self) {
+        if !self.depot_default_migrated
+            && self.installation_source_order
+                == [
+                    PreferredInstallationSource::LinuxOffline,
+                    PreferredInstallationSource::WindowsGalaxy,
+                    PreferredInstallationSource::WindowsOffline,
+                ]
+        {
+            self.installation_source_order = default_installation_source_order();
+        }
+        self.depot_default_migrated = true;
     }
 }
 
@@ -267,7 +375,9 @@ pub fn default_download_directory() -> PathBuf {
 }
 
 pub fn default_game_directory() -> PathBuf {
-    crate::identity::data_root().join("games")
+    dirs::home_dir()
+        .unwrap_or_else(crate::identity::data_root)
+        .join("Games/Ludomere/games")
 }
 
 pub fn game_library_id(path: &std::path::Path) -> String {
@@ -297,7 +407,97 @@ fn default_max_concurrent_downloads() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_game_default_preserves_saved_library_paths_on_reload() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.default_game_library().unwrap().path,
+            dirs::home_dir().unwrap().join("Games/Ludomere/games")
+        );
+        assert!(config.offline_libraries.is_empty() && config.extras_libraries.is_empty());
+        config.game_libraries[0].path = "/saved/older-game-library".into();
+        config.game_libraries[0].id = "saved-identity".into();
+        let mut loaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        loaded.normalize_libraries();
+        assert_eq!(loaded.game_libraries, config.game_libraries);
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn depot_default_migrates_once_and_preserves_later_explicit_choices() {
+        let old = vec![
+            PreferredInstallationSource::LinuxOffline,
+            PreferredInstallationSource::WindowsGalaxy,
+            PreferredInstallationSource::WindowsOffline,
+        ];
+        let mut config: Config = toml::from_str(
+            "installation_source_order=['linux_offline','windows_galaxy','windows_offline']",
+        )
+        .unwrap();
+        assert!(!config.depot_default_migrated);
+        config.migrate_source_default();
+        assert_eq!(
+            config.installation_source_order,
+            default_installation_source_order()
+        );
+        config.installation_source_order = old.clone();
+        let mut reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        reloaded.migrate_source_default();
+        assert_eq!(reloaded.installation_source_order, old);
+        let mut custom: Config = toml::from_str(
+            "installation_source_order=['windows_offline','linux_offline','windows_galaxy']",
+        )
+        .unwrap();
+        let before = custom.installation_source_order.clone();
+        custom.migrate_source_default();
+        assert_eq!(custom.installation_source_order, before);
+        let mut missing: Config = toml::from_str("").unwrap();
+        missing.migrate_source_default();
+        assert_eq!(
+            missing.installation_source_order,
+            default_installation_source_order()
+        );
+        assert!(missing.auto_update_galaxy_installations);
+        assert!(
+            !missing.auto_download_offline_installers
+                && !missing.prune_superseded_offline_installers
+        );
+    }
+
+    #[test]
+    fn setup_visibility_and_deferral_persist_without_changing_existing_preferences() {
+        let mut config: Config =
+            toml::from_str("theme = 'dark'\ninstaller_language = 'French'").unwrap();
+        assert!(!config.setup_seen);
+        assert!(!config.setup_completed);
+        config.setup_seen = true;
+        config.windows_setup_deferred = true;
+        let saved: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(saved.setup_seen && saved.windows_setup_deferred);
+        assert!(!saved.setup_completed);
+        assert_eq!(saved.installer_language.as_deref(), Some("French"));
+        assert!(matches!(saved.theme, Theme::Dark));
+        assert_eq!(saved.download_directory, config.download_directory);
+        assert_eq!(
+            saved.installer_library().unwrap().path,
+            config.installer_library().unwrap().path
+        );
+    }
+
+    #[test]
+    fn legacy_sign_out_reset_preference_is_ignored_and_not_saved() {
+        let configured: Config = toml::from_str(
+            "theme = 'dark'\nclear_profile_on_sign_out = true\ndownload_directory = '/tmp/kept-downloads'",
+        ).unwrap();
+        assert!(matches!(configured.theme, Theme::Dark));
+        assert_eq!(
+            configured.download_directory,
+            PathBuf::from("/tmp/kept-downloads")
+        );
+        let saved = toml::to_string(&configured).unwrap();
+        assert!(!saved.contains("clear_profile_on_sign_out"));
+    }
 
     #[test]
     fn obsolete_roots_are_ignored_and_not_serialized() {
@@ -324,14 +524,14 @@ enabled = true
         );
         assert_eq!(config.installer_language.as_deref(), Some("English"));
         assert!(!config.installer_windows);
-        assert!(config.download_extras_by_default);
+        assert!(!config.download_extras_by_default);
         assert!(!config.download_patches_by_default);
         assert!(!config.show_retired_artifacts);
         assert_eq!(config.max_concurrent_downloads, 2);
         assert_eq!(config.game_libraries.len(), 1);
         assert!(config.game_libraries[0].default);
         let saved = toml::to_string(&config).unwrap();
-        assert!(saved.contains("download_extras_by_default = true"));
+        assert!(saved.contains("download_extras_by_default = false"));
         assert!(saved.contains("download_patches_by_default = false"));
         assert!(saved.contains("show_retired_artifacts = false"));
         assert!(!saved.contains(&obsolete_key));
@@ -380,6 +580,151 @@ enabled = true
     }
 
     #[test]
+    fn typed_optional_libraries_have_independent_defaults_without_migration_fallback() {
+        let mut config = Config {
+            download_directory: PathBuf::from("/legacy-mixed"),
+            ..Default::default()
+        };
+        config.normalize_libraries();
+        assert!(
+            config
+                .default_library(LibraryKind::OfflineInstallers)
+                .is_none()
+        );
+        assert!(config.default_library(LibraryKind::Extras).is_none());
+        assert!(!config.auto_download_extras);
+        config.offline_libraries = vec![GameLibrary {
+            id: "offline".into(),
+            name: "Offline".into(),
+            path: "/offline".into(),
+            default: false,
+        }];
+        config.extras_libraries = vec![GameLibrary {
+            id: "extras".into(),
+            name: "Extras".into(),
+            path: "/extras".into(),
+            default: false,
+        }];
+        config.normalize_libraries();
+        let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .default_library(LibraryKind::OfflineInstallers)
+                .unwrap()
+                .path,
+            PathBuf::from("/offline")
+        );
+        assert_eq!(
+            restored.default_library(LibraryKind::Extras).unwrap().path,
+            PathBuf::from("/extras")
+        );
+        assert_eq!(restored.download_directory, PathBuf::from("/legacy-mixed"));
+    }
+
+    #[test]
+    fn extras_default_off_preserves_explicit_existing_preferences() {
+        assert!(!Config::default().download_extras_by_default);
+        assert!(
+            !toml::from_str::<Config>("")
+                .unwrap()
+                .download_extras_by_default
+        );
+        for enabled in [false, true] {
+            let config: Config =
+                toml::from_str(&format!("download_extras_by_default = {enabled}")).unwrap();
+            assert_eq!(config.download_extras_by_default, enabled);
+            assert_eq!(
+                toml::from_str::<Config>(&toml::to_string(&config).unwrap())
+                    .unwrap()
+                    .download_extras_by_default,
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn saved_download_folder_survives_loading_and_library_normalization() {
+        if std::env::var_os("LUDOMERE_CONFIG_ROUNDTRIP_CHILD").is_some() {
+            let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let download_directory = root.join("Independent Downloads");
+            let library = root.join("Game Library");
+            let config = Config {
+                max_concurrent_downloads: 99,
+                library_card_size: 99,
+                download_directory: download_directory.clone(),
+                game_libraries: vec![GameLibrary {
+                    id: String::new(),
+                    name: String::new(),
+                    path: library.clone(),
+                    default: false,
+                }],
+                installer_library_id: Some("old-library-id".into()),
+                ..Config::default()
+            };
+            config.save().unwrap();
+            for attempt in 0..2 {
+                let partial = Config::path().with_extension("toml.part");
+                if attempt == 1 {
+                    fs::write(&partial, "another writer's pending settings").unwrap();
+                }
+                let before = fs::metadata(Config::path()).unwrap().modified().unwrap();
+                let loaded = Config::load_or_create().unwrap();
+                assert_eq!(loaded.max_concurrent_downloads, 4);
+                assert_eq!(loaded.library_card_size, 3);
+                let persisted: Config =
+                    toml::from_str(&fs::read_to_string(Config::path()).unwrap()).unwrap();
+                assert_eq!(persisted, loaded, "normalization must persist once");
+                if attempt == 1 {
+                    assert_eq!(
+                        fs::metadata(Config::path()).unwrap().modified().unwrap(),
+                        before
+                    );
+                    assert_eq!(
+                        fs::read_to_string(&partial).unwrap(),
+                        "another writer's pending settings"
+                    );
+                }
+                assert_eq!(loaded.download_directory, download_directory);
+                assert_eq!(loaded.installer_library().unwrap().path, library);
+                assert_eq!(
+                    loaded.installer_library().unwrap().id,
+                    game_library_id(&library)
+                );
+                assert!(loaded.installer_library().unwrap().default);
+                loaded.save().unwrap();
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "config::tests::saved_download_folder_survives_loading_and_library_normalization",
+                "--nocapture",
+            ])
+            .env("LUDOMERE_CONFIG_ROUNDTRIP_CHILD", "1");
+        for (key, name) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
+            let path = root.path().join(name);
+            fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            child.env(key, path);
+        }
+        assert!(child.status().unwrap().success());
+    }
+
+    #[test]
     fn installation_source_order_defaults_and_normalizes() {
         assert_eq!(
             Config::default().installation_source_order,
@@ -397,8 +742,8 @@ enabled = true
             config.installation_source_order,
             [
                 PreferredInstallationSource::WindowsOffline,
-                PreferredInstallationSource::LinuxOffline,
                 PreferredInstallationSource::WindowsGalaxy,
+                PreferredInstallationSource::LinuxOffline,
             ]
         );
     }

@@ -93,6 +93,10 @@ pub(crate) struct InstallationControl {
 }
 
 impl InstallationControl {
+    pub(crate) fn uses_cancellation(&self, cancellation: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(&self.cancellation, cancellation)
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancellation.store(true, Ordering::Release);
     }
@@ -125,7 +129,22 @@ pub fn start_installation(
     install_base: bool,
     interactive_prompts: bool,
 ) -> InstallationHandle {
-    let cancellation = Arc::new(AtomicBool::new(false));
+    start_installation_with_cancellation(
+        plan,
+        additional_installers,
+        install_base,
+        interactive_prompts,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+pub(crate) fn start_installation_with_cancellation(
+    plan: InstalledGame,
+    additional_installers: Vec<AdditionalInstaller>,
+    install_base: bool,
+    interactive_prompts: bool,
+    cancellation: Arc<AtomicBool>,
+) -> InstallationHandle {
     let worker_cancellation = cancellation.clone();
     let (sender, events) = mpsc::channel();
     let (responses, response_receiver) = mpsc::channel();
@@ -136,6 +155,25 @@ pub fn start_installation(
             let _ = sender.send(InstallationEvent::Cancelled);
             return;
         };
+        let validation = (|| -> Result<()> {
+            let config = crate::storage::read_config()?;
+            super::validate_game_library(&config, &plan.library_id, &plan.installation_directory)?;
+            let files = plan
+                .installer_files
+                .iter()
+                .cloned()
+                .chain(
+                    additional_installers
+                        .iter()
+                        .flat_map(|installer| installer.files.clone()),
+                )
+                .collect::<Vec<_>>();
+            super::validate_offline_sources(&config, &files)
+        })();
+        if let Err(error) = validation {
+            let _ = sender.send(InstallationEvent::Failed(format!("{error:#}")));
+            return;
+        }
         if let Err(error) = run_installation(
             &plan,
             &additional_installers,
@@ -190,8 +228,15 @@ pub fn start_uninstallation(game: InstalledGame) -> UninstallationHandle {
             let _ = sender.send(UninstallationEvent::Cancelled);
             return;
         };
+        if let Err(error) = crate::storage::read_config().and_then(|config| {
+            super::validate_game_library(&config, &game.library_id, &game.installation_directory)
+        }) {
+            let _ = sender.send(UninstallationEvent::Failed(format!("{error:#}")));
+            return;
+        }
         match run_uninstallation(&game, &worker_cancellation) {
             Ok(()) => {
+                drop(_permit);
                 let _ = sender.send(UninstallationEvent::Complete);
             }
             Err(error) => {
@@ -322,27 +367,23 @@ fn run_depot_uninstallation(
     }
     reject_symlink_path(directory)?;
     let journal = super::depot::operation_staging_path(library, directory, &marker.slug, "")?;
-    let prefix = marker
-        .compatibility
-        .filter(|compatibility| compatibility.managed_by_ludomere)
-        .map(|compatibility| {
-            crate::compatibility::prefix_path(library, &compatibility.prefix_slug)
-        });
-    if let Some(prefix) = prefix.as_deref() {
-        reject_symlink_path(prefix)?;
-    }
     if cancellation.load(Ordering::Acquire) {
         bail!("uninstallation cancelled");
     }
+    let session = crate::online::account_session();
+    let prefix = super::recovery::begin_uninstall_prefix(directory, product_id, &marker)?;
+    super::recovery::remove_prefix(directory, prefix, cancellation, session)
+        .context("Managed prefix removal failed; review and retry Uninstall")?;
     if directory.exists() {
         fs::remove_dir_all(directory)?;
-    }
-    if let Some(prefix) = prefix.filter(|path| path.exists()) {
-        fs::remove_dir_all(prefix)?;
     }
     super::depot_actions::remove_support_staging(&journal)?;
     if journal.exists() {
         fs::remove_file(journal)?;
+    }
+    if marker.compatibility.is_some() {
+        super::prefix_recovery::retire_after_uninstall(directory, product_id)?;
+        super::recovery::remove_control_file(&super::recovery::receipt_path(directory)?)?;
     }
     Ok(())
 }
@@ -360,6 +401,7 @@ fn reject_symlink_path(path: &Path) -> Result<()> {
 
 fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -> Result<()> {
     use crate::compatibility::{CompatibilityBackend, CompatibilityRunRequest};
+    let backend = crate::compatibility::backend_for_game(game.product_id)?;
     let compatibility = game
         .compatibility
         .as_ref()
@@ -371,35 +413,54 @@ fn run_windows_uninstallation(game: &InstalledGame, cancellation: &AtomicBool) -
         .parent()
         .context("installation has no library root")?;
     let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
+    let marker = super::marker::load(&game.installation_directory)?
+        .context("Windows installation marker is missing; reopen Uninstall for recovery")?;
+    anyhow::ensure!(
+        compatibility.prefix_slug == marker.slug,
+        "Windows prefix identity changed; reopen Uninstall"
+    );
+    let session = crate::online::account_session();
+    let prefix_identity = super::recovery::begin_uninstall_prefix(
+        &game.installation_directory,
+        game.product_id,
+        &marker,
+    )?;
     crate::compatibility::configure_library_drive(&prefix, library)
         .map_err(|e| anyhow::anyhow!(e))?;
     let log_path = uninstallation_log_path(game.product_id)?;
-    let backend = crate::compatibility::default_backend();
     let profile = crate::compatibility::profile_for_use(game.product_id, &compatibility.profile);
-    let mut process = backend.run_executable(CompatibilityRunRequest {
-        prefix,
-        profile,
-        executable: uninstaller.clone(),
-        arguments: Vec::new(),
-        working_directory: uninstaller.parent().map(PathBuf::from),
-        log_path,
-        background: false,
-    })?;
-    loop {
-        if cancellation.load(Ordering::Acquire) {
-            backend.stop(&mut process)?;
-            bail!("uninstallation cancelled")
-        }
-        if let Some(status) = process.try_wait()? {
-            if !status.success() {
-                bail!("Windows uninstaller exited unsuccessfully: {status}")
-            }
-            break;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
+    super::recovery::run_prefix_uninstaller(
+        &game.installation_directory,
+        game.product_id,
+        cancellation,
+        &log_path,
+        || {
+            Ok(backend.run_executable(CompatibilityRunRequest {
+                prefix,
+                profile,
+                executable: uninstaller.clone(),
+                arguments: Vec::new(),
+                working_directory: uninstaller.parent().map(PathBuf::from),
+                log_path: log_path.clone(),
+                background: false,
+            })?)
+        },
+    )?;
+    super::recovery::remove_prefix(
+        &game.installation_directory,
+        prefix_identity,
+        cancellation,
+        session,
+    )
+    .context(
+        "The game uninstaller finished, but its managed prefix remains. Review and retry Uninstall",
+    )?;
     super::marker::remove(&game.installation_directory)?;
     remove_empty_installation_directories(&game.installation_directory);
+    super::prefix_recovery::retire_after_uninstall(&game.installation_directory, game.product_id)?;
+    super::recovery::remove_control_file(&super::recovery::receipt_path(
+        &game.installation_directory,
+    )?)?;
     Ok(())
 }
 
@@ -598,6 +659,22 @@ fn run_windows_installation(
     cancellation: &AtomicBool,
     events: &mpsc::Sender<InstallationEvent>,
 ) -> Result<()> {
+    let prefix_recovery = super::prefix_recovery::setup_ticket(
+        &plan.installation_directory,
+        &super::marker::from_game(
+            plan,
+            additional
+                .iter()
+                .map(|dlc| super::marker::InstalledDlc {
+                    product_id: dlc.product_id,
+                    version: dlc.version.clone(),
+                    revision_id: dlc.revision_id,
+                    installed_at: 0,
+                })
+                .collect(),
+        ),
+        install_base,
+    )?;
     use crate::compatibility::{
         CompatibilityBackend, CompatibilityBackendKind, CompatibilityRunRequest,
         GameCompatibilityPreferences, InitializePrefixRequest,
@@ -608,7 +685,7 @@ fn run_windows_installation(
     if install_base {
         validate_plan(plan)?;
     }
-    let backend = crate::compatibility::default_backend();
+    let backend = crate::compatibility::backend_for_game(plan.product_id)?;
     let backend_status = backend.status()?;
     if !backend_status.available || !backend_status.healthy {
         bail!(
@@ -641,13 +718,24 @@ fn run_windows_installation(
     let current_component = Arc::new(Mutex::new(None));
     let _log_monitor =
         UmuLogStatusMonitor::start(log_path.clone(), events.clone(), current_component.clone());
-    let prefix = backend.initialize_prefix(InitializePrefixRequest {
+    let initialize = InitializePrefixRequest {
         library_id: plan.library_id.clone(),
         library: library.clone(),
         slug: slug.clone(),
         profile: profile.clone(),
         log_path: log_path.clone(),
-    })?;
+    };
+    let prefix = if let Some(ticket) = &prefix_recovery {
+        backend.initialize_prefix_controlled(initialize, |command, log| {
+            super::prefix_recovery::run_setup(ticket, cancellation, log, || {
+                Ok(crate::compatibility::CompatibilityProcess::spawn(
+                    command, log,
+                )?)
+            })
+        })?
+    } else {
+        backend.initialize_prefix(initialize)?
+    };
     fs::create_dir_all(&plan.installation_directory)?;
     let prefix_path = library.join(&prefix.relative_path);
     let component_count = usize::from(install_base) + additional.len();
@@ -667,7 +755,7 @@ fn run_windows_installation(
                 message: component_message,
             })
             .ok();
-        let mut process = backend.run_executable(CompatibilityRunRequest {
+        let request = CompatibilityRunRequest {
             prefix: prefix_path.clone(),
             profile: profile.clone(),
             executable: installer.clone(),
@@ -679,7 +767,13 @@ fn run_windows_installation(
             working_directory: installer.parent().map(PathBuf::from),
             log_path: log_path.clone(),
             background: !interactive_install,
-        })?;
+        };
+        if let Some(ticket) = &prefix_recovery {
+            return super::prefix_recovery::run_setup(ticket, cancellation, &log_path, || {
+                Ok(backend.run_executable(request)?)
+            });
+        }
+        let mut process = backend.run_executable(request)?;
         loop {
             if cancellation.load(Ordering::Acquire) {
                 backend.stop(&mut process)?;
@@ -723,25 +817,29 @@ fn run_windows_installation(
         .selected;
         let store = StateStore::open()?;
         super::save_game_preferences(&store, &completed)?;
-        super::marker::write(
-            &super::marker::from_game(&completed, Vec::new()),
-            &completed.installation_directory,
-        )?;
+        if prefix_recovery.is_none() {
+            super::marker::write(
+                &super::marker::from_game(&completed, Vec::new()),
+                &completed.installation_directory,
+            )?;
+        }
     }
     for (additional_index, dlc) in additional.iter().enumerate() {
         validate_installer_files(&dlc.files)
             .with_context(|| format!("DLC installer is incomplete: {}", dlc.title))?;
         let component_index = usize::from(install_base) + additional_index + 1;
         run_one(&dlc.files, &dlc.title, component_index, cancellation)?;
-        super::marker::record_dlc(
-            &completed,
-            super::marker::InstalledDlc {
-                product_id: dlc.product_id,
-                version: dlc.version.clone(),
-                revision_id: dlc.revision_id,
-                installed_at: chrono::Utc::now().timestamp(),
-            },
-        )?;
+        if prefix_recovery.is_none() {
+            super::marker::record_dlc(
+                &completed,
+                super::marker::InstalledDlc {
+                    product_id: dlc.product_id,
+                    version: dlc.version.clone(),
+                    revision_id: dlc.revision_id,
+                    installed_at: chrono::Utc::now().timestamp(),
+                },
+            )?;
+        }
     }
     let executable = completed.primary_executable.clone().or_else(|| {
         super::discover_windows_executable(
@@ -754,6 +852,25 @@ fn run_windows_installation(
     completed.primary_executable = executable.clone();
     completed.state = InstallationState::Installed;
     completed.updated_at = chrono::Utc::now().timestamp();
+    anyhow::ensure!(
+        !cancellation.load(Ordering::Acquire),
+        "Installation cancelled before prefix setup completion"
+    );
+    if prefix_recovery.is_some() {
+        let marker = super::marker::from_game(
+            &completed,
+            additional
+                .iter()
+                .map(|dlc| super::marker::InstalledDlc {
+                    product_id: dlc.product_id,
+                    version: dlc.version.clone(),
+                    revision_id: dlc.revision_id,
+                    installed_at: completed.updated_at,
+                })
+                .collect(),
+        );
+        super::prefix_recovery::setup_completed(prefix_recovery, &marker, true)?;
+    }
     let store = StateStore::open()?;
     super::save_game_preferences(&store, &completed)?;
     store.record_product_activity(completed.product_id, completed.updated_at)?;
@@ -1320,12 +1437,31 @@ mod tests {
             super::super::depot::operation_staging_path(&library, &directory, "game", "").unwrap();
         fs::create_dir_all(journal.parent().unwrap()).unwrap();
         fs::write(&journal, b"journal").unwrap();
+        let preferences = library.join("config/proton.json");
+        fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+        let saved = serde_json::to_vec(&crate::compatibility::ProtonPreferences {
+            default: Some(PathBuf::from("/external/GE-Proton")),
+            overrides: std::collections::BTreeMap::from([(
+                "7".into(),
+                PathBuf::from("/external/UMU-Proton"),
+            )]),
+            dll_overrides: std::collections::BTreeMap::from([(
+                "7".into(),
+                std::collections::BTreeMap::from([(
+                    "dinput8".into(),
+                    crate::compatibility::DllLoadOrder::Builtin,
+                )]),
+            )]),
+        })
+        .unwrap();
+        fs::write(&preferences, &saved).unwrap();
 
         run_depot_uninstallation(7, &directory, &AtomicBool::new(false)).unwrap();
 
         assert!(!directory.exists());
         assert!(!prefix.exists());
         assert!(!journal.exists());
+        assert_eq!(fs::read(preferences).unwrap(), saved);
         fs::remove_dir_all(library).unwrap();
     }
 

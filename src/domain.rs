@@ -80,6 +80,35 @@ pub struct ExternalLinks {
     pub support: Option<String>,
 }
 
+impl From<Dlc> for Game {
+    fn from(dlc: Dlc) -> Self {
+        Self {
+            product_id: dlc.product_id,
+            slug: dlc.slug,
+            title: dlc.title,
+            release_date: dlc.release_date,
+            description: dlc.description,
+            changelog: dlc.changelog,
+            platforms: dlc.platforms,
+            languages: dlc.languages,
+            metadata: dlc.metadata,
+            galaxy_builds: dlc.galaxy_builds,
+            location: dlc.location,
+            artwork: dlc.artwork,
+            detail_artwork: dlc.detail_artwork,
+            hero_logo: dlc.hero_logo,
+            icon: dlc.icon,
+            screenshots: dlc.screenshots,
+            links: dlc.links,
+            installers: dlc.installers,
+            extras: dlc.extras,
+            remote_artifacts: dlc.remote_artifacts,
+            disk_usage: dlc.disk_usage,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Screenshot {
     pub id: String,
@@ -433,12 +462,16 @@ pub struct InstalledGame {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GamePreferences {
     pub product_id: i64,
     pub executable_path: Option<std::path::PathBuf>,
     pub launch_arguments: Vec<String>,
     pub compatibility: Option<crate::compatibility::GameCompatibilityPreferences>,
+    pub auto_update_galaxy: Option<bool>,
+    pub auto_download_offline_installer: Option<bool>,
+    pub prune_superseded_installers: Option<bool>,
+    pub galaxy_language: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -567,16 +600,36 @@ fn platform_label(platforms: &Platforms) -> String {
 }
 
 pub fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
         unit += 1;
     }
     if unit == 0 {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn displays_decimal_bytes_without_changing_the_input() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (999, "999 B"),
+            (1000, "1.0 kB"),
+            (1024, "1.0 kB"),
+            (1_000_000, "1.0 MB"),
+            (1_048_576, "1.0 MB"),
+            (1_500_000, "1.5 MB"),
+            (1_000_000_000, "1.0 GB"),
+            (1_000_000_000_000, "1.0 TB"),
+        ] {
+            assert_eq!(super::human_size(bytes), expected);
+        }
     }
 }

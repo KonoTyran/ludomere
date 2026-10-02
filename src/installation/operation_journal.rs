@@ -105,7 +105,19 @@ pub fn scan() -> Result<Vec<(PathBuf, OperationJournal)>> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with(".operation.json"))
             {
-                journals.push((path.clone(), read(&path)?));
+                let journal = read(&path)?;
+                let product_id = match &journal {
+                    OperationJournal::Offline { record, .. } => record.product_id,
+                    OperationJournal::Depot { record, .. } => record.product_id,
+                };
+                let slug = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap()
+                    .trim_end_matches(".operation.json");
+                if !super::recovery::pending(&library.path.join(slug), product_id)? {
+                    journals.push((path.clone(), journal));
+                }
             }
         }
     }

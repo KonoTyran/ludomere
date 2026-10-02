@@ -4,16 +4,57 @@ use std::{
     sync::{Arc, atomic::AtomicBool, mpsc},
 };
 
+mod auto_install;
+mod cleanup;
+mod completion;
 pub mod depot;
 mod files;
 mod layout;
 mod manager;
+pub(crate) use manager::quiesce_recovery;
+
+pub(crate) fn recovery_staging(
+    job: &crate::state::DownloadJobRecord,
+    slug: &str,
+    child: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    anyhow::ensure!(
+        !job.artifacts.is_empty(),
+        "Download has no artifact identity"
+    );
+    let relative =
+        layout::destination(std::path::Path::new("/"), slug, child, &[&job.artifacts[0]]);
+    anyhow::ensure!(
+        job.destination.is_absolute()
+            && job.destination.components().all(|part| matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::RootDir
+            ))
+            && job.destination.ends_with(relative.strip_prefix("/")?),
+        "Download layout is ambiguous; its partial files were retained"
+    );
+    Ok(layout::staging_directory(
+        &job.destination,
+        &job.artifacts,
+        &job.job_id,
+    ))
+}
 mod protocol;
 mod transfer;
+mod trash;
 mod verify;
 mod worker;
 
+pub use cleanup::{CleanupResult, ManagedDownloads, managed_downloads, managed_downloads_for_kind};
 pub use files::{delete_completed_files, prune_empty_directories};
+
+pub fn delete_managed_downloads(files: ManagedDownloads) -> anyhow::Result<CleanupResult> {
+    manager::delete_managed_downloads(files, false)
+}
+
+pub(crate) fn cleanup_after_uninstall(files: ManagedDownloads) -> anyhow::Result<CleanupResult> {
+    manager::delete_managed_downloads(files, true)
+}
 pub use layout::destination;
 use layout::{key, staging_directory};
 pub use verify::{GogChecksum, file_md5_with_progress, gog_checksum};
@@ -35,6 +76,7 @@ pub enum DownloadFailureKind {
     ManifestChanged,
     DiskFull,
     PermissionDenied,
+    Bookkeeping,
     Other,
 }
 
@@ -51,11 +93,46 @@ impl std::fmt::Display for DownloadFailure {
 }
 
 pub struct DownloadRequest {
+    pub library_id: String,
     pub artifacts: Vec<RemoteArtifact>,
     pub title: String,
     pub access_token: String,
     pub destination: PathBuf,
     pub events: mpsc::Sender<DownloadEvent>,
+}
+
+pub struct AutoInstallRequest {
+    pub library_id: String,
+    pub product_id: i64,
+    pub slug: String,
+    pub title: String,
+    pub config: crate::config::Config,
+}
+
+/// Worker-only: persist the explicit install choice before any selected download can complete.
+pub fn enqueue_with_install(
+    requests: Vec<DownloadRequest>,
+    install: Option<AutoInstallRequest>,
+    session: u64,
+) -> anyhow::Result<usize> {
+    manager::enqueue_with_install(requests, install, session)
+}
+
+pub fn retry_install_after_download(product_id: i64) -> anyhow::Result<()> {
+    manager::retry_install_after_download(product_id)
+}
+
+/// Automatic backups never create, replace or revoke installation consent.
+pub(crate) fn enqueue_backup(request: DownloadRequest, session: u64) -> anyhow::Result<()> {
+    manager::enqueue_backup(request, session)
+}
+
+pub(crate) fn check_installer_retention(
+    product_id: i64,
+    token: &str,
+    session: u64,
+) -> anyhow::Result<()> {
+    manager::check_retention(product_id, token, session)
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +145,12 @@ pub enum DownloadManagerEvent {
     },
     AuthenticationRequired,
     ManagedFilesChanged(i64),
+    BookkeepingFailed {
+        job_id: String,
+        product_id: i64,
+        message: String,
+        session: u64,
+    },
 }
 
 pub fn job_id(artifacts: &[&RemoteArtifact]) -> String {
@@ -112,13 +195,43 @@ pub fn job_id(artifacts: &[&RemoteArtifact]) -> String {
 }
 
 pub fn enqueue(request: DownloadRequest) -> Arc<AtomicBool> {
-    manager::enqueue(
-        request.artifacts,
-        request.title,
-        request.access_token,
-        request.destination,
-        request.events,
+    manager::enqueue(request)
+}
+
+pub fn job_id_at(artifacts: &[&RemoteArtifact], destination: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    format!(
+        "{}-{:x}",
+        job_id(artifacts),
+        md5::compute(destination.as_os_str().as_bytes())
     )
+}
+
+/// Worker-only: reuse an existing queue identity only for this exact revision and destination.
+pub fn resolve_job_id(
+    artifacts: &[&RemoteArtifact],
+    destination: &std::path::Path,
+) -> anyhow::Result<String> {
+    job_id_in(&crate::state::StateStore::open()?, artifacts, destination)
+}
+
+fn job_id_in(
+    store: &crate::state::StateStore,
+    artifacts: &[&RemoteArtifact],
+    destination: &std::path::Path,
+) -> anyhow::Result<String> {
+    let identity = job_id(artifacts);
+    Ok(store
+        .download_jobs()?
+        .into_iter()
+        .filter(|job| {
+            job.destination == destination
+                && !job.artifacts.is_empty()
+                && job_id(&job.artifacts.iter().collect::<Vec<_>>()) == identity
+        })
+        .max_by_key(|job| job.updated_at)
+        .map(|job| job.job_id)
+        .unwrap_or_else(|| job_id_at(artifacts, destination)))
 }
 
 pub fn manager_events() -> mpsc::Receiver<DownloadManagerEvent> {
@@ -159,6 +272,10 @@ pub fn set_network_available(available: bool) {
 
 pub fn set_authenticated(authenticated: bool) {
     manager::set_authenticated(authenticated);
+}
+
+pub fn pause_for_sign_out() -> anyhow::Result<()> {
+    manager::pause_for_sign_out()
 }
 
 pub fn shutdown() {
@@ -354,6 +471,7 @@ mod tests {
             &sender,
             false,
             1,
+            crate::online::account_session(),
         )
     }
 
@@ -420,6 +538,123 @@ mod tests {
         );
         descriptor_thread.join().unwrap();
         cdn_thread.join().unwrap();
+    }
+
+    #[test]
+    fn automatic_backup_requests_keep_download_and_staging_layout_under_configured_root() {
+        let directory = TestDirectory::new("automatic-backup-layout");
+        let library = crate::config::GameLibrary {
+            id: "offline".into(),
+            name: "Offline".into(),
+            path: directory.0.join("downloads"),
+            default: true,
+        };
+        let token = crate::auth::Token {
+            access_token: "inert".into(),
+            refresh_token: "inert".into(),
+            user_id: "fixture".into(),
+            expires_at: 0,
+        };
+        for (slug, expected_slug) in [
+            ("example_game", "example_game"),
+            ("../../outside", "outside"),
+            ("/outside", "outside"),
+            ("..", "123"),
+        ] {
+            let artifacts = vec![RemoteArtifact {
+                product_id: 123,
+                kind: crate::domain::ArtifactKind::Installer,
+                name: "Example".into(),
+                language: Some("English".into()),
+                operating_system: Some("windows".into()),
+                version: Some("1".into()),
+                release_date: None,
+                size_label: None,
+                size_bytes: None,
+                part_number: None,
+                part_count: None,
+                download_path: "/downloads/example".into(),
+                provider_group_id: None,
+                provider_file_id: None,
+                provider_category: None,
+            }];
+            let request = crate::updates::backup_request(
+                &library,
+                &crate::domain::Game {
+                    product_id: 123,
+                    slug: slug.into(),
+                    title: "Example".into(),
+                    ..Default::default()
+                },
+                &token,
+                artifacts,
+            );
+            assert_eq!(
+                request.destination,
+                library
+                    .path
+                    .join(expected_slug)
+                    .join("installer/windows/english")
+            );
+            let id = job_id(&request.artifacts.iter().collect::<Vec<_>>());
+            let staging = staging_directory(&request.destination, &request.artifacts, &id);
+            assert_eq!(
+                staging,
+                library
+                    .path
+                    .join(crate::identity::STAGING_DIRECTORY)
+                    .join(key(&id))
+            );
+            fs::create_dir_all(&staging).unwrap();
+            fs::write(staging.join("inert-part"), b"fixture").unwrap();
+            assert!(
+                staging
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(library.path.canonicalize().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn destination_identity_keeps_independent_copies_and_exact_legacy_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::state::StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":7,"kind":"installer","name":"setup","size_bytes":4,"download_path":"/inert"}
+        ])).unwrap();
+        let refs = artifacts.iter().collect::<Vec<_>>();
+        let first = root.path().join("first/game/installer");
+        let second = root.path().join("second/game/installer");
+        assert_ne!(job_id_at(&refs, &first), job_id_at(&refs, &second));
+        let legacy = job_id(&refs);
+        store
+            .save_download_job(&crate::state::DownloadJobUpdate {
+                job_id: &legacy,
+                product_id: 7,
+                title: "Fixture",
+                artifacts: &artifacts,
+                destination: &first,
+                state: crate::state::DownloadState::Paused,
+                bytes_downloaded: 2,
+                total_bytes: Some(4),
+                completed_files: &[],
+                error: None,
+            })
+            .unwrap();
+        assert_eq!(job_id_in(&store, &refs, &first).unwrap(), legacy);
+        assert_eq!(
+            job_id_in(&store, &refs, &second).unwrap(),
+            job_id_at(&refs, &second)
+        );
+        assert_eq!(
+            store
+                .download_job(&legacy)
+                .unwrap()
+                .unwrap()
+                .bytes_downloaded,
+            2
+        );
     }
 
     #[test]
@@ -672,6 +907,7 @@ mod tests {
             &sender,
             false,
             2,
+            crate::online::account_session(),
         )
         .unwrap();
         server.join().unwrap();

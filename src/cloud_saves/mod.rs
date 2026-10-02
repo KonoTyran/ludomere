@@ -245,9 +245,9 @@ fn windows_builds(
         .collect())
 }
 
-pub fn inventory(game: &InstalledGame) -> Result<CloudSaveInventory> {
-    let session = crate::auth::session();
+pub fn inventory(game: &InstalledGame, session: u64) -> Result<CloudSaveInventory> {
     ensure_session(session)?;
+    let _activity = crate::profile_reset::begin_activity("checking cloud-save storage")?;
     let store = crate::state::StateStore::open()?;
     let record = store.cloud_save_record(game.product_id)?;
     if record.availability != CloudSaveAvailability::Supported {
@@ -278,10 +278,6 @@ fn summarize_inventory(objects: &[api::RemoteObject]) -> CloudSaveInventory {
             .fold(0, |total, object| total.saturating_add(object.size)),
         latest_modified_at: objects.iter().map(|object| object.modified_at).max(),
     }
-}
-
-pub fn sync(request: CloudSyncRequest) -> Result<CloudSyncResult> {
-    sync_for_session(request, crate::auth::session())
 }
 
 pub fn sync_for_session(mut request: CloudSyncRequest, session: u64) -> Result<CloudSyncResult> {

@@ -12,6 +12,12 @@ pub(super) fn show_game_settings(
     };
     let window_name = format!("ludomere-game-settings-{}", game.product_id);
     let session = online::account_session();
+    let cloud_session = CloudActionSession {
+        auth: auth::session(),
+        online: session,
+        epoch: model.borrow().account_epoch,
+        model: Rc::downgrade(model),
+    };
     if let Some(existing) = application
         .windows()
         .into_iter()
@@ -390,13 +396,13 @@ pub(super) fn show_game_settings(
             check_inventory.set_sensitive(supported);
             let inventory_game = installed_game.clone();
             let inventory_status = inventory_row.clone();
+            let origin = cloud_session.clone();
             check_inventory.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                inventory_status.set_subtitle("Checking remote save files…");
                 load_cloud_inventory(
                     inventory_game.clone(),
                     inventory_status.clone(),
                     button.clone(),
+                    origin.clone(),
                 );
             });
             inventory_row.add_suffix(&check_inventory);
@@ -462,10 +468,12 @@ pub(super) fn show_game_settings(
             let game = installed_game.clone();
             let locations = locations_state.clone();
             let status = cloud_status.clone();
+            let origin = cloud_session.clone();
             sync_now.connect_clicked(move |button| {
                 run_cloud_action(
                     button,
                     &status,
+                    &origin,
                     crate::cloud_saves::CloudSyncRequest {
                         game: game.clone(),
                         locations: locations.borrow().clone(),
@@ -523,12 +531,14 @@ pub(super) fn show_game_settings(
                 let status = cloud_status.clone();
                 let parent = window.clone();
                 let popover = popover.clone();
+                let origin = cloud_session.clone();
                 button.connect_clicked(move |button| {
                     popover.popdown();
                     confirm_force_cloud_action(
                         &parent,
                         button,
                         &status,
+                        &origin,
                         crate::cloud_saves::CloudSyncRequest {
                             game: game.clone(),
                             locations: locations.borrow().clone(),
@@ -1915,24 +1925,80 @@ fn monitor_source_migration(
     });
 }
 
+#[derive(Clone)]
+struct CloudActionSession {
+    auth: u64,
+    online: u64,
+    epoch: u64,
+    model: std::rc::Weak<RefCell<AppModel>>,
+}
+
+impl CloudActionSession {
+    fn is_current(&self) -> bool {
+        auth::session_is_current(self.auth)
+            && self.online == online::account_session()
+            && self.model.upgrade().is_some_and(|model| {
+                model
+                    .try_borrow()
+                    .is_ok_and(|state| state.account_epoch == self.epoch && !state.logout_pending)
+            })
+    }
+
+    fn check(&self, button: &gtk::Button, status: &gtk::Label) -> bool {
+        let current = self.is_current();
+        if !current {
+            button.set_sensitive(false);
+            status.set_label(
+                "Account changed. Close and reopen game properties before synchronizing saves.",
+            );
+        }
+        current
+    }
+}
+
 fn run_cloud_action(
     button: &gtk::Button,
     status: &gtk::Label,
+    origin: &CloudActionSession,
     request: crate::cloud_saves::CloudSyncRequest,
 ) {
+    if !origin.check(button, status) {
+        return;
+    }
     button.set_sensitive(false);
     status.set_label("Synchronizing…");
     let (sender, receiver) = std::sync::mpsc::channel();
+    let auth_session = origin.auth;
+    let online_session = origin.online;
     std::thread::spawn(move || {
-        sender
-            .send(crate::cloud_saves::sync(request).map_err(|error| format!("{error:#}")))
-            .ok();
+        let result = if online::account_session() == online_session {
+            crate::cloud_saves::sync_for_session(request, auth_session)
+                .map_err(|error| format!("{error:#}"))
+        } else {
+            Err("Account changed before synchronization started.".into())
+        };
+        let _ = sender.send(result);
     });
-    let button = button.clone();
-    let status = status.clone();
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(100),
-        move || match receiver.try_recv() {
+    monitor_cloud_action(button, status, origin, receiver);
+}
+
+fn monitor_cloud_action(
+    button: &gtk::Button,
+    status: &gtk::Label,
+    origin: &CloudActionSession,
+    receiver: mpsc::Receiver<Result<crate::domain::CloudSyncResult, String>>,
+) {
+    let button = button.downgrade();
+    let status = status.downgrade();
+    let origin = origin.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let (Some(button), Some(status)) = (button.upgrade(), status.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if !origin.check(&button, &status) {
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
             Ok(Ok(result)) => {
                 button.set_sensitive(true);
                 if result.conflicts.is_empty() {
@@ -1950,7 +2016,10 @@ fn run_cloud_action(
             }
             Ok(Err(error)) => {
                 button.set_sensitive(true);
-                status.set_label(&error);
+                status.set_label(&super::notifications::failure_message(
+                    "Cloud synchronization failed",
+                    &error,
+                ));
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1959,24 +2028,59 @@ fn run_cloud_action(
                 status.set_label("Cloud-save worker stopped unexpectedly");
                 glib::ControlFlow::Break
             }
-        },
-    );
+        }
+    });
 }
 
 fn load_cloud_inventory(
     game: crate::domain::InstalledGame,
     row: adw::ActionRow,
     button: gtk::Button,
+    origin: CloudActionSession,
 ) {
+    if !origin.is_current() {
+        button.set_sensitive(false);
+        row.set_subtitle(
+            "Account changed. Close and reopen game properties before checking cloud storage.",
+        );
+        return;
+    }
+    button.set_sensitive(false);
+    row.set_subtitle("Checking remote save files…");
     let (sender, receiver) = std::sync::mpsc::channel();
+    let auth_session = origin.auth;
+    let online_session = origin.online;
     std::thread::spawn(move || {
-        sender
-            .send(crate::cloud_saves::inventory(&game).map_err(|error| format!("{error:#}")))
-            .ok();
+        let result = if online::account_session() == online_session {
+            crate::cloud_saves::inventory(&game, auth_session).map_err(|error| format!("{error:#}"))
+        } else {
+            Err("Account changed before checking cloud storage.".into())
+        };
+        let _ = sender.send(result);
     });
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(100),
-        move || match receiver.try_recv() {
+    monitor_cloud_inventory(&row, &button, origin, receiver);
+}
+
+fn monitor_cloud_inventory(
+    row: &adw::ActionRow,
+    button: &gtk::Button,
+    origin: CloudActionSession,
+    receiver: mpsc::Receiver<Result<crate::cloud_saves::CloudSaveInventory, String>>,
+) {
+    let row = row.downgrade();
+    let button = button.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let (Some(row), Some(button)) = (row.upgrade(), button.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if !origin.is_current() {
+            button.set_sensitive(false);
+            row.set_subtitle(
+                "Account changed. Close and reopen game properties before checking cloud storage.",
+            );
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
             Ok(Ok(inventory)) => {
                 button.set_sensitive(true);
                 let files = match inventory.file_count {
@@ -2001,7 +2105,10 @@ fn load_cloud_inventory(
             }
             Ok(Err(error)) => {
                 button.set_sensitive(true);
-                row.set_subtitle(&format!("Could not check cloud storage: {error}"));
+                row.set_subtitle(&super::notifications::failure_message(
+                    "Could not check cloud storage",
+                    &error,
+                ));
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2010,16 +2117,20 @@ fn load_cloud_inventory(
                 row.set_subtitle("Cloud-storage check stopped unexpectedly");
                 glib::ControlFlow::Break
             }
-        },
-    );
+        }
+    });
 }
 
 fn confirm_force_cloud_action(
     parent: &adw::ApplicationWindow,
     button: &gtk::Button,
     status: &gtk::Label,
+    origin: &CloudActionSession,
     request: crate::cloud_saves::CloudSyncRequest,
 ) {
+    if !origin.check(button, status) {
+        return;
+    }
     let (heading, body, response) = match request.mode {
         crate::domain::CloudSyncMode::ForceDownload => (
             "Replace local saves?",
@@ -2043,9 +2154,10 @@ fn confirm_force_cloud_action(
     dialog.set_close_response("cancel");
     let button = button.clone();
     let status = status.clone();
+    let origin = origin.clone();
     dialog.choose(Some(parent), gio::Cancellable::NONE, move |response| {
         if response == "force" {
-            run_cloud_action(&button, &status, request);
+            run_cloud_action(&button, &status, &origin, request);
         }
     });
 }
@@ -2283,6 +2395,241 @@ fn info_row(title: &str, value: &str) -> adw::ActionRow {
 #[cfg(test)]
 mod control_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus; no real cloud calls"]
+    fn cloud_actions_reject_stale_confirmation_and_completion() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p267-")
+        );
+        adw::init().unwrap();
+        fn click_response(widget: &gtk::Widget, label: &str) -> bool {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>()
+                && button.label().as_deref() == Some(label)
+            {
+                button.emit_clicked();
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if click_response(&current, label) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.CloudSessionTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let button = gtk::Button::with_label("Sync now");
+        let status = gtk::Label::new(Some("Ready"));
+        content.append(&button);
+        content.append(&status);
+        window.set_content(Some(&content));
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let origin = CloudActionSession {
+            auth: auth::session(),
+            online: online::account_session(),
+            epoch: 0,
+            model: Rc::downgrade(&model),
+        };
+        let mut request = crate::cloud_saves::CloudSyncRequest {
+            game: crate::domain::InstalledGame {
+                product_id: 9267001,
+                library_id: "synthetic".into(),
+                installed_version: None,
+                installation_directory: "/inert/not-a-real-game".into(),
+                installer_revision_id: None,
+                installer_job_id: None,
+                installer_files: vec![],
+                installer_complete: false,
+                installer_operating_system: None,
+                installer_language: None,
+                compatibility: None,
+                primary_executable: None,
+                launch_arguments: vec![],
+                state: crate::domain::InstallationState::Pending,
+                error: None,
+                installed_at: None,
+                verified_at: None,
+                last_played_at: None,
+                playtime_seconds: 0,
+                created_at: 0,
+                updated_at: 0,
+            },
+            locations: vec![],
+            mode: crate::domain::CloudSyncMode::Normal,
+        };
+        let stale_auth = origin.auth.wrapping_add(1);
+        assert!(
+            crate::cloud_saves::sync_for_session(request.clone(), stale_auth)
+                .unwrap_err()
+                .to_string()
+                .contains("session changed")
+        );
+        assert!(
+            crate::cloud_saves::inventory(&request.game, stale_auth)
+                .unwrap_err()
+                .to_string()
+                .contains("session changed")
+        );
+        for stale in [
+            CloudActionSession {
+                auth: origin.auth.wrapping_add(1),
+                ..origin.clone()
+            },
+            CloudActionSession {
+                online: origin.online.wrapping_add(1),
+                ..origin.clone()
+            },
+        ] {
+            button.set_sensitive(true);
+            run_cloud_action(&button, &status, &stale, request.clone());
+            assert!(!button.is_sensitive());
+            assert!(status.label().contains("Account changed"));
+        }
+        model.borrow_mut().logout_pending = true;
+        run_cloud_action(&button, &status, &origin, request.clone());
+        assert!(status.label().contains("Account changed"));
+        model.borrow_mut().logout_pending = false;
+        button.set_sensitive(true);
+        status.set_label("Ready");
+        request.mode = crate::domain::CloudSyncMode::ForceDownload;
+        confirm_force_cloud_action(&window, &button, &status, &origin, request.clone());
+        let dialog = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert!(click_response(dialog.upcast_ref(), "Cancel"));
+        wait_until(|| window.visible_dialog().is_none());
+        assert_eq!(status.label(), "Ready");
+        assert!(button.is_sensitive());
+        confirm_force_cloud_action(&window, &button, &status, &origin, request.clone());
+        let dialog = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .unwrap();
+        model.borrow_mut().account_epoch += 1;
+        assert!(click_response(dialog.upcast_ref(), "Force download"));
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!button.is_sensitive());
+        model.borrow_mut().account_epoch = 0;
+
+        let (sender, receiver) = mpsc::channel();
+        button.set_sensitive(false);
+        status.set_label("Synchronizing…");
+        monitor_cloud_action(&button, &status, &origin, receiver);
+        model.borrow_mut().account_epoch += 1;
+        sender
+            .send(Ok(crate::domain::CloudSyncResult::default()))
+            .unwrap();
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!button.is_sensitive());
+        assert!(!status.label().contains("Synchronized:"));
+        model.borrow_mut().account_epoch = 0;
+
+        for outcome in [
+            Some(Ok(crate::domain::CloudSyncResult {
+                uploaded: 2,
+                ..Default::default()
+            })),
+            Some(Err(
+                "synthetic failure https://example.invalid/?token=SECRET".into(),
+            )),
+            None,
+        ] {
+            button.set_sensitive(false);
+            status.set_label("Synchronizing…");
+            let (sender, receiver) = mpsc::channel();
+            monitor_cloud_action(&button, &status, &origin, receiver);
+            let expected = match &outcome {
+                Some(Ok(_)) => "2 uploaded",
+                Some(Err(_)) => "synthetic failure",
+                None => "stopped unexpectedly",
+            };
+            if let Some(result) = outcome {
+                sender.send(result).unwrap();
+            }
+            drop(sender);
+            wait_until(|| status.label().contains(expected));
+            assert!(button.is_sensitive());
+            assert!(!status.label().contains("SECRET"));
+        }
+        let inventory = adw::ActionRow::new();
+        let check = gtk::Button::with_label("Check now");
+        inventory.add_suffix(&check);
+        content.append(&inventory);
+        load_cloud_inventory(
+            request.game,
+            inventory.clone(),
+            check.clone(),
+            CloudActionSession {
+                auth: origin.auth.wrapping_add(1),
+                ..origin.clone()
+            },
+        );
+        assert!(!check.is_sensitive());
+        assert!(inventory.subtitle().unwrap().contains("Account changed"));
+        let (sender, receiver) = mpsc::channel();
+        inventory.set_subtitle("Checking…");
+        monitor_cloud_inventory(&inventory, &check, origin.clone(), receiver);
+        model.borrow_mut().account_epoch += 1;
+        sender
+            .send(Ok(crate::cloud_saves::CloudSaveInventory {
+                file_count: 99,
+                total_size: 0,
+                latest_modified_at: None,
+            }))
+            .unwrap();
+        wait_until(|| inventory.subtitle().unwrap().contains("Account changed"));
+        assert!(!check.is_sensitive());
+        model.borrow_mut().account_epoch = 0;
+        for outcome in [
+            Some(Ok(crate::cloud_saves::CloudSaveInventory {
+                file_count: 1,
+                total_size: 42,
+                latest_modified_at: None,
+            })),
+            Some(Err(
+                "synthetic inventory failure https://example.invalid/?token=SECRET".into(),
+            )),
+            None,
+        ] {
+            inventory.set_subtitle("Checking…");
+            check.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            monitor_cloud_inventory(&inventory, &check, origin.clone(), receiver);
+            let expected = match &outcome {
+                Some(Ok(_)) => "1 remote save file",
+                Some(Err(_)) => "synthetic inventory failure",
+                None => "stopped unexpectedly",
+            };
+            if let Some(result) = outcome {
+                sender.send(result).unwrap();
+            }
+            drop(sender);
+            wait_until(|| inventory.subtitle().unwrap().contains(expected));
+            assert!(check.is_sensitive());
+            assert!(!inventory.subtitle().unwrap().contains("SECRET"));
+        }
+        window.close();
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/XDG, private GTK display and D-Bus"]

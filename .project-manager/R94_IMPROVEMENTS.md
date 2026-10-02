@@ -105,7 +105,13 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   and terminal/disconnect feedback in place, suppress stale account/view actions, and no longer
   open background completion/error modals. Unused patch_with_components removed. GTK1 PASS and
   independent review PASS /tmp/ludomere-p268-patch-review.md. Separate commit next.
+  Commit7fd0c7f exact post-commit build PASS (/tmp/ludomere-r94-set12-build.log).
 - P263 commit656d145 exact post-commit build PASS (/tmp/ludomere-r94-set11-build.log).
+- P267 manual cloud Normal/Force/Check now actions carry original auth+online+UI account identity
+  through confirmation, worker and result; stale actions/results disable with reopen guidance.
+  Inventory joins profile activity; diagnostics sanitized and unused fresh-session sync wrapper
+  removed. Owner GTK1+pure2 and independent GTK1/security review PASS
+  (/tmp/ludomere-p268-cloud-review.md). No real cloud/keyring/save operations. Committing next.
 
 ## Deferred findings and verification limits
 

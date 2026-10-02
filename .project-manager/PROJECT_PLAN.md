@@ -1,5 +1,22 @@
 # Project plan
 
+## P272 R94 downloaded-file verification feedback
+
+- storage_audit identified start_product_verification presenting a completion modal from a
+  background callback, losing full details from the persistent status and mislabeling unavailable
+  checksums as no downloads. Own files.rs verification path only: retain sanitized completion/error
+  detail inline, remove unsolicited terminal modal, distinguish empty input from unavailable checks.
+  Preserve consent, repair/deletion decisions, cancellation and session checks. Synthetic events/
+  private GTK or pure outcomes only; no real files/helper/network. Independent review and focused
+  tests, separate commit/build; stop for scope expansion or unresolved deletion-policy ambiguity.
+
+## P273 R94 further library responsiveness audit
+
+- Depot read-only audit library.rs rebuild/title and grid-scroll cover-priority work. Establish
+  actual redundant work and propose bounded improvements with source evidence and synthetic
+  verification; no edits before manager accepts proposal. Preserve live-state checks, row identity,
+  priority ordering and account/closing behavior; no persistent broad model-index redesign.
+
 ## P270 R94 organization write lifecycle
 
 - Confirmed root review: organization.rs hide/tag worker writes use UI epoch only for results;

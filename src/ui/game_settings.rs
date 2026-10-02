@@ -158,9 +158,6 @@ pub(super) fn show_game_settings(
     fixes_group.set_description(Some(
         "Recommended fixes are preselected for known games. Changes apply the next time the game launches.",
     ));
-    let overrides = crate::state::StateStore::open()
-        .and_then(|store| store.compatibility_fix_overrides(game.product_id))
-        .unwrap_or_default();
     let recommended = crate::compatibility::recommended_fix_ids(game.product_id);
     let resetting = Rc::new(std::cell::Cell::new(false));
     let fixes_status = gtk::Label::builder().wrap(true).xalign(0.0).build();
@@ -175,8 +172,8 @@ pub(super) fn show_game_settings(
         } else {
             fix.description.clone()
         });
-        row.set_active(overrides.get(&fix.id).copied().unwrap_or(is_recommended));
-        row.set_sensitive(installed.is_some());
+        row.set_active(is_recommended);
+        row.set_sensitive(false);
         let product_id = game.product_id;
         let fix_id = fix.id.clone();
         let resetting = resetting.clone();
@@ -223,7 +220,7 @@ pub(super) fn show_game_settings(
         .set_subtitle("Reset the compatibility-fix switches to shipped recommendations. DLL overrides are unchanged.");
     let reset = gtk::Button::with_label("Reapply Recommended");
     reset.set_valign(gtk::Align::Center);
-    reset.set_sensitive(installed.is_some());
+    reset.set_sensitive(false);
     reset_row.add_suffix(&reset);
     fixes_group.add(&reset_row);
     let product_id = game.product_id;
@@ -232,6 +229,7 @@ pub(super) fn show_game_settings(
         let refresh_after_change = refresh_after_change.clone();
         let group = fixes_group.downgrade();
         let status = fixes_status.clone();
+        let fix_rows = fix_rows.clone();
         move |_| {
             let Some(group) = group.upgrade() else {
                 return;
@@ -258,6 +256,16 @@ pub(super) fn show_game_settings(
             );
         }
     });
+    load_compatibility_fix_preferences(
+        &fixes_group,
+        &fixes_status,
+        fix_rows,
+        &reset,
+        resetting,
+        game.product_id,
+        session,
+        installed.is_some(),
+    );
     compatibility_page.add(&fixes_group);
     let updates_page = adw::PreferencesPage::new();
     updates_page.set_title("Updates");
@@ -1925,6 +1933,123 @@ fn monitor_source_migration(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn load_compatibility_fix_preferences(
+    group: &adw::PreferencesGroup,
+    status: &gtk::Label,
+    rows: Vec<(String, adw::SwitchRow)>,
+    reset: &gtk::Button,
+    resetting: Rc<std::cell::Cell<bool>>,
+    product_id: i64,
+    session: u64,
+    installed: bool,
+) {
+    let retry = gtk::Button::with_label("Retry");
+    retry.set_widget_name("compatibility-fixes-retry");
+    retry.set_halign(gtk::Align::Start);
+    group.add(&retry);
+    let load: Rc<dyn Fn()> = Rc::new({
+        let group = group.downgrade();
+        let retry = retry.downgrade();
+        let status = status.clone();
+        let reset = reset.clone();
+        let loading = Rc::new(std::cell::Cell::new(false));
+        move || {
+            let Some(retry) = retry.upgrade() else { return };
+            if group.upgrade().is_none() || loading.get() {
+                return;
+            }
+            for (_, row) in &rows {
+                row.set_sensitive(false);
+            }
+            reset.set_sensitive(false);
+            if online::account_session() != session {
+                retry.set_sensitive(false);
+                status
+                    .set_label("The account changed. Reopen Properties before changing settings.");
+                return;
+            }
+            loading.set(true);
+            retry.set_visible(false);
+            status.remove_css_class("error");
+            status.set_label("Loading compatibility fixes…");
+            let receiver = update_policies::policy_request(move || {
+                let _activity =
+                    crate::profile_reset::begin_activity("loading compatibility fixes")?;
+                anyhow::ensure!(
+                    online::account_session() == session,
+                    "Account changed; reopen Properties."
+                );
+                StateStore::open()?.compatibility_fix_overrides(product_id)
+            });
+            let group = group.clone();
+            let retry = retry.downgrade();
+            let status = status.clone();
+            let reset = reset.clone();
+            let rows = rows.clone();
+            let loading = loading.clone();
+            let resetting = resetting.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                let Some(retry) = retry.upgrade().filter(|_| group.upgrade().is_some()) else {
+                    return glib::ControlFlow::Break;
+                };
+                if online::account_session() != session {
+                    status.set_label(
+                        "The account changed. Reopen Properties before changing settings.",
+                    );
+                    retry.set_sensitive(false);
+                    loading.set(false);
+                    return glib::ControlFlow::Break;
+                }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Compatibility preference loading stopped unexpectedly."
+                    )),
+                };
+                loading.set(false);
+                match result {
+                    Ok(overrides) => {
+                        let recommended = crate::compatibility::recommended_fix_ids(product_id);
+                        resetting.set(true);
+                        for (id, row) in &rows {
+                            row.set_active(
+                                overrides
+                                    .get(id)
+                                    .copied()
+                                    .unwrap_or(recommended.contains(id)),
+                            );
+                            row.set_sensitive(installed);
+                        }
+                        resetting.set(false);
+                        reset.set_sensitive(installed);
+                        status.set_label(if installed {
+                            "Changes apply the next time the game launches."
+                        } else {
+                            "Install this game before changing compatibility fixes."
+                        });
+                    }
+                    Err(error) => {
+                        status.add_css_class("error");
+                        status.set_label(&super::notifications::failure_message(
+                            "Could not load compatibility fixes",
+                            &format!("{error:#}"),
+                        ));
+                        retry.set_visible(true);
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    retry.connect_clicked({
+        let load = load.clone();
+        move |_| load()
+    });
+    load();
+}
+
 #[derive(Clone)]
 struct CloudActionSession {
     auth: u64,
@@ -2395,6 +2520,134 @@ fn info_row(title: &str, value: &str) -> adw::ActionRow {
 #[cfg(test)]
 mod control_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn compatibility_fix_loading_retries_errors_without_saving_defaults() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p264-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let group = adw::PreferencesGroup::new();
+        let status = gtk::Label::new(None);
+        let row = adw::SwitchRow::new();
+        let reset = gtk::Button::with_label("Reapply Recommended");
+        group.add(&status);
+        group.add(&row);
+        group.add(&reset);
+        let resetting = Rc::new(std::cell::Cell::new(false));
+        let changes = Rc::new(std::cell::Cell::new(0));
+        row.connect_active_notify({
+            let resetting = resetting.clone();
+            let changes = changes.clone();
+            move |_| {
+                if !resetting.get() {
+                    changes.set(changes.get() + 1);
+                }
+            }
+        });
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var_os("XDG_DATA_HOME").unwrap()));
+        std::fs::create_dir_all(&database).unwrap();
+        let session = online::account_session();
+        load_compatibility_fix_preferences(
+            &group,
+            &status,
+            vec![("synthetic-fix".into(), row.clone())],
+            &reset,
+            resetting.clone(),
+            9264001,
+            session,
+            true,
+        );
+        assert_eq!(status.label(), "Loading compatibility fixes…");
+        assert!(!row.is_sensitive());
+        assert!(!reset.is_sensitive());
+        wait_until(|| {
+            status
+                .label()
+                .contains("Could not load compatibility fixes")
+        });
+        assert!(!row.is_sensitive());
+        assert!(!reset.is_sensitive());
+        assert_eq!(changes.get(), 0);
+        std::fs::remove_dir(&database).unwrap();
+        StateStore::open()
+            .unwrap()
+            .set_compatibility_fix_override(9264001, "synthetic-fix", true)
+            .unwrap();
+        let retry = find_named_descendant(group.upcast_ref(), "compatibility-fixes-retry")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        assert!(retry.is_visible());
+        retry.emit_clicked();
+        retry.emit_clicked();
+        assert_eq!(status.label(), "Loading compatibility fixes…");
+        wait_until(|| row.is_sensitive());
+        assert!(row.is_active());
+        assert!(reset.is_sensitive());
+        assert!(!retry.is_visible());
+        assert_eq!(
+            changes.get(),
+            0,
+            "initial population must not trigger saves"
+        );
+        assert!(
+            StateStore::open()
+                .unwrap()
+                .compatibility_fix_overrides(9264001)
+                .unwrap()["synthetic-fix"]
+        );
+        for (installed, expected_session) in [(false, session), (true, session.wrapping_add(1))] {
+            let group = adw::PreferencesGroup::new();
+            let status = gtk::Label::new(None);
+            let row = adw::SwitchRow::new();
+            let reset = gtk::Button::new();
+            group.add(&status);
+            group.add(&row);
+            group.add(&reset);
+            load_compatibility_fix_preferences(
+                &group,
+                &status,
+                vec![("synthetic-fix".into(), row.clone())],
+                &reset,
+                Rc::new(std::cell::Cell::new(false)),
+                9264001,
+                expected_session,
+                installed,
+            );
+            wait_until(|| {
+                status.label().contains(if installed {
+                    "account changed"
+                } else {
+                    "Install this game"
+                })
+            });
+            assert!(!row.is_sensitive());
+            assert!(!reset.is_sensitive());
+            assert_eq!(
+                row.is_active(),
+                !installed,
+                "stale session must not apply data"
+            );
+        }
+        let weak = group.downgrade();
+        drop(group);
+        assert!(
+            weak.upgrade().is_none(),
+            "Retry callback must not keep its group alive"
+        );
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus; no real cloud calls"]

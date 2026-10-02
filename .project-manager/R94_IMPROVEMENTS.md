@@ -28,6 +28,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | 656d145 | P263 | Skip unrelated game-folder traversal during targeted local refresh. |
 | 7fd0c7f | P268 | Show explicit archive patch progress and terminal details in the existing row. |
 | e326e21 | P267 | Bind manual cloud actions and confirmations to the originating account. |
+| 4ed3ee3 | P269 | Batch catalog evidence used to classify stored files without changing validation. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -40,6 +41,10 @@ hidden/tag writes are source-ready under independent review and coordinated priv
   retired/error semantics retained. Catalog SELECTs 1000→4; independent synthetic timing 28.503ms
   →4.960ms, not end-to-end refresh timing. Wave5 shipping compilation/fmt/diff/all-target Clippy
   PASS. Report `/tmp/ludomere-p270-storage-review.md`; committing as set14.
+  Commit4ed3ee3 exact post-commit build PASS; owner storage11 and independent regression1 PASS.
+- P264 owner and independent private GTK1 each PASS, including error/Retry/stored overrides,
+  no initial autosaves, uninstalled/stale controls and group release. Review
+  `/tmp/ludomere-p264-independent-review.md`; committing as set15.
 
 ## Completed sets
 

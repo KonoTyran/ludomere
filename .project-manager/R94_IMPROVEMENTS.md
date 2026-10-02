@@ -18,13 +18,17 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   1000-row GTK regression pass; unchanged20 refreshes emit zero CSS notifications. Synthetic
   installed lookup compares500,500 entries before versus1000 map lookups afterward (1.60ms versus
   0.125ms locally; not whole-app timing). Independent P254 sidebar review PASS. Exact post-commit
-  build result will be recorded after commit. Evidence /tmp/ludomere-p253-gtk.log and
+  build PASS at0dd8af8 (/tmp/ludomere-r94-set1-build.log). Evidence /tmp/ludomere-p253-gtk.log and
   /tmp/ludomere-p254-sidebar-review.md.
 
 ## Approved sets in progress
 
-- P251: batch repeated product revision/build queries during cached library loading; preserve
-  single-product scope and DLC ordering, benchmark synthetic500-game data.
+- P251 cache loading (reviewed, committing): batch selected product catalogs in400-ID groups and
+  index DLC parents; one deferred read snapshot, narrow lookup/order/error semantics retained.
+  Seven focused tests pass, including500 bases+500 DLC/2000parts/builds and existing caller
+  transactions. Synthetic10 reads:1.012s baseline→0.421s patched (independent0.402s); source-derived
+  SELECTs3001→10. Independent P254 state review PASS. Reports /tmp/ludomere-p251-report.md and
+  /tmp/ludomere-p254-state-review.md. Exact post-commit build pending.
 - P252: move source-change inspection/preparation off GTK, display actual migration phases and
   stopped-worker errors, prevent duplicate submissions; keep existing source/saves policy.
 - Follow-ons queued separately: efficient image FIFO; GOG login page loading/error/retry feedback.

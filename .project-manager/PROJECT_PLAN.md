@@ -1,5 +1,17 @@
 # Project plan
 
+## P255–P258 R94 second wave
+
+- P255 ui_review owns details.rs operation-log loading/error/Retry: preserve available sources,
+  display installation errors without files, stale-refresh/session guards; private GTK synthetic
+  success/error/empty/disconnect/retry. No actual discard/log-folder action.
+- P256 depot owns online.rs image FIFO VecDeque scheduling, preserve selected priority/cancel/
+  workers semantics; focused scheduler tests. P257 storage_audit owns account.rs embedded-login
+  loading/error/retry using sanitized generic messages and ephemeral WebKit; preserve OAuth,
+  redirect/session/cancel behavior, no real network/account tests. Each separate reviewed commit.
+- P258 independent cross-review follows each; root serializes Cargo and uses immutable copied
+  test binaries plus exact-commit build checkout. No new work beyond these approved scopes yet.
+
 ## P251–P254 R94 bounded audit, first wave
 
 - Approved first sets: P251 state.rs bulk normalized-library child data loading, preserving narrow

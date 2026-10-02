@@ -2630,7 +2630,7 @@ impl StateStore {
             .unwrap_or_default())
     }
 
-    fn load_download_revisions_for(
+    pub(crate) fn load_download_revisions_for(
         &self,
         product_ids: &[i64],
         current_only: bool,

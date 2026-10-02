@@ -122,12 +122,18 @@ fn library_evidence(
         .filter(|file| file.present && root.is_none_or(|root| file.path.starts_with(root)))
         .collect::<Vec<_>>();
     let mut parts = HashMap::new();
-    for product in files
+    let products = files
         .iter()
         .map(|file| file.product_id)
         .collect::<std::collections::HashSet<_>>()
-    {
-        for revision in store.load_all_download_revisions(product)? {
+        .into_iter()
+        .collect::<Vec<_>>();
+    for products in products.chunks(400) {
+        for revision in store
+            .load_download_revisions_for(products, false)?
+            .into_values()
+            .flatten()
+        {
             let kind = if revision.provider_category == DownloadCategory::Bonus {
                 LibraryKind::Extras
             } else {
@@ -1052,6 +1058,127 @@ fn inspect_archive_files(path: &Path, depth: usize, budget: &mut usize) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_evidence_batches_catalogs_without_changing_scope_or_categories() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("library.sqlite3");
+        let store = crate::state::StateStore::open_at(&database).unwrap();
+        let mut connection = rusqlite::Connection::open(&database).unwrap();
+        let selected = root.path().join("selected");
+        let other = root.path().join("other");
+        let transaction = connection.transaction().unwrap();
+        for product in 1..=500 {
+            transaction.execute(
+                "INSERT INTO download_slots(slot_id,product_id,provider_group_id,provider_category,name,first_seen_at,last_seen_at)
+                 VALUES(?1,?1,'group',?2,'fixture',1,1)",
+                rusqlite::params![product, if product % 2 == 1 { "bonus" } else { "installer" }],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO download_revisions(revision_id,slot_id,manifest_fingerprint,currently_offered,first_seen_at,last_seen_at,retired_at)
+                 VALUES(?1,?1,'fixture',0,1,1,2)", [product],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO download_parts(part_id,revision_id,provider_file_id,part_index,downlink)
+                 VALUES(?1,?1,'file',0,'fixture')", [product],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,part_id)
+                 VALUES(?1,?2,'fixture','extra','fixture',1,?2)",
+                rusqlite::params![(if product == 500 { &other } else { &selected }).join(format!("file-{product}")).to_str().unwrap(), product],
+            ).unwrap();
+        }
+        for (name, kind, part) in [
+            ("legacy", "patch", None),
+            ("missing-part", "extra", Some(9000)),
+            ("cross-product", "extra", Some(500)),
+        ] {
+            transaction.execute(
+                "INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,part_id)
+                 VALUES(?1,1,'fixture',?2,'fixture',1,?3)",
+                rusqlite::params![selected.join(name).to_str().unwrap(), kind, part],
+            ).unwrap();
+        }
+        transaction.execute_batch(
+            "INSERT INTO download_slots VALUES(999,999,'group','bonus',X'FF',NULL,NULL,NULL,1,1);
+             INSERT INTO download_revisions VALUES(999,999,NULL,NULL,'fixture',1,1,1,NULL);
+             INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,present)
+             VALUES('/synthetic/absent',999,'fixture','extra','fixture',1,0);",
+        ).unwrap();
+        transaction.commit().unwrap();
+
+        // Reference the former per-product loading path using exactly the represented
+        // products, including retired revisions. No unrelated catalog is materialized.
+        let started = std::time::Instant::now();
+        let files = store.managed_files().unwrap();
+        let mut categories = HashMap::new();
+        for product in files
+            .iter()
+            .filter(|file| file.present)
+            .map(|file| file.product_id)
+            .collect::<std::collections::HashSet<_>>()
+        {
+            for revision in store.load_all_download_revisions(product).unwrap() {
+                let kind = if revision.provider_category == DownloadCategory::Bonus {
+                    LibraryKind::Extras
+                } else {
+                    LibraryKind::OfflineInstallers
+                };
+                categories.extend(revision.parts.into_iter().map(|part| (part.part_id, kind)));
+            }
+        }
+        let expected = files
+            .into_iter()
+            .filter(|file| file.present)
+            .map(|file| {
+                let kind = file
+                    .part_id
+                    .and_then(|part| categories.get(&part))
+                    .copied()
+                    .unwrap_or(if file.kind == ArtifactKind::Extra {
+                        LibraryKind::Extras
+                    } else {
+                        LibraryKind::OfflineInstallers
+                    });
+                (file.path, kind)
+            })
+            .collect::<Vec<_>>();
+        let previous_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let actual = library_evidence(&store, None).unwrap();
+        eprintln!(
+            "500 product catalogs: per-product {previous_elapsed:?}, batched {:?}",
+            started.elapsed()
+        );
+        assert_eq!(actual, expected);
+        let actual = actual.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(actual[&selected.join("file-1")], LibraryKind::Extras);
+        assert_eq!(
+            actual[&selected.join("legacy")],
+            LibraryKind::OfflineInstallers
+        );
+        assert_eq!(actual[&selected.join("missing-part")], LibraryKind::Extras);
+        assert_eq!(
+            actual[&selected.join("cross-product")],
+            LibraryKind::OfflineInstallers
+        );
+        let scoped = library_evidence(&store, Some(&selected))
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(scoped[&selected.join("cross-product")], LibraryKind::Extras);
+        assert_eq!(scoped.len(), 502);
+        connection
+            .execute(
+                "UPDATE download_slots SET name=X'FF' WHERE product_id=500",
+                [],
+            )
+            .unwrap();
+        assert!(library_evidence(&store, Some(&selected)).is_ok());
+        assert!(library_evidence(&store, None).is_err());
+        connection.execute("DELETE FROM managed_files", []).unwrap();
+        assert!(library_evidence(&store, None).unwrap().is_empty());
+    }
 
     fn configured(root: &Path) -> Config {
         let mut config = Config::default();

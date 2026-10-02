@@ -8,7 +8,38 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 
 - Initial read-only audits: backend efficiency, async dialog feedback, library/detail rendering.
 - Each implemented set gets a separate commit, independent review, relevant tests and a verified
-  post-commit build. No real profile/game files or account/helper operations used for testing.
+  post-commit build. Tests use synthetic fixtures and private profiles; the P263 isolation mistake
+  and its uncertain impact are documented below. No real account/helper operations were requested.
+
+## Current completion index
+
+| Commit | Task | Change |
+| --- | --- | --- |
+| 0dd8af8 | P253 | Reuse installed-game lookups and avoid unchanged sidebar widget writes. |
+| 0e69cd7 | P251 | Batch cached catalog reads and index DLC parents in a coherent snapshot. |
+| 30fdce4 | P252 | Move source migration preparation off GTK and show meaningful stages/results. |
+| b7a45fd | P256 | Use a FIFO image queue without repeated vector shifting. |
+| b2a451f | P255 | Show operation-log loading, partial failures, Retry and fileless errors. |
+| 689c786 | P257 | Show embedded sign-in page loading, safe failures and Retry. |
+| 6b03690 | P259 | Reuse resolved download identities and DLC membership during auto-install planning. |
+| 277888a | P261 | Inspect preferred patches asynchronously with consent and in-place progress/results. |
+| a6fe580 | P260 | Reuse one filter predicate pass for counts and sidebar headers. |
+| b383ad9 | P266 | Preserve sanitized update-check and policy-loading error details. |
+| 656d145 | P263 | Skip unrelated game-folder traversal during targeted local refresh. |
+| 7fd0c7f | P268 | Show explicit archive patch progress and terminal details in the existing row. |
+| e326e21 | P267 | Bind manual cloud actions and confirmations to the originating account. |
+
+Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
+The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
+chronological evidence, including intermediate states; this index is the current disposition.
+
+P269 batched storage classification, P264 Compatibility preference loading and P270 account-bound
+hidden/tag writes are source-ready under independent review and coordinated private testing.
+
+- P269 independent source and private 500-product regression PASS, with original category/root/
+  retired/error semantics retained. Catalog SELECTs 1000→4; independent synthetic timing 28.503ms
+  →4.960ms, not end-to-end refresh timing. Wave5 shipping compilation/fmt/diff/all-target Clippy
+  PASS. Report `/tmp/ludomere-p270-storage-review.md`; committing as set14.
 
 ## Completed sets
 
@@ -112,6 +143,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   Inventory joins profile activity; diagnostics sanitized and unused fresh-session sync wrapper
   removed. Owner GTK1+pure2 and independent GTK1/security review PASS
   (/tmp/ludomere-p268-cloud-review.md). No real cloud/keyring/save operations. Committing next.
+  Commite326e21 exact post-commit build PASS (/tmp/ludomere-r94-set13-build.log).
 
 ## Deferred findings and verification limits
 

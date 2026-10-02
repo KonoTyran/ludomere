@@ -2,6 +2,25 @@
 
 Last meaningful update: 2026-10-02.
 
+## Failed 0.2.2 build
+
+- P229 final build gate passes: tools/check.sh exit0, fmt, all-target Clippy -D warnings,
+ 508 unit tests (12 existing ignored),6 integrations (3 existing helper/opt-in ignored),5 Python
+  boundary tests. P230 independent test-only review passes with original lifecycle assertions
+  and production validation unchanged. Evidence /tmp/ludomere-p229-{before,diagnostic,after,full}.log,
+  p229-report.md and p230-review.md. Root publishes fix; remote CI result remains a separate check.
+
+- P229 reproduced exact failure; diagnostic launch event was Failed(ENOENT) from missing Config,
+  and fixture also lacked the now-required typed library layout. Test-only fix supplies private
+  child HOME/XDG/TMP, saved native GameFiles parent/child marker and cleanup; original heartbeat,
+  sign-out/reset reservation and Stop/Exit assertions remain. Focused regression now passes.
+  P230 source review finds no production bypass/test weakening. Full tools/check build gate running.
+
+- R87: CI36965512633 at264533b failed one launch sign-out/reset regression (507 passed,1 failed,
+ 12 ignored), assertion expected launch event at launcher.rs:965. Format/compile progressed to
+  tests; source build failure is currently a test failure. P229 reproduces/fixes, P230 reviews.
+  User authorizes commit/push after verification; actual affected build checks may run full suite.
+
 ## Version 0.2.2 publication
 
 - P227 metadata consistency, locked offline Cargo metadata, formatting and whitespace checks pass.

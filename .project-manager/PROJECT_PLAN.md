@@ -1,5 +1,19 @@
 # Project plan
 
+## P229–P230 R87 build failure
+
+- Fix/checks complete: isolated before/after regression confirmed missing persisted config and
+  outdated fixture layout. Only launcher test setup changed; lifecycle assertions/production guards
+  retained. tools/check passes508 unit/6 integration/5 Python plus fmt/Clippy. P230 independent
+  source review passes. Root commits/pushes and checks new CI under existing authorization.
+
+- P229 compatibility owns diagnosis/reproduction/minimal fix for failed launch sign-out fixture
+  at launcher.rs:965, and directly necessary affected paths. Reproduce exact test then tools/check
+  build checks under isolated profile; no real game/helper/account. Report evidence/limits.
+- P230 security independently reviews root cause, fix and no weakened lifecycle/storage guards;
+  no product edits or duplicate full build. Root verifies logs, records, commits and pushes on
+  user authorization, then monitors CI. No new features, package install or unrelated refactor.
+
 ## P227–P228 R86 version and publication
 
 - P227 ui owns0.2.2 Cargo/lock/package/metainfo synchronization and scoped metadata checks.

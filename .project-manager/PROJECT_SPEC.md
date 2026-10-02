@@ -1,5 +1,12 @@
 # Project specification
 
+## R87 failed 0.2.2 build — 2026-10-02
+
+User requests fixing the failed build, committing and pushing. Diagnose actual failed build
+logs, preserve production safeguards, fix only the evidenced cause and verify the affected build
+checks before publication. Full checks are appropriate here as part of the build process; no real
+game/account/helper or system package installation. No version bump or PR comment requested.
+
 ## R86 version 0.2.2 and publication — 2026-10-02
 
 User requests committing and pushing current accumulated changes, adding an upstream PR comment

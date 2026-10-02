@@ -943,29 +943,81 @@ mod tests {
 
     #[test]
     fn sign_out_keeps_owned_synthetic_game_running_and_reset_can_reserve() {
+        use std::os::unix::fs::PermissionsExt;
+
         if std::env::var_os("LUDOMERE_SIGNOUT_GAME_FIXTURE").is_none() {
-            assert!(Command::new(std::env::current_exe().unwrap())
+            let root = tempfile::tempdir().unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args(["--exact", "installation::launcher::tests::sign_out_keeps_owned_synthetic_game_running_and_reset_can_reserve", "--nocapture"])
-                .env("LUDOMERE_SIGNOUT_GAME_FIXTURE", "1").status().unwrap().success());
+                .env("LUDOMERE_SIGNOUT_GAME_FIXTURE", "1");
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+            ] {
+                let path = root.path().join(key);
+                fs::create_dir(&path).unwrap();
+                command.env(key, path);
+            }
+            assert!(command.status().unwrap().success());
             return;
         }
         crate::auth::invalidate_session();
         let root = tempfile::tempdir().unwrap();
-        let heartbeat = root.path().join("heartbeat");
-        let mut game = test_game(
-            root.path().to_path_buf(),
-            PathBuf::from("/usr/bin/python3"),
-            false,
-        );
+        let library = root.path().join("library");
+        let directory = library.join("game");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("start.sh"),
+            b"inert native payload; never executed",
+        )
+        .unwrap();
+        fs::set_permissions(
+            directory.join("start.sh"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let heartbeat = directory.join("heartbeat");
+        let mut game = test_game(directory, PathBuf::from("/usr/bin/python3"), false);
         game.product_id = 918887;
+        crate::config::Config {
+            game_libraries: vec![crate::config::GameLibrary {
+                id: game.library_id.clone(),
+                name: "Synthetic native game".into(),
+                path: library,
+                default: true,
+            }],
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        super::super::marker::write(
+            &super::super::marker::from_game(&game, Vec::new()),
+            &game.installation_directory,
+        )
+        .unwrap();
         game.launch_arguments = vec!["-c".into(),
             "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]);\nwhile True:\n p.write_text(str(time.monotonic_ns())); time.sleep(0.02)".into(),
             heartbeat.to_string_lossy().into_owned()];
         let events = launch_game(game);
-        assert!(matches!(
-            events.recv_timeout(Duration::from_secs(5)).unwrap(),
-            LaunchEvent::Started
-        ));
+        struct StopOnDrop;
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                stop_game(918887);
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while is_game_running(918887) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let _stop = StopOnDrop;
+        let event = events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(event, LaunchEvent::Started), "{event:?}");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !heartbeat.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));

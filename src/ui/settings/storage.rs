@@ -298,6 +298,9 @@ fn build_storage_section(
     let recheck = gtk::Button::with_label("Recheck library");
     recheck.set_halign(gtk::Align::Start);
     root.append(&recheck);
+    let game_issues = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    game_issues.set_visible(false);
+    root.append(&game_issues);
     if kind != crate::config::LibraryKind::GameFiles {
         let updates = gtk::CheckButton::with_label("Keep downloaded files up to date");
         updates.set_tooltip_text(Some("Only update files already downloaded into this library type. Does not download other owned games."));
@@ -488,11 +491,19 @@ fn build_storage_section(
         let remove_library = remove_library.clone();
         let default_games = default_games.clone();
         let request = Rc::new(std::cell::Cell::new(0u64));
+        let game_issues = game_issues.clone();
+        let window = window.clone();
+        let w = w.clone();
+        let recheck = recheck.downgrade();
         Rc::new(move || {
             request.set(request.get().wrapping_add(1));
             footer.set_sensitive(false);
             *usage_values.borrow_mut() = StorageBreakdown::default();
             usage.queue_draw();
+            while let Some(child) = game_issues.first_child() {
+                game_issues.remove(&child);
+            }
+            game_issues.set_visible(false);
             let Some(selected_library) =
                 libraries.borrow().get(library.selected() as usize).cloned()
             else {
@@ -526,6 +537,7 @@ fn build_storage_section(
             items.borrow_mut().clear();
             refresh();
             let all_libraries = vec![selected_library.clone()];
+            let recovery_library_id = selected_library.id.clone();
             let titles = model_game_display_data(&model.borrow());
             let config = model.borrow().config.clone();
             let epoch = model.borrow().account_epoch;
@@ -533,7 +545,18 @@ fn build_storage_section(
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<_> {
-                    crate::storage::validate_library(&config, kind, &selected_library.id)?;
+                    let inspection = crate::storage::inspect_library_status(
+                        &config,
+                        kind,
+                        &selected_library.id,
+                    )?;
+                    match inspection.compatibility {
+                        crate::storage::LibraryCompatibility::Compatible => {}
+                        crate::storage::LibraryCompatibility::Incompatible(reason)
+                        | crate::storage::LibraryCompatibility::Unavailable(reason) => {
+                            anyhow::bail!(reason)
+                        }
+                    }
                     let storage = filesystem_storage(&selected_library.path);
                     let store = StateStore::open()?;
                     let games = if kind == crate::config::LibraryKind::GameFiles {
@@ -588,7 +611,7 @@ fn build_storage_section(
                         })
                         .map(|file| file.size)
                         .sum::<u64>();
-                    Ok((storage, games, installers, extras))
+                    Ok((storage, games, installers, extras, inspection.game_issues))
                 })();
                 let _ = sender.send(result);
             });
@@ -606,13 +629,128 @@ fn build_storage_section(
             let request = request.clone();
             let path_label = path_label.clone();
             let footer = footer.clone();
+            let game_issues = game_issues.clone();
+            let window = window.clone();
+            let w = w.clone();
+            let recheck = recheck.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 if model.borrow().account_epoch != epoch || request.get() != generation {
                     return glib::ControlFlow::Break;
                 }
                 match receiver.try_recv() {
-                    Ok(Ok((storage, games, installers, extras))) => {
-                        path_label.set_label("Compatible");
+                    Ok(Ok((storage, games, installers, extras, issues))) => {
+                        path_label.set_label(if issues.is_empty() { "Compatible" } else { "Library available. Some game folders need attention; other games remain usable." });
+                        game_issues.set_visible(!issues.is_empty());
+                        for issue in issues {
+                            let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+                            let message = gtk::Label::new(Some(&format!(
+                                "{}\n{}",
+                                issue.path.display(),
+                                issue.reason
+                            )));
+                            message.set_wrap(true);
+                            message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                            message.set_selectable(true);
+                            message.set_xalign(0.0);
+                            row.append(&message);
+                            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                            let browse = gtk::Button::with_label("Browse Files");
+                            browse.connect_clicked({
+                                let window = window.clone();
+                                let model = model.clone();
+                                let path = issue.path.clone();
+                                move |_| {
+                                    if model.borrow().account_epoch == epoch
+                                        && !model.borrow().logout_pending
+                                    {
+                                        browse_recovery_directory(&window, &model, path.clone());
+                                    }
+                                }
+                            });
+                            buttons.append(&browse);
+                            let known = {
+                                let state = model.borrow();
+                                let mut matches = state.games.iter().filter(|game| {
+                                    issue.path.file_name().and_then(|name| name.to_str())
+                                        == Some(game.slug.as_str())
+                                });
+                                matches
+                                    .next()
+                                    .filter(|_| matches.next().is_none())
+                                    .map(|game| {
+                                        DetailPageModel::game(
+                                            game.clone(),
+                                            state.favorites.contains(&game.product_id),
+                                        )
+                                    })
+                            };
+                            if let Some(game) = known {
+                                let repair = gtk::Button::with_label("Review Repair…");
+                                repair.connect_clicked({
+                                    let window = window.clone();
+                                    let model = model.clone();
+                                    let game = game.clone();
+                                    let directory = issue.path.clone();
+                                    move |_| {
+                                        if model.borrow().account_epoch == epoch
+                                            && !model.borrow().logout_pending
+                                        {
+                                            show_directory_repair_dialog(
+                                                &window,
+                                                &model,
+                                                &game,
+                                                directory.clone(),
+                                            );
+                                        }
+                                    }
+                                });
+                                buttons.append(&repair);
+                                let reset = gtk::Button::with_label("Review File Reset…");
+                                reset.connect_clicked({
+                                    let window = window.clone();
+                                    let model = model.clone();
+                                    let w = w.clone();
+                                    let recheck = recheck.clone();
+                                    let recovery_library_id = recovery_library_id.clone();
+                                    move |_| {
+                                        if model.borrow().account_epoch != epoch
+                                            || model.borrow().logout_pending
+                                        {
+                                            return;
+                                        }
+                                        let refresh: Rc<dyn Fn()> = Rc::new({
+                                            let w = w.clone();
+                                            let model = model.clone();
+                                            let recheck = recheck.clone();
+                                            move || {
+                                                super::refresh_installed_state_after_library_change(
+                                                    &w, &model,
+                                                );
+                                                if let Some(recheck) = recheck.upgrade() {
+                                                    recheck.emit_clicked();
+                                                }
+                                            }
+                                        });
+                                        super::super::uninstall::show_game_directory_reset_dialog(
+                                            &window,
+                                            &model,
+                                            &game,
+                                            recovery_library_id.clone(),
+                                            refresh,
+                                        );
+                                    }
+                                });
+                                buttons.append(&reset);
+                            } else {
+                                let explanation = gtk::Label::new(Some(
+                                    "This folder is not linked to a game in this profile. Browse it before deciding what to keep; Ludomere will not delete unidentified contents.",
+                                ));
+                                explanation.set_wrap(true);
+                                row.append(&explanation);
+                            }
+                            row.append(&buttons);
+                            game_issues.append(&row);
+                        }
                         footer.set_sensitive(true);
                         let games_bytes = games.iter().map(|game| game.size).sum::<u64>();
                         if let Some((total, free)) = storage {

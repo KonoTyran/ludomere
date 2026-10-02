@@ -105,6 +105,7 @@ pub struct GameResetPlan {
     identities: Vec<Option<(u64, u64)>>,
     prefix_identities: Vec<Option<(u64, u64)>>,
     prefix_checks: Vec<bool>,
+    explicit_directory: bool,
     session: u64,
 }
 #[derive(Default)]
@@ -113,6 +114,288 @@ pub struct GameResetResult {
     pub removed_prefixes: usize,
     pub retained_downloads: usize,
     pub failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryReadiness {
+    RestartRequired,
+    Ready,
+}
+
+#[derive(Debug)]
+pub struct DamagedOperationRecord;
+impl std::fmt::Display for DamagedOperationRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("This game's operation record is damaged. Choose Prepare recovery, then restart the computer before retrying; no game files were removed")
+    }
+}
+impl std::error::Error for DamagedOperationRecord {}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebootRecovery {
+    version: u32,
+    product_id: i64,
+    directory: PathBuf,
+    root_identity: (u64, u64),
+    directory_identity: (u64, u64),
+    journal_identity: (u64, u64),
+    journal_hash: String,
+    boot: String,
+}
+
+/// Explicit recovery preparation only. A damaged process journal cannot prove
+/// quiescence on this boot. Preserve it and require a new boot before quarantine;
+/// payload deletion still needs a separate, freshly reviewed reset confirmation.
+pub fn prepare_game_directory_recovery(
+    config: &crate::config::Config,
+    product_id: i64,
+    slug: &str,
+    library_id: &str,
+) -> Result<RecoveryReadiness> {
+    prepare_directory_recovery_at_boot(
+        config,
+        product_id,
+        slug,
+        library_id,
+        &super::dependency_setup::boot_identity()?,
+    )
+}
+
+fn prepare_directory_recovery_at_boot(
+    config: &crate::config::Config,
+    product_id: i64,
+    slug: &str,
+    library_id: &str,
+    boot: &str,
+) -> Result<RecoveryReadiness> {
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::fs::MetadataExt},
+    };
+    let _activity = crate::profile_reset::begin_activity("preparing damaged game recovery")?;
+    let _reservation = Reservation::reserve(&[product_id])?;
+    let _permit = crate::operation_gate::try_acquire()
+        .context("Pause active operations before preparing recovery")?;
+    ensure!(
+        !super::manager::recovery_busy(&[product_id]),
+        "Wait for this game's operations to stop before preparing recovery"
+    );
+    let session = crate::online::account_session();
+    let game = crate::state::StateStore::open()?
+        .cached_product_game(product_id)?
+        .context("Load this game's library information before preparing recovery")?;
+    ensure!(
+        product_id > 0 && game.slug == slug,
+        "The game identity changed; reopen recovery"
+    );
+    let library = config
+        .game_libraries
+        .iter()
+        .find(|library| library.id == library_id)
+        .context("The selected Game Files library is no longer configured")?;
+    let directory = library.path.join(slug);
+    crate::storage::validate_game_directory_location(config, &directory)?;
+    super::prefix_recovery::ensure_quiescent(&directory)?;
+    let mut ids = vec![product_id];
+    ids.extend(
+        game.dlcs
+            .iter()
+            .filter(|dlc| dlc.owned)
+            .map(|dlc| dlc.product_id),
+    );
+    ensure_no_foreign_game(&directory, product_id, &ids)?;
+    let root = open_directory(&library.path)?;
+    let payload = open_child(&root, std::ffi::OsStr::new(slug), true, true)?;
+    let root_metadata = root.metadata()?;
+    let payload_metadata = payload.metadata()?;
+    let root_identity = (root_metadata.dev(), root_metadata.ino());
+    let directory_identity = (payload_metadata.dev(), payload_metadata.ino());
+    let path = super::operation_journal::path(&library.path, slug)?;
+    let parent = open_directory(path.parent().unwrap())?;
+    let anchored = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
+    let barrier_name = format!("{slug}.reboot-recovery.json");
+    let prior = read_json(&path.with_file_name(&barrier_name))?
+        .map(serde_json::from_value::<RebootRecovery>)
+        .transpose()?;
+    if let Some(prior) = &prior {
+        ensure!(
+            prior.version == 1
+                && prior.product_id == product_id
+                && prior.journal_hash.len() == 64
+                && prior.journal_hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && prior.boot.len() == 36
+                && prior.boot.bytes().enumerate().all(|(index, value)| {
+                    if [8, 13, 18, 23].contains(&index) {
+                        value == b'-'
+                    } else {
+                        value.is_ascii_hexdigit()
+                    }
+                }),
+            "The recovery target changed. No files were changed; reopen recovery and review the directory"
+        );
+    }
+    let journal = match open_child(&parent, path.file_name().unwrap(), false, false) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && prior.is_some() => None,
+        Err(error) => return Err(error).context(
+            "There is no damaged operation record to prepare; use the normal game recovery action",
+        ),
+    };
+    let read_bytes = |mut file: std::fs::File| -> Result<Vec<u8>> {
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.nlink() == 1 && metadata.len() <= 64 * 1024 * 1024,
+            "Unsafe or oversized operation record; it was not changed"
+        );
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 64 * 1024 * 1024,
+            "Operation record grew beyond the safety limit"
+        );
+        Ok(bytes)
+    };
+    let Some(journal) = journal else {
+        let prior = prior.unwrap();
+        ensure!(
+            prior.directory == directory
+                && prior.root_identity == root_identity
+                && prior.directory_identity == directory_identity,
+            "The recovery target changed; review the new directory before resetting it"
+        );
+        ensure!(
+            prior.boot != boot,
+            "Restart the computer before retrying recovery"
+        );
+        let backup = open_child(
+            &parent,
+            std::ffi::OsStr::new(&format!(
+                "{slug}.operation-quarantine-{}.json",
+                prior.journal_hash
+            )),
+            false,
+            false,
+        )?;
+        ensure!(
+            format!("{:x}", Sha256::digest(read_bytes(backup)?)) == prior.journal_hash,
+            "The operation recovery copy changed; no files were removed"
+        );
+        return Ok(RecoveryReadiness::Ready);
+    };
+    let metadata = journal.metadata()?;
+    let journal_identity = (metadata.dev(), metadata.ino());
+    let bytes = read_bytes(journal)?;
+    let journal_hash = format!("{:x}", Sha256::digest(&bytes));
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if let Some(id) = value
+            .pointer("/record/product_id")
+            .and_then(serde_json::Value::as_i64)
+        {
+            ensure!(
+                id == product_id,
+                "Another game's operation owns this record"
+            );
+        }
+        if let Some(version) = value.get("version").and_then(serde_json::Value::as_u64) {
+            ensure!(
+                version == 1,
+                "Unsupported operation record version; use a compatible Ludomere version"
+            );
+        }
+    }
+    if let Ok(operation) =
+        serde_json::from_slice::<super::operation_journal::OperationJournal>(&bytes)
+    {
+        let plan = match operation {
+            super::operation_journal::OperationJournal::Depot { record, .. } => {
+                ensure!(
+                    record.destination == directory,
+                    "The operation belongs to a different directory"
+                );
+                record.plan_json
+            }
+            super::operation_journal::OperationJournal::Offline { record, .. } => record.plan_json,
+        };
+        ensure!(
+            serde_json::from_str::<serde_json::Value>(&plan).is_err(),
+            "This operation record is readable. Use Resume or normal recovery; restart the computer first if its setup process is uncertain"
+        );
+    }
+    let replace_barrier = prior.is_some();
+    let prior = prior.filter(|prior| {
+        prior.directory == directory
+            && prior.root_identity == root_identity
+            && prior.directory_identity == directory_identity
+            && prior.journal_identity == journal_identity
+            && prior.journal_hash == journal_hash
+    });
+    let Some(prior) = prior else {
+        let record = RebootRecovery {
+            version: 1,
+            product_id,
+            directory,
+            root_identity,
+            directory_identity,
+            journal_identity,
+            journal_hash,
+            boot: boot.into(),
+        };
+        let mut temporary = tempfile::NamedTempFile::new_in(&anchored)?;
+        serde_json::to_writer(&mut temporary, &record)?;
+        temporary.as_file().sync_all()?;
+        crate::online::with_account_session(session, || {
+            ensure!(
+                read_config()?.game_libraries == config.game_libraries,
+                "Game libraries changed; reopen recovery"
+            );
+            if replace_barrier {
+                temporary.persist(anchored.join(&barrier_name))?;
+            } else {
+                temporary.persist_noclobber(anchored.join(&barrier_name))?;
+            }
+            parent.sync_all()?;
+            Ok(())
+        })?;
+        return Ok(RecoveryReadiness::RestartRequired);
+    };
+    if prior.boot == boot {
+        return Ok(RecoveryReadiness::RestartRequired);
+    }
+    let backup_name = format!("{slug}.operation-quarantine-{journal_hash}.json");
+    match open_child(&parent, std::ffi::OsStr::new(&backup_name), false, false) {
+        Ok(backup) => ensure!(
+            read_bytes(backup)? == bytes,
+            "The operation recovery copy does not match"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut temporary = tempfile::NamedTempFile::new_in(&anchored)?;
+            temporary.write_all(&bytes)?;
+            temporary.as_file().sync_all()?;
+            temporary.persist_noclobber(anchored.join(&backup_name))?;
+            parent.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let current = open_child(&parent, path.file_name().unwrap(), false, false)?;
+    let metadata = current.metadata()?;
+    ensure!(
+        (metadata.dev(), metadata.ino()) == journal_identity && read_bytes(current)? == bytes,
+        "The operation changed during recovery; it was retained"
+    );
+    crate::online::with_account_session(session, || {
+        ensure!(
+            read_config()?.game_libraries == config.game_libraries,
+            "Game libraries changed; reopen recovery"
+        );
+        unlink(&parent, path.file_name().unwrap(), false)?;
+        parent.sync_all()?;
+        Ok(())
+    })?;
+    Ok(RecoveryReadiness::Ready)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -161,6 +444,39 @@ pub(crate) fn pending(directory: &Path, product_id: i64) -> Result<bool> {
 }
 
 // Broken JSON is not ownership evidence. Filesystem errors remain errors, not absence.
+fn ensure_no_foreign_game(directory: &Path, product_id: i64, ids: &[i64]) -> Result<()> {
+    if let Some(marker) = optional_metadata(&super::marker::marker_path(directory))? {
+        let marker_id = marker
+            .get("product_id")
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()));
+        ensure!(
+            marker_id.is_none_or(|id| id == product_id),
+            "The installation marker belongs to another game"
+        );
+    }
+    for (index, entry) in std::fs::read_dir(directory)?.enumerate() {
+        ensure!(
+            index < 100_000,
+            "Game metadata inspection exceeds its bounded entry limit"
+        );
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("goggame-"))
+            .and_then(|name| name.strip_suffix(".info"))
+            .and_then(|name| name.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        ensure!(
+            ids.contains(&id),
+            "This directory contains metadata for another game; choose that game's own recovery action"
+        );
+    }
+    Ok(())
+}
+
 fn optional_metadata(path: &Path) -> Result<Option<serde_json::Value>> {
     match read_json(path) {
         Err(error) if error.downcast_ref::<serde_json::Error>().is_some() => Ok(None),
@@ -546,6 +862,44 @@ pub fn prepare_uninstall(
     product_id: i64,
     slug: &str,
 ) -> Result<UninstallPreparation> {
+    prepare_uninstall_inner(config, product_id, slug, None)
+}
+
+/// Preview an exact, explicitly selected directory for deletion. The caller must
+/// show its full path and warn that unrecognized files and contained saves are
+/// included before calling reset_game. Prefixes are deliberately retained.
+pub fn prepare_game_directory_reset(
+    config: &crate::config::Config,
+    product_id: i64,
+    slug: &str,
+    library_id: &str,
+) -> Result<GameResetPlan> {
+    let game = crate::state::StateStore::open()?
+        .cached_product_game(product_id)?
+        .context("Load this game's library information before preparing recovery")?;
+    ensure!(
+        product_id > 0 && game.slug == slug,
+        "The selected game identity changed; reopen recovery"
+    );
+    ensure!(
+        config
+            .game_libraries
+            .iter()
+            .any(|library| library.id == library_id),
+        "The selected Game Files library is no longer configured"
+    );
+    match prepare_uninstall_inner(config, product_id, slug, Some(library_id))? {
+        UninstallPreparation::Recovery(plan) => Ok(plan),
+        UninstallPreparation::Normal(_) => unreachable!("explicit reset always needs confirmation"),
+    }
+}
+
+fn prepare_uninstall_inner(
+    config: &crate::config::Config,
+    product_id: i64,
+    slug: &str,
+    exact_library: Option<&str>,
+) -> Result<UninstallPreparation> {
     use std::os::unix::fs::MetadataExt;
     crate::compatibility::validate_slug(slug)?;
     let store = crate::state::StateStore::open()?;
@@ -575,13 +929,17 @@ pub fn prepare_uninstall(
     let mut prefix_checks = Vec::new();
     let mut installed = None;
     for library in &config.game_libraries {
+        if exact_library.is_some_and(|id| id != library.id) {
+            continue;
+        }
         let directory = library.path.join(slug);
         // An unrelated unavailable library must not prevent managing this game's valid copy.
         if directory.try_exists()?
             || crate::compatibility::prefix_path(&library.path, slug).try_exists()?
             || super::operation_journal::path(&library.path, slug)?.try_exists()?
         {
-            super::validate_game_library(config, &library.id, &directory)?;
+            super::prefix_recovery::ensure_quiescent(&directory)?;
+            crate::storage::validate_game_directory_location(config, &directory)?;
         } else {
             continue;
         }
@@ -607,17 +965,24 @@ pub fn prepare_uninstall(
             "A configured library is inside this game's directory; move that library before recovery"
         );
         let journal = super::operation_journal::path(&library.path, slug)?;
-        let operation = read_json(&journal)
-            .context("Cannot verify this game's operation journal; restore a valid record before retrying recovery")?
+        let operation = read_json_bounded(&journal, 64 * 1024 * 1024)
+            .map_err(|error| {
+                if error.downcast_ref::<serde_json::Error>().is_some() {
+                    error.context(DamagedOperationRecord)
+                } else {
+                    error
+                }
+            })?
             .map(serde_json::from_value::<super::operation_journal::OperationJournal>)
             .transpose()
-            .context("Cannot verify this game's operation journal; restore a valid record before retrying recovery")?;
+            .context(DamagedOperationRecord)?;
         let operation_matches = match &operation {
             Some(super::operation_journal::OperationJournal::Offline { record, .. }) => {
                 if record.product_id != product_id {
                     false
                 } else {
-                    let plan: serde_json::Value = serde_json::from_str(&record.plan_json)?;
+                    let plan: serde_json::Value =
+                        serde_json::from_str(&record.plan_json).context(DamagedOperationRecord)?;
                     let target = plan
                         .pointer("/game/installation_directory")
                         .or_else(|| plan.get("installation_directory"));
@@ -633,7 +998,8 @@ pub fn prepare_uninstall(
                 if record.product_id != product_id {
                     false
                 } else {
-                    let plan: serde_json::Value = serde_json::from_str(&record.plan_json)?;
+                    let plan: serde_json::Value =
+                        serde_json::from_str(&record.plan_json).context(DamagedOperationRecord)?;
                     ensure!(
                         plan.get("destination")
                             .and_then(serde_json::Value::as_str)
@@ -663,10 +1029,16 @@ pub fn prepare_uninstall(
         }
         let marker = optional_metadata(&super::marker::marker_path(&directory))?;
         if let Some(marker) = &marker {
+            let marker_id = marker
+                .get("product_id")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()));
             ensure!(
-                marker.get("product_id").and_then(serde_json::Value::as_i64) == Some(product_id),
+                marker_id == Some(product_id) || (exact_library.is_some() && marker_id.is_none()),
                 "Installation marker belongs to another game"
             );
+        }
+        if exact_library.is_some() && metadata.is_some() {
+            ensure_no_foreign_game(&directory, product_id, &ids)?;
         }
         let info_matches = if metadata.is_some() && marker.is_none() && !operation_matches {
             optional_metadata(&directory.join(format!("goggame-{product_id}.info")))?.is_some_and(
@@ -712,7 +1084,8 @@ pub fn prepare_uninstall(
                 || operation_matches
                 || info_matches
                 || download_matches
-                || prior.is_some(),
+                || prior.is_some()
+                || (exact_library.is_some() && metadata.is_some()),
             "Cannot verify ownership of {}; no files were removed",
             directory.display()
         );
@@ -740,7 +1113,7 @@ pub fn prepare_uninstall(
                     })
                     .filter(|value| !value.is_null())
             });
-        if let Some(compatibility) = compatibility {
+        if let Some(compatibility) = compatibility.filter(|_| exact_library.is_none()) {
             ensure!(
                 compatibility
                     .get("prefix_slug")
@@ -764,15 +1137,17 @@ pub fn prepare_uninstall(
                     .as_ref()
                     .and_then(|marker| marker.pointer("/base/operating_system"))
             });
-        let native = compatibility.is_none()
-            && platform
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|os| os != "windows");
+        let native = exact_library.is_some()
+            || (compatibility.is_none()
+                && platform
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|os| os != "windows"));
         let prefix = prefix_identity(&directory, product_id, compatibility.is_some(), native)?;
         if prefix.is_some() {
             prefixes.push(managed_prefix_path(&directory)?);
         }
-        if !active
+        if exact_library.is_none()
+            && !active
             && operation.is_none()
             && prior.is_none()
             && marker.is_some()
@@ -823,11 +1198,16 @@ pub fn prepare_uninstall(
         identities,
         prefix_identities,
         prefix_checks,
+        explicit_directory: exact_library.is_some(),
         session: crate::online::account_session(),
     }))
 }
 
 pub(super) fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
+    read_json_bounded(path, 4 * 1024 * 1024)
+}
+
+fn read_json_bounded(path: &Path, limit: usize) -> Result<Option<serde_json::Value>> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let opened = (|| -> std::io::Result<std::fs::File> {
@@ -854,10 +1234,10 @@ pub(super) fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
     );
     let mut bytes = Vec::new();
     file.by_ref()
-        .take(4 * 1024 * 1024 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(
-        bytes.len() <= 4 * 1024 * 1024,
+        bytes.len() <= limit,
         "Recovery metadata exceeds its safety limit"
     );
     Ok(Some(
@@ -998,7 +1378,15 @@ pub fn reset_game(
     }
     progress("Stopping this game's downloads and installers…");
     crate::download::quiesce_recovery(&plan.ids, cancelled)?;
-    super::manager::quiesce_recovery(&plan.ids, cancelled, &plan.config, &plan.slug)?;
+    let mut recovery_config = plan.config.clone();
+    if plan.explicit_directory {
+        recovery_config.game_libraries.retain(|library| {
+            plan.directories
+                .iter()
+                .any(|directory| directory.parent() == Some(library.path.as_path()))
+        });
+    }
+    super::manager::quiesce_recovery(&plan.ids, cancelled, &recovery_config, &plan.slug)?;
     ensure!(
         !cancelled.load(Ordering::Relaxed) && crate::online::account_session() == plan.session,
         "Recovery cancelled before deleting game files"
@@ -1019,7 +1407,7 @@ pub fn reset_game(
     );
     let mut protected = Vec::new();
     for root in &plan.directories {
-        crate::storage::validate_path(&current, crate::config::LibraryKind::GameFiles, root)?;
+        crate::storage::validate_game_directory_location(&current, root)?;
     }
     protected.extend(
         [
@@ -1079,6 +1467,9 @@ pub fn reset_game(
             actual.is_none() || actual == *identity,
             "The game directory changed; reopen Uninstall to review it"
         );
+        if plan.explicit_directory && actual.is_some() {
+            ensure_no_foreign_game(path, plan.product_id, &plan.ids)?;
+        }
         let actual_prefix =
             prefix_identity(path, plan.product_id, prefix.is_some(), !check_prefix)?;
         ensure!(
@@ -1117,7 +1508,9 @@ pub fn reset_game(
             error: Some("Game recovery interrupted this download; remove or explicitly requeue it"),
         })?;
     }
-    progress("Removing this game's managed prefix and its contained saves/settings…");
+    if plan.prefix_identities.iter().any(Option::is_some) {
+        progress("Removing this game's managed prefix and its contained saves/settings…");
+    }
     for (path, prefix) in plan.directories.iter().zip(&plan.prefix_identities) {
         match remove_prefix(path, *prefix, cancelled, plan.session) {
             Ok(true) => result.removed_prefixes += 1,
@@ -1278,6 +1671,210 @@ mod tests {
             UninstallPreparation::Recovery(plan) => plan,
             UninstallPreparation::Normal(_) => panic!("unexpected normal uninstall"),
         }
+    }
+
+    fn known_fixture(id: i64) -> (tempfile::TempDir, crate::config::Config, PathBuf) {
+        let fixture = fixture(id);
+        crate::state::StateStore::open()
+            .unwrap()
+            .upsert_normalized_library(&[crate::domain::Game {
+                product_id: id,
+                slug: format!("recovery-{id}"),
+                title: "Synthetic recovery game".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        fixture
+    }
+
+    #[test]
+    fn explicit_directory_reset_requires_fresh_identity_and_preserves_other_data() {
+        let (_temporary, config, directory) = known_fixture(910090);
+        let slug = "recovery-910090";
+        std::fs::remove_file(directory.join(format!("goggame-{}.info", 910090))).unwrap();
+        std::fs::write(directory.join("unrecognized-save"), b"explicitly reviewed").unwrap();
+        let marker = super::super::marker::marker_path(&directory);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"{}").unwrap();
+        let sibling = config.game_libraries[0].path.join("healthy-other-game");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("sentinel"), b"keep sibling").unwrap();
+        let prefix = crate::compatibility::prefix_path(&config.game_libraries[0].path, slug);
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::write(prefix.join("sentinel"), b"unowned prefix").unwrap();
+        assert!(prepare_uninstall(&config, 910090, slug).is_err());
+        let preview = prepare_game_directory_reset(&config, 910090, slug, "recovery").unwrap();
+        assert!(preview.prefixes.is_empty());
+        assert!(
+            directory.join("unrecognized-save").exists(),
+            "preview never deletes"
+        );
+        std::fs::write(&marker, br#"{"product_id":999}"#).unwrap();
+        assert!(reset_game(preview, false, &AtomicBool::new(false), |_| {}).is_err());
+        assert!(directory.join("unrecognized-save").exists());
+        std::fs::remove_file(&marker).unwrap();
+        let preview = prepare_game_directory_reset(&config, 910090, slug, "recovery").unwrap();
+        std::fs::write(directory.join("goggame-999.info"), b"{}").unwrap();
+        assert!(reset_game(preview, false, &AtomicBool::new(false), |_| {}).is_err());
+        std::fs::remove_file(directory.join("goggame-999.info")).unwrap();
+        let preview = prepare_game_directory_reset(&config, 910090, slug, "recovery").unwrap();
+        let old = directory.with_extension("old");
+        std::fs::rename(&directory, &old).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert!(reset_game(preview, false, &AtomicBool::new(false), |_| {}).is_err());
+        std::fs::remove_dir(&directory).unwrap();
+        std::fs::rename(&old, &directory).unwrap();
+        let preview = prepare_game_directory_reset(&config, 910090, slug, "recovery").unwrap();
+        let result = reset_game(preview, false, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(!directory.exists());
+        assert_eq!(
+            std::fs::read(sibling.join("sentinel")).unwrap(),
+            b"keep sibling"
+        );
+        assert_eq!(
+            std::fs::read(prefix.join("sentinel")).unwrap(),
+            b"unowned prefix"
+        );
+    }
+
+    #[test]
+    fn exact_reset_ignores_corrupt_same_game_journal_in_another_library() {
+        let (temporary, mut config, directory) = known_fixture(910094);
+        let other = temporary.path().join("other-library");
+        let other_game = other.join("recovery-910094");
+        std::fs::create_dir_all(&other_game).unwrap();
+        std::fs::write(other_game.join("sentinel"), b"keep other copy").unwrap();
+        let journal = super::super::operation_journal::path(&other, "recovery-910094").unwrap();
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, b"{corrupt other record").unwrap();
+        config.game_libraries.push(crate::config::GameLibrary {
+            id: "other".into(),
+            name: "Other library".into(),
+            path: other,
+            default: false,
+        });
+        config.save().unwrap();
+        let preview =
+            prepare_game_directory_reset(&config, 910094, "recovery-910094", "recovery").unwrap();
+        let result = reset_game(preview, false, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(!directory.exists());
+        assert_eq!(
+            std::fs::read(other_game.join("sentinel")).unwrap(),
+            b"keep other copy"
+        );
+        assert_eq!(std::fs::read(journal).unwrap(), b"{corrupt other record");
+    }
+
+    #[test]
+    fn damaged_journal_recovery_requires_new_boot_and_restarts_if_evidence_changes() {
+        let (_temporary, config, directory) = known_fixture(910091);
+        let slug = "recovery-910091";
+        let path =
+            super::super::operation_journal::path(&config.game_libraries[0].path, slug).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{unfinished").unwrap();
+        let marker = super::super::marker::marker_path(&directory);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(marker, b"{}").unwrap();
+        let error = prepare_game_directory_reset(&config, 910091, slug, "recovery")
+            .err()
+            .unwrap();
+        assert!(error.downcast_ref::<DamagedOperationRecord>().is_some());
+        let prepare = |boot| {
+            prepare_directory_recovery_at_boot(&config, 910091, slug, "recovery", boot).unwrap()
+        };
+        let boot_a = "00000000-0000-0000-0000-000000000001";
+        let boot_b = "00000000-0000-0000-0000-000000000002";
+        let boot_c = "00000000-0000-0000-0000-000000000003";
+        assert_eq!(prepare(boot_a), RecoveryReadiness::RestartRequired);
+        assert_eq!(prepare(boot_a), RecoveryReadiness::RestartRequired);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{unfinished");
+        std::fs::write(&path, b"{changed unfinished").unwrap();
+        assert_eq!(
+            prepare(boot_b),
+            RecoveryReadiness::RestartRequired,
+            "changed evidence starts a fresh wait"
+        );
+        assert_eq!(prepare(boot_b), RecoveryReadiness::RestartRequired);
+        assert_eq!(prepare(boot_c), RecoveryReadiness::Ready);
+        assert!(!path.exists());
+        assert!(directory.exists(), "preparation never deletes the payload");
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("operation-quarantine-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"{changed unfinished");
+        assert_eq!(
+            prepare(boot_c),
+            RecoveryReadiness::Ready,
+            "retry after quarantine is idempotent"
+        );
+        let preview = prepare_game_directory_reset(&config, 910091, slug, "recovery").unwrap();
+        let result = reset_game(preview, false, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert!(!directory.exists());
+        assert!(backup.exists(), "forensic operation copy remains");
+    }
+
+    #[test]
+    fn damaged_journal_recovery_rejects_links_other_products_and_future_records() {
+        let (temporary, config, directory) = known_fixture(910092);
+        let slug = "recovery-910092";
+        let path =
+            super::super::operation_journal::path(&config.game_libraries[0].path, slug).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let outside = temporary.path().join("outside-record");
+        std::fs::write(&outside, b"{broken").unwrap();
+        symlink(&outside, &path).unwrap();
+        let prepare = || {
+            prepare_directory_recovery_at_boot(
+                &config,
+                910092,
+                slug,
+                "recovery",
+                "00000000-0000-0000-0000-000000000001",
+            )
+        };
+        assert!(prepare().is_err());
+        std::fs::remove_file(&path).unwrap();
+        for bytes in [
+            br#"{"record":{"product_id":999}}"#.as_slice(),
+            br#"{"version":2}"#.as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(prepare().is_err());
+        }
+        assert!(directory.exists());
+        assert_eq!(std::fs::read(outside).unwrap(), b"{broken");
+        assert!(
+            !path
+                .with_file_name(format!("{slug}.reboot-recovery.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn valid_large_operation_record_is_not_treated_as_corrupt_during_recovery() {
+        let (_temporary, config, directory) = known_fixture(910093);
+        let slug = "recovery-910093";
+        let path =
+            super::super::operation_journal::path(&config.game_libraries[0].path, slug).unwrap();
+        super::super::operation_journal::write_offline(&path, &crate::state::InstallationOperationRecord {
+            product_id: 910093, operation: "install".into(), state: "failed".into(),
+            plan_json: serde_json::json!({"game":{"product_id":910093,"installation_directory":directory,"installer_operating_system":"linux"}}).to_string(),
+            message: Some("x".repeat(5 * 1024 * 1024)), percentage: None, queue_position: None, created_at:1, updated_at:1, completed_at:None,
+        }).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
+        assert!(prepare_game_directory_reset(&config, 910093, slug, "recovery").is_ok());
     }
 
     fn windows_marker(id: i64) -> super::super::marker::InstallationMarker {
@@ -1576,7 +2173,7 @@ mod tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(marker, b"{broken").unwrap();
         let config_before = std::fs::read(crate::config::Config::path()).unwrap();
-        assert!(prepare_uninstall(&config, 910001, "recovery-910001").is_err());
+        assert!(prepare_uninstall(&config, 910001, "recovery-910001").is_ok());
         assert!(directory.join("untracked-save").exists());
         // Correct the known inert metadata before exercising authorized recovery.
         super::super::marker::write(&windows_marker(910001), &directory).unwrap();

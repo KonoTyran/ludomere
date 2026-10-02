@@ -141,6 +141,7 @@ struct VerificationDisplayState {
     running: bool,
 }
 
+#[cfg_attr(test, derive(Default))]
 struct AppModel {
     config: Config,
     library_statuses: Vec<crate::storage::LibraryStatus>,

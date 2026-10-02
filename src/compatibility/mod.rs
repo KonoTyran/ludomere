@@ -21,8 +21,8 @@ pub use process::CompatibilityProcess;
 pub(crate) use process::append_step_log;
 pub use proton::{
     ProtonFamily, ProtonInstallation, ProtonPreferences, discover_proton, game_dll_overrides,
-    proton_preferences, select_proton, set_default_proton, set_game_dll_overrides, set_game_proton,
-    validate_proton,
+    proton_preferences, proton_preferences_generation, reset_invalid_proton_preferences,
+    select_proton, set_default_proton, set_game_dll_overrides, set_game_proton, validate_proton,
 };
 pub use umu::UmuBackend;
 

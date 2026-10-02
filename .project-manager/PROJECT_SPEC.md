@@ -1,5 +1,23 @@
 # Project specification
 
+## R93 version 0.2.4 and publication — 2026-10-02
+
+User requests bumping to0.2.4, committing and pushing the reviewed R92 changes, and posting a
+new comment on upstream PR6 summarizing the additions and fixes. No package build requested.
+
+## R92 per-game recovery instead of library-wide blocking — 2026-10-02
+
+User requests addressing latest Kono PR comments: one partial/corrupt game must not disable all
+games in a library. Offer game repair and browsing its files before confirmed deletion/start-over.
+Find similar manual-filesystem dead ends and provide explicit automated recovery choices, such as
+prefix rebuild with retained backup, game deletion/reinstall and resetting options. Users may
+decline; never automatically destroy/adopt unknown data or reset preferences silently. This replaces
+earlier library-wide blocking for individual broken game payloads; retain root-level identity/type,
+overlap/permission protections and per-target safety. Background work must not steal focus. Synthetic
+fixtures and targeted tests only; no real user-game deletion, helpers, account actions or publication.
+Kono comments5958588715 describes paused Terraria blocking Grim Dawn;5959082290 confirms Terraria
+extraction performance is fixed. Both read directly from upstream PR6 in this turn.
+
 ## R91 version 0.2.3 and publication — 2026-10-02
 
 User requests bumping to0.2.3, committing/pushing accumulated R88–R90 changes and updating the

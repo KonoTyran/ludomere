@@ -96,21 +96,26 @@ A resolved dependency is not a guarantee that its installer or the game will wor
 Failures keep the operation retryable and do not mark the game successfully installed.
 If interrupted setup cannot be proven stopped, Resume and recovery refuse to change its files.
 An interrupted launch with no saved process identity requires a reboot, not just restarting Ludomere.
-An unreadable operation journal requires repair before recovery; it is not discarded to bypass this check.
+For an unreadable operation journal, Uninstall → Review File Reset → Prepare Recovery can record a
+safe recovery checkpoint. Restart the computer, then explicitly prepare recovery again: unchanged
+damaged operation data is retained as a recovery copy before a separate file-reset confirmation.
+It is never discarded automatically to bypass the process-safety check.
 
 Adding a game library refreshes installed state and sidebar colors without opening each game.
 Storage separates **Game Files**, **Offline Installers**, and **Goodies & Extras**. Each type supports
 multiple directories and its own default. Only Game Files is required; optional types have no
-implicit fallback. Libraries with mixed or unrecognized layouts are marked incompatible with a
-reason. Their content actions stay disabled until corrected; configuration, removal and Recheck
-remain available. No files are automatically moved or deleted.
+implicit fallback. Unsafe library roots (including overlapping paths or inaccessible directories)
+remain blocked with a reason. A partial, corrupt or unrecognized game folder is reported separately
+and does not disable other games in that Game Files library. Storage lists affected folders with
+Browse Files and, for recognized account games, repair and confirmed file-reset actions. Unmatched
+folders can be inspected but are not adopted or deleted automatically.
 Use separate, nonoverlapping roots, for example sibling `Games`, `Installers`, and `Extras`
 directories. Game Files contains installed game directories and Ludomere's `.ludomere`
 infrastructure. Archive roots use the managed `<game>/installer`, `<game>/patch`, or
 `<game>/extra` category layout, with platform/language subdirectories when provided and
 `<game>/dlc/<dlc>/…` for DLC. Installer components such as language packs belong with Offline
-Installers. Select correctly separated existing directories, or organize incompatible content
-yourself and use Recheck; changing configuration does not convert a mixed library.
+Installers. Archive libraries still require the matching managed layout; changing configuration does
+not convert mixed contents. No files are automatically moved or deleted.
 Installation records are retained while a library is incompatible, and running games are not stopped.
 Already indexed files in configured archive libraries are rematched as game/DLC metadata arrives,
 using unambiguous filename, OS, language and known-size matches. Arbitrary flat folders are not
@@ -227,7 +232,12 @@ game directories, are deleted. External saves, other games' prefixes, Proton/run
 and Ludomere preferences are kept. Full profile reset continues to preserve installed games and their
 prefixes. Downloaded installers and extras remain unless the unchecked cleanup option
 is selected. Recovery can be cancelled, and unsafe paths or partial failures remain visible with a
-fresh review/retry action.
+fresh review/retry action. Browse Local Files remains available even when a game is incomplete or its
+marker is damaged, and the uninstall dialog lets you inspect files before removal. If normal removal
+cannot identify a healthy installation, Review File Reset offers the exact known-game folder with
+an explicit all-contents warning. This fallback preserves Windows prefixes; only the listed game
+folder is reset. After successful recovery, Install Again opens the normal installation choices;
+it never silently starts a new download.
 
 > [!IMPORTANT]
 > Ludomere was built entirely with AI assistance for the author's personal use. Its behavior and
@@ -302,9 +312,14 @@ override matching Ludomere defaults and incoming DLL selections; Proton can stil
 runtime compatibility policy. Each choice covers both Wine's bare and wildcard DLL-name keys so
 an existing wildcard registry entry cannot defeat it for a qualified load. An exact path registry
 entry or later runtime policy can still take precedence; no registry is rewritten.
+**Reset DLL Overrides** clears only the current game's DLL choices after confirmation.
+If Proton preferences cannot be read, **Reset Proton Preferences** offers to preserve the
+unreadable file as a private recovery copy and reset all Proton selections and DLL overrides.
+Games, prefixes, saves and installed runtimes stay intact; select a default Proton again afterward.
+Unsafe or oversized preference files are refused without changing the original.
 For an older prefix without a verified Ludomere recipe receipt, open the game's Compatibility
 settings, add `xinput1_1`, `xinput1_2`, `xinput1_3`
-and `xinput9_1_0`, select **Builtin** for each, Save, then restart the game. Remove those rows to
+and `xinput9_1_0`, select **Builtin** for each, wait for automatic saving, then restart the game. Remove those rows to
 return to existing defaults. This is an explicit user choice, not a guarantee of controller support.
 
 The download controls offer stable current and historical GE-Proton and UMU-Proton releases;

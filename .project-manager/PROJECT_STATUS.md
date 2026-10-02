@@ -2,6 +2,65 @@
 
 Last meaningful update: 2026-10-02.
 
+## R93 active publication
+
+- P249 metadata checks pass; Cargo/lock/pacman/AppStream now0.2.4, pkgrel1 and release history
+  retained. R92 source hashes still match; final cargo build --locked passes for0.2.4
+  (/tmp/ludomere-r93-build.log). P250 reviewed feature inventory and prior verification; root
+  prepares comprehensive commit and PR comment for publication, with remote verification next.
+- User authorizes version0.2.4, commit/push and new PR6 comment. P249 metadata and P250 independent
+  release review assigned; R92 focused tests/reviews/final checks retained. Root handles publication.
+
+## R92 completed per-game recovery
+
+- P245–P248 complete for this bounded scope. Game Files child problems no longer disable healthy
+  siblings; selected-copy Repair/Browse/confirmed file reset and explicit Install Again, unreadable
+  journal preparation with reboot/quarantine, backed-up malformed Proton preferences reset and
+  per-game DLL reset are implemented. Existing prefix rebuild/backup behavior is preserved.
+- Final evidence: storage9, recovery19, Proton preferences10, confirmation-text2, and two explicitly
+  run retained private GTK regressions pass. Independent backend, UI and preference reviews PASS:
+  /tmp/ludomere-p248-{backend,ui,preferences}-review.md. Owner reports p245/p246/p247 retain scope,
+  changes and outcomes. Review fixes cover fresh ownership, selected-copy targeting, stale recovery
+  checkpoints, account/file lock order and pending settings in another editor.
+- Root final fmt/diff, all-target Clippy -D warnings and cargo build --locked pass, logs
+  /tmp/ludomere-r92-final-{clippy,build}.log; all9 final reviewed source hashes match
+  /tmp/ludomere-r92-final-source.sha256. Shipping-source test binary used; no injected product code.
+  No full suite/package/publication, real game/profile deletion, helper launch or actual reboot.
+  Real file-manager activation/reboot/installer integration remain untested; unknown unmatched
+  folders are browse-only and unsafe roots/conflicting ownership remain blocked. No global
+  Prototype ready claim. Changes remain uncommitted as publication was not requested for R92.
+
+- Focused backend evidence: storage9 and recovery19 pass, including selected-root-only reset
+  and >4 MiB valid journal regression. Initial preferences9 plus retained GTK reset test pass.
+  Independent final corrections in progress: bind Storage recovery to its selected copy; prevent
+  other-editor autosave resurrection after global reset; keep preference file/account locks ordered
+  and avoid holding account lock across blocking filesystem preparation. Final reruns still needed.
+- Source scope frozen; root all-target Clippy -D warnings and cargo build --locked pass
+  (/tmp/ludomere-r92-final-{clippy,build}.log). Shared shipping test binary compiling for scoped
+  storage/recovery/preferences and retained isolated GTK control tests; final reviews pending.
+  P246 additionally handles Repair with missing metadata, helper-free file reset, safe parent
+  browsing for loose/link entries, and limits restart preparation to typed damaged-record errors.
+- P248 review found two required backend corrections before completion: reset preparation must
+  restart safely when a prior reboot checkpoint becomes stale, and execution must recheck readable
+  conflicting game ownership after preview even when the folder inode is unchanged. P245 owns
+  fixes/regressions. P246 also covers file-only reset when missing Windows tools block uninstallation.
+- P245 root/child isolation and exact-folder preview implemented; corrupt-journal restart barrier
+  finishing. P246 Browse/Repair/Reset and Storage issue controls implemented awaiting stable APIs.
+  P247 backed-up Proton preference reset and per-game DLL reset implemented, scoped tests pending
+  shared compilation. P248 independent backend/UI/preferences cross-reviews assigned to other
+  owners, with isolated actual-control GTK checks; no real profile/game actions.
+- Design approved: isolate child game errors; direct-action Repair/Browse/Reset with Install again;
+  explicit exact known-game-folder reset can handle missing ownership metadata without pretending
+  files are owned. Corrupt process-bearing journals require prepared reboot/identity barrier before
+  quarantine and confirmed reset. P247 fixes malformed Proton preferences with backed-up defaults
+  and adds DLL reset; existing prefix rebuild/backup flow reused. No real user-file action authorized.
+- Clean baseline a13f8c6 (0.2.3). Kono latest comments confirm extraction fix but interrupted
+  Terraria still blocks unrelated Grim Dawn through whole-library content classification. User
+  supersedes that policy for individual game problems; P245 backend/P246 game recovery/P247 related
+  dead-end audit, with independent P248 review and synthetic verification to follow.
+- R91 publication verified: a13f8c6 pushed to main, upstream PR6 exact body/head verified; remote
+  CI37045726246 was running at handoff. No local package installed or built.
+
 ## R91 active publication
 
 - P243 metadata and P244 independent release inventory PASS. Cargo/lock/PKGBUILD/AppStream now

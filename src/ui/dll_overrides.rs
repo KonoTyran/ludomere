@@ -9,6 +9,7 @@ struct Editor {
     product_id: i64,
     session: u64,
     revision: Rc<std::cell::Cell<u64>>,
+    preferences_generation: Rc<std::cell::Cell<u64>>,
     group: glib::WeakRef<adw::PreferencesGroup>,
     rows: gtk::ListBox,
     entries: Rc<RefCell<Vec<(adw::ActionRow, gtk::Entry, gtk::DropDown)>>>,
@@ -109,6 +110,7 @@ impl Editor {
         let revision = self.revision.clone();
         let product_id = self.product_id;
         let session = self.session;
+        let preferences_generation = self.preferences_generation.clone();
         Rc::new(move |debounce| {
             let (Some(entries), Some(status)) = (entries.upgrade(), status.upgrade()) else {
                 return;
@@ -117,6 +119,11 @@ impl Editor {
                 status.set_label(
                     "The account changed. Reopen Properties before changing DLL overrides.",
                 );
+                return;
+            }
+            let generation = preferences_generation.get();
+            if generation != crate::compatibility::proton_preferences_generation() {
+                status.set_label("Proton preferences were reset. Reopen Properties before editing DLL overrides.");
                 return;
             }
             revision.set(revision.get().wrapping_add(1));
@@ -135,6 +142,12 @@ impl Editor {
             glib::timeout_add_local_once(
                 Duration::from_millis(if debounce { 400 } else { 0 }),
                 move || {
+                    if generation != crate::compatibility::proton_preferences_generation() {
+                        if let Some(status) = status.upgrade() {
+                            status.set_label("Proton preferences were reset. Reopen Properties before editing DLL overrides.");
+                        }
+                        return;
+                    }
                     if online::account_session() != session {
                         if let Some(status) = status.upgrade() {
                             status.set_label("The account changed. Reopen Properties before changing DLL overrides.");
@@ -159,12 +172,22 @@ impl Editor {
                         status.set_label("Saving DLL overrides…");
                     }
                     let receiver = update_policies::policy_request(move || {
+                        anyhow::ensure!(
+                            generation == crate::compatibility::proton_preferences_generation(),
+                            "Proton preferences were reset. Reopen Properties before editing DLL overrides."
+                        );
                         online::with_account_session(session, || {
                             set_game_dll_overrides(product_id, values.clone())
                         })?;
                         Ok(values)
                     });
                     glib::timeout_add_local(Duration::from_millis(50), move || {
+                        if generation != crate::compatibility::proton_preferences_generation() {
+                            if let Some(status) = status.upgrade() {
+                                status.set_label("Proton preferences were reset. Reopen Properties before editing DLL overrides.");
+                            }
+                            return glib::ControlFlow::Break;
+                        }
                         let result = match receiver.try_recv() {
                             Ok(result) => result,
                             Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
@@ -203,6 +226,9 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
         product_id,
         session: online::account_session(),
         revision: Rc::new(std::cell::Cell::new(0)),
+        preferences_generation: Rc::new(std::cell::Cell::new(
+            crate::compatibility::proton_preferences_generation(),
+        )),
         group: group.downgrade(),
         rows: gtk::ListBox::new(),
         entries: Rc::new(RefCell::new(Vec::new())),
@@ -216,14 +242,71 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
     editor.status.set_selectable(true);
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let add = gtk::Button::with_label("Add DLL");
+    let reset = gtk::Button::with_label("Reset DLL Overrides…");
+    let recover = gtk::Button::with_label("Reset Proton Preferences…");
+    recover.set_visible(false);
     let reload = gtk::Button::with_label("Retry Loading");
     reload.set_visible(false);
     controls.append(&add);
+    controls.append(&reset);
     controls.set_sensitive(false);
     group.add(&editor.rows);
     group.add(&controls);
     group.add(&editor.status);
     group.add(&reload);
+    group.add(&recover);
+    reset.connect_clicked({
+        let editor = editor.clone();
+        let controls = controls.clone();
+        move |button| {
+            let Some(window) = button.root().and_downcast::<adw::ApplicationWindow>() else { return; };
+            if online::account_session() != editor.session { return; }
+            let dialog = adw::AlertDialog::builder().heading("Reset this game's DLL overrides?")
+                .body("Remove all DLL overrides for this game and use the existing defaults. Its Proton choice, compatibility-fix switches, files and saves will not change.").build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("reset", "Reset DLL Overrides")]);
+            dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let editor = editor.clone();
+            let controls = controls.clone();
+            dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
+                if response != "reset" || !window.is_visible() || online::account_session() != editor.session { return; }
+                // Invalidate pending text timers; FIFO puts reset after already submitted saves.
+                editor.revision.set(editor.revision.get().wrapping_add(1));
+                editor.rows.set_sensitive(false);
+                controls.set_sensitive(false);
+                editor.status.set_label("Resetting DLL overrides…");
+                let session = editor.session;
+                let generation = editor.preferences_generation.get();
+                let receiver = update_policies::policy_request(move || {
+                    anyhow::ensure!(generation == crate::compatibility::proton_preferences_generation(), "Proton preferences were reset. Reopen Properties before editing DLL overrides.");
+                    online::with_account_session(session, || set_game_dll_overrides(product_id, BTreeMap::new()))
+                });
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(_) => Err(anyhow::anyhow!("DLL reset worker stopped. Reopen Properties before retrying.")),
+                    };
+                    if online::account_session() != session {
+                        editor.status.set_label("The account changed. Reopen Properties before changing DLL overrides.");
+                        return glib::ControlFlow::Break;
+                    }
+                    controls.set_sensitive(true);
+                    editor.rows.set_sensitive(true);
+                    match result {
+                        Ok(()) => {
+                            editor.saved.borrow_mut().clear();
+                            editor.restore();
+                            editor.status.set_label("DLL overrides reset. Defaults apply to the next launch.");
+                        }
+                        Err(error) => editor.status.set_label(&format!("Could not reset DLL overrides: {error}. Try again.")),
+                    }
+                    glib::ControlFlow::Break
+                });
+            });
+        }
+    });
     add.connect_clicked({
         let editor = editor.clone();
         move |_| editor.add("", DllLoadOrder::NativeThenBuiltin)
@@ -231,13 +314,36 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
     reload.connect_clicked({
         let editor = editor.clone();
         let controls = controls.clone();
-        move |reload| load(product_id, &editor, &controls, reload)
+        let recover = recover.clone();
+        move |reload| load(product_id, &editor, &controls, reload, &recover)
     });
-    load(product_id, &editor, &controls, &reload);
+    proton::connect_preferences_recovery(
+        &recover,
+        &editor.status,
+        Rc::new({
+            let editor = editor.clone();
+            let controls = controls.clone();
+            let reload = reload.clone();
+            let recover = recover.clone();
+            move || load(product_id, &editor, &controls, &reload, &recover)
+        }),
+    );
+    load(product_id, &editor, &controls, &reload, &recover);
     group
 }
 
-fn load(product_id: i64, editor: &Editor, controls: &gtk::Box, reload: &gtk::Button) {
+fn load(
+    product_id: i64,
+    editor: &Editor,
+    controls: &gtk::Box,
+    reload: &gtk::Button,
+    recover: &gtk::Button,
+) {
+    let generation = crate::compatibility::proton_preferences_generation();
+    editor.preferences_generation.set(generation);
+    editor.revision.set(editor.revision.get().wrapping_add(1));
+    editor.rows.set_sensitive(false);
+    controls.set_sensitive(false);
     reload.set_visible(false);
     editor.status.set_label("Loading DLL overrides…");
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -247,7 +353,15 @@ fn load(product_id: i64, editor: &Editor, controls: &gtk::Box, reload: &gtk::But
     let editor = editor.clone();
     let controls = controls.clone();
     let reload = reload.clone();
+    let recover = recover.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        if generation != crate::compatibility::proton_preferences_generation() {
+            editor.status.set_label(
+                "Proton preferences were reset. Reopen Properties before editing DLL overrides.",
+            );
+            reload.set_visible(true);
+            return glib::ControlFlow::Break;
+        }
         if editor.group.upgrade().is_none() {
             return glib::ControlFlow::Break;
         }
@@ -262,13 +376,16 @@ fn load(product_id: i64, editor: &Editor, controls: &gtk::Box, reload: &gtk::But
         }
         match receiver.try_recv() {
             Ok(Ok(values)) => {
+                recover.set_visible(false);
                 *editor.saved.borrow_mut() = values;
                 editor.restore();
+                editor.rows.set_sensitive(true);
                 controls.set_sensitive(true);
             }
             Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                editor.status.set_label("Could not load DLL overrides. Check Proton configuration access and syntax, then retry; existing preferences were not changed.");
+                editor.status.set_label("Could not load DLL overrides. Retry loading, or back up and reset unreadable Proton preferences. Existing preferences were not changed.");
                 reload.set_visible(true);
+                recover.set_visible(true);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
         }
@@ -281,6 +398,157 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires private HOME/all XDG, GTK display and D-Bus"]
+    fn confirmed_resets_preserve_other_games_cancel_and_pending_edit_order() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p247-")
+        );
+        adw::init().unwrap();
+        fn pump() {
+            let deadline = std::time::Instant::now() + Duration::from_millis(750);
+            while std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut all = vec![root.clone()];
+            let mut child = root.first_child();
+            while let Some(widget) = child {
+                all.extend(widgets(&widget));
+                child = widget.next_sibling();
+            }
+            all
+        }
+        let application = adw::Application::builder()
+            .application_id("io.github.ludomere.PreferenceRecoveryTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&application)
+            .build();
+        let overrides = BTreeMap::from([("dinput8".to_owned(), DllLoadOrder::Builtin)]);
+        set_game_dll_overrides(7, overrides.clone()).unwrap();
+        set_game_dll_overrides(8, overrides.clone()).unwrap();
+        let group = group(7);
+        window.set_content(Some(&group));
+        window.present();
+        pump();
+        let button = |label: &str| {
+            widgets(group.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(label))
+                .unwrap()
+        };
+        let respond = |response: &str| {
+            window
+                .visible_dialog()
+                .unwrap()
+                .downcast::<adw::AlertDialog>()
+                .unwrap()
+                .emit_by_name::<()>("response", &[&response])
+        };
+        button("Reset DLL Overrides…").emit_clicked();
+        respond("cancel");
+        pump();
+        assert_eq!(game_dll_overrides(7).unwrap(), overrides);
+        let entry = widgets(group.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .unwrap();
+        entry.set_text("pending_new_name");
+        button("Reset DLL Overrides…").emit_clicked();
+        respond("reset");
+        pump();
+        assert!(game_dll_overrides(7).unwrap().is_empty());
+        assert_eq!(game_dll_overrides(8).unwrap(), overrides);
+        assert!(
+            widgets(group.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.label().contains("DLL overrides reset"))
+        );
+
+        let path = crate::identity::config_root().join("proton.json");
+        let other = super::group(8);
+        let other_window = adw::ApplicationWindow::builder()
+            .application(&application)
+            .build();
+        other_window.set_content(Some(&other));
+        other_window.present();
+        pump();
+        let other_entry = widgets(other.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::Entry>().ok())
+            .unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let malformed = b"{ unreadable preference fixture";
+        std::fs::write(&path, malformed).unwrap();
+        button("Retry Loading").emit_clicked();
+        pump();
+        assert!(button("Reset Proton Preferences…").is_visible());
+        button("Reset Proton Preferences…").emit_clicked();
+        respond("cancel");
+        pump();
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        // A stale recovery offer must never discard settings repaired in another view.
+        std::fs::write(&path, &valid).unwrap();
+        button("Reset Proton Preferences…").emit_clicked();
+        respond("reset");
+        pump();
+        assert_eq!(std::fs::read(&path).unwrap(), valid);
+        assert!(
+            widgets(group.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.label().contains("readable now"))
+        );
+        std::fs::write(&path, malformed).unwrap();
+        other_entry.set_text("must_not_survive_global_reset");
+        button("Reset Proton Preferences…").emit_clicked();
+        respond("reset");
+        pump();
+        assert!(
+            crate::compatibility::proton_preferences()
+                .unwrap()
+                .dll_overrides
+                .is_empty()
+        );
+        assert!(!button("Reset Proton Preferences…").is_visible());
+        assert!(
+            widgets(other.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.label().contains("preferences were reset"))
+        );
+        let backup = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("proton-recovery-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(&backup).unwrap(), malformed);
+        let done = window
+            .visible_dialog()
+            .unwrap()
+            .downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert!(done.body().contains(backup.to_str().unwrap()));
+        respond("close");
+        other_window.close();
+        window.close();
+    }
+
+    #[test]
     #[ignore = "requires private HOME/all XDG and an isolated GTK display"]
     fn dll_autosave_preserves_invalid_drafts_and_orders_reverted_choices() {
         assert!(std::env::var("HOME").unwrap().starts_with("/tmp/ludomere-"));
@@ -290,6 +558,9 @@ mod tests {
             product_id: 997,
             session: online::account_session(),
             revision: Rc::new(std::cell::Cell::new(0)),
+            preferences_generation: Rc::new(std::cell::Cell::new(
+                crate::compatibility::proton_preferences_generation(),
+            )),
             group: group.downgrade(),
             rows: gtk::ListBox::new(),
             entries: Rc::new(RefCell::new(Vec::new())),
@@ -341,6 +612,9 @@ mod tests {
             product_id: 7,
             session: online::account_session(),
             revision: Rc::new(std::cell::Cell::new(0)),
+            preferences_generation: Rc::new(std::cell::Cell::new(
+                crate::compatibility::proton_preferences_generation(),
+            )),
             group: group.downgrade(),
             rows: gtk::ListBox::new(),
             entries: Rc::new(RefCell::new(Vec::new())),

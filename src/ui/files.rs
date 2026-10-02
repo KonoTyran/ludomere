@@ -1,5 +1,162 @@
 use super::*;
 
+/// A read-only recovery affordance: damaged metadata must not prevent inspecting the folder.
+pub(super) fn browse_game_files(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    game: &DetailPageModel,
+) {
+    let config = model.borrow().config.clone();
+    let slug = game.slug.clone();
+    let title = format!("{} — Local Files", game.title);
+    show_recovery_folders(window, model, &title, move || {
+        crate::storage::game_directories_for_browsing(&config, &slug)
+    });
+}
+
+pub(super) fn browse_recovery_directory(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    directory: std::path::PathBuf,
+) {
+    let config = model.borrow().config.clone();
+    show_recovery_folders(window, model, "Inspect local files", move || {
+        let library = config
+            .game_libraries
+            .iter()
+            .find(|library| directory.parent() == Some(library.path.as_path()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("This item is no longer in a configured Game Files library.")
+            })?;
+        crate::storage::validate_library(
+            &config,
+            crate::config::LibraryKind::GameFiles,
+            &library.id,
+        )?;
+        let metadata = std::fs::symlink_metadata(&directory)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            crate::storage::validate_game_directory_location(&config, &directory)?;
+            Ok(vec![directory])
+        } else {
+            // Inspect loose files and links from the safe parent, without following the entry.
+            Ok(vec![library.path.clone()])
+        }
+    });
+}
+
+fn show_recovery_folders(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    title: &str,
+    inspect: impl FnOnce() -> anyhow::Result<Vec<std::path::PathBuf>> + Send + 'static,
+) {
+    let dialog = adw::AlertDialog::builder().heading(title).build();
+    dialog.add_response("close", "Close");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let status = gtk::Label::new(Some("Checking game folder locations…"));
+    status.set_wrap(true);
+    status.set_selectable(true);
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    content.append(&spinner);
+    content.append(&status);
+    dialog.set_extra_child(Some(&content));
+    let closed = Rc::new(std::cell::Cell::new(false));
+    dialog.connect_closed({
+        let closed = closed.clone();
+        move |_| closed.set(true)
+    });
+    dialog.present(Some(window));
+    let epoch = model.borrow().account_epoch;
+    let model = model.clone();
+    let window = window.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(inspect());
+    });
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+            dialog.close();
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!(
+                "Folder inspection stopped. Close this dialog and try again."
+            )),
+        };
+        spinner.stop();
+        spinner.set_visible(false);
+        match result {
+            Ok(paths) => {
+                status.set_label(if paths.is_empty() { "No game files were found in the configured Game Files libraries. Download or install the game to create them." } else { "Open a folder to inspect or back up its contents. Browsing does not change files or make this installation ready to play." });
+                for path in paths {
+                    let open = gtk::Button::new();
+                    let label = gtk::Label::new(Some(&path.display().to_string()));
+                    label.set_wrap(true);
+                    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                    open.set_child(Some(&label));
+                    let window = window.clone();
+                    let model = model.clone();
+                    let status = status.clone();
+                    open.connect_clicked(move |button| {
+                        if model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
+                        button.set_sensitive(false);
+                        status.set_label("Checking and opening the folder…");
+                        let path = path.clone();
+                        let (sender, receiver) = mpsc::channel();
+                        std::thread::spawn(move || {
+                            let result = crate::storage::read_config().and_then(|config| {
+                                if let Some(library) = config.game_libraries.iter().find(|library| library.path == path) {
+                                    crate::storage::validate_library(&config, crate::config::LibraryKind::GameFiles, &library.id)?;
+                                } else {
+                                    crate::storage::validate_game_directory_location(&config, &path)?;
+                                }
+                                Ok(path)
+                            });
+                            let _ = sender.send(result);
+                        });
+                        let window = window.clone();
+                        let model = model.clone();
+                        let status = status.clone();
+                        let button = button.downgrade();
+                        glib::timeout_add_local(Duration::from_millis(50), move || {
+                            if model.borrow().account_epoch != epoch || model.borrow().logout_pending || !status.is_mapped() { return glib::ControlFlow::Break; }
+                            let result = match receiver.try_recv() {
+                                Ok(result) => result,
+                                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                                Err(_) => Err(anyhow::anyhow!("Folder inspection stopped. Try again.")),
+                            };
+                            if let Some(button) = button.upgrade() { button.set_sensitive(true); }
+                            match result {
+                                Ok(path) => {
+                                    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+                                    let window = window.clone();
+                                    status.set_label("Requested the file manager. You can inspect or back up these files before resetting the game.");
+                                    launcher.launch(Some(&window.clone()), gio::Cancellable::NONE, move |result| {
+                                        super::widgets::file_open::report_launch_result(&window, "game folder", result);
+                                    });
+                                }
+                                Err(error) => status.set_label(&format!("Could not open this folder: {error:#}")),
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    });
+                    content.append(&open);
+                }
+            }
+            Err(error) => status.set_label(&format!(
+                "Could not inspect game files: {error:#}. No files were changed."
+            )),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 pub(super) fn detail_file_management(
     game: &DetailPageModel,
     window: &adw::ApplicationWindow,
@@ -315,23 +472,11 @@ pub(super) fn detail_file_management(
         manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         let browse = management_menu_button("Browse Local Files");
         {
-            let product_id = game.product_id;
+            let game = game.clone();
             let model = model.clone();
             let window = window.clone();
             browse.connect_clicked(move |_| {
-                let Some(path) = model
-                    .borrow()
-                    .installed_games
-                    .get(&product_id)
-                    .map(|game| game.installation_directory.clone())
-                else {
-                    return;
-                };
-                super::widgets::file_open::open_directory(
-                    &path,
-                    &window,
-                    "installed-game directory",
-                );
+                browse_game_files(&window, &model, &game);
             });
         }
         manage_actions.append(&browse);
@@ -339,7 +484,7 @@ pub(super) fn detail_file_management(
 
         let repair = management_menu_button("Repair Installation");
         repair.set_tooltip_text(Some(
-            "Rerun the current full game installer and all available DLC installers",
+            "Check whether the current installation can be repaired; otherwise review reinstall or reset options",
         ));
         {
             let window = window.clone();
@@ -359,34 +504,6 @@ pub(super) fn detail_file_management(
         let uninstall = management_menu_button("Uninstall");
         uninstall.set_widget_name("game-uninstall");
         uninstall.add_css_class("destructive-action");
-        let product_id = game.product_id;
-        let installed_controls = [browse.clone(), repair.clone()];
-        {
-            let model = model.clone();
-            let epoch = model.borrow().account_epoch;
-            let controls = installed_controls
-                .iter()
-                .map(|button| button.downgrade())
-                .collect::<Vec<_>>();
-            glib::timeout_add_local(Duration::from_millis(100), move || {
-                if model.borrow().account_epoch != epoch {
-                    return glib::ControlFlow::Break;
-                }
-                let visible = model.borrow().installed_games.contains_key(&product_id);
-                let mut alive = false;
-                for button in &controls {
-                    if let Some(button) = button.upgrade() {
-                        button.set_visible(visible);
-                        alive = true;
-                    }
-                }
-                if alive {
-                    glib::ControlFlow::Continue
-                } else {
-                    glib::ControlFlow::Break
-                }
-            });
-        }
         {
             let window = window.clone();
             let model = model.clone();

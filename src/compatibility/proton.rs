@@ -3,10 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
-    io::Read,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+
+static PREFERENCES_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn proton_preferences_generation() -> u64 {
+    PREFERENCES_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProtonFamily {
@@ -209,6 +215,102 @@ pub fn proton_preferences() -> Result<ProtonPreferences> {
     read_preferences(&crate::identity::config_root().join("proton.json"))
 }
 
+/// Preserve unreadable preferences before explicitly replacing them with defaults.
+pub fn reset_invalid_proton_preferences(session: u64) -> anyhow::Result<PathBuf> {
+    let _activity = crate::profile_reset::begin_activity("recovering Proton preferences")?;
+    reset_invalid_preferences(&crate::identity::config_root().join("proton.json"), session)
+}
+
+fn reset_invalid_preferences(path: &Path, session: u64) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        crate::online::account_session() == session,
+        "The account changed; reopen preference recovery"
+    );
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path.with_extension("lock"))?;
+    anyhow::ensure!(
+        lock.metadata()?.is_file(),
+        "Proton preference lock is not a regular file"
+    );
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() },
+        "Only your regular Proton preferences file can be reset"
+    );
+    anyhow::ensure!(
+        metadata.len() <= 1024 * 1024,
+        "Proton preferences are too large to reset safely; the original file has not been changed"
+    );
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 1024 * 1024,
+        "Proton preferences changed while being read; retry recovery"
+    );
+    anyhow::ensure!(
+        serde_json::from_slice::<ProtonPreferences>(&bytes).is_err(),
+        "Proton preferences are readable now. Refresh instead; nothing was reset"
+    );
+    let mut backup = tempfile::Builder::new()
+        .prefix("proton-recovery-")
+        .suffix(".json")
+        .tempfile_in(path.parent().unwrap())?;
+    backup.write_all(&bytes)?;
+    backup.as_file().sync_all()?;
+    let (_, backup) = backup.keep()?;
+    let directory = fs::File::open(path.parent().unwrap())?;
+    directory.sync_all()?;
+    let mut replacement = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    serde_json::to_writer_pretty(&mut replacement, &ProtonPreferences::default())?;
+    replacement.as_file().sync_all()?;
+    // Existing writers take the account guard before the file lock. Release ours
+    // first, then only try the file lock under that guard; never invert/wait.
+    fs2::FileExt::unlock(&lock)?;
+    crate::online::with_account_session(session, || {
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
+            anyhow::anyhow!(
+                "Proton preferences are busy; retry recovery: {error}. Recovery copy: {}",
+                backup.display()
+            )
+        })?;
+        let result = (|| {
+            let current = fs::symlink_metadata(path)?;
+            anyhow::ensure!(
+                current.is_file()
+                    && current.dev() == metadata.dev()
+                    && current.ino() == metadata.ino()
+                    && current.len() == metadata.len()
+                    && current.mtime_nsec() == metadata.mtime_nsec()
+                    && current.mtime() == metadata.mtime(),
+                "Proton preferences changed during recovery. Original recovery copy: {}",
+                backup.display()
+            );
+            replacement.persist(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "Could not reset Proton preferences: {error}. Recovery copy: {}",
+                    backup.display()
+                )
+            })?;
+            PREFERENCES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        })();
+        fs2::FileExt::unlock(&lock)?;
+        result
+    })?;
+    directory.sync_all().map_err(|error| anyhow::anyhow!("Preferences were reset but directory synchronization failed: {error}. Recovery copy: {}", backup.display()))?;
+    Ok(backup)
+}
+
 pub fn game_dll_overrides(
     product_id: i64,
 ) -> anyhow::Result<BTreeMap<String, super::DllLoadOrder>> {
@@ -343,6 +445,122 @@ fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preference_recovery_lock_wait_does_not_block_account_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proton.json");
+        fs::write(&path, "{broken").unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let session = crate::online::account_session();
+        let worker = std::thread::spawn({
+            let path = path.clone();
+            move || reset_invalid_preferences(&path, session)
+        });
+        // The file lock intentionally keeps recovery pending while an account commit is probed.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            sender
+                .send(crate::online::with_account_session(session, || Ok(())))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        fs2::FileExt::unlock(&lock).unwrap();
+        worker.join().unwrap().unwrap();
+        probe.join().unwrap();
+        assert!(
+            result.unwrap().is_ok(),
+            "account commits must not wait for a preference file lock"
+        );
+    }
+
+    #[test]
+    fn malformed_preferences_reset_retains_exact_private_recovery_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proton.json");
+        let original = b"{\"default\":\"/some/Proton\",\"overrides\": broken\xff";
+        fs::write(&path, original).unwrap();
+        let old_backup = root.path().join("proton-recovery-existing.json");
+        fs::write(&old_backup, "older recovery").unwrap();
+        let backup = reset_invalid_preferences(&path, crate::online::account_session()).unwrap();
+        assert_ne!(backup, old_backup);
+        assert_eq!(fs::read(backup.clone()).unwrap(), original);
+        assert_eq!(fs::read_to_string(old_backup).unwrap(), "older recovery");
+        assert_eq!(
+            fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reset = read_preferences(&path).unwrap();
+        assert!(
+            reset.default.is_none() && reset.overrides.is_empty() && reset.dll_overrides.is_empty()
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn preference_recovery_refuses_readable_unsafe_and_oversized_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("proton.json");
+        fs::write(&path, "{broken").unwrap();
+        assert!(
+            reset_invalid_preferences(&path, crate::online::account_session().wrapping_add(1))
+                .unwrap_err()
+                .to_string()
+                .contains("account changed")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{broken");
+        let valid =
+            br#"{"default":"/preserved/Proton","dll_overrides":{"7":{"dinput8":"builtin"}}}"#;
+        fs::write(&path, valid).unwrap();
+        assert!(
+            reset_invalid_preferences(&path, crate::online::account_session())
+                .unwrap_err()
+                .to_string()
+                .contains("readable now")
+        );
+        assert_eq!(fs::read(&path).unwrap(), valid);
+        fs::remove_file(&path).unwrap();
+        let target = root.path().join("external");
+        fs::write(&target, "malformed but protected").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(reset_invalid_preferences(&path, crate::online::account_session()).is_err());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "malformed but protected"
+        );
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(reset_invalid_preferences(&path, crate::online::account_session()).is_err());
+        assert!(path.is_dir());
+        fs::remove_dir(&path).unwrap();
+        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        fs::write(&path, &oversized).unwrap();
+        assert!(
+            reset_invalid_preferences(&path, crate::online::account_session())
+                .unwrap_err()
+                .to_string()
+                .contains("too large")
+        );
+        assert_eq!(fs::read(&path).unwrap(), oversized);
+        assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("proton-recovery-")
+        }));
+    }
 
     #[test]
     fn oversized_dll_preferences_never_replace_the_readable_file() {

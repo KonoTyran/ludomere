@@ -1098,6 +1098,22 @@ pub(super) fn show_repair_dialog(
         model,
         detail,
         crate::domain::DepotOperationKind::Repair,
+        None,
+    );
+}
+
+pub(super) fn show_directory_repair_dialog(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+    directory: std::path::PathBuf,
+) {
+    start_existing_depot_operation_dialog(
+        window,
+        model,
+        detail,
+        crate::domain::DepotOperationKind::Repair,
+        Some(directory),
     );
 }
 
@@ -1111,6 +1127,7 @@ pub(super) fn show_update_dialog(
         model,
         detail,
         crate::domain::DepotOperationKind::Update,
+        None,
     );
 }
 
@@ -1119,6 +1136,7 @@ fn start_existing_depot_operation_dialog(
     model: &Rc<RefCell<AppModel>>,
     detail: &DetailPageModel,
     kind: crate::domain::DepotOperationKind,
+    directory: Option<std::path::PathBuf>,
 ) {
     let (config, epoch) = {
         let state = model.borrow();
@@ -1144,14 +1162,38 @@ fn start_existing_depot_operation_dialog(
         move |_| closed.set(true)
     });
     let product_id = detail.product_id;
+    let exact_library = directory
+        .as_ref()
+        .and_then(|directory| {
+            config
+                .game_libraries
+                .iter()
+                .find(|library| directory.parent() == Some(library.path.as_path()))
+        })
+        .map(|library| library.id.clone());
+    let expected_directory = directory.clone();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<_> {
             let store = StateStore::open()?;
-            let installed =
-                crate::installation::reconcile_installed_games(&store, &config.game_libraries)?
-                    .into_iter()
-                    .find(|game| game.product_id == product_id);
+            let libraries = config
+                .game_libraries
+                .iter()
+                .filter(|library| {
+                    expected_directory
+                        .as_ref()
+                        .is_none_or(|directory| directory.parent() == Some(library.path.as_path()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let installed = crate::installation::reconcile_installed_games(&store, &libraries)?
+                .into_iter()
+                .find(|game| {
+                    game.product_id == product_id
+                        && expected_directory
+                            .as_ref()
+                            .is_none_or(|directory| &game.installation_directory == directory)
+                });
             let Some(installed) = installed else {
                 return Ok(None);
             };
@@ -1167,7 +1209,7 @@ fn start_existing_depot_operation_dialog(
     let model = model.clone();
     let detail = detail.clone();
     glib::timeout_add_local(Duration::from_millis(32), move || {
-        if closed.get() || model.borrow().account_epoch != epoch {
+        if closed.get() || model.borrow().account_epoch != epoch || model.borrow().logout_pending {
             pending.close();
             return glib::ControlFlow::Break;
         }
@@ -1178,8 +1220,29 @@ fn start_existing_depot_operation_dialog(
                 present_existing_depot_operation_dialog(
                     &window, &model, &detail, kind, installed, marker,
                 );
+                return glib::ControlFlow::Break;
             }
-            Ok(Ok(None)) => load_install_choices(&pending, &window, &model, &detail, true),
+            Ok(Ok(None)) => {
+                spinner.set_spinning(false);
+                label.set_label("No recognized Depot installation is available to repair. Review the reinstall choices, or inspect and reset the existing game folder first. Nothing has been changed.");
+                if directory.is_some() {
+                    label.set_label("This folder has no recognized Depot installation to repair. Browse its files or review a reset of this folder, then choose Install Again. Other installed copies are not changed.");
+                }
+                let reinstall = gtk::Button::with_label("Review Reinstallation…");
+                reinstall.set_visible(directory.is_none());
+                reinstall.connect_clicked({
+                    let pending = pending.clone();
+                    let window = window.clone();
+                    let model = model.clone();
+                    let detail = detail.clone();
+                    move |_| {
+                        if model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
+                            load_install_choices(&pending, &window, &model, &detail, true);
+                        }
+                    }
+                });
+                shell.append(&reinstall);
+            }
             result => {
                 spinner.set_spinning(false);
                 label.set_label(&format!(
@@ -1195,14 +1258,68 @@ fn start_existing_depot_operation_dialog(
                     let window = window.clone();
                     let model = model.clone();
                     let detail = detail.clone();
+                    let directory = directory.clone();
                     move |_| {
+                        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                            return;
+                        }
                         pending.close();
-                        start_existing_depot_operation_dialog(&window, &model, &detail, kind)
+                        start_existing_depot_operation_dialog(
+                            &window,
+                            &model,
+                            &detail,
+                            kind,
+                            directory.clone(),
+                        )
                     }
                 });
                 shell.append(&retry);
             }
         }
+        let browse = gtk::Button::with_label("Browse Local Files");
+        browse.connect_clicked({
+            let window = window.clone();
+            let model = model.clone();
+            let detail = detail.clone();
+            move |_| {
+                if model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
+                    browse_game_files(&window, &model, &detail);
+                }
+            }
+        });
+        shell.append(&browse);
+        let reset = gtk::Button::with_label("Review File Reset…");
+        reset.connect_clicked({
+            let pending = pending.clone();
+            let window = window.clone();
+            let model = model.clone();
+            let detail = detail.clone();
+            let exact_library = exact_library.clone();
+            move |_| {
+                if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                    return;
+                }
+                pending.close();
+                // Completion publishes the existing uninstallation event for global UI refresh.
+                if let Some(library) = &exact_library {
+                    super::uninstall::show_game_directory_reset_dialog(
+                        &window,
+                        &model,
+                        &detail,
+                        library.clone(),
+                        Rc::new(|| {}),
+                    );
+                } else {
+                    super::uninstall::show_uninstall_dialog(
+                        &window,
+                        &model,
+                        &detail,
+                        Rc::new(|| {}),
+                    );
+                }
+            }
+        });
+        shell.append(&reset);
         glib::ControlFlow::Break
     });
 }

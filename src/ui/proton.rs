@@ -211,6 +211,60 @@ pub(super) struct ProtonSelection {
     pub selected_path: Rc<dyn Fn() -> anyhow::Result<Option<PathBuf>>>,
 }
 
+pub(super) fn connect_preferences_recovery(
+    button: &gtk::Button,
+    status: &gtk::Label,
+    refresh: Rc<dyn Fn()>,
+) {
+    let session = online::account_session();
+    button.connect_clicked({
+        let status = status.clone();
+        move |button| {
+            let Some(window) = button.root().and_downcast::<adw::ApplicationWindow>() else { return; };
+            if online::account_session() != session { return; }
+            let dialog = adw::AlertDialog::builder()
+                .heading("Reset unreadable Proton preferences?")
+                .body("Ludomere will keep a recovery copy of the unreadable preferences, then clear the default Proton choice and every game's Proton and DLL overrides. Choose your default Proton again afterward.\n\nGame files, prefixes, saves, installed Proton versions and runtimes will not be changed.")
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("reset", "Back Up and Reset")]);
+            dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let status = status.clone();
+            let refresh = refresh.clone();
+            let button = button.clone();
+            dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
+                if response != "reset" || !window.is_visible() || online::account_session() != session { return; }
+                button.set_sensitive(false);
+                status.set_label("Backing up and resetting Proton preferences…");
+                let receiver = update_policies::policy_request(move || compatibility::reset_invalid_proton_preferences(session));
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(_) => Err(anyhow::anyhow!("The preference recovery worker stopped. Refresh before trying again.")),
+                    };
+                    button.set_sensitive(true);
+                    if online::account_session() != session { return glib::ControlFlow::Break; }
+                    match result {
+                        Ok(backup) => {
+                            refresh();
+                            if window.is_visible() {
+                                let done = adw::AlertDialog::builder().heading("Proton preferences reset")
+                                    .body(format!("Choose your default Proton again. Your previous preferences are preserved at:\n{}", backup.display())).build();
+                                done.add_response("close", "Close");
+                                done.present(Some(&window));
+                            }
+                        }
+                        Err(error) => status.set_label(&format!("Could not reset Proton preferences: {error}. No game files were changed.")),
+                    }
+                    glib::ControlFlow::Break
+                });
+            });
+        }
+    });
+}
+
 pub(super) fn proton_selection_group_guarded(
     window: &adw::ApplicationWindow,
     product_id: Option<i64>,
@@ -272,8 +326,11 @@ pub(super) fn proton_selection_group_guarded(
     let browse = gtk::Button::with_label("Choose folder…");
     browse.set_visible(false);
     let refresh = gtk::Button::with_label("Refresh");
+    let recover = gtk::Button::with_label("Reset Proton Preferences…");
+    recover.set_visible(false);
     buttons.append(&browse);
     buttons.append(&refresh);
+    buttons.append(&recover);
     group.add(&buttons);
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
@@ -287,6 +344,9 @@ pub(super) fn proton_selection_group_guarded(
     let saved_index = Rc::new(std::cell::Cell::new(gtk::INVALID_LIST_POSITION));
     let save_error = Rc::new(RefCell::new(None::<String>));
     let session = online::account_session();
+    let preferences_generation = Rc::new(std::cell::Cell::new(
+        compatibility::proton_preferences_generation(),
+    ));
     let reload: Rc<dyn Fn()> = Rc::new({
         let choices = choices.clone();
         let selected = selected.clone();
@@ -300,6 +360,8 @@ pub(super) fn proton_selection_group_guarded(
         let active = active.clone();
         let browse = browse.clone();
         let save_error = save_error.clone();
+        let recover = recover.clone();
+        let preferences_generation = preferences_generation.clone();
         move || {
             if online::account_session() != session {
                 busy.set(false);
@@ -311,6 +373,8 @@ pub(super) fn proton_selection_group_guarded(
             if active.as_ref().is_some_and(|active| !active()) {
                 return;
             }
+            let generation = compatibility::proton_preferences_generation();
+            preferences_generation.set(generation);
             busy.set(true);
             selected.set_sensitive(false);
             buttons.set_sensitive(false);
@@ -348,7 +412,16 @@ pub(super) fn proton_selection_group_guarded(
             let active = active.clone();
             let browse = browse.clone();
             let save_error = save_error.clone();
+            let recover = recover.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                if compatibility::proton_preferences_generation() != generation {
+                    busy.set(false);
+                    status.set_label(
+                        "Proton preferences were reset. Refresh before selecting a version.",
+                    );
+                    buttons.set_sensitive(true);
+                    return glib::ControlFlow::Break;
+                }
                 if online::account_session() != session {
                     busy.set(false);
                     status
@@ -361,6 +434,7 @@ pub(super) fn proton_selection_group_guarded(
                 }
                 match receiver.try_recv() {
                     Ok(Ok((preferences, installations))) => {
+                        recover.set_visible(false);
                         detected.set(Some(!installations.is_empty()));
                         let saved = product_id
                             .and_then(|id| preferences.overrides.get(&id.to_string()))
@@ -429,6 +503,7 @@ pub(super) fn proton_selection_group_guarded(
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {
+                        recover.set_visible(true);
                         busy.set(false);
                         status.set_label(&format!("Could not read Proton preferences: {error}"));
                         buttons.set_sensitive(true);
@@ -455,6 +530,7 @@ pub(super) fn proton_selection_group_guarded(
         let reload = reload.clone();
         let active = active.clone();
         let acquisition_busy = acquisition_busy.clone();
+        let preferences_generation = preferences_generation.clone();
         move |path| {
             if online::account_session() != session {
                 status.set_label("The account changed. Reopen settings before selecting Proton.");
@@ -470,9 +546,13 @@ pub(super) fn proton_selection_group_guarded(
             status.set_label("Validating and saving Proton selection…");
             buttons.set_sensitive(false);
             selected.set_sensitive(false);
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = online::with_account_session(session, || {
+            let generation = preferences_generation.get();
+            let receiver = update_policies::policy_request(move || {
+                anyhow::ensure!(
+                    compatibility::proton_preferences_generation() == generation,
+                    "Proton preferences were reset. Refresh before selecting a version."
+                );
+                online::with_account_session(session, || {
                     match product_id {
                         Some(id) => compatibility::set_game_proton(id, path.as_deref()),
                         None => compatibility::set_default_proton(
@@ -480,8 +560,7 @@ pub(super) fn proton_selection_group_guarded(
                         ),
                     }?;
                     Ok(())
-                });
-                let _ = sender.send(result.map_err(|error| error.to_string()));
+                })
             });
             let busy = busy.clone();
             let active = active.clone();
@@ -493,7 +572,7 @@ pub(super) fn proton_selection_group_guarded(
                     return glib::ControlFlow::Break;
                 }
                 let result = match receiver.try_recv() {
-                    Ok(result) => result,
+                    Ok(result) => result.map_err(|error| error.to_string()),
                     Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
                     Err(_) => Err("Saving Proton selection stopped unexpectedly".into()),
                 };
@@ -584,6 +663,7 @@ pub(super) fn proton_selection_group_guarded(
             }
         }
     });
+    connect_preferences_recovery(&recover, &status, reload.clone());
     reload();
     let selected_path = Rc::new(move || {
         let path = paths.borrow().get(selected.selected() as usize).cloned();

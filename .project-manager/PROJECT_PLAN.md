@@ -1,5 +1,48 @@
 # Project plan
 
+## P249–P250 R93 publication
+
+- P249 storage_audit owns version0.2.4 in Cargo/lock/PKGBUILD/AppStream only; keep package release1
+  and preserve release history. Verify metadata consistency/XML/package syntax; no dependency or
+  product changes. P250 depot independently reviews accumulated release inventory and metadata.
+- Root prepares comprehensive commit and concise PR comment, checks prior evidence plus final
+  formatting/build as needed, commits and pushes fork main without force and posts requested PR6
+  comment. Verify remote head/comment. User explicitly authorizes publication; no package build,
+  actual profile/helper actions, new features or full suite repetition required for version bump.
+
+## P245–P248 R92 actionable per-game recovery
+
+- Status complete: owner implementations and independent cross-reviews verified. Scoped tests
+  total38 storage/recovery/preferences plus2 confirmation tests and2 retained actual GTK tests pass;
+  final fmt/diff/all-target Clippy/debug build pass. Reports /tmp/ludomere-p245-report.md,
+  p246-report.md, p247-report.md and p248-{backend,ui,preferences}-review.md. No full suite, real
+  user-file/helper operations or publication. Read-only actual file-manager/reboot behavior not
+  exercised; scope and limits recorded in status. Root preserved all work without committing.
+- Agreed interface: LibraryStatus.game_issues(path,reason), root/direct-child browsing validation,
+  per-target game validation. Healthy siblings remain usable. P245 explicit known-product/selected
+  root reset may remove unrecognized direct-child contents only after exact-path UI consent, with
+  directory identity recheck, conflicting readable ownership rejection and unowned prefixes kept.
+- Approved corrupt-journal recovery extension: explicit preparation stores bounded path/product/
+  directory+journal identity/hash/current boot. Same boot refuses reset; after reboot unchanged
+  evidence allows journal quarantine and another explicit reset confirmation. No automatic deletion
+  or system reboot; no inferred process quiescence. P246 owns uninstall.rs Browse and Install again.
+- P247 approved malformed Proton preference recovery: confirmed original-file backup and defaults
+  under existing locks/session guards, plus confirmed per-game DLL reset; own compatibility/proton.rs,
+  ui/proton.rs,dll_overrides.rs and coordinated README. No broader startup/config rewrite.
+- P245 depot owns storage/backend discovery: distinguish root configuration failures from child
+  game problems, scope destination validation, reuse existing repair/reset ownership controls.
+  Report concrete design and exact owned paths before edits; no blanket validation bypass.
+- P246 storage_audit owns game-level UI recovery flows (details/files/chooser/settings-storage
+  as coordinated): offer repair/browse/confirmed start-over and remove manual-file-work dead ends.
+  Wait backend interface agreement; preserve progress, account/lifetime guards and action consent.
+- P247 ui_review independently inventories related settings/prefix/default recovery dead ends;
+  report bounded fixes and coordinate ownership before edits. Reuse existing prefix backup/repair,
+  preference defaults and typed-library tools; no unrelated recovery framework.
+- P248 cross-review by nonimplementers, focused backend and private GTK tests, then root fmt/lint/
+  build. Root owns records only. Read AGENTS/terse-code/scope-creep; preserve clean a13f8c6 baseline.
+  Routine local reads/scoped edits/tests authorized. No secrets, real profile/library mutation,
+  installer/helper execution, full suite/package/publication or new dependencies/schema.
+
 ## P243–P244 R91 publication
 
 - P243/P244 complete: all four version files consistent, scoped metadata/XML/package syntax and

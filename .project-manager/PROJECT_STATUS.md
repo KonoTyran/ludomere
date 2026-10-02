@@ -4,6 +4,12 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- All16 exact post-commit builds PASS. P272 verification, P273 titles and P274 achievements source
+  frozen for wave6 compile; cross-reviews underway. P275 incremental status-log reader approved
+  after compilation snapshot. Final full build process plus changed-control/safety review pending.
+- Sixteen commits complete through1511b83, first15 exact builds PASS and set16 checking. Wave5
+  owner/independent tests all PASS. P272 verification feedback with minimum account/reset guards
+  and P273 title lookup reuse approved next; achievements remains read-only audit. No PR/push.
 - Wave5 shipping compilation/fmt/diff/all-target Clippy PASS. P269 source review and private
   500-product equivalence regression PASS; set14 committing. P270 private GTK1+tag filter1 PASS;
   P264/P270 independent GTK checks pending. Continue bounded audits until22:25, then final checks.

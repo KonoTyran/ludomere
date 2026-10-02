@@ -136,6 +136,7 @@ static VERIFICATION_STATES: OnceLock<Mutex<HashMap<i64, VerificationDisplayState
 
 #[derive(Clone)]
 struct VerificationDisplayState {
+    session: (u64, u64),
     message: String,
     fraction: Option<f64>,
     running: bool,

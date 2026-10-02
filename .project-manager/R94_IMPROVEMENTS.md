@@ -30,6 +30,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | e326e21 | P267 | Bind manual cloud actions and confirmations to the originating account. |
 | 4ed3ee3 | P269 | Batch catalog evidence used to classify stored files without changing validation. |
 | b2a7c99 | P264 | Load Compatibility preferences asynchronously with error details and Retry. |
+| 1511b83 | P270 | Guard hidden-game and tag saves across sign-out/reset and report save failures. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -51,6 +52,15 @@ hidden/tag writes are source-ready under independent review and coordinated priv
   show immediate visibility-save feedback, preserve pending behavior and retain sanitized errors.
   Owner and independent private GTK1+pure1 each PASS; independent security review PASS
   `/tmp/ludomere-p271-organization-review.md`. Committing as set16.
+  Commit1511b83 exact post-commit build PASS.
+- P272 verification feedback/account guards, P273 rebuild title lookup reuse and P274 achievement
+  loading/account guards approved next. Product edits remain bounded; no new edits after22:25 UTC.
+- P272 verified owner+independent private GTK1 each PASS, source/session/lock review PASS. Full
+  sanitized verification outcomes stay inline; unavailable checksums and disconnected workers are
+  explicit, progress remains determinate where known, stale account/reset work is rejected.
+  Existing repair choices retained. `/tmp/ludomere-p272-report.md` and
+  `/tmp/ludomere-p275-verification-review.md`. Wave6c shipping compile/all-target Clippy PASS after
+  a style-only collapsible-if correction. Committing set17; no real verification/repair executed.
 
 ## Completed sets
 
@@ -165,9 +175,8 @@ user is unavailable. Private GTK fixtures can exercise controls but not real gam
   blocking Client::new uses30s default timeout, verified in local dependency source. Existing
   gog::client uses45s. No speculative network/deadline policy change made; aggregate multi-request
   duration remains distinct from per-request bounds.
-- Targeted local refresh still inspects every game child before reconciling selected products.
-  Proposed later root-only inspection can retain root/archive validation and full Storage
-  diagnostics; pending separate ownership/review rather than weakening validation opportunistically.
+- Grid scrolling still checks all card bounds on each adjustment signal. Coalescing that work may
+  help, but introduces timing/lifecycle behavior; deferred while the smaller title lookup fix proceeds.
 - Game Properties Cloud Saves still reads its initial record synchronously and falls back on read
   failure; fixing safely requires separating its large record-dependent builder. Deferred pending
   a bounded design. The narrower Compatibility fixes read/loading/Retry change is approved next.

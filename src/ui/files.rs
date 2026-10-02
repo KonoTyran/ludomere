@@ -645,6 +645,7 @@ pub(super) fn detail_file_management(
             .map(|token| token.access_token.clone());
         let status = status.clone();
         let progress = progress.clone();
+        let session = (online::account_session(), auth::session());
         verify.connect_clicked(move |button| {
             let confirmation = adw::AlertDialog::builder()
                 .heading("Verify and repair downloads?")
@@ -659,21 +660,15 @@ pub(super) fn detail_file_management(
                 title: title.clone(),
                 artifacts: artifacts.clone(),
                 access_token: access_token.clone(),
+                session,
             };
             let button = button.clone();
             let window = window.clone();
-            let response_window = window.clone();
             let status = status.clone();
             let progress = progress.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response == "verify" {
-                    start_product_verification(
-                        request,
-                        &button,
-                        &response_window,
-                        &status,
-                        &progress,
-                    );
+                    start_product_verification(request, &button, &status, &progress);
                 }
             });
         });
@@ -3496,13 +3491,18 @@ pub(super) fn verification_state(product_id: i64) -> Option<VerificationDisplayS
         .lock()
         .ok()?
         .get(&product_id)
+        .filter(|state| check_verification_session(state.session).is_ok())
         .cloned()
 }
 
 pub(super) fn set_verification_state(product_id: i64, state: VerificationDisplayState) {
+    if check_verification_session(state.session).is_err() {
+        return;
+    }
     if let Ok(mut states) = VERIFICATION_STATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
+        && check_verification_session(state.session).is_ok()
     {
         states.insert(product_id, state);
     }
@@ -3516,8 +3516,11 @@ pub(super) fn apply_verification_display(
 ) {
     button.set_sensitive(!state.running);
     status.set_label(&state.message);
+    status.set_wrap(true);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    status.set_selectable(true);
     status.set_visible(true);
-    progress.set_visible(true);
+    progress.set_visible(state.running);
     if let Some(fraction) = state.fraction {
         progress.set_fraction(fraction);
         progress.set_show_text(state.running);
@@ -3548,11 +3551,20 @@ pub(super) fn restore_verification_display(
     if !state.running {
         return;
     }
-    let button = button.clone();
-    let status = status.clone();
-    let progress = progress.clone();
+    let button = button.downgrade();
+    let status = status.downgrade();
+    let progress = progress.downgrade();
     glib::timeout_add_local(Duration::from_millis(200), move || {
+        let (Some(button), Some(status), Some(progress)) =
+            (button.upgrade(), status.upgrade(), progress.upgrade())
+        else {
+            return glib::ControlFlow::Break;
+        };
         let Some(state) = verification_state(product_id) else {
+            status
+                .set_label("Account changed. Reopen the game's files before verifying downloads.");
+            progress.set_visible(false);
+            button.set_sensitive(false);
             return glib::ControlFlow::Break;
         };
         apply_verification_display(&state, &button, &status, &progress);
@@ -3567,14 +3579,20 @@ pub(super) fn restore_verification_display(
 fn start_product_verification(
     request: VerificationRequest,
     button: &gtk::Button,
-    window: &adw::ApplicationWindow,
     status: &gtk::Label,
     progress: &gtk::ProgressBar,
 ) {
+    if let Err(error) = check_verification_session(request.session) {
+        status.set_label(&error.to_string());
+        status.set_visible(true);
+        button.set_sensitive(false);
+        return;
+    }
     if verification_state(request.product_id).is_some_and(|state| state.running) {
         return;
     }
     let product_id = request.product_id;
+    let session = request.session;
     let (sender, receiver) = mpsc::channel();
     button.set_sensitive(false);
     button.set_tooltip_text(Some("Verifying files…"));
@@ -3585,6 +3603,7 @@ fn start_product_verification(
     set_verification_state(
         product_id,
         VerificationDisplayState {
+            session,
             message: "Preparing verification…".into(),
             fraction: None,
             running: true,
@@ -3596,94 +3615,104 @@ fn start_product_verification(
             &request.title,
             &request.artifacts,
             request.access_token.as_deref(),
+            session,
             &sender,
         );
         let _ = sender.send(VerificationEvent::Finished(result));
     });
+    monitor_product_verification(product_id, session, button, status, progress, receiver);
+}
+
+fn monitor_product_verification(
+    product_id: i64,
+    session: (u64, u64),
+    button: &gtk::Button,
+    status: &gtk::Label,
+    progress: &gtk::ProgressBar,
+    receiver: mpsc::Receiver<VerificationEvent>,
+) {
     let button = button.clone();
-    let window = window.clone();
     let status = status.clone();
     let progress = progress.clone();
+    let mut determinate = false;
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        match receiver.try_recv() {
+        if let Err(error) = check_verification_session(session) {
+            status.set_label(&error.to_string());
+            progress.set_visible(false);
+            button.set_sensitive(false);
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
             Ok(VerificationEvent::Progress { message, fraction }) => {
-                set_verification_state(
-                    product_id,
-                    VerificationDisplayState {
-                        message: message.clone(),
-                        fraction,
-                        running: true,
-                    },
-                );
-                status.set_label(&message);
-                if let Some(fraction) = fraction {
-                    progress.set_fraction(fraction);
-                    progress.set_show_text(true);
-                    progress.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
-                } else {
-                    progress.set_show_text(false);
+                determinate = fraction.is_some();
+                let state = VerificationDisplayState {
+                    session,
+                    message,
+                    fraction,
+                    running: true,
+                };
+                apply_verification_display(&state, &button, &status, &progress);
+                set_verification_state(product_id, state);
+                return glib::ControlFlow::Continue;
+            }
+            Ok(VerificationEvent::Finished(result)) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                if !determinate {
                     progress.pulse();
                 }
-                glib::ControlFlow::Continue
+                return glib::ControlFlow::Continue;
             }
-            Ok(VerificationEvent::Finished(result)) => {
-                button.set_sensitive(true);
-                button.set_tooltip_text(Some(
-                    "Check downloaded files using the native download database",
-                ));
-                progress.set_fraction(1.0);
-                progress.set_show_text(false);
-                status.set_label(match &result {
-                    Ok(report) if report.repair_groups > 0 => {
-                        "Verification complete; repairs queued"
-                    }
-                    Ok(_) => "Verification complete",
-                    Err(_) => "Verification failed",
-                });
-                set_verification_state(
-                    product_id,
-                    VerificationDisplayState {
-                        message: status.label().to_string(),
-                        fraction: Some(1.0),
-                        running: false,
-                    },
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "Verification worker stopped unexpectedly. Inspect downloaded files and retry verification."
+            )),
+        };
+        let message = match result {
+            Ok(report)
+                if report.checked == 0 && report.repair_groups == 0 && report.unavailable == 0 =>
+            {
+                "No completed downloads were found for this product.".into()
+            }
+            Ok(report) => {
+                let mut message = format!(
+                    "{} files verified against GOG checksums. {} download groups queued for repair. {} downloaded groups could not be verified against GOG's current checksums.",
+                    report.checked, report.repair_groups, report.unavailable
                 );
-                let dialog = match result {
-                Ok(report) if report.checked > 0 || report.repair_groups > 0 => adw::AlertDialog::builder()
-                    .heading(if report.repair_groups > 0 { "Repair downloads queued" } else { "Verification complete" })
-                    .body(format!(
-                        "{} files verified against GOG checksums. {} download groups queued for repair. {} downloaded groups could not be matched to a version currently published by GOG.",
-                        report.checked, report.repair_groups, report.unavailable
-                    ))
-                    .build(),
-                Ok(_) => adw::AlertDialog::builder()
-                    .heading("Nothing to verify")
-                    .body("No completed downloads were found for this product.")
-                    .build(),
-                Err(error) => adw::AlertDialog::builder()
-                    .heading("Verification failed")
-                    .body(error.to_string())
-                    .build(),
-            };
-                dialog.add_response("ok", "OK");
-                dialog.present(Some(&window));
-                glib::ControlFlow::Break
+                if report.unavailable > 0 {
+                    message.push_str(" Unverified groups were not repaired. Retry verification when their checksums are available.");
+                }
+                for error in report.checksum_errors {
+                    message.push('\n');
+                    message.push_str(&error);
+                }
+                super::notifications::failure_message("", &message)
+                    .trim_start()
+                    .to_owned()
             }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                button.set_sensitive(true);
-                set_verification_state(
-                    product_id,
-                    VerificationDisplayState {
-                        message: "Verification stopped unexpectedly".into(),
-                        fraction: None,
-                        running: false,
-                    },
-                );
-                glib::ControlFlow::Break
+            Err(error) => {
+                super::notifications::failure_message("Verification failed", &format!("{error:#}"))
             }
-        }
+        };
+        let state = VerificationDisplayState {
+            session,
+            message,
+            fraction: None,
+            running: false,
+        };
+        button.set_tooltip_text(Some(
+            "Check downloaded files using the native download database",
+        ));
+        apply_verification_display(&state, &button, &status, &progress);
+        set_verification_state(product_id, state);
+        glib::ControlFlow::Break
     });
+}
+
+fn check_verification_session(session: (u64, u64)) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        online::account_session() == session.0 && auth::session_is_current(session.1),
+        "Account changed. Reopen the game's files before verifying downloads."
+    );
+    Ok(())
 }
 
 struct VerificationRequest {
@@ -3691,6 +3720,7 @@ struct VerificationRequest {
     title: String,
     artifacts: Vec<RemoteArtifact>,
     access_token: Option<String>,
+    session: (u64, u64),
 }
 
 enum VerificationEvent {
@@ -3706,6 +3736,7 @@ struct VerificationReport {
     checked: usize,
     repair_groups: usize,
     unavailable: usize,
+    checksum_errors: Vec<String>,
 }
 
 fn verify_product_files(
@@ -3713,9 +3744,15 @@ fn verify_product_files(
     title: &str,
     remote_artifacts: &[RemoteArtifact],
     access_token: Option<&str>,
+    session: (u64, u64),
     progress: &mpsc::Sender<VerificationEvent>,
 ) -> anyhow::Result<VerificationReport> {
-    let jobs = StateStore::open()?.download_jobs()?;
+    check_verification_session(session)?;
+    let _activity = crate::profile_reset::begin_activity("verifying downloaded files")?;
+    let jobs = online::with_account_session(session.0, || {
+        check_verification_session(session)?;
+        StateStore::open()?.download_jobs()
+    })?;
     let completed = jobs
         .iter()
         .filter(|job| job.product_id == product_id && job.state == "complete")
@@ -3754,6 +3791,7 @@ fn verify_product_files(
     let mut processed = 0_usize;
     let mut used_jobs = HashSet::new();
     for group in groups.values_mut() {
+        check_verification_session(session)?;
         group.sort_by_key(|artifact| artifact.part_number.unwrap_or(1));
         let requested_id = download::job_id(group);
         let job = completed
@@ -3798,20 +3836,29 @@ fn verify_product_files(
         let mut corrupt = Vec::new();
         let mut matched = true;
         for artifact in group.iter() {
+            check_verification_session(session)?;
             let _ = progress.send(VerificationEvent::Progress {
                 message: format!("Fetching GOG checksum for {}…", artifact.name),
                 fraction: None,
             });
             let checksum = match download::gog_checksum(artifact, access_token) {
                 Ok(checksum) => checksum,
-                Err(_) => {
+                Err(error) => {
+                    report
+                        .checksum_errors
+                        .push(super::notifications::failure_message(
+                            "Could not obtain GOG checksums",
+                            &format!("{}: {error:#}", artifact.name),
+                        ));
                     matched = false;
                     break;
                 }
             };
-            if let Ok(store) = StateStore::open()
-                && let Err(error) = store.observe_part_checksum(artifact, &checksum.md5)
-            {
+            check_verification_session(session)?;
+            if let Err(error) = online::with_account_session(session.0, || {
+                check_verification_session(session)?;
+                StateStore::open()?.observe_part_checksum(artifact, &checksum.md5)
+            }) {
                 tracing::warn!(product_id = artifact.product_id, %error, "could not persist GOG checksum identity");
             }
             let local = job.completed_files.iter().find(|path| {
@@ -3849,12 +3896,13 @@ fn verify_product_files(
                 })
                 .is_ok_and(|actual| actual.eq_ignore_ascii_case(&checksum.md5));
             processed += 1;
+            check_verification_session(session)?;
             if hash_matches {
                 report.checked += 1;
-                if let Ok(store) = StateStore::open()
-                    && let Err(error) =
-                        store.mark_managed_file_verified(local, artifact, &checksum.md5)
-                {
+                if let Err(error) = online::with_account_session(session.0, || {
+                    check_verification_session(session)?;
+                    StateStore::open()?.mark_managed_file_verified(local, artifact, &checksum.md5)
+                }) {
                     tracing::warn!(path = %local.display(), %error, "could not record verified managed file");
                 }
             } else {
@@ -3867,22 +3915,29 @@ fn verify_product_files(
         used_jobs.insert(job.job_id.clone());
         if !corrupt.is_empty() {
             for path in corrupt {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+                online::with_account_session(session.0, || {
+                    check_verification_session(session)?;
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error.into()),
+                    }
+                })?;
             }
             let artifacts = group.iter().map(|artifact| (*artifact).clone()).collect();
             let (sender, _receiver) = mpsc::channel();
-            download::enqueue(download::DownloadRequest {
-                artifacts,
-                title: title.to_owned(),
-                access_token: access_token.to_owned(),
-                destination: job.destination.clone(),
-                library_id: library.id,
-                events: sender,
-            });
+            online::with_account_session(session.0, || {
+                check_verification_session(session)?;
+                download::enqueue(download::DownloadRequest {
+                    artifacts,
+                    title: title.to_owned(),
+                    access_token: access_token.to_owned(),
+                    destination: job.destination.clone(),
+                    library_id: library.id,
+                    events: sender,
+                });
+                Ok(())
+            })?;
             report.repair_groups += 1;
         }
     }
@@ -4006,6 +4061,140 @@ fn inferred_local_artifact(file: &LibraryFile) -> Option<RemoteArtifact> {
 #[cfg(test)]
 mod unified_row_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG and private GTK; synthetic verification events only, no hashing/network/deletion"]
+    fn verification_feedback_preserves_results_and_rejects_stale_work() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p272-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let session = (online::account_session(), auth::session());
+        let stale = (session.0.wrapping_add(1), session.1);
+        let (sender, _) = mpsc::channel();
+        assert!(verify_product_files(9272001, "Synthetic", &[], None, stale, &sender).is_err());
+        let reservation = crate::profile_reset::reserve().unwrap();
+        assert!(verify_product_files(9272001, "Synthetic", &[], None, session, &sender).is_err());
+        drop(reservation);
+        assert!(!crate::identity::database().exists());
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.VerificationTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.set_content(Some(&content));
+        window.present();
+        for case in 0..7 {
+            let id = 9272001 + case;
+            let button = gtk::Button::with_label("Verify and Repair");
+            let status = gtk::Label::new(Some("Preparing verification…"));
+            let progress = gtk::ProgressBar::new();
+            content.append(&button);
+            content.append(&status);
+            content.append(&progress);
+            button.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            monitor_product_verification(
+                id,
+                if case == 6 { stale } else { session },
+                &button,
+                &status,
+                &progress,
+                receiver,
+            );
+            if case != 6 {
+                sender
+                    .send(VerificationEvent::Progress {
+                        message: "Verifying synthetic file".into(),
+                        fraction: Some(0.5),
+                    })
+                    .unwrap();
+                wait_until(|| status.label() == "Verifying synthetic file");
+                assert!(progress.shows_text());
+                assert_eq!(progress.fraction(), 0.5);
+                assert!(!button.is_sensitive());
+            }
+            let result = match case {
+                0 => Some(Ok(VerificationReport::default())),
+                1 => Some(Ok(VerificationReport {
+                    unavailable: 2,
+                    checksum_errors: vec![
+                        "Checksum unavailable https://example.invalid/?token=SECRET".into(),
+                    ],
+                    ..Default::default()
+                })),
+                2 => Some(Ok(VerificationReport {
+                    checked: 3,
+                    ..Default::default()
+                })),
+                3 => Some(Ok(VerificationReport {
+                    repair_groups: 1,
+                    ..Default::default()
+                })),
+                4 => Some(Err(anyhow::anyhow!(
+                    "synthetic outer failure https://example.invalid/?token=SECRET"
+                ))),
+                _ => None,
+            };
+            if let Some(result) = result {
+                sender.send(VerificationEvent::Finished(result)).unwrap();
+            }
+            drop(sender);
+            wait_until(|| !progress.is_visible());
+            let expected = match case {
+                0 => "No completed downloads",
+                1 => "2 downloaded groups could not be verified",
+                2 => "3 files verified",
+                3 => "1 download groups queued",
+                4 => "synthetic outer failure",
+                5 => "stopped unexpectedly",
+                _ => "Account changed",
+            };
+            assert!(status.label().contains(expected), "{}", status.label());
+            assert!(!status.label().contains("SECRET"));
+            assert_eq!(button.is_sensitive(), case != 6);
+            assert!(
+                window.visible_dialog().is_none(),
+                "completion must not present a dialog"
+            );
+            if case != 6 {
+                let restored = gtk::Label::new(None);
+                restore_verification_display(
+                    id,
+                    &gtk::Button::new(),
+                    &restored,
+                    &gtk::ProgressBar::new(),
+                );
+                assert_eq!(restored.label(), status.label());
+                set_verification_state(
+                    id,
+                    VerificationDisplayState {
+                        session: stale,
+                        message: "stale overwrite".into(),
+                        fraction: None,
+                        running: true,
+                    },
+                );
+                assert_eq!(verification_state(id).unwrap().message, status.label());
+            }
+            content.remove(&button);
+            content.remove(&status);
+            content.remove(&progress);
+        }
+        window.close();
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/all XDG and private GTK display; uses synthetic patch events only"]

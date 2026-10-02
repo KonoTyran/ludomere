@@ -1,5 +1,49 @@
 # Project plan
 
+## P277 R94 source migration lifecycle follow-up
+
+- Independent cumulative review found strong Close/Continue callback cycles in P252 MigrationView
+  and missing initial-preflight profile activity. ui_review owns game_settings.rs narrow fix:
+  weak captures, original-session/activity checks before inspection, preserve explicit migration
+  consent and existing progress/close behavior. Retained private GTK weak-release and stale/reset
+  tests; no real migration/helper. Independent review and separate commit/build required.
+
+## P276 R94 authoritative checksum filename safety
+
+- storage_audit found pre-existing parse_gog_checksum accepts raw XML filenames which verification
+  may join to a destination before deleting a corrupt/missing download. Approve narrow verify.rs
+  validation proposal, then reject unsafe XML and fallback filenames before exposing GogChecksum;
+  never normalize an authoritative traversal into another filename. Synthetic parser/path tests,
+  no file deletion/network. Preserve valid names, checksum/size semantics. Independent review and
+  separate commit/build. Source frozen P272 first; no destructive diagnostic test needed.
+- Approved strict basename validation after XML/fallback selection: reject empty/whitespace-only,
+  dot/dotdot, separators, controls and non-single-normal components; retain accepted original name.
+  Invalid explicit XML must not fall back to a safe name. Pure valid Unicode/space/multipart and
+  traversal/absolute/control rejection tables; existing protocol fallback normalization unchanged.
+
+## P275 R94 installation status-log efficiency audit
+
+- Root found UmuLogStatusMonitor rereads its entire growing log every100ms in executor.rs, then
+  processes only new bytes. Depot read-only audit next: propose bounded incremental reading while
+  preserving complete-line/status behavior, truncation/replacement and prompt worker shutdown.
+  Synthetic files only, no helper/process/game launch. No edits until proposal reviewed; avoid
+  generic log framework or unrelated logging changes. Independent tests/review if approved.
+- Approved executor.rs-only incremental reader: inode/device+offset,64 KiB reads, stop checks
+  between chunks,100ms idle wait,16 KiB pending-line bound with oversized status lines skipped
+  until newline (raw saved logs untouched). Reset pending/dedup on truncation/replacement; decode
+  completed lines to preserve split UTF-8. Private append/unchanged/truncate/replace/oversize and
+  synthetic monitor shutdown tests. No real helper launch; no generic log infrastructure.
+
+## P274 R94 achievement loading lifecycle and truthful failures
+
+- ui_review confirmed the only achievement worker opens cache without profile activity/session
+  precheck, discards cache failures and claims cached achievements exist even when absent/offline.
+  Own ui/achievements.rs: original-session check and activity around worker, session-aware UI
+  results, sanitized diagnostics retaining useful cache failure when refresh fails, truthful empty
+  offline feedback. Preserve cache-first rendering, refresh and Comet policy; no network/backend
+  protocol change. Private synthetic offline cache/error/reset tests and independent review; never
+  real account, keyring, achievements or profile operations. Separate commit/post-commit build.
+
 ## P272 R94 downloaded-file verification feedback
 
 - storage_audit identified start_product_verification presenting a completion modal from a
@@ -9,6 +53,11 @@
   Preserve consent, repair/deletion decisions, cancellation and session checks. Synthetic events/
   private GTK or pure outcomes only; no real files/helper/network. Independent review and focused
   tests, separate commit/build; stop for scope expansion or unresolved deletion-policy ambiguity.
+- Approved minimum lifecycle correction: capture original online/auth sessions in request and
+  ephemeral verification state (ui/mod.rs field extension allowed); profile activity covers worker,
+  session checks between stages, account commit guard only for short mutations/delete+enqueue,
+  never network/hash/traversal. Reject stale confirmation and UI results. Preserve existing selected
+  corrupt-file decisions and explicit Verify-and-repair consent. No real verification execution.
 
 ## P273 R94 further library responsiveness audit
 
@@ -16,6 +65,11 @@
   actual redundant work and propose bounded improvements with source evidence and synthetic
   verification; no edits before manager accepts proposal. Preserve live-state checks, row identity,
   priority ordering and account/closing behavior; no persistent broad model-index redesign.
+- Confirmed title refresh makes two per-widget linear searches and unconditional title writes.
+  Depot owns library.rs bounded fix: ephemeral ID→title map preserving first-duplicate behavior,
+  release model borrow before GTK mutations, skip identical labels. Keep idle new-row live-model
+  relookup unchanged. Private retained GTK unchanged/changed/removed IDs, focus/selection and
+  row/card identity plus independent review required. Scroll throttling deferred due timing surface.
 
 ## P270 R94 organization write lifecycle
 

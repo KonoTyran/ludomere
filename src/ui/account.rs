@@ -1,5 +1,13 @@
 use super::*;
 
+fn account_result_is_current(
+    expected: (u64, u64),
+    current: (u64, u64),
+    logout_pending: bool,
+) -> bool {
+    expected == current && !logout_pending
+}
+
 pub(super) fn show_gog_login(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     use webkit6::prelude::*;
     if model.borrow().logout_pending {
@@ -7,7 +15,9 @@ pub(super) fn show_gog_login(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     }
     let epoch = model.borrow().account_epoch;
 
-    let web_view = webkit6::WebView::new();
+    let web_view = webkit6::WebView::builder()
+        .network_session(&webkit6::NetworkSession::new_ephemeral())
+        .build();
     web_view.load_uri(&auth::login_url());
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
@@ -66,7 +76,7 @@ pub(super) fn begin_account_exchange(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
     std::thread::spawn(move || {
         let _ = sender.send(auth::exchange_code(&code, auth_session));
     });
-    poll_account_result(w, model, receiver, epoch);
+    poll_account_result(w, model, receiver, epoch, auth_session);
 }
 
 pub(super) fn start_account_restore(
@@ -83,7 +93,11 @@ pub(super) fn start_account_restore(
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+        if !account_result_is_current(
+            (epoch, auth_session),
+            (model.borrow().account_epoch, auth::session()),
+            model.borrow().logout_pending,
+        ) {
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {
@@ -98,7 +112,7 @@ pub(super) fn start_account_restore(
                 glib::ControlFlow::Break
             }
             Ok(Err(error)) => {
-                tracing::warn!(%error, "could not restore GOG session");
+                tracing::warn!(message = %auth::sign_in_error_message(&error), "could not restore GOG session");
                 download::set_authenticated(false);
                 model.borrow_mut().token_refresh_in_progress = false;
                 update_header_network_indicator(&w, &model.borrow());
@@ -121,11 +135,16 @@ pub(super) fn poll_account_result(
     model: &Rc<RefCell<AppModel>>,
     receiver: mpsc::Receiver<anyhow::Result<(auth::Token, auth::Profile)>>,
     epoch: u64,
+    auth_session: u64,
 ) {
     let w = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+        if !account_result_is_current(
+            (epoch, auth_session),
+            (model.borrow().account_epoch, auth::session()),
+            model.borrow().logout_pending,
+        ) {
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {
@@ -139,15 +158,12 @@ pub(super) fn poll_account_result(
                 show_status(&w, "Signed in to GOG");
                 glib::ControlFlow::Break
             }
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 w.sign_in.set_sensitive(true);
                 if w.live_status.label() == "Signing in to GOG…" {
                     show_progress(&w, "");
                 }
-                show_status(
-                    &w,
-                    "GOG sign-in failed. Check your connection and try signing in again.",
-                );
+                show_status(&w, &auth::sign_in_error_message(&error));
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -226,7 +242,11 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
         let w = w.clone();
         let model = model.clone();
         glib::timeout_add_local(Duration::from_millis(100), move || {
-            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+            if !account_result_is_current(
+                (epoch, auth_session),
+                (model.borrow().account_epoch, auth::session()),
+                model.borrow().logout_pending,
+            ) {
                 return glib::ControlFlow::Break;
             }
             match receiver.try_recv() {
@@ -241,7 +261,7 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "automatic GOG token renewal failed");
+                    tracing::warn!(message = %auth::sign_in_error_message(&error), "automatic GOG token renewal failed");
                     model.borrow_mut().token_refresh_in_progress = false;
                     update_header_network_indicator(&w, &model.borrow());
                     w.account_library_status
@@ -257,4 +277,31 @@ pub(super) fn start_token_renewal_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<Ap
         });
         glib::ControlFlow::Continue
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_restore_or_renewal_cannot_replace_a_new_login_in_the_same_ui_epoch() {
+        let (send, receive) = mpsc::channel();
+        // The cached account can remain unchanged, so only the auth generation advances.
+        let current = (7, 12);
+        send.send(((7, 12), "signed in")).unwrap();
+        send.send(((7, 11), "restore found no credentials"))
+            .unwrap();
+        send.send(((7, 11), "renewal failed")).unwrap();
+        send.send(((6, 12), "old page result")).unwrap();
+        drop(send);
+        let mut status = "signing in";
+        for (expected, result) in receive {
+            if account_result_is_current(expected, current, false) {
+                status = result;
+            }
+        }
+        assert_eq!(status, "signed in");
+        assert!(!account_result_is_current(current, current, true));
+        assert!(!account_result_is_current(current, (7, 13), false));
+    }
 }

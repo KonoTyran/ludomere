@@ -340,10 +340,33 @@ fn run(
         .old_game
         .clone()
         .context("save migration has no existing installation plan")?;
+    let config = crate::storage::read_config()?;
+    super::validate_game_library(&config, &old.library_id, &old.installation_directory)?;
     let target = journal
         .target
         .clone()
         .context("save migration has no target installation plan")?;
+    if let MigrationTarget::Offline {
+        game,
+        additional_installers,
+        ..
+    } = &target
+    {
+        super::validate_game_library(&config, &game.library_id, &game.installation_directory)?;
+        super::validate_offline_sources(
+            &config,
+            &game
+                .installer_files
+                .iter()
+                .cloned()
+                .chain(
+                    additional_installers
+                        .iter()
+                        .flat_map(|installer| installer.files.clone()),
+                )
+                .collect::<Vec<_>>(),
+        )?;
+    }
     let target_windows = match &target {
         MigrationTarget::Offline { game, .. } => game
             .installer_operating_system
@@ -391,6 +414,11 @@ fn run(
 }
 
 fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> {
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &game.library_id,
+        &game.installation_directory,
+    )?;
     if game.installation_directory.parent() != Some(library) {
         bail!("source migration installation is outside its library");
     }
@@ -419,6 +447,12 @@ fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> 
             }
         }
     }
+    let _permit = crate::operation_gate::try_acquire()?;
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &game.library_id,
+        &game.installation_directory,
+    )?;
     if game.installation_directory.exists() {
         fs::remove_dir_all(&game.installation_directory)?;
     }

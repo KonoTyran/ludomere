@@ -1,6 +1,6 @@
 use super::{
     DownloadEvent, DownloadFailure, DownloadFailureKind, DownloadManagerEvent, cancel_worker,
-    delete_completed_files, job_id, staging_directory, start_worker, worker_is_active,
+    delete_completed_files, staging_directory, start_worker, worker_is_active,
 };
 use crate::{
     domain::RemoteArtifact,
@@ -21,6 +21,7 @@ use std::{
 #[derive(Clone)]
 struct Request {
     id: String,
+    library_id: String,
     session: u64,
     recovery_generation: u64,
     artifacts: Vec<RemoteArtifact>,
@@ -180,23 +181,8 @@ pub(super) fn check_retention(product_id: i64, token: &str, session: u64) -> any
     Ok(())
 }
 
-pub(super) fn enqueue(
-    artifacts: Vec<RemoteArtifact>,
-    title: String,
-    access_token: String,
-    destination: PathBuf,
-    listener: mpsc::Sender<DownloadEvent>,
-) -> Arc<AtomicBool> {
-    let request = request_from_download(
-        super::DownloadRequest {
-            artifacts,
-            title,
-            access_token,
-            destination,
-            events: listener,
-        },
-        crate::online::account_session(),
-    );
+pub(super) fn enqueue(request: super::DownloadRequest) -> Arc<AtomicBool> {
+    let request = request_from_download(request, crate::online::account_session());
     let handle = request.handle.clone();
     let _ = manager().commands.send(Command::Enqueue(request));
     handle
@@ -204,6 +190,7 @@ pub(super) fn enqueue(
 
 fn request_from_download(request: super::DownloadRequest, session: u64) -> Request {
     let super::DownloadRequest {
+        library_id,
         artifacts,
         title,
         access_token,
@@ -211,10 +198,11 @@ fn request_from_download(request: super::DownloadRequest, session: u64) -> Reque
         events: listener,
     } = request;
     let refs = artifacts.iter().collect::<Vec<_>>();
-    let id = job_id(&refs);
+    let id = super::job_id_at(&refs, &destination);
     let handle = Arc::new(AtomicBool::new(false));
     Request {
         id,
+        library_id,
         session,
         recovery_generation: crate::installation::recovery::generation(artifacts[0].product_id),
         artifacts,
@@ -229,6 +217,38 @@ fn request_from_download(request: super::DownloadRequest, session: u64) -> Reque
         queue_position: None,
         manifest_refresh_attempted: false,
     }
+}
+
+fn validate_request(request: &Request) -> anyhow::Result<()> {
+    validate_destination(
+        &request.artifacts,
+        &request.destination,
+        (!request.library_id.is_empty()).then_some(request.library_id.as_str()),
+    )
+}
+
+pub(super) fn validate_destination(
+    artifacts: &[RemoteArtifact],
+    destination: &std::path::Path,
+    id: Option<&str>,
+) -> anyhow::Result<()> {
+    let first = artifacts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("A download group contains no files"))?;
+    let kind = crate::storage::artifact_library_kind(first);
+    anyhow::ensure!(
+        artifacts
+            .iter()
+            .all(|artifact| crate::storage::artifact_library_kind(artifact) == kind),
+        "Download group mixes library types"
+    );
+    let config = crate::storage::read_config()?;
+    let library = crate::storage::validate_path(&config, kind, destination)?;
+    anyhow::ensure!(
+        id.is_none_or(|id| id == library.id),
+        "The selected download library changed; choose its destination again"
+    );
+    Ok(())
 }
 
 pub(super) fn enqueue_with_install(
@@ -515,7 +535,31 @@ fn run(
                         let _activity = crate::profile_reset::begin_activity("backup scheduling")?;
                         anyhow::ensure!(shutdown_acknowledgement.is_none(), "Ludomere is closing");
                         let store = StateStore::open()?;
-                        let request = request_from_download(request, session);
+                        let mut request = request_from_download(request, session);
+                        validate_request(&request)?;
+                        let config = crate::storage::read_config()?;
+                        let allowed =
+                            match crate::storage::artifact_library_kind(&request.artifacts[0]) {
+                                crate::config::LibraryKind::OfflineInstallers => {
+                                    crate::updates::UpdatePolicy::resolve(
+                                        &config,
+                                        store
+                                            .game_preferences(request.artifacts[0].product_id)?
+                                            .as_ref(),
+                                    )
+                                    .auto_download_offline_installer
+                                }
+                                crate::config::LibraryKind::Extras => config.auto_download_extras,
+                                crate::config::LibraryKind::GameFiles => false,
+                            };
+                        anyhow::ensure!(
+                            allowed,
+                            "Automatic archive updates were disabled before registration"
+                        );
+                        request.id = super::resolve_job_id(
+                            &request.artifacts.iter().collect::<Vec<_>>(),
+                            &request.destination,
+                        )?;
                         let _admission = crate::installation::recovery::admit_generation(
                             request.artifacts[0].product_id,
                             generation,
@@ -558,6 +602,13 @@ fn run(
                                 "Ludomere is closing; retry after restarting"
                             );
                             let store = StateStore::open()?;
+                            for request in &requests {
+                                validate_destination(
+                                    &request.artifacts,
+                                    &request.destination,
+                                    Some(&request.library_id),
+                                )?;
+                            }
                             let intent = choice
                                 .as_ref()
                                 .map(|choice| {
@@ -570,6 +621,7 @@ fn run(
                                 .map(|request| {
                                     request_from_download(
                                         super::DownloadRequest {
+                                            library_id: request.library_id.clone(),
                                             artifacts: request.artifacts.clone(),
                                             title: request.title.clone(),
                                             access_token: request.access_token.clone(),
@@ -580,6 +632,16 @@ fn run(
                                     )
                                 })
                                 .collect::<Vec<_>>();
+                            let prepared = prepared
+                                .into_iter()
+                                .map(|mut request| {
+                                    request.id = super::resolve_job_id(
+                                        &request.artifacts.iter().collect::<Vec<_>>(),
+                                        &request.destination,
+                                    )?;
+                                    Ok(request)
+                                })
+                                .collect::<anyhow::Result<Vec<_>>>()?;
                             let _admission = crate::installation::recovery::admit_stamps(&stamps)?;
                             super::auto_install::clear_for_requests(&store, &requests)?;
                             if let Some(choice) = choice {
@@ -633,7 +695,22 @@ fn run(
                     })();
                     let _ = reply.send(result);
                 }
-                Command::Enqueue(request) => {
+                Command::Enqueue(mut request) => {
+                    if let Err(error) = validate_request(&request).and_then(|()| {
+                        request.id = super::resolve_job_id(
+                            &request.artifacts.iter().collect::<Vec<_>>(),
+                            &request.destination,
+                        )?;
+                        Ok(())
+                    }) {
+                        let _ = request
+                            .listener
+                            .send(DownloadEvent::Failed(DownloadFailure {
+                                kind: DownloadFailureKind::Other,
+                                message: error.to_string(),
+                            }));
+                        continue;
+                    }
                     if request.session != crate::online::account_session() {
                         let _ = request.listener.send(DownloadEvent::Cancelled);
                         continue;
@@ -882,9 +959,14 @@ fn run(
                     match result {
                         Ok(artifacts) => {
                             let old_id = request.id.clone();
+                            let unchanged =
+                                super::job_id(&request.artifacts.iter().collect::<Vec<_>>())
+                                    == super::job_id(&artifacts.iter().collect::<Vec<_>>());
                             request.artifacts = artifacts;
                             let refs = request.artifacts.iter().collect::<Vec<_>>();
-                            request.id = job_id(&refs);
+                            if !unchanged {
+                                request.id = super::job_id_at(&refs, &request.destination);
+                            }
                             if request.id != old_id {
                                 // A refreshed mutable GOG slot can represent different bytes. Never
                                 // append those bytes to partial files belonging to the old revision.
@@ -1083,6 +1165,22 @@ fn schedule(
         ) else {
             continue;
         };
+        if let Err(error) = validate_request(&request) {
+            persist_state(&request, DownloadState::Paused);
+            set_waiting_status(
+                &request.id,
+                Some(&format!(
+                    "Library requires attention: {error}. Correct Storage and resume this download."
+                )),
+            );
+            let _ = request
+                .listener
+                .send(DownloadEvent::Failed(DownloadFailure {
+                    kind: DownloadFailureKind::Other,
+                    message: error.to_string(),
+                }));
+            continue;
+        }
         if let Err(error) = ensure_download_directory(&request.destination) {
             set_waiting_status(
                 &request.id,
@@ -1096,6 +1194,7 @@ fn schedule(
         persist_state(&request, DownloadState::Downloading);
         let (worker_sender, worker_receiver) = mpsc::channel();
         let worker = start_worker(
+            request.id.clone(),
             request.artifacts.clone(),
             request.title.clone(),
             request.access_token.clone(),
@@ -1246,10 +1345,20 @@ fn recover_jobs(
         else {
             continue;
         };
+        if let Err(error) = validate_destination(&job.artifacts, &job.destination, None) {
+            let _ = store.set_download_job_failure(
+                &job.job_id,
+                &format!(
+                    "Library requires attention: {error}. Correct Storage and resume this download."
+                ),
+            );
+            continue;
+        }
         let downloaded = recovered_bytes(&job);
         let _ = store.recover_download_job(&job.job_id, downloaded);
         let (listener, _) = mpsc::channel();
         queued.push_back(Request {
+            library_id: String::new(),
             recovery_generation: generation,
             session: crate::online::account_session(),
             id: job.job_id,
@@ -1297,6 +1406,7 @@ fn request_from_job(id: &str, access_token: String) -> Option<Request> {
     }
     let (listener, _) = mpsc::channel();
     Some(Request {
+        library_id: String::new(),
         recovery_generation: crate::installation::recovery::generation(job.product_id),
         session: crate::online::account_session(),
         id: job.job_id,
@@ -1394,6 +1504,15 @@ fn cleanup_job(id: &str) {
     let Ok(Some(job)) = store.download_job(id) else {
         return;
     };
+    if let Err(error) = validate_destination(&job.artifacts, &job.destination, None) {
+        set_waiting_status(
+            id,
+            Some(&format!(
+                "Library requires attention: {error}; files were retained"
+            )),
+        );
+        return;
+    }
     if job.state != DownloadState::Complete {
         let _ = delete_completed_files(&job.destination, &job.completed_files);
         if !job.artifacts.is_empty() {
@@ -1412,6 +1531,131 @@ mod tests {
     use crate::download::DownloadFailureKind;
 
     #[test]
+    fn startup_blocks_legacy_untyped_download_without_touching_its_partial_files() {
+        use super::*;
+        if std::env::var_os("LUDOMERE_TYPED_RECOVERY_CHILD").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "download::manager::tests::startup_blocks_legacy_untyped_download_without_touching_its_partial_files", "--nocapture"])
+                .env("LUDOMERE_TYPED_RECOVERY_CHILD", "1");
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+            ] {
+                let path = root.path().join(key);
+                fs::create_dir(&path).unwrap();
+                command.env(key, path);
+            }
+            assert!(command.status().unwrap().success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("legacy/game/installer");
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":9101952,"kind":"installer","name":"Fixture","size_bytes":4,"download_path":"/never-fetched"}
+        ])).unwrap();
+        let id = crate::download::job_id(&artifacts.iter().collect::<Vec<_>>());
+        let staging = staging_directory(&destination, &artifacts, &id);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("1.download"), b"pa").unwrap();
+        crate::config::Config {
+            download_directory: root.path().join("legacy"),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        let store = StateStore::open().unwrap();
+        store
+            .save_download_job(&DownloadJobUpdate {
+                job_id: &id,
+                product_id: 9101952,
+                title: "Fixture",
+                artifacts: &artifacts,
+                destination: &destination,
+                state: DownloadState::Queued,
+                bytes_downloaded: 2,
+                total_bytes: Some(4),
+                completed_files: &[],
+                error: None,
+            })
+            .unwrap();
+        let mut queue = VecDeque::new();
+        recover_jobs(
+            &mut queue,
+            &Arc::new(Mutex::new(HashMap::new())),
+            "inert".into(),
+        );
+        assert!(queue.is_empty());
+        let saved = store.download_job(&id).unwrap().unwrap();
+        assert_eq!(saved.state, DownloadState::Failed);
+        assert_eq!(saved.destination, destination);
+        assert!(saved.error.unwrap().contains("Correct Storage"));
+        assert_eq!(fs::read(staging.join("1.download")).unwrap(), b"pa");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn unchanged_manifest_refresh_preserves_legacy_queue_identity_and_partial_files() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":910195,"kind":"installer","name":"Fixture","size_bytes":4,"download_path":"/never-fetched"}
+        ])).unwrap();
+        let (events, _) = mpsc::channel();
+        let mut request = request_from_download(
+            crate::download::DownloadRequest {
+                library_id: "offline".into(),
+                artifacts: artifacts.clone(),
+                title: "Fixture".into(),
+                access_token: "inert".into(),
+                destination: root.path().join("game/installer"),
+                events,
+            },
+            crate::online::account_session(),
+        );
+        let scoped = request.id.clone();
+        request.id = crate::download::job_id(&artifacts.iter().collect::<Vec<_>>());
+        let staging = staging_directory(&request.destination, &artifacts, &request.id);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("1.download"), b"pa").unwrap();
+        let store = StateStore::open().unwrap();
+        save_request(&store, &request, DownloadState::Queued).unwrap();
+        let (commands, receiver) = mpsc::channel();
+        let worker_commands = commands.clone();
+        let worker = std::thread::spawn(move || {
+            run(
+                receiver,
+                worker_commands,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                HashMap::new(),
+            )
+        });
+        commands
+            .send(Command::ManifestRefreshed(
+                request.clone(),
+                DownloadFailure {
+                    kind: DownloadFailureKind::TransientNetwork,
+                    message: "fixture".into(),
+                },
+                Ok(artifacts),
+            ))
+            .unwrap();
+        let (reply, done) = mpsc::channel();
+        commands.send(Command::Shutdown(reply)).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(store.download_job(&request.id).unwrap().is_some());
+        assert!(store.download_job(&scoped).unwrap().is_none());
+        assert_eq!(fs::read(staging.join("1.download")).unwrap(), b"pa");
+        store.delete_download_job(&request.id).unwrap();
+    }
+
+    #[test]
     fn sign_out_drains_active_work_and_ignores_old_resume_and_manifest_commands() {
         use super::*;
         let root = tempfile::tempdir().unwrap();
@@ -1421,6 +1665,7 @@ mod tests {
         let (listener, _) = mpsc::channel();
         let request = request_from_download(
             super::super::DownloadRequest {
+                library_id: String::new(),
                 artifacts: artifacts.clone(),
                 title: "Fixture".into(),
                 access_token: "inert".into(),
@@ -1502,6 +1747,7 @@ mod tests {
         let (listener, _) = mpsc::channel();
         let request = request_from_download(
             crate::download::DownloadRequest {
+                library_id: String::new(),
                 artifacts: artifacts.clone(),
                 title: "Fixture".into(),
                 access_token: "inert".into(),
@@ -1600,6 +1846,7 @@ mod tests {
             let (listener, events) = mpsc::channel();
             let request = request_from_download(
                 crate::download::DownloadRequest {
+                    library_id: String::new(),
                     artifacts,
                     title: "Fixture".into(),
                     access_token: "inert".into(),

@@ -17,6 +17,7 @@ pub(crate) mod patch_notes;
 pub mod profile_reset;
 pub mod screenshots;
 pub mod state;
+pub mod storage;
 pub mod text;
 pub mod ui;
 pub mod updates;

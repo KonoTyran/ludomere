@@ -43,6 +43,10 @@ fn run_patch_worker(
     events: &mpsc::Sender<PatchEvent>,
 ) -> Result<()> {
     let _activity = crate::profile_reset::begin_activity("game patch")?;
+    let _permit = crate::operation_gate::try_acquire()?;
+    let config = crate::storage::read_config()?;
+    super::validate_game_library(&config, &game.library_id, &game.installation_directory)?;
+    super::validate_offline_sources(&config, &[patch.to_owned()])?;
     let mut game = game.clone();
     if !patch.is_file() {
         bail!("patch file is missing: {}", patch.display());

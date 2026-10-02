@@ -304,9 +304,9 @@ impl ResetReservation {
             lock_profile(lock, true, false)
                 .context("Another Ludomere process is using this profile; close it and retry")?;
             let [config_root, data, cache] = current_roots();
-            let mut protected = config
-                .game_libraries
-                .iter()
+            let mut protected = crate::config::LibraryKind::ALL
+                .into_iter()
+                .flat_map(|kind| config.libraries(kind))
                 .map(|library| library.path.clone())
                 .collect::<Vec<_>>();
             protected.push(config.download_directory.clone());
@@ -374,11 +374,6 @@ impl ResetReservation {
                 journals,
             };
             validate_plan(&plan, &current_roots())?;
-            // Check secret-service accessibility without deleting or logging the credential.
-            match keyring::Entry::new(crate::identity::APP_ID, "gog-oauth")?.get_password() {
-                Ok(_) | Err(keyring::Error::NoEntry) => {}
-                Err(error) => return Err(error.into()),
-            }
             let plan_digest = digest(&serde_json::to_vec(&plan)?);
             Ok(PendingReset {
                 request: Request { plan, plan_digest },
@@ -515,8 +510,16 @@ pub fn complete(arguments: &[String]) -> Result<()> {
     let result = (|| {
         let (request, _) = read_request(Some(&arguments[2]))?;
         validate_plan(&request.plan, &current_roots())?;
-        crate::auth::logout()
-            .context("Could not remove the GOG login; the profile has not been erased")?;
+        if matches!(
+            crate::auth::logout_for_reset().context(
+                "Could not secure the signed-out state; the profile has not been erased"
+            )?,
+            crate::auth::ResetCredentialCleanup::Unavailable
+        ) {
+            tracing::warn!(
+                "Factory Reset: external credential entry may remain; automatic login stays disabled"
+            );
+        }
         remove_profile(&request.plan)?;
         Ok(())
     })();
@@ -869,6 +872,8 @@ mod tests {
                 directory.path().join("data/cloud-save-backups"),
                 directory.path().join("data/cloud-save-deletion-recovery"),
                 directory.path().join("installers"),
+                directory.path().join("extras"),
+                directory.path().join("second-installers"),
             ],
             journals: Vec::new(),
         };
@@ -974,6 +979,8 @@ mod tests {
         }
         write(&plan.data.join("comet/state/comet/redist/peer.dll"));
         write(&plan.data.join("unrecognized"));
+        let signed_out = plan.config.join(".gog-signed-out");
+        fs::write(&signed_out, b"signed out; external credential may remain").unwrap();
         save_manifest(&plan, &manifest(&plan));
         validate_plan(&plan, &roots(&plan)).unwrap();
         remove_profile(&plan).unwrap();
@@ -987,6 +994,10 @@ mod tests {
                 .is_file()
         );
         assert!(plan.data.join("unrecognized").is_file());
+        assert_eq!(
+            fs::read(&signed_out).unwrap(),
+            b"signed out; external credential may remain"
+        );
         assert!(!plan.config.join(MANIFEST).exists());
     }
 

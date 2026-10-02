@@ -205,10 +205,21 @@ fn launch_recent_game(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id
     if game.installer_operating_system.as_deref() != Some("linux") && !w.window.is_visible() {
         show_main_window(w);
     }
+    let session = online::account_session();
+    let auth_session = auth::session();
+    let epoch = model.borrow().account_epoch;
     let receiver = launch_with_components(&w.window, game);
+    let launch_generation = model.borrow().detail_generation;
     let widgets = w.clone();
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if online::account_session() != session
+            || auth::session() != auth_session
+            || model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+        {
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(
                 event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
@@ -236,6 +247,29 @@ fn launch_recent_game(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id
                 glib::ControlFlow::Continue
             }
             Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
+            Ok(crate::installation::LaunchEvent::PrefixRecoveryRequired {
+                message,
+                game,
+                setup_required,
+            }) => {
+                let title = model
+                    .borrow()
+                    .games
+                    .iter()
+                    .find(|entry| entry.product_id == product_id)
+                    .map(|game| game.title.clone())
+                    .unwrap_or_else(|| format!("Game {product_id}"));
+                offer_prefix_recovery(
+                    &widgets.window,
+                    &model,
+                    *game,
+                    &title,
+                    &message,
+                    setup_required,
+                    launch_generation,
+                );
+                glib::ControlFlow::Break
+            }
             Ok(crate::installation::LaunchEvent::Failed(error)) => {
                 show_main_window(&widgets);
                 let dialog = adw::AlertDialog::builder()

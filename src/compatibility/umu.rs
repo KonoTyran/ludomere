@@ -172,12 +172,30 @@ impl UmuBackend {
         r: InitializePrefixRequest,
         run_initialization: impl FnOnce(Command, &std::path::Path) -> anyhow::Result<()>,
     ) -> Result<CompatibilityPrefix> {
+        self.initialize_prefix_inner(r, false, run_initialization)
+    }
+
+    pub(crate) fn rebuild_prefix_controlled(
+        &self,
+        r: InitializePrefixRequest,
+        run_initialization: impl FnOnce(Command, &std::path::Path) -> anyhow::Result<()>,
+    ) -> Result<CompatibilityPrefix> {
+        validate_ownership(&prefix_path(&r.library, &r.slug), &r.slug)?;
+        self.initialize_prefix_inner(r, true, run_initialization)
+    }
+
+    fn initialize_prefix_inner(
+        &self,
+        r: InitializePrefixRequest,
+        rebuild: bool,
+        run_initialization: impl FnOnce(Command, &std::path::Path) -> anyhow::Result<()>,
+    ) -> Result<CompatibilityPrefix> {
         super::check_prerequisites(&self.proton)?;
         validate_slug(&r.slug)?;
         let library = validate_library(&r.library)?;
         let prefix = prefix_path(&library, &r.slug);
-        let mut initialize = !prefix.exists();
-        if prefix.exists() {
+        let mut initialize = rebuild || !prefix.exists();
+        if prefix.exists() && !rebuild {
             if !prefix.join("dosdevices").is_dir() {
                 if is_incomplete_umu_prefix(&prefix) {
                     initialize = true;

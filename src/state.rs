@@ -251,8 +251,9 @@ pub struct CloudSaveRecord {
 const BASELINE_SCHEMA_VERSION: i64 = 24;
 const CURRENT_SCHEMA_VERSION: i64 = 25;
 // Revision 6: install-after-download intents. Revision 7: local organization, update policies,
-// account-scoped achievements and cloud deletion suppression. Public target remains 25.
-const CURRENT_DEVELOPMENT_REVISION: i64 = 7;
+// account-scoped achievements and cloud deletion suppression. Revision 8: per-path archive copies.
+// Public target remains 25.
+const CURRENT_DEVELOPMENT_REVISION: i64 = 8;
 const TRANSIENT_SCHEMA_VERSION: i64 = 26;
 
 impl StateStore {
@@ -328,7 +329,7 @@ impl StateStore {
                 provider_file_id TEXT
              );
              CREATE INDEX IF NOT EXISTS managed_files_product ON managed_files(product_id, present);
-             CREATE UNIQUE INDEX IF NOT EXISTS managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;
              CREATE TABLE IF NOT EXISTS download_artifact_catalog (
                 artifact_id TEXT PRIMARY KEY, product_id INTEGER NOT NULL, artifact_json TEXT NOT NULL,
                 currently_offered INTEGER NOT NULL DEFAULT 1, first_seen_at INTEGER NOT NULL,
@@ -485,6 +486,8 @@ impl StateStore {
             if initial_development_revision == Some(4) {
                 connection.execute("DROP TABLE galaxy_depot_chunks", [])?;
             }
+            connection.execute_batch("DROP INDEX IF EXISTS managed_files_artifact_id;
+                CREATE INDEX managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;")?;
             connection.execute(
                 "INSERT INTO schema_state(state_key, development_revision) VALUES (1, ?1)
                  ON CONFLICT(state_key) DO UPDATE SET development_revision = excluded.development_revision",
@@ -3058,16 +3061,7 @@ impl StateStore {
                     gog_checksum=COALESCE(managed_files.gog_checksum, excluded.gog_checksum),
                     verified_at=COALESCE(managed_files.verified_at, excluded.verified_at)",
             )?;
-            let mut assigned_artifacts = transaction
-                .prepare("SELECT artifact_id FROM managed_files WHERE artifact_id IS NOT NULL")?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<HashSet<_>>>()?;
             for file in files {
-                let artifact_id = file
-                    .artifact_id
-                    .as_deref()
-                    .filter(|id| assigned_artifacts.insert((*id).to_owned()));
-                let unique_match = file.artifact_id.is_none() || artifact_id.is_some();
                 statement.execute(params![
                     file.path.display().to_string(),
                     file.product_id,
@@ -3077,11 +3071,9 @@ impl StateStore {
                     file.language,
                     file.filename,
                     file.size as i64,
-                    unique_match
-                        .then_some(file.artifact_path.as_deref())
-                        .flatten(),
-                    file.matched && unique_match,
-                    artifact_id,
+                    file.artifact_path,
+                    file.matched,
+                    file.artifact_id,
                     file.job_id,
                     file.version,
                     file.expected_size.map(|size| size as i64),
@@ -3177,8 +3169,7 @@ impl StateStore {
                    AND operating_system IS ?5 AND language IS ?6 AND filename=?7 AND size=?8
                    AND present=1 AND matched=0 AND artifact_path IS NULL AND artifact_id IS NULL
                    AND version IS NULL AND revision_id IS NULL AND part_id IS NULL
-                   AND job_id IS NULL AND gog_checksum IS NULL AND verified_at IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM managed_files WHERE artifact_id=?10)",
+                   AND job_id IS NULL AND gog_checksum IS NULL AND verified_at IS NULL",
                 params![
                     file.path.to_string_lossy(),
                     file.product_id,
@@ -3461,6 +3452,20 @@ fn checked_schema_revision(connection: &Connection) -> Result<Option<i64>> {
         );
     }
     if revision == CURRENT_DEVELOPMENT_REVISION {
+        let index: Option<(i64, i64)> = connection.query_row(
+            "SELECT \"unique\", partial FROM pragma_index_list('managed_files') WHERE name='managed_files_artifact_id'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let columns = connection
+            .prepare(
+                "SELECT name FROM pragma_index_info('managed_files_artifact_id') ORDER BY seqno",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            index == Some((0, 1)) && columns == ["artifact_id"],
+            "Database archive-copy index is not the supported development layout; restore a compatible backup or reset this profile"
+        );
         // Validate required columns without repairing a database claiming to be current.
         for (table, columns) in [
             ("user_game_state", "product_id,favorite,hidden"),
@@ -3946,7 +3951,10 @@ mod tests {
             .unwrap();
         drop(store);
         let store = StateStore::open_at(&path).unwrap();
-        assert_eq!(development_revision(&store.connection).unwrap(), Some(7));
+        assert_eq!(
+            development_revision(&store.connection).unwrap(),
+            Some(CURRENT_DEVELOPMENT_REVISION)
+        );
         assert!(store.favorites().unwrap().contains(&7));
         assert_eq!(store.tags().unwrap()[&7], vec!["Keep"]);
         assert_eq!(
@@ -5370,6 +5378,37 @@ mod tests {
                 .map(|file| file.path.as_path()),
             Some(current.as_path())
         );
+        store.connection.execute_batch("DROP INDEX managed_files_artifact_id;
+            CREATE UNIQUE INDEX managed_files_artifact_id ON managed_files(artifact_id) WHERE artifact_id IS NOT NULL;
+            UPDATE schema_state SET development_revision=7;").unwrap();
+        store.set_favorite(42, true).unwrap();
+        drop(store);
+        let mut store = StateStore::open_at(&root.join("state.sqlite3")).unwrap();
+        assert_eq!(development_revision(&store.connection).unwrap(), Some(8));
+        assert!(store.favorites().unwrap().contains(&42));
+        let second = root.join("second/setup.exe");
+        let mut copy = record(second.clone());
+        copy.verified_at = Some(123);
+        copy.gog_checksum = Some("keep-checksum".into());
+        store
+            .replace_managed_files_in_root(&root.join("second"), &[copy])
+            .unwrap();
+        let files = store.managed_files().unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.present && file.matched && file.artifact_id.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == current && file.present)
+        );
+        assert!(files.iter().any(|file| file.path == second
+            && file.verified_at == Some(123)
+            && file.gog_checksum.as_deref() == Some("keep-checksum")));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

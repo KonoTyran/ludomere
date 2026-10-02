@@ -35,12 +35,24 @@ pub fn rebuild_for_session(
 }
 
 pub fn ensure_download_root(root: &Path) -> Result<()> {
-    let config: crate::config::Config =
-        toml::from_str(&fs::read_to_string(crate::config::Config::path())?)?;
-    anyhow::ensure!(
-        config.download_directory == root,
-        "Download directory changed; refresh the local files again"
-    );
+    let config = crate::storage::read_config()?;
+    let kind = [
+        crate::config::LibraryKind::OfflineInstallers,
+        crate::config::LibraryKind::Extras,
+    ]
+    .into_iter()
+    .find(|kind| {
+        config
+            .libraries(*kind)
+            .iter()
+            .any(|library| library.path == root)
+    })
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "Archive library changed; select a compatible typed library and refresh again"
+        )
+    })?;
+    crate::storage::validate_path(&config, kind, root)?;
     Ok(())
 }
 
@@ -50,6 +62,9 @@ fn rebuild_guarded(
     games: &[Game],
     session: Option<u64>,
 ) -> Result<RebuildSummary> {
+    if session.is_some() {
+        ensure_download_root(root)?;
+    }
     let jobs = store.download_jobs()?;
     let games_by_slug = games
         .iter()
@@ -481,9 +496,12 @@ pub fn apply_to_games(games: &mut [Game], records: &[ManagedFileRecord]) {
     }
 }
 
-pub fn set_locations(games: &mut [Game], root: &Path) {
+pub fn set_library_locations(games: &mut [Game], config: &crate::config::Config) {
+    let root = config
+        .default_library(crate::config::LibraryKind::OfflineInstallers)
+        .map(|library| library.path.as_path());
     for game in games {
-        game.location = root.join(&game.slug);
+        game.location = root.map_or_else(std::path::PathBuf::new, |root| root.join(&game.slug));
         for dlc in &mut game.dlcs {
             dlc.location = game.location.join("dlc").join(&dlc.slug);
         }
@@ -819,7 +837,7 @@ mod tests {
             &original
         );
         assert!(files.iter().all(|file| file.present));
-        assert_eq!(files.iter().filter(|file| file.matched).count(), 1);
+        assert_eq!(files.iter().filter(|file| file.matched).count(), 2);
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

@@ -1,7 +1,6 @@
 use super::{
     DownloadEvent,
     files::fallback_filename,
-    job_id,
     layout::staging_directory,
     protocol::{download_url, resolve_download_response, response_filename},
 };
@@ -81,7 +80,21 @@ pub(super) fn run_transfer(
 ) -> Result<()> {
     fs::create_dir_all(destination)?;
     let refs = artifacts.iter().collect::<Vec<_>>();
-    let staging = staging_directory(destination, artifacts, &job_id(&refs));
+    let id = if persist_state {
+        super::resolve_job_id(&refs, destination)?
+    } else {
+        // Multipart children had artifact-only staging identities before typed libraries.
+        // The staging root still comes from this exact destination, never another library.
+        let legacy = super::job_id(&refs);
+        if fs::symlink_metadata(staging_directory(destination, artifacts, &legacy))
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            legacy
+        } else {
+            super::job_id_at(&refs, destination)
+        }
+    };
+    let staging = staging_directory(destination, artifacts, &id);
     fs::create_dir_all(&staging)?;
     let expected_total = artifacts
         .iter()
@@ -433,7 +446,7 @@ fn run_parallel_parts(
     let staging = staging_directory(
         destination,
         artifacts,
-        &job_id(&artifacts.iter().collect::<Vec<_>>()),
+        &super::resolve_job_id(&artifacts.iter().collect::<Vec<_>>(), destination)?,
     );
     finish(
         artifacts,
@@ -509,7 +522,11 @@ fn register_completion(
             .sum::<std::io::Result<u64>>()?;
         store.complete_download_job(
             &DownloadJobUpdate {
-                job_id: &job_id(&artifacts.iter().collect::<Vec<_>>()),
+                job_id: &super::job_id_in(
+                    store,
+                    &artifacts.iter().collect::<Vec<_>>(),
+                    destination,
+                )?,
                 product_id: artifacts[0].product_id,
                 title,
                 artifacts,
@@ -584,7 +601,9 @@ fn persist_if(
 pub(super) fn persist(artifacts: &[RemoteArtifact], title: &str, snapshot: DownloadSnapshot<'_>) {
     let refs = artifacts.iter().collect::<Vec<_>>();
     if let Ok(store) = StateStore::open() {
-        let id = job_id(&refs);
+        let Ok(id) = super::job_id_in(&store, &refs, snapshot.destination) else {
+            return;
+        };
         let _ = store.save_download_job(&DownloadJobUpdate {
             job_id: &id,
             product_id: artifacts[0].product_id,
@@ -642,6 +661,7 @@ pub(super) fn downloaded_on_disk(destination: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::job_id;
 
     #[test]
     fn published_files_survive_failed_atomic_registration_and_retry_without_network() {

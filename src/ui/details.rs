@@ -206,6 +206,27 @@ pub(super) fn render_detail_page(
         let cloud_launch_status = cloud_launch_status.clone();
         let launch_pending = launch_pending.clone();
         download_button.connect_clicked(move |_| {
+            {
+                let state = model.borrow();
+                if state
+                    .installed_games
+                    .get(&detail.product_id)
+                    .is_some_and(|game| {
+                        matches!(
+                            crate::storage::path_status(
+                                &state.library_statuses,
+                                &game.installation_directory
+                            ),
+                            Some(
+                                crate::storage::LibraryCompatibility::Incompatible(_)
+                                    | crate::storage::LibraryCompatibility::Unavailable(_)
+                            )
+                        )
+                    })
+                {
+                    return;
+                }
+            }
             let Some(detail) = current_detail(&model.borrow(), detail.product_id, detail.parent_id)
             else {
                 return;
@@ -331,6 +352,7 @@ pub(super) fn render_detail_page(
                 let session = online::account_session();
                 let auth_session = auth::session();
                 let epoch = model.borrow().account_epoch;
+                let launch_generation = model.borrow().detail_generation;
                 launch_pending.set(true);
                 let receiver = launch_with_components(&widgets.window, installed);
                 let button = primary_button.clone();
@@ -440,6 +462,34 @@ pub(super) fn render_detail_page(
                             }
                             glib::ControlFlow::Break
                         }
+                        Ok(crate::installation::LaunchEvent::PrefixRecoveryRequired {
+                            message,
+                            game,
+                            setup_required,
+                        }) => {
+                            launch_pending.set(false);
+                            if let Some(status) = cloud_launch_status.borrow().as_ref() {
+                                *status.failure.borrow_mut() = Some(message.clone());
+                            }
+                            button.set_sensitive(true);
+                            button.remove_css_class("operational-action");
+                            action_group.remove_css_class("operational-state");
+                            set_primary_button_content(
+                                &button,
+                                primary_action.icon(),
+                                primary_action.label(),
+                            );
+                            offer_prefix_recovery(
+                                &window,
+                                &activity_model,
+                                *game,
+                                &detail.title,
+                                &message,
+                                setup_required,
+                                launch_generation,
+                            );
+                            glib::ControlFlow::Break
+                        }
                         Ok(crate::installation::LaunchEvent::Failed(error)) => {
                             launch_pending.set(false);
                             if let Some(status) = cloud_launch_status.borrow().as_ref() {
@@ -520,6 +570,182 @@ pub(super) fn render_detail_page(
         actions.set_margin_end(6);
         actions.set_margin_top(6);
         actions.set_margin_bottom(6);
+        if installed.is_some() {
+            let check = gtk::Button::with_label("Check for Updates");
+            check.set_sensitive(false);
+            check.set_visible(false);
+            check.add_css_class("flat");
+            check.set_halign(gtk::Align::Fill);
+            actions.append(&check);
+            popover.connect_show({
+                let model = model.clone();
+                let check = check.downgrade();
+                let generation = Rc::new(std::cell::Cell::new(0_u64));
+                let id = game.product_id;
+                move |_| {
+                    generation.set(generation.get() + 1);
+                    let current = generation.get();
+                    let check = check.clone();
+                    let model = model.clone();
+                    let generation = generation.clone();
+                    glib::idle_add_local_once(move || {
+                        let Some(check) = check.upgrade() else {
+                            return;
+                        };
+                        let (config, epoch, online, depot) = {
+                            let state = model.borrow();
+                            (
+                                state.config.clone(),
+                                state.account_epoch,
+                                state.network_available
+                                    && state.account_token.is_some()
+                                    && !state.logout_pending,
+                                state
+                                    .local_actions
+                                    .get(&id)
+                                    .is_some_and(|local| local.depot),
+                            )
+                        };
+                        let session = online::account_session();
+                        check.set_visible(true);
+                        check.set_sensitive(false);
+                        check.set_label("Checking update policy…");
+                        let receiver = update_policies::policy_request(move || {
+                            let _activity =
+                                crate::profile_reset::begin_activity("loading update preferences")?;
+                            online::with_account_session(session, || {
+                                let preferences = StateStore::open()?.game_preferences(id)?;
+                                let policy = crate::updates::UpdatePolicy::resolve(
+                                    &config,
+                                    preferences.as_ref(),
+                                );
+                                Ok(if depot {
+                                    policy.auto_update_galaxy
+                                } else {
+                                    policy.auto_download_offline_installer
+                                })
+                            })
+                        });
+                        let check = check.downgrade();
+                        glib::timeout_add_local(Duration::from_millis(50), move || {
+                            if generation.get() != current
+                                || model.borrow().account_epoch != epoch
+                                || model.borrow().logout_pending
+                                || online::account_session() != session
+                            {
+                                return glib::ControlFlow::Break;
+                            }
+                            let Some(check) = check.upgrade() else {
+                                return glib::ControlFlow::Break;
+                            };
+                            match receiver.try_recv() {
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    return glib::ControlFlow::Continue;
+                                }
+                                Ok(Ok(automatic)) => {
+                                    check.set_label("Check for Updates");
+                                    check.set_visible(!automatic);
+                                    check.set_sensitive(online);
+                                    check.set_tooltip_text(
+                                        (!online).then_some(
+                                            "Sign in and go online to check for updates",
+                                        ),
+                                    );
+                                }
+                                Ok(Err(error)) => {
+                                    check.set_label("Could not load update policy");
+                                    check.set_tooltip_text(Some(&error.to_string()));
+                                }
+                                Err(_) => {
+                                    check.set_label("Update policy loading stopped");
+                                    check.set_tooltip_text(Some(
+                                        "Close and reopen this menu to retry",
+                                    ));
+                                }
+                            }
+                            glib::ControlFlow::Break
+                        });
+                    });
+                }
+            });
+            check.connect_clicked({
+                let model = model.clone();
+                let window = w.window.downgrade();
+                let popover = popover.downgrade();
+                let detail = game.clone();
+                move |_| {
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
+                    if let Some(window) = window.upgrade() {
+                        show_manual_update_check(&window, &model, &detail);
+                    }
+                }
+            });
+        }
+        if installed.is_some() {
+            let update = gtk::Button::with_label("Install update");
+            update.add_css_class("flat");
+            update.set_halign(gtk::Align::Fill);
+            update.set_visible(false);
+            popover.connect_show({
+                let model = model.clone();
+                let update = update.downgrade();
+                let id = game.product_id;
+                move |_| {
+                    let model = model.clone();
+                    let update = update.clone();
+                    glib::idle_add_local_once(move || {
+                        let local = model
+                            .borrow()
+                            .local_actions
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(update) = update.upgrade() {
+                            update.set_visible(
+                                local.installed_update
+                                    || local.backup_update
+                                    || local.dlc.missing_download
+                                    || local.dlc.missing_install,
+                            );
+                            update.set_label(
+                                if local.installed_update && (local.depot || local.downloaded)
+                                    || local.dlc.missing_install && !local.dlc.missing_download
+                                {
+                                    "Install update"
+                                } else {
+                                    "Download update"
+                                },
+                            );
+                        }
+                    });
+                }
+            });
+            let widgets = w.clone_refs();
+            let model = model.clone();
+            let detail = game.clone();
+            let action_popover = popover.downgrade();
+            update.connect_clicked(move |_| {
+                if let Some(popover) = action_popover.upgrade() {
+                    popover.popdown();
+                }
+                let local = model
+                    .borrow()
+                    .local_actions
+                    .get(&detail.product_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let install_update = local.installed_update && (local.depot || local.downloaded)
+                    || local.dlc.missing_install && !local.dlc.missing_download;
+                if install_update {
+                    show_update_dialog(&widgets.window, &model, &detail);
+                } else {
+                    show_download_selector(&widgets, &model, &detail);
+                }
+            });
+            actions.append(&update);
+        }
         if matches!(
             primary_action,
             GamePrimaryAction::DownloadUpdate | GamePrimaryAction::InstallUpdate
@@ -530,10 +756,11 @@ pub(super) fn render_detail_page(
             play_current.set_halign(gtk::Align::Fill);
             let widgets = w.clone_refs();
             let title = game.title.clone();
+            let model = model.clone();
             let action_popover = popover.clone();
             play_current.connect_clicked(move |_| {
                 action_popover.popdown();
-                launch_installed_game(&widgets, installed_game.clone(), &title);
+                launch_installed_game(&widgets, &model, installed_game.clone(), &title);
             });
             actions.append(&play_current);
         }
@@ -872,7 +1099,7 @@ pub(super) fn render_detail_page(
                 "Offline installers",
                 false,
                 Rc::new(move |game| {
-                    let (config, token, installed) = {
+                    let (config, token, installed, library_statuses) = {
                         let state = files_model.borrow();
                         (
                             state.config.clone(),
@@ -881,6 +1108,7 @@ pub(super) fn render_detail_page(
                                 .as_ref()
                                 .map(|token| token.access_token.clone()),
                             state.installed_games.get(&game.product_id).cloned(),
+                            state.library_statuses.clone(),
                         )
                     };
                     let installer_defaults = InstallerFilterDefaults {
@@ -894,7 +1122,8 @@ pub(super) fn render_detail_page(
                         &window,
                         FilesPageOptions {
                             access_token: token.as_deref(),
-                            download_directory: &config.download_directory,
+                            config: &config,
+                            library_statuses: &library_statuses,
                             installer_defaults: &installer_defaults,
                             show_retired_artifacts: config.show_retired_artifacts,
                             management: management.as_ref(),
@@ -962,6 +1191,232 @@ pub(super) fn render_detail_page(
     }
     let adjustment = w.details_scroll.vadjustment();
     glib::idle_add_local_once(move || adjustment.set_value(adjustment.lower()));
+}
+
+fn show_manual_update_check(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+) {
+    let (game, installed, token, epoch, session) = {
+        let state = model.borrow();
+        let (Some(game), Some(installed), Some(token)) = (
+            state
+                .games
+                .iter()
+                .find(|game| game.product_id == detail.product_id),
+            state.installed_games.get(&detail.product_id),
+            state.account_token.as_ref(),
+        ) else {
+            return;
+        };
+        if state.logout_pending || !state.network_available {
+            return;
+        }
+        (
+            game.clone(),
+            installed.clone(),
+            token.clone(),
+            state.account_epoch,
+            online::account_session(),
+        )
+    };
+    let dialog = adw::Dialog::builder()
+        .title("Check for Updates")
+        .content_width(480)
+        .build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.append(&adw::HeaderBar::new());
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_start(20);
+    body.set_margin_end(20);
+    body.set_margin_bottom(20);
+    let status = gtk::Label::new(Some("Checking for an update…"));
+    status.set_wrap(true);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    body.append(&status);
+    let spinner = gtk::Spinner::builder().spinning(true).build();
+    body.append(&spinner);
+    let confirm = gtk::Button::with_label("Update");
+    confirm.add_css_class("suggested-action");
+    confirm.set_sensitive(false);
+    body.append(&confirm);
+    root.append(&body);
+    dialog.set_child(Some(&root));
+    let closed = Rc::new(std::cell::Cell::new(false));
+    dialog.connect_closed({
+        let closed = closed.clone();
+        move |_| closed.set(true)
+    });
+    let offer = Rc::new(RefCell::new(None::<crate::updates::ManualUpdateOffer>));
+    let install_ready = Rc::new(std::cell::Cell::new(false));
+    let submit = Rc::new({
+        let model = model.clone();
+        let closed = closed.clone();
+        let status = status.downgrade();
+        let confirm = confirm.downgrade();
+        let install_ready = install_ready.clone();
+        let token = token.clone();
+        let dialog = dialog.downgrade();
+        let spinner = spinner.downgrade();
+        move |offer, library| {
+            if closed.get()
+                || model.borrow().account_epoch != epoch
+                || model.borrow().logout_pending
+                || online::account_session() != session
+            {
+                return;
+            }
+            let (Some(status), Some(confirm)) = (status.upgrade(), confirm.upgrade()) else {
+                return;
+            };
+            confirm.set_sensitive(false);
+            if let Some(spinner) = spinner.upgrade() {
+                spinner.start();
+            }
+            status.set_label("Preparing the confirmed update…");
+            let token = token.clone();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(crate::updates::confirm_installed_update(
+                    offer, &token, session, library,
+                ));
+            });
+            let closed = closed.clone();
+            let model = model.clone();
+            let install_ready = install_ready.clone();
+            let dialog = dialog.clone();
+            let spinner = spinner.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if closed.get()
+                    || model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                    || online::account_session() != session
+                {
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Ok(Ok(
+                        crate::updates::ManualUpdateQueued::Depot
+                        | crate::updates::ManualUpdateQueued::OfflineDownload,
+                    )) => {
+                        if let Some(dialog) = dialog.upgrade() {
+                            dialog.close();
+                        }
+                    }
+                    Ok(Ok(crate::updates::ManualUpdateQueued::OfflineReady)) => {
+                        status.set_label("The update installer is ready. Continue to review installation; the current game remains installed until you confirm it.");
+                        install_ready.set(true);
+                        confirm.set_label("Install update");
+                        confirm.set_sensitive(true);
+                    }
+                    Ok(Err(error)) => {
+                        status.set_label(&format!("Could not queue the update: {error}"));
+                        confirm.set_sensitive(true);
+                    }
+                    Err(_) => status.set_label("The update worker stopped. Close and check again."),
+                }
+                if let Some(spinner) = spinner.upgrade() {
+                    spinner.stop();
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    confirm.connect_clicked({
+        let needs_windows = installed.compatibility.is_some();
+        let model = model.clone();
+        let window = window.downgrade();
+        let dialog = dialog.downgrade();
+        let detail = detail.clone();
+        let offer = offer.clone();
+        let install_ready = install_ready.clone();
+        let closed = closed.clone();
+        move |_| {
+            if closed.get()
+                || model.borrow().account_epoch != epoch
+                || model.borrow().logout_pending
+                || online::account_session() != session
+            {
+                return;
+            }
+            let (Some(window), Some(dialog)) = (window.upgrade(), dialog.upgrade()) else {
+                return;
+            };
+            if install_ready.get() {
+                dialog.close();
+                show_update_dialog(&window, &model, &detail);
+                return;
+            }
+            let Some(offer) = offer.borrow().clone() else {
+                return;
+            };
+            let submit = submit.clone();
+            if offer.source == crate::domain::InstallationSource::OfflineInstaller
+                && offer.download_required
+            {
+                download_chooser::choose_download_libraries(
+                    &window,
+                    vec![crate::config::LibraryKind::OfflineInstallers],
+                    move |libraries| {
+                        if let Some((_, library)) = libraries.into_iter().next() {
+                            submit(offer, Some(library));
+                        }
+                    },
+                );
+            } else if offer.source == crate::domain::InstallationSource::GalaxyDepot
+                && needs_windows
+            {
+                with_windows_components(&window, detail.product_id, true, None, move || {
+                    submit(offer, None)
+                });
+            } else {
+                submit(offer, None);
+            }
+        }
+    });
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(crate::updates::check_installed_update(
+            &game, &installed, &token, session,
+        ));
+    });
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if closed.get()
+            || model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+            || online::account_session() != session
+        {
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Ok(Ok(crate::updates::ManualUpdateCheck::UpToDate)) => status
+                .set_label("No update is available. You can keep playing the installed version."),
+            Ok(Ok(crate::updates::ManualUpdateCheck::Available(found))) => {
+                let found = *found;
+                status.set_label(&format!("An update{} is available. Nothing has been queued. Your automatic update preferences will stay unchanged.", found.version.as_ref().map(|version| format!(" ({version})")).unwrap_or_default()));
+                confirm.set_label(
+                    if found.source == crate::domain::InstallationSource::GalaxyDepot {
+                        "Download and apply update"
+                    } else if found.download_required {
+                        "Download update"
+                    } else {
+                        "Review installer update"
+                    },
+                );
+                confirm.set_sensitive(true);
+                offer.replace(Some(found));
+            }
+            Ok(Err(error)) => status.set_label(&format!("Could not check for updates: {error}")),
+            Err(_) => status.set_label("The update check stopped. Close and try again."),
+        }
+        spinner.stop();
+        glib::ControlFlow::Break
+    });
+    dialog.present(Some(window));
 }
 
 fn detail_section(
@@ -1251,15 +1706,27 @@ fn set_primary_button_content(button: &gtk::Button, icon: &str, label: &str) {
     button.set_child(Some(&content));
 }
 
-fn launch_installed_game(widgets: &Widgets, installed: crate::domain::InstalledGame, title: &str) {
+fn launch_installed_game(
+    widgets: &Widgets,
+    model: &Rc<RefCell<AppModel>>,
+    installed: crate::domain::InstalledGame,
+    title: &str,
+) {
     let title = title.to_owned();
     let session = online::account_session();
     let auth_session = auth::session();
+    let epoch = model.borrow().account_epoch;
     let receiver = launch_with_components(&widgets.window, installed);
+    let launch_generation = model.borrow().detail_generation;
     let widgets = widgets.clone_refs();
+    let model = model.clone();
     let window = widgets.window.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        if auth::session() != auth_session || online::account_session() != session {
+        if auth::session() != auth_session
+            || online::account_session() != session
+            || model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+        {
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {
@@ -1279,6 +1746,22 @@ fn launch_installed_game(widgets: &Widgets, installed: crate::domain::InstalledG
                 glib::ControlFlow::Continue
             }
             Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
+            Ok(crate::installation::LaunchEvent::PrefixRecoveryRequired {
+                message,
+                game,
+                setup_required,
+            }) => {
+                offer_prefix_recovery(
+                    &window,
+                    &model,
+                    *game,
+                    &title,
+                    &message,
+                    setup_required,
+                    launch_generation,
+                );
+                glib::ControlFlow::Break
+            }
             Ok(crate::installation::LaunchEvent::Failed(error)) => {
                 show_status(
                     &widgets,
@@ -1362,11 +1845,15 @@ fn installation_status_panel(
     detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
     detail.set_max_width_chars(42);
     detail.add_css_class("hero-transfer-detail");
+    detail.connect_label_notify(|label| label.set_tooltip_text(Some(&label.label())));
     text.append(&detail);
     let progress = gtk::ProgressBar::new();
     progress.set_pulse_step(0.08);
     progress.add_css_class("hero-transfer-progress");
     text.append(&progress);
+    let component_progress = gtk::ProgressBar::builder().visible(false).build();
+    component_progress.add_css_class("hero-transfer-progress");
+    text.append(&component_progress);
     panel.append(&text);
     let view_error = gtk::Button::with_label("View error");
     view_error.set_widget_name("installation-error-details");
@@ -1545,6 +2032,9 @@ fn installation_status_panel(
     let launch_pending = launch_pending.clone();
     let detail_generation = model.borrow().detail_generation;
     let depot_rate = Rc::new(RefCell::new(SmoothedTransferRate::default()));
+    let mut depot_operation_id = None::<String>;
+    let mut download_completed = false;
+    let mut active_download_ids = HashSet::new();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if panel_for_poll.root().is_none() || model.borrow().detail_generation != detail_generation
         {
@@ -1553,6 +2043,26 @@ fn installation_status_panel(
         if model.borrow().logout_pending {
             panel_for_poll.set_visible(false);
             return glib::ControlFlow::Continue;
+        }
+        {
+            let state = model.borrow();
+            if let Some(game) = state.installed_games.get(&product_id)
+                && let Some(
+                    crate::storage::LibraryCompatibility::Incompatible(reason)
+                    | crate::storage::LibraryCompatibility::Unavailable(reason),
+                ) = crate::storage::path_status(
+                    &state.library_statuses,
+                    &game.installation_directory,
+                )
+            {
+                panel_for_poll.set_visible(true);
+                heading.set_label("LIBRARY UNAVAILABLE");
+                detail.set_label(reason);
+                detail.set_tooltip_text(Some(reason));
+                primary_action.set_sensitive(false);
+                set_alternate_game_actions_sensitive(&action_group, false);
+                return glib::ControlFlow::Continue;
+            }
         }
         let normal_action = {
             let state = model.borrow();
@@ -1584,15 +2094,25 @@ fn installation_status_panel(
         if launch_pending.get() {
             return glib::ControlFlow::Continue;
         }
-        if let Some(error) = failure.borrow().as_ref() {
-            set_idle_primary_action(&primary_action, &action_group, normal_action);
-            heading.set_label("LAUNCH FAILED");
-            detail.set_label(error);
-            panel_for_poll.set_visible(true);
-            progress.set_visible(false);
-            view_error.set_visible(true);
-            return glib::ControlFlow::Continue;
+        let depot_snapshot = crate::installation::depot_operation_snapshot_for_product(product_id);
+        let archive_active = model.borrow().download_jobs.iter().any(|job| {
+            job.product_id == product_id
+                && matches!(
+                    job.state,
+                    DownloadState::Queued | DownloadState::Downloading
+                )
+        });
+        if archive_active
+            || depot_snapshot.as_ref().is_some_and(|snapshot| {
+                !matches!(
+                    snapshot.state.as_str(),
+                    "complete" | "failed" | "cancelled" | "abandoned" | "interrupted" | "paused"
+                )
+            })
+        {
+            failure.borrow_mut().take();
         }
+        component_progress.set_visible(false);
         if progress.is_visible() && !determinate.get() {
             progress.pulse();
         }
@@ -1614,6 +2134,9 @@ fn installation_status_panel(
                 } => product_id,
             };
             if event_product_id == product_id {
+                failure.borrow_mut().take();
+                download_completed = false;
+                depot_operation_id = None;
                 *pending_snapshot.borrow_mut() =
                     crate::installation::installation_operation_snapshot(product_id);
             }
@@ -1621,6 +2144,10 @@ fn installation_status_panel(
         while let Ok(crate::installation::DepotManagerEvent::Snapshot(snapshot)) =
             depot_receiver.try_recv()
         {
+            if snapshot.product_id == product_id {
+                failure.borrow_mut().take();
+                depot_operation_id = Some(snapshot.operation_id.clone());
+            }
             if snapshot.product_id == product_id
                 && matches!(
                     snapshot.state.as_str(),
@@ -1631,8 +2158,16 @@ fn installation_status_panel(
                 refresh_after_install();
             }
         }
-        if let Some(snapshot) =
-            crate::installation::depot_operation_snapshot_for_product(product_id)
+        if let Some(error) = failure.borrow().as_ref() {
+            set_idle_primary_action(&primary_action, &action_group, normal_action);
+            heading.set_label("LAUNCH FAILED");
+            detail.set_label(error);
+            panel_for_poll.set_visible(true);
+            progress.set_visible(false);
+            view_error.set_visible(true);
+            return glib::ControlFlow::Continue;
+        }
+        if let Some(snapshot) = depot_snapshot.as_ref()
             && matches!(snapshot.state.as_str(), "interrupted" | "failed")
         {
             panel_for_poll.set_visible(true);
@@ -1668,13 +2203,13 @@ fn installation_status_panel(
             cancel.set_visible(true);
             return glib::ControlFlow::Continue;
         }
-        if let Some(snapshot) =
-            crate::installation::depot_operation_snapshot_for_product(product_id)
+        if let Some(snapshot) = depot_snapshot.as_ref()
             && !matches!(
                 snapshot.state.as_str(),
                 "complete" | "failed" | "cancelled" | "abandoned"
             )
         {
+            depot_operation_id = Some(snapshot.operation_id.clone());
             view_error.set_visible(false);
             panel_for_poll.set_visible(true);
             primary_action.set_sensitive(false);
@@ -1694,7 +2229,50 @@ fn installation_status_panel(
                 _ => snapshot.state.replace('_', " ").to_uppercase(),
             };
             heading.set_label(&display_state);
-            if let Some(total) = snapshot.download_total_bytes {
+            if snapshot.state == "setup" {
+                determinate.set(false);
+                depot_rate.borrow_mut().reset();
+                if let Some(setup) = &snapshot.setup {
+                    if setup.total > 0 {
+                        detail.set_label(&format!(
+                            "{} · {} of {} components completed",
+                            setup.component, setup.completed, setup.total
+                        ));
+                        component_progress
+                            .set_fraction((setup.completed as f64 / setup.total as f64).min(1.0));
+                        component_progress.set_visible(true);
+                    } else {
+                        heading.set_label("SETTING UP GAME");
+                        detail.set_label(&setup.component);
+                    }
+                } else {
+                    detail.set_label("Applying required game setup");
+                }
+            } else if snapshot.state == "dependencies" {
+                depot_rate.borrow_mut().reset();
+                if snapshot.total_bytes > 0 {
+                    progress.set_fraction(
+                        (snapshot.bytes_completed as f64 / snapshot.total_bytes as f64).min(1.0),
+                    );
+                    determinate.set(true);
+                    detail.set_label(&format!(
+                        "{} / {}",
+                        human_size(snapshot.bytes_completed),
+                        human_size(snapshot.total_bytes)
+                    ));
+                } else {
+                    determinate.set(false);
+                    detail.set_label("Preparing required components");
+                }
+            } else if matches!(snapshot.state.as_str(), "committing" | "finalizing") {
+                determinate.set(false);
+                depot_rate.borrow_mut().reset();
+                detail.set_label(if snapshot.state == "committing" {
+                    "Installing game files"
+                } else {
+                    "Finishing game installation"
+                });
+            } else if let Some(total) = snapshot.download_total_bytes {
                 let fraction = if total == 0 {
                     1.0
                 } else {
@@ -1730,6 +2308,8 @@ fn installation_status_panel(
                 });
             }
             progress.set_visible(true);
+            cancel.set_sensitive(true);
+            cancel.set_tooltip_text(Some("Pause installation"));
             cancel.set_visible(true);
             return glib::ControlFlow::Continue;
         }
@@ -1737,7 +2317,18 @@ fn installation_status_panel(
             .borrow_mut()
             .take()
             .or_else(|| crate::installation::installation_operation_snapshot(product_id));
-        if installation_snapshot.is_none() {
+        if installation_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.queued
+                || matches!(
+                    snapshot.state,
+                    crate::domain::InstallationState::Installing
+                        | crate::domain::InstallationState::Uninstalling
+                )
+        }) {
+            download_completed = false;
+            depot_operation_id = None;
+        }
+        if installation_snapshot.is_none() || archive_active || was_downloading.get() {
             set_alternate_game_actions_sensitive(&action_group, true);
             let jobs = model
                 .borrow()
@@ -1756,6 +2347,9 @@ fn installation_status_panel(
                 })
                 .collect::<Vec<_>>();
             if !active.is_empty() {
+                download_completed = false;
+                depot_operation_id = None;
+                active_download_ids.extend(active.iter().map(|job| job.job_id.clone()));
                 view_error.set_visible(false);
                 if action_visual.replace(1) != 1 {
                     set_primary_button_content(
@@ -1822,6 +2416,12 @@ fn installation_status_panel(
                 return glib::ControlFlow::Continue;
             }
             if was_downloading.replace(false) {
+                download_completed = !active_download_ids.is_empty()
+                    && active_download_ids.iter().all(|id| {
+                        jobs.iter()
+                            .any(|job| &job.job_id == id && job.state == DownloadState::Complete)
+                    });
+                active_download_ids.clear();
                 view_error.set_visible(false);
                 refresh_after_install();
             }
@@ -1896,6 +2496,48 @@ fn installation_status_panel(
                 normal_action.icon(),
                 normal_action.label(),
             );
+        }
+        if let Some(snapshot) = depot_snapshot.as_ref().filter(|snapshot| {
+            depot_operation_id.as_ref() == Some(&snapshot.operation_id)
+                && matches!(
+                    snapshot.state.as_str(),
+                    "complete" | "cancelled" | "abandoned"
+                )
+        }) {
+            set_idle_primary_action(&primary_action, &action_group, normal_action);
+            panel_for_poll.set_visible(true);
+            cancel.set_visible(false);
+            view_error.set_visible(false);
+            heading.set_label(if snapshot.state == "complete" {
+                "INSTALLATION COMPLETE"
+            } else {
+                "INSTALLATION STOPPED"
+            });
+            detail.set_label(if snapshot.state == "complete" {
+                "Game files and required setup are ready"
+            } else {
+                "The operation was stopped; review the game before retrying"
+            });
+            progress.set_visible(snapshot.state == "complete");
+            progress.set_fraction(1.0);
+            determinate.set(true);
+            return glib::ControlFlow::Continue;
+        }
+        if download_completed
+            && installation_snapshot.as_ref().is_none_or(|snapshot| {
+                !snapshot.queued && snapshot.state != crate::domain::InstallationState::Installing
+            })
+        {
+            set_idle_primary_action(&primary_action, &action_group, normal_action);
+            panel_for_poll.set_visible(true);
+            cancel.set_visible(false);
+            view_error.set_visible(false);
+            heading.set_label("DOWNLOAD COMPLETE");
+            detail.set_label("Downloaded files are ready. Installer updates still need review from the arrow beside Play.");
+            progress.set_visible(true);
+            progress.set_fraction(1.0);
+            determinate.set(true);
+            return glib::ControlFlow::Continue;
         }
         if cloud_enable.is_visible() || checking_cloud.get() {
             view_error.set_visible(false);

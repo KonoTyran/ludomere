@@ -7,6 +7,27 @@ use std::{
 
 pub fn delete_completed_files(destination: &Path, files: &[PathBuf]) -> Result<()> {
     let _activity = crate::profile_reset::begin_activity("installer deletion")?;
+    let config = crate::storage::read_config()?;
+    let kind = [
+        crate::config::LibraryKind::OfflineInstallers,
+        crate::config::LibraryKind::Extras,
+    ]
+    .into_iter()
+    .find(|kind| {
+        config
+            .libraries(*kind)
+            .iter()
+            .any(|library| destination.starts_with(&library.path))
+    })
+    .context("Download directory is not in a configured archive library")?;
+    crate::storage::validate_path(&config, kind, destination)?;
+    for file in files {
+        crate::storage::validate_path(&config, kind, file)?;
+        anyhow::ensure!(
+            file.starts_with(destination),
+            "refusing to delete a file outside its managed download directory"
+        );
+    }
     for file in files {
         if !file.starts_with(destination) {
             bail!("refusing to delete a file outside its managed download directory");

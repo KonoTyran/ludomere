@@ -93,6 +93,11 @@ pub(super) fn show_game_settings(
     let general_page = adw::PreferencesPage::new();
     general_page.set_title("General");
     general_page.add(&general_group);
+    general_page.add(&files::archive_deletion_group(
+        &window,
+        game.product_id,
+        refresh_after_change.clone(),
+    ));
 
     let save_status = gtk::Label::new(None);
     save_status.set_xalign(0.0);
@@ -213,11 +218,9 @@ pub(super) fn show_game_settings(
         }
     });
     compatibility_page.add(&fixes_group);
-    let updates_page = placeholder_page(
-        "Updates",
-        "Automatic updates",
-        "Per-game update policy will be available when installed-game update workflows are implemented. Offline installer backups remain managed separately.",
-    );
+    let updates_page = adw::PreferencesPage::new();
+    updates_page.set_title("Updates");
+    updates_page.add(&update_policies::game_group(model, game));
 
     let files_page = adw::PreferencesPage::new();
     files_page.set_title("Installed Files");
@@ -755,7 +758,6 @@ pub(super) fn show_game_settings(
     reinstall_row.add_suffix(&reinstall);
     installation_group.add(&reinstall_row);
     installation_page.add(&installation_group);
-    installation_page.add(&update_policies::game_group(&window, model, game));
 
     if let Some(installed_game) = &installed
         && let Some(marker) = installation_marker
@@ -1530,6 +1532,15 @@ fn launch_source_migration(
     let slug = game.slug.clone();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
+            let current = crate::storage::validate_path(
+                &crate::storage::read_config()?,
+                crate::config::LibraryKind::GameFiles,
+                &installed.installation_directory,
+            )?;
+            anyhow::ensure!(
+                current.path == library_path,
+                "The selected Game Files library changed; reopen source selection."
+            );
             let mut journal = crate::installation::source_migration::begin_backup(
                 &library_path,
                 &operation_id,
@@ -1776,21 +1787,6 @@ fn persist_launch_settings(
             status.add_css_class("error");
         }
     }
-}
-
-fn placeholder_page(title: &str, group_title: &str, description: &str) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title(title);
-    let group = adw::PreferencesGroup::new();
-    group.set_title(group_title);
-    group.set_description(Some(description));
-    let status = adw::ActionRow::new();
-    status.set_title("Planned feature");
-    status.set_subtitle("Not available yet");
-    status.set_sensitive(false);
-    group.add(&status);
-    page.add(&group);
-    page
 }
 
 fn info_row(title: &str, value: &str) -> adw::ActionRow {

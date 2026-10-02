@@ -1,4 +1,179 @@
 use super::*;
+use anyhow::Context;
+
+pub(super) fn sign_out(
+    w: &Rc<Widgets>,
+    model: &Rc<RefCell<AppModel>>,
+    reset: bool,
+    reset_status: Option<gtk::Label>,
+) {
+    if model.borrow().logout_pending {
+        return;
+    }
+    if let Some(status) = &reset_status {
+        status.set_label("Stopping background work and preparing Factory Reset…");
+        status.set_visible(true);
+    }
+    auth::begin_sign_out();
+    crate::installation::request_sign_out_pause();
+    cancel_cover_indicators(w);
+    w.notifications.clear();
+    show_progress(w, "");
+    let config = {
+        let mut state = model.borrow_mut();
+        state.logout_pending = true;
+        state.token_refresh_in_progress = false;
+        state.core_loading = false;
+        state.account_token = None;
+        state.account_profile = None;
+        invalidate_section_requests_ui(&mut state);
+        state.config.clone()
+    };
+    download::set_authenticated(false);
+    update_header_network_indicator(w, &model.borrow());
+    update_account_widgets(w, None);
+    update_account_library_status(w, &model.borrow());
+    let reservation = reset.then(crate::profile_reset::reserve_for_sign_out);
+    w.sign_out.set_sensitive(false);
+    w.sign_in.set_sensitive(false);
+    let reset_windows = if reset {
+        w.window
+            .application()
+            .map(|app| {
+                app.windows()
+                    .into_iter()
+                    .map(|window| {
+                        let sensitive = window.is_sensitive();
+                        window.set_sensitive(false);
+                        (window, sensitive)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    w.sync_spinner.set_spinning(false);
+    w.sync_spinner.set_visible(false);
+    w.sync_progress.set_visible(false);
+    w.sync_status.set_visible(false);
+    w.sync_retry.set_visible(false);
+    w.sync_dismiss.set_visible(false);
+    w.sync_options.set_visible(false);
+    w.account_popover.popdown();
+    show_progress(
+        w,
+        if reset {
+            "Factory Reset: stopping background work before clearing the profile…"
+        } else {
+            "Signed out. Clearing saved login and pausing background work…"
+        },
+    );
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Option<auth::ResetCredentialCleanup>> {
+            let marker = auth::persist_sign_out().context("Could not record signed-out state");
+            crate::online::invalidate_library_session();
+            let paused = crate::installation::pause_for_sign_out()
+                .context("Could not pause installation work");
+            let credentials = if reset {
+                auth::logout_for_reset().map(Some)
+            } else {
+                auth::logout().map(|_| None)
+            };
+            marker?;
+            paused?;
+            if let Some(reservation) = reservation {
+                let reservation = reservation.context("Could not reserve Factory Reset")?;
+                let credentials = credentials.context("Could not secure the signed-out state")?;
+                download::pause_for_sign_out().context("Could not stop download work")?;
+                crate::installation::wait_for_paused()
+                    .context("Installation work has not stopped")?;
+                reservation
+                    .prepare(&config)
+                    .context("Factory Reset safety checks failed")?
+                    .commit()
+                    .context("Could not save the Factory Reset cleanup request")?;
+                return Ok(credentials);
+            }
+            credentials?;
+            crate::installation::wait_for_paused()?;
+            crate::installation::normalize_signed_out_operations()?;
+            crate::installation::finish_sign_out_pause();
+            Ok(None)
+        })();
+        let _ = sender.send(result);
+    });
+    let w = w.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!("Sign-out preparation stopped; try again")),
+        };
+        if let Ok(Some(cleanup)) = &result {
+            let message = match cleanup {
+                auth::ResetCredentialCleanup::Removed => {
+                    "Closing Ludomere to complete Factory Reset…"
+                }
+                auth::ResetCredentialCleanup::Unavailable => {
+                    "Closing Ludomere to complete Factory Reset. The system credential store is unavailable; its saved entry may remain, but automatic login stays disabled."
+                }
+            };
+            if let Some(status) = &reset_status {
+                status.set_label(message);
+            }
+            show_progress(&w, message);
+            if let Some(app) = w.window.application() {
+                app.quit();
+            }
+            return glib::ControlFlow::Break;
+        }
+        model.borrow_mut().logout_pending = false;
+        show_progress(&w, "");
+        w.sign_out.set_sensitive(true);
+        w.sign_in.set_sensitive(true);
+        for (window, sensitive) in &reset_windows {
+            window.set_sensitive(*sensitive);
+        }
+        match result {
+            Ok(None) => {
+                update_header_network_indicator(&w, &model.borrow());
+                update_account_widgets(&w, None);
+                update_account_library_status(&w, &model.borrow());
+                w.sign_out.set_label("Sign out");
+                show_status(
+                    &w,
+                    "Signed out of GOG. Interrupted operations can be resumed after signing in; running games continue.",
+                );
+            }
+            Err(error) => {
+                w.sign_out.set_label("Retry sign-out cleanup");
+                w.sign_out.set_visible(true);
+                let message = if reset {
+                    format!(
+                        "{}\nYour account is signed out. Factory Reset has not completed. Review the error, then use Factory Reset above to retry.",
+                        notifications::failure_message(
+                            "Factory Reset could not continue",
+                            &format!("{error:#}")
+                        )
+                    )
+                } else {
+                    format!(
+                        "Signed out. Cleanup is incomplete: {error}. Use the account menu to retry."
+                    )
+                };
+                if let Some(status) = &reset_status {
+                    status.set_label(&message);
+                }
+                show_status(&w, &message);
+            }
+            Ok(Some(_)) => unreachable!(),
+        }
+        glib::ControlFlow::Break
+    });
+}
 
 pub fn build_window(app: &adw::Application) {
     comet::start_component_check();
@@ -38,6 +213,7 @@ pub fn build_window(app: &adw::Application) {
         detail_generation: 0,
         detail_target: None,
         installed_games: HashMap::new(),
+        library_statuses: Vec::new(),
         local_actions: HashMap::new(),
         local_refresh_running: false,
         local_refresh_pending: false,
@@ -60,7 +236,6 @@ pub fn build_window(app: &adw::Application) {
         tag_filters: BTreeSet::new(),
         tag_match_all: false,
         organization_pending: false,
-        policy_saving: HashSet::new(),
         favorites_only: false,
         downloaded_only: false,
         installed_only: false,
@@ -492,24 +667,42 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
         summary: anyhow::Result<managed::RebuildSummary>,
         files: Vec<crate::state::ManagedFileRecord>,
         jobs: Vec<DownloadJobRecord>,
+        statuses: Vec<crate::storage::LibraryStatus>,
     }
 
     let epoch = model.borrow().account_epoch;
-    let root = model.borrow().config.download_directory.clone();
+    let config = model.borrow().config.clone();
     let games = model.borrow().games.clone();
     let session = online::account_session();
-    let scanned_root = root.clone();
+    let scanned_config = serde_json::to_string(&config).unwrap();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let reconciliation = (|| -> anyhow::Result<Reconciliation> {
             let mut store = StateStore::open()?;
-            let summary = managed::rebuild_for_session(&mut store, &root, &games, session);
+            let statuses = crate::storage::inspect_libraries(&config)?;
+            let summary = (|| -> anyhow::Result<managed::RebuildSummary> {
+                let mut total = managed::RebuildSummary::default();
+                for status in statuses.iter().filter(|status| {
+                    status.kind != crate::config::LibraryKind::GameFiles
+                        && status.compatibility == crate::storage::LibraryCompatibility::Compatible
+                }) {
+                    let result =
+                        managed::rebuild_for_session(&mut store, &status.path, &games, session)?;
+                    total.files += result.files;
+                    total.matched += result.matched;
+                    total.unmatched += result.unmatched;
+                    total.partials += result.partials;
+                    total.ignored += result.ignored;
+                }
+                Ok(total)
+            })();
             let files = store.managed_files()?;
             let jobs = store.download_jobs()?;
             Ok(Reconciliation {
                 summary,
                 files,
                 jobs,
+                statuses,
             })
         })();
         let _ = sender.send(reconciliation);
@@ -519,16 +712,17 @@ pub(super) fn start_managed_reconciliation(w: &Rc<Widgets>, model: &Rc<RefCell<A
     let model = model.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         if model.borrow().account_epoch != epoch
-            || model.borrow().config.download_directory != scanned_root
+            || serde_json::to_string(&model.borrow().config).unwrap() != scanned_config
         {
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {
             Ok(Ok(reconciliation)) => {
                 let mut state = model.borrow_mut();
-                let download_directory = state.config.download_directory.clone();
+                let config = state.config.clone();
                 managed::apply_to_games(&mut state.games, &reconciliation.files);
-                managed::set_locations(&mut state.games, &download_directory);
+                managed::set_library_locations(&mut state.games, &config);
+                state.library_statuses = reconciliation.statuses;
                 state.download_jobs = reconciliation.jobs;
                 state.downloaded_products = reconciliation
                     .files
@@ -1361,125 +1555,7 @@ pub(super) fn connect_actions(
         let w = w.clone();
         let model = model.clone();
         let button = w.sign_out.clone();
-        button.connect_clicked(move |_| {
-            if model.borrow().logout_pending {
-                return;
-            }
-            auth::begin_sign_out();
-            crate::installation::request_sign_out_pause();
-            cancel_cover_indicators(&w);
-            w.notifications.clear();
-            show_progress(&w, "");
-            let config = {
-                let mut state = model.borrow_mut();
-                state.logout_pending = true;
-                state.token_refresh_in_progress = false;
-                state.core_loading = false;
-                state.account_token = None;
-                state.account_profile = None;
-                invalidate_section_requests_ui(&mut state);
-                state.config.clone()
-            };
-            download::set_authenticated(false);
-            update_header_network_indicator(&w, &model.borrow());
-            update_account_widgets(&w, None);
-            update_account_library_status(&w, &model.borrow());
-            let reservation = config.clear_profile_on_sign_out.then(crate::profile_reset::reserve_for_sign_out);
-            w.sign_out.set_sensitive(false);
-            w.sign_in.set_sensitive(false);
-            let reset_windows = if config.clear_profile_on_sign_out {
-                w.window.application().map(|app| {
-                    app.windows().into_iter().map(|window| {
-                        let sensitive = window.is_sensitive();
-                        window.set_sensitive(false);
-                        (window, sensitive)
-                    }).collect::<Vec<_>>()
-                }).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            w.sync_spinner.set_spinning(false);
-            w.sync_spinner.set_visible(false);
-            w.sync_progress.set_visible(false);
-            w.sync_status.set_visible(false);
-            w.sync_retry.set_visible(false);
-            w.sync_dismiss.set_visible(false);
-            w.sync_options.set_visible(false);
-            w.account_popover.popdown();
-            show_progress(&w, if config.clear_profile_on_sign_out {
-                "Signed out. Stopping background work before clearing the profile…"
-            } else {
-                "Signed out. Clearing saved login and pausing background work…"
-            });
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = (|| -> anyhow::Result<bool> {
-                    let marker = auth::persist_sign_out();
-                    crate::online::invalidate_library_session();
-                    let paused = crate::installation::pause_for_sign_out();
-                    let credentials = auth::logout();
-                    marker?;
-                    paused?;
-                    if let Some(reservation) = reservation {
-                        let reservation = reservation?;
-                        credentials?;
-                        download::pause_for_sign_out()?;
-                        crate::installation::wait_for_paused()?;
-                        reservation.prepare(&config)?.commit()?;
-                        return Ok(true);
-                    }
-                    credentials?;
-                    crate::installation::wait_for_paused()?;
-                    crate::installation::normalize_signed_out_operations()?;
-                    crate::installation::finish_sign_out_pause();
-                    Ok(false)
-                })();
-                let _ = sender.send(result);
-            });
-            let w = w.clone();
-            let model = model.clone();
-            glib::timeout_add_local(Duration::from_millis(50), move || {
-                let result = match receiver.try_recv() {
-                    Ok(result) => result,
-                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(_) => Err(anyhow::anyhow!("Sign-out preparation stopped; try again")),
-                };
-                if matches!(result, Ok(true)) {
-                    show_progress(&w, "Closing Ludomere to clear the profile…");
-                    if let Some(app) = w.window.application() {
-                        app.quit();
-                    }
-                    return glib::ControlFlow::Break;
-                }
-                model.borrow_mut().logout_pending = false;
-                show_progress(&w, "");
-                w.sign_out.set_sensitive(true);
-                w.sign_in.set_sensitive(true);
-                for (window, sensitive) in &reset_windows {
-                    window.set_sensitive(*sensitive);
-                }
-                match result {
-                    Ok(false) => {
-                        update_header_network_indicator(&w, &model.borrow());
-                        update_account_widgets(&w, None);
-                        update_account_library_status(&w, &model.borrow());
-                        w.sign_out.set_label("Sign out");
-                        show_status(&w, "Signed out of GOG. Interrupted operations can be resumed after signing in; running games continue.");
-                    }
-                    Err(error) => {
-                        w.sign_out.set_label(if model.borrow().config.clear_profile_on_sign_out {
-                            "Retry profile reset"
-                        } else {
-                            "Retry sign-out cleanup"
-                        });
-                        w.sign_out.set_visible(true);
-                        show_status(&w, &format!("Signed out. Cleanup is incomplete: {error}. Use the account menu to retry."));
-                    }
-                    Ok(true) => unreachable!(),
-                }
-                glib::ControlFlow::Break
-            });
-        });
+        button.connect_clicked(move |_| sign_out(&w, &model, false, None));
     }
     {
         let model = model.clone();

@@ -143,6 +143,7 @@ struct VerificationDisplayState {
 
 struct AppModel {
     config: Config,
+    library_statuses: Vec<crate::storage::LibraryStatus>,
     games: Vec<Game>,
     section_states: HashMap<(i64, online::DetailSection), SectionState>,
     section_queue: VecDeque<(i64, online::DetailSection)>,
@@ -178,7 +179,6 @@ struct AppModel {
     tag_filters: BTreeSet<String>,
     tag_match_all: bool,
     organization_pending: bool,
-    policy_saving: HashSet<i64>,
     favorites_only: bool,
     downloaded_only: bool,
     installed_only: bool,
@@ -339,18 +339,15 @@ fn primary_action_for_state(
     current_installer_downloaded: bool,
     dlc_action: DlcActionState,
 ) -> GamePrimaryAction {
+    if installed {
+        return GamePrimaryAction::Play;
+    }
     let needs_download = backup_update
         || dlc_action.missing_download
         || (installed_update && !current_installer_downloaded);
-    let needs_install =
-        dlc_action.missing_install || (installed_update && current_installer_downloaded);
 
     if needs_download {
         GamePrimaryAction::DownloadUpdate
-    } else if installed && needs_install {
-        GamePrimaryAction::InstallUpdate
-    } else if installed {
-        GamePrimaryAction::Play
     } else if current_installer_downloaded {
         GamePrimaryAction::Install
     } else {
@@ -389,9 +386,8 @@ struct DownloadDialogWidgets {
     confirm: gtk::Button,
     authenticated: bool,
     online: bool,
-    download_directory: std::path::PathBuf,
     artifact_states: RefCell<HashMap<String, DialogArtifactState>>,
-    directory_available: std::cell::Cell<bool>,
+    libraries_available: RefCell<Vec<crate::config::LibraryKind>>,
 }
 
 impl DetailPageModel {
@@ -1054,14 +1050,14 @@ mod primary_action_tests {
     }
 
     #[test]
-    fn downloaded_update_is_installed_while_missing_update_is_downloaded() {
+    fn available_updates_keep_the_installed_game_playable() {
         assert_eq!(
             primary_action_for_state(true, true, false, true, DlcActionState::default()),
-            GamePrimaryAction::InstallUpdate
+            GamePrimaryAction::Play
         );
         assert_eq!(
             primary_action_for_state(true, true, false, false, DlcActionState::default()),
-            GamePrimaryAction::DownloadUpdate
+            GamePrimaryAction::Play
         );
     }
 
@@ -1087,7 +1083,7 @@ mod primary_action_tests {
     }
 
     #[test]
-    fn missing_dlc_files_take_priority_over_installing_downloaded_content() {
+    fn missing_dlc_files_do_not_replace_play() {
         assert_eq!(
             primary_action_for_state(
                 true,
@@ -1099,7 +1095,7 @@ mod primary_action_tests {
                     missing_install: true,
                 },
             ),
-            GamePrimaryAction::DownloadUpdate
+            GamePrimaryAction::Play
         );
     }
 }

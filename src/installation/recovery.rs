@@ -156,7 +156,7 @@ fn receipt(directory: &Path, product_id: i64) -> Result<Option<Receipt>> {
         .transpose()
 }
 
-pub(super) fn pending(directory: &Path, product_id: i64) -> Result<bool> {
+pub(crate) fn pending(directory: &Path, product_id: i64) -> Result<bool> {
     Ok(receipt(directory, product_id)?.is_some())
 }
 
@@ -358,7 +358,7 @@ fn read_config() -> Result<crate::config::Config> {
     Ok(toml::from_str(&text)?)
 }
 
-fn validate_prefix_locations(prefix: &Path) -> Result<()> {
+pub(super) fn validate_prefix_locations(prefix: &Path) -> Result<()> {
     let config = read_config()?;
     let preferences = crate::compatibility::proton_preferences()?;
     let store = crate::state::StateStore::open()?;
@@ -366,13 +366,13 @@ fn validate_prefix_locations(prefix: &Path) -> Result<()> {
         crate::identity::config_root(),
         crate::identity::data_root(),
         crate::identity::cache_root(),
-        config.download_directory,
+        config.download_directory.clone(),
     ];
     protected.extend(
-        config
-            .game_libraries
+        crate::config::LibraryKind::ALL
             .into_iter()
-            .map(|library| library.path),
+            .flat_map(|kind| config.libraries(kind))
+            .map(|library| library.path.clone()),
     );
     protected.extend(preferences.default);
     protected.extend(preferences.overrides.into_values());
@@ -470,6 +470,11 @@ fn marker_prefix_identity(
 
 /// Worker-only preview: use the same marker and prefix ownership checks as execution.
 pub fn uninstall_prefix(game: &crate::domain::InstalledGame) -> Result<Option<PathBuf>> {
+    super::validate_game_library(
+        &read_config()?,
+        &game.library_id,
+        &game.installation_directory,
+    )?;
     let marker = super::marker::load(&game.installation_directory)?
         .context("Installation marker is missing; reopen Uninstall for recovery")?;
     marker_prefix_identity(&game.installation_directory, game.product_id, &marker)?
@@ -571,6 +576,15 @@ pub fn prepare_uninstall(
     let mut installed = None;
     for library in &config.game_libraries {
         let directory = library.path.join(slug);
+        // An unrelated unavailable library must not prevent managing this game's valid copy.
+        if directory.try_exists()?
+            || crate::compatibility::prefix_path(&library.path, slug).try_exists()?
+            || super::operation_journal::path(&library.path, slug)?.try_exists()?
+        {
+            super::validate_game_library(config, &library.id, &directory)?;
+        } else {
+            continue;
+        }
         ensure!(
             slug != ".ludomere",
             "The library control directory cannot be reset as a game"
@@ -586,9 +600,9 @@ pub fn prepare_uninstall(
             "This game folder contains Ludomere profile data; move the game before recovery"
         );
         ensure!(
-            !config
-                .game_libraries
-                .iter()
+            !crate::config::LibraryKind::ALL
+                .into_iter()
+                .flat_map(|kind| config.libraries(kind))
                 .any(|other| other.path.starts_with(&directory)),
             "A configured library is inside this game's directory; move that library before recovery"
         );
@@ -813,7 +827,7 @@ pub fn prepare_uninstall(
     }))
 }
 
-fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
+pub(super) fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let opened = (|| -> std::io::Result<std::fs::File> {
@@ -851,7 +865,7 @@ fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
     ))
 }
 
-fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
     let mut directory = std::fs::File::open("/")?;
     if !path.is_absolute() {
         return Err(std::io::Error::other(
@@ -870,7 +884,7 @@ fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(directory)
 }
 
-fn open_child(
+pub(super) fn open_child(
     parent: &std::fs::File,
     name: &std::ffi::OsStr,
     directory: bool,
@@ -998,10 +1012,24 @@ pub fn reset_game(
     let current = read_config()?;
     ensure!(
         current.game_libraries == plan.config.game_libraries
+            && current.offline_libraries == plan.config.offline_libraries
+            && current.extras_libraries == plan.config.extras_libraries
             && current.download_directory == plan.config.download_directory,
         "Library or download locations changed; reopen Uninstall"
     );
     let mut protected = Vec::new();
+    for root in &plan.directories {
+        crate::storage::validate_path(&current, crate::config::LibraryKind::GameFiles, root)?;
+    }
+    protected.extend(
+        [
+            crate::config::LibraryKind::OfflineInstallers,
+            crate::config::LibraryKind::Extras,
+        ]
+        .into_iter()
+        .flat_map(|kind| current.libraries(kind))
+        .map(|library| library.path.clone()),
+    );
     // Download paths stay indexed and in place, even with a shared game/download root.
     for file in store.managed_files()? {
         if file.present {
@@ -1186,6 +1214,7 @@ pub fn reset_game(
     }
     if result.failures.is_empty() {
         for path in &plan.directories {
+            super::prefix_recovery::retire_after_uninstall(path, plan.product_id)?;
             remove_control_file(&receipt_path(path)?)?;
         }
     }
@@ -1287,7 +1316,7 @@ mod tests {
                 .unwrap();
                 super::super::operation_journal::write_offline(&journal, &crate::state::InstallationOperationRecord {
                     product_id: id, operation:"install".into(), state:"failed".into(),
-                    plan_json: serde_json::json!({"game":{"installation_directory":directory,"installer_operating_system":"linux","compatibility":null}}).to_string(),
+                    plan_json: serde_json::json!({"game":{"product_id":id,"installation_directory":directory,"installer_operating_system":"linux","compatibility":null}}).to_string(),
                     message:None, percentage:None, queue_position:None, created_at:1, updated_at:1, completed_at:None,
                 }).unwrap();
             }
@@ -1547,6 +1576,10 @@ mod tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(marker, b"{broken").unwrap();
         let config_before = std::fs::read(crate::config::Config::path()).unwrap();
+        assert!(prepare_uninstall(&config, 910001, "recovery-910001").is_err());
+        assert!(directory.join("untracked-save").exists());
+        // Correct the known inert metadata before exercising authorized recovery.
+        super::super::marker::write(&windows_marker(910001), &directory).unwrap();
         let snapshot = plan(&config, 910001);
         assert!(directory.join("untracked-save").exists()); // Preview is read-only.
         let result = reset_game(snapshot, false, &AtomicBool::new(false), |_| {}).unwrap();
@@ -1650,15 +1683,31 @@ mod tests {
     }
 
     #[test]
-    fn download_only_shared_root_preserves_downloads_unless_explicitly_selected() {
+    fn download_only_typed_root_preserves_downloads_unless_explicitly_selected() {
         for (id, delete) in [(910006, false), (910007, true)] {
-            let (_temporary, config, directory) = fixture(id);
-            std::fs::remove_file(directory.join(format!("goggame-{id}.info"))).unwrap();
+            let (temporary, mut config, directory) = fixture(id);
+            let archive = temporary.path().join("offline");
+            std::fs::create_dir(&archive).unwrap();
+            config.offline_libraries.push(crate::config::GameLibrary {
+                id: "offline".into(),
+                name: "Offline".into(),
+                path: archive.clone(),
+                default: true,
+            });
+            let extras = temporary.path().join("extras");
+            std::fs::create_dir(&extras).unwrap();
+            config.extras_libraries.push(crate::config::GameLibrary {
+                id: "extras".into(),
+                name: "Extras".into(),
+                path: extras.clone(),
+                default: true,
+            });
+            config.save().unwrap();
             let artifacts: Vec<crate::domain::RemoteArtifact> = serde_json::from_value(serde_json::json!([
                 {"product_id":id,"kind":"installer","name":"Fixture","operating_system":"windows","language":"en","size_bytes":4,"download_path":"/inert"}
             ])).unwrap();
             let destination = crate::download::destination(
-                &config.download_directory,
+                &archive,
                 &format!("recovery-{id}"),
                 None,
                 &[&artifacts[0]],
@@ -1690,13 +1739,30 @@ mod tests {
                     std::slice::from_ref(&file),
                 )
                 .unwrap();
+            let mut extra = artifacts[0].clone();
+            extra.kind = crate::domain::ArtifactKind::Extra;
+            extra.download_path = "/inert-extra".into();
+            let extra_directory =
+                crate::download::destination(&extras, &format!("recovery-{id}"), None, &[&extra]);
+            std::fs::create_dir_all(&extra_directory).unwrap();
+            let extra_file = extra_directory.join("soundtrack.zip");
+            std::fs::write(&extra_file, b"data").unwrap();
+            store
+                .record_completed_artifacts(
+                    &format!("{job}-extra"),
+                    &format!("recovery-{id}"),
+                    &[extra],
+                    std::slice::from_ref(&extra_file),
+                )
+                .unwrap();
             std::fs::write(directory.join("partial-payload"), b"remove").unwrap();
             let result =
                 reset_game(plan(&config, id), delete, &AtomicBool::new(false), |_| {}).unwrap();
             assert!(result.failures.is_empty(), "{:?}", result.failures);
             assert!(!directory.join("partial-payload").exists());
             assert_eq!(file.exists(), !delete);
-            assert_eq!(result.retained_downloads, usize::from(!delete));
+            assert_eq!(extra_file.exists(), !delete);
+            assert_eq!(result.retained_downloads, 2 * usize::from(!delete));
             assert_eq!(
                 store
                     .managed_files_for_products(&[id])

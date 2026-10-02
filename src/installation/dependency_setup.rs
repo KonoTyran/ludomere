@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub(super) struct SetupProcessGuard {
     pub boot: String,
     pub group: Option<u32>,
@@ -96,49 +96,58 @@ pub(crate) fn run_tracked(
     log: &Path,
     spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
 ) -> Result<()> {
-    ensure!(!stopped(), "Required setup cancelled before starting");
-    let boot = boot_identity()?;
     if let Some(operation) = operation {
         let (_, record) = super::operation_journal::find_depot(operation)?;
         ensure_setup_quiescent(&record)?;
-        // Arm durably before spawn. An unknown same-boot group cannot be assumed safe
-        // after a crash, even if the application itself has since restarted.
-        write_setup_guard(
-            operation,
-            Some(SetupProcessGuard {
-                boot: boot.clone(),
-                group: None,
-            }),
-        )?;
     }
+    run_guarded(
+        stopped,
+        name,
+        log,
+        |guard| {
+            if let Some(operation) = operation {
+                write_setup_guard(operation, guard)?;
+            }
+            Ok(())
+        },
+        spawn,
+    )
+}
+
+pub(super) fn run_guarded(
+    stopped: &impl Fn() -> bool,
+    name: &str,
+    log: &Path,
+    mut persist: impl FnMut(Option<SetupProcessGuard>) -> Result<()>,
+    spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
+) -> Result<()> {
+    ensure!(!stopped(), "Required setup cancelled before starting");
+    let boot = boot_identity()?;
+    // Arm durably before spawn. An unknown same-boot group cannot be assumed safe
+    // after a crash, even if the application itself has since restarted.
+    persist(Some(SetupProcessGuard {
+        boot: boot.clone(),
+        group: None,
+    }))?;
     if stopped() {
-        if let Some(operation) = operation {
-            write_setup_guard(operation, None)?;
-        }
+        persist(None)?;
         anyhow::bail!("Required setup cancelled before starting");
     }
     let mut process = match spawn() {
         Ok(process) => process,
         Err(error) => {
-            if let Some(operation) = operation {
-                write_setup_guard(operation, None)?;
-            }
+            persist(None)?;
             return Err(error);
         }
     };
-    if let Some(operation) = operation
-        && let Err(error) = write_setup_guard(
-            operation,
-            Some(SetupProcessGuard {
-                boot,
-                group: Some(process.group_id()),
-            }),
-        )
-    {
+    if let Err(error) = persist(Some(SetupProcessGuard {
+        boot,
+        group: Some(process.group_id()),
+    })) {
         process.stop().context(
             "Setup identity could not be saved and its process could not be drained; reboot before recovery",
         )?;
-        write_setup_guard(operation, None)?;
+        persist(None)?;
         return Err(error);
     }
     let result = wait_process(&mut process, stopped, name, log);
@@ -149,9 +158,7 @@ pub(crate) fn run_tracked(
             .stop()
             .context("Required setup did not drain; recovery remains blocked")?;
     }
-    if let Some(operation) = operation {
-        write_setup_guard(operation, None)?;
-    }
+    persist(None)?;
     result
 }
 
@@ -421,22 +428,26 @@ pub(crate) fn apply(
     prepared: &[PreparedDependency],
     context: &ActionContext,
     stopped: impl Fn() -> bool,
-    mut progress: impl FnMut(&str),
+    mut progress: impl FnMut(&str, usize, usize),
 ) -> Result<()> {
     let ids = plan
         .entries
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
-    for entry in &plan.entries {
+    let entries = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.method,
+                Method::GameFiles | Method::ScriptInterpreter { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    for (completed, entry) in entries.iter().enumerate() {
         ensure!(!stopped(), "Dependency setup cancelled");
-        if matches!(
-            entry.method,
-            Method::GameFiles | Method::ScriptInterpreter { .. }
-        ) {
-            continue;
-        }
-        progress(&entry.name);
+        progress(&entry.name, completed, entries.len());
         let verbs = override_verbs(&entry.id, &ids);
         let method = verbs
             .as_ref()
@@ -490,6 +501,7 @@ pub(crate) fn apply(
                 }
             },
         )?;
+        progress(&entry.name, completed + 1, entries.len());
     }
     Ok(())
 }
@@ -599,6 +611,15 @@ fn command(
     })
 }
 
+#[derive(Debug)]
+pub(super) struct UnsuccessfulExit(String);
+impl std::fmt::Display for UnsuccessfulExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for UnsuccessfulExit {}
+
 pub(crate) fn wait_process(
     process: &mut crate::compatibility::CompatibilityProcess,
     stopped: &impl Fn() -> bool,
@@ -622,10 +643,11 @@ pub(crate) fn wait_process(
                 }
                 let detail = super::runtime_logs::installation_tail(log)
                     .unwrap_or_else(|_| "Installation log could not be read".into());
-                anyhow::bail!(
+                return Err(UnsuccessfulExit(format!(
                     "Required dependency {name} failed ({status}). Log: {}\n{detail}",
                     log.display()
-                );
+                ))
+                .into());
             }
             if !process.group_running()? {
                 return Ok(());
@@ -638,6 +660,106 @@ pub(crate) fn wait_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_progress_counts_verified_checkpoints_but_not_failed_components() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().join("prefix");
+        fs::create_dir_all(prefix.join("drive_c")).unwrap();
+        for name in ["system.reg", "user.reg"] {
+            fs::write(prefix.join(name), "inert registry fixture").unwrap();
+        }
+        let component = |id: &str, method| Dependency {
+            id: id.into(),
+            name: id.into(),
+            manifest_id: String::new(),
+            manifest_bytes: Vec::new(),
+            method,
+        };
+        let plan = Plan {
+            version: 1,
+            catalog_build: "fixture".into(),
+            entries: vec![
+                component("Files", Method::GameFiles),
+                component(
+                    "Cached",
+                    Method::Exe {
+                        path: "cached.exe".into(),
+                        args: Vec::new(),
+                    },
+                ),
+                component(
+                    "Missing",
+                    Method::Msi {
+                        path: "missing.msi".into(),
+                        args: Vec::new(),
+                    },
+                ),
+                component(
+                    "ISI",
+                    Method::ScriptInterpreter {
+                        path: "isi.exe".into(),
+                        args: Vec::new(),
+                    },
+                ),
+            ],
+        };
+        complete_step(
+            &prefix,
+            format!("{}:gog-native-v1", plan.entries[1].identity()),
+            &|| false,
+            || Ok(()),
+        )
+        .unwrap();
+        let context = ActionContext {
+            operation_id: None,
+            product_id: 221,
+            app: root.path().join("game"),
+            support: root.path().join("support"),
+            prefix: prefix.clone(),
+            windows_app: "L:\\game".into(),
+            profile: crate::compatibility::UmuProfile::fallback(),
+            log_path: root.path().join("log"),
+            galaxy_setup: None,
+        };
+        let mut progress = Vec::new();
+        let result = apply(
+            &crate::compatibility::UmuBackend::default(),
+            &plan,
+            &[],
+            &context,
+            || false,
+            |name, completed, total| progress.push((name.to_owned(), completed, total)),
+        );
+        assert!(result.unwrap_err().to_string().contains("not acquired"));
+        assert_eq!(
+            progress,
+            vec![
+                ("Cached".into(), 0, 2),
+                ("Cached".into(), 1, 2),
+                ("Missing".into(), 1, 2)
+            ]
+        );
+        // A later verified completion is counted on retry without invoking any helper.
+        complete_step(
+            &prefix,
+            format!("{}:gog-native-v1", plan.entries[2].identity()),
+            &|| false,
+            || Ok(()),
+        )
+        .unwrap();
+        progress.clear();
+        apply(
+            &crate::compatibility::UmuBackend::default(),
+            &plan,
+            &[],
+            &context,
+            || false,
+            |name, completed, total| progress.push((name.to_owned(), completed, total)),
+        )
+        .unwrap();
+        assert_eq!(progress.last(), Some(&("Missing".into(), 2, 2)));
+    }
 
     struct GuardJournal {
         root: tempfile::TempDir,

@@ -63,6 +63,24 @@ The existing DirectX and supported Visual C++ compatibility recipes continue thr
 other supported dependencies use GOG's declared installer and arguments through UMU. Successful
 setup is recorded for the selected prefix, dependency revision and installation method. Resume
 retries unfinished work and reuses intact cached files; recreating a prefix requires setup again.
+If an active launch detects a safely recoverable Windows setup failure, a **Repair Windows setup**
+dialog opens. Confirm repair to retain the old environment as a backup; exact paths and diagnostics
+are available under **Details**. If you have left the launch view, the notification area keeps a
+repair action without opening a dialog over your current work.
+Ludomere retains the old prefix, including its saves and settings; restoring individual save files
+may require manual work, and the old registry is not copied into the new prefix. Game files and
+preferences remain intact. Initialization alone is not a completed repair: **Continue setup** opens
+the existing Repair flow to complete game setup, using the installed Depot build or an explicitly
+chosen offline installer. Repair may download needed files. Until setup succeeds, later launches
+offer to continue setup again, including after restarting Ludomere. The recovery dialog provides
+**Open backup folder**; rebuilding never launches the game. Setup progress stays visible after
+component confirmation, with download progress and completed component counts where available,
+and a pulsing bar while an installer is running. **Stop setup** requests cancellation;
+**Details** shows the current operation, available byte/component counts and the eight most recent
+stage messages, including the final result. Repair preparation also shows activity while the
+required files and components are being checked; no percentage is implied when none is available.
+**Run in background** closes the dialog while work continues. Completion never reopens the dialog
+or launches the game.
 For Winetricks downloads, Ludomere preserves the trust selected by `CURL_CA_BUNDLE`, `SSL_CERT_FILE`
 and `SSL_CERT_DIR`, translating readable host paths under `/etc` or `/usr` to the runtime's read-only
 host mount. This also handles certificate variables added by `cargo run`. Other custom, relative or
@@ -76,19 +94,50 @@ An interrupted launch with no saved process identity requires a reboot, not just
 An unreadable operation journal requires repair before recovery; it is not discarded to bypass this check.
 
 Adding a game library refreshes installed state and sidebar colors without opening each game.
-**Default for installer storage** changes the actual download folder and refreshes its index.
-Already indexed files in the configured download folder are rematched as game/DLC metadata arrives,
+Storage separates **Game Files**, **Offline Installers**, and **Goodies & Extras**. Each type supports
+multiple directories and its own default. Only Game Files is required; optional types have no
+implicit fallback. Libraries with mixed or unrecognized layouts are marked incompatible with a
+reason. Their content actions stay disabled until corrected; configuration, removal and Recheck
+remain available. No files are automatically moved or deleted.
+Use separate, nonoverlapping roots, for example sibling `Games`, `Installers`, and `Extras`
+directories. Game Files contains installed game directories and Ludomere's `.ludomere`
+infrastructure. Archive roots use the managed `<game>/installer`, `<game>/patch`, or
+`<game>/extra` category layout, with platform/language subdirectories when provided and
+`<game>/dlc/<dlc>/…` for DLC. Installer components such as language packs belong with Offline
+Installers. Select correctly separated existing directories, or organize incompatible content
+yourself and use Recheck; changing configuration does not convert a mixed library.
+Installation records are retained while a library is incompatible, and running games are not stopped.
+Already indexed files in configured archive libraries are rematched as game/DLC metadata arrives,
 using unambiguous filename, OS, language and known-size matches. Arbitrary flat folders are not
 imported; previously unknown directories need an explicit index rebuild after their games are known.
 Changing folders does not move files or erase other download roots' records and receipts.
+Uninstall keeps downloaded installers and goodies by default. Removing those files requires the
+explicit, initially unchecked option in the uninstall confirmation. Game Properties → General also
+provides separate **Delete Offline Installers** and **Delete Goodies & Extras** buttons, even when
+the game is not installed. Each confirmation lists the exact managed files to delete from compatible
+configured libraries; installed payloads, saves, and the other archive category remain intact.
 
-Settings → Downloads includes automatic Depot updates (on), offline installer backups (off),
-and superseded-installer cleanup (off). Checks run after library synchronization and every six
+Settings → Downloads includes automatic Depot updates (on) and superseded-installer cleanup (off).
+Storage offers one **Keep downloaded files up to date** option per optional library type (both off).
+These update existing copies in each configured root, including uninstalled games; they never start
+an initial backup of all owned games. Per-game installer overrides remain available.
+Checks run after library synchronization and every six
 hours while signed in and online. **Check and queue updates** applies the same selected policies
-immediately. Per-game settings offer Inherit/On/Off controls and an explicit Depot language
-reconciliation; changing the global default language does not change existing installations.
-Saving a per-game language override affects future updates; applying it now may also update to
-the latest available build on the same branch.
+immediately. **Game Properties → Updates** offers Inherit/On/Off controls for Depot updates,
+existing installer backups, and old-installer cleanup, plus an optional Depot language override.
+Changes save automatically for future checks without starting downloads. A blank per-game language
+inherits the global default. Initial Depot downloads use this per-game language override, or the
+global default when no override is set. Changing language preferences does not immediately change
+existing installations.
+Installed games keep **Play** as their main action when an update is available. When automatic
+updates are off for that game's installation source, the arrow beside Play offers **Check for
+Updates**. Checking does not queue anything or change the policy: confirm an offered Depot update
+to download and apply it, or choose a library for an offline installer update download. Downloaded
+installer updates remain a separate **Install update** action in the same menu.
+The confirmation shows activity while preparing the update and closes after it is accepted.
+Download, required-component and final setup progress then appear on the current game's detail
+page; completed downloads do not imply setup is finished. Preparation failures stay in the dialog
+for retry. Prefix recovery retains its separate repair dialog and progress flow.
 Running or busy games are skipped. Opt-in cleanup moves eligible old managed installers to Trash
 only after verified replacements exist; active work, install intents, extras and unmanaged files
 are protected. Results appear in Downloads.
@@ -118,12 +167,19 @@ reuploaded unless you modify them, explicitly Force upload, or reset the profile
 Cloud recovery copies are preserved by full profile reset, while account-scoped synchronization
 and deletion tracking are reset; preserved local saves can upload again afterward.
 
-The one-time setup wizard welcomes you, then shows one step at a time: game folder, download folder,
-Proton choice, and Windows runtime readiness. Back retains your drafts; Next checks the relevant
+The one-time setup wizard welcomes you, then shows separate Game Files, Offline Installers,
+Goodies & Extras, Proton choice, and Windows runtime steps. Back retains your drafts; Next checks the relevant
 choice before advancing. Skip for now keeps existing folder defaults and leaves Finish setup
-available; completed profiles are not automatically taken through setup again. Both folder fields
-have a directory picker and remain editable. Changing the game folder suggests its `downloads`
-subfolder; editing the download folder independently never changes the game folder. Proton choices
+available; completed profiles are not automatically taken through setup again. Each library step
+has one directory field and Browse button; existing defaults are prefilled and additional libraries
+are preserved. Game Files also offers **Automatically update Depot builds** for installed Depot
+games; it defaults on for new profiles and preserves an existing choice. This checkbox is saved
+with setup completion and does not start downloads. Skip an optional archive step or leave its
+field empty to keep its saved configuration.
+Add further libraries afterward in Settings: expand Storage to choose Game Library, Offline Installers,
+or Goodies & Extras. Game Display contains the separate display preferences.
+New profiles suggest `~/Games/Ludomere/{games,installers,extras}`. Chosen new directories are created
+only on Save; incompatible selections remain visible for correction. Proton choices
 show their full paths, including a selectable wrapping path below the version selector. Choosing a
 version saves it automatically; Custom Proton Directory reveals the folder picker. Proton downloads
 are offered when no valid existing versions are detected. The next step automatically checks the
@@ -132,6 +188,10 @@ before optional GOG sign-in opens in its own modal. Close the
 sign-in modal to skip; already signed-in users do not need to sign in again. Failed saves keep your
 edits in the wizard for retry. Skip or close the wizard to finish later without saving folder drafts;
 Finish setup remains available without repeatedly opening it.
+Closing the login window after GOG redirects does not itself mean sign-in succeeded: token exchange,
+account verification and secure credential storage must finish first. Failures appear in Notifications
+with stage-specific retry guidance; optional public-profile or avatar failures do not block login.
+Each login window uses temporary browser data.
 Explicit Proton selection and component-download actions save independently;
 skipping does not undo those choices or completed downloads. Navigation waits for active component
 work, while closing or skipping cancels it. Folder defaults are committed only by the final Save.
@@ -173,6 +233,12 @@ Python, python-xlib, and python-urllib3. Arch supplies development headers with 
 A graphical session and session D-Bus are needed to run the application. Login additionally needs
 an unlocked Secret Service provider, such as GNOME Keyring or a compatible desktop keyring;
 installing libsecret alone does not provide that service.
+During explicit sign-in, Ludomere detects the session's standard Secret Service. If none is
+running or activatable but KDE advertises its compatibility service, Ludomere requests normal
+D-Bus activation and checks the standard interface again. It does not change wallet settings or
+bypass a disabled API. Unavailable services, activation failures, denied wallet access, and
+duplicate login entries have distinct safe errors; successful secure credential storage remains
+required before sign-in completes.
 
 The package includes a private [UMU Launcher](https://github.com/Open-Wine-Components/umu-launcher)
 1.4.4 and [Comet](https://github.com/imLinguin/comet) v0.3.2 with its Windows service helper.
@@ -289,23 +355,29 @@ adapter and `LUDOMERE_COMET_DIR` to the directory containing Comet, its Windows 
 `build.json`. An incomplete Comet directory is not a verified installation. Release builds use
 the packaged helpers or explicit overrides.
 
-The first run creates `~/.config/ludomere/config.toml`. The default game library and managed
-download location are `$XDG_DATA_HOME/ludomere/games`. The executable is `ludomere`.
+The first run creates `~/.config/ludomere/config.toml`. The default Game Files library is
+`~/Games/Ludomere/games`; Offline Installers and Goodies & Extras need explicit directories.
+The executable is `ludomere`.
 
-Settings → Account → **Clear full profile when signing out** is off by default. Enabling it only
-saves the preference. On your next sign-out, Ludomere closes and clears login data, settings,
-favorites, tags, playtime, queue records, cached metadata, images and logs. Games, downloaded
-installers, Proton versions and runtimes stay intact. Sign-out revokes the account immediately,
-pauses downloads and interrupts setup safely; running games continue. Without full reset,
-interrupted operations remain recoverable after signing in. Full reset discards queue and
+Settings → Account → **Factory Reset…** is available even while signed out. Confirmation closes
+Ludomere and deletes its database, local login data, settings, favorites, tags, playtime, queue records,
+cached metadata, images and logs. Cancel leaves everything unchanged. Games, downloaded files,
+game prefixes and their saves, Proton versions, runtimes and cloud recovery copies stay intact.
+Normal sign-out never resets the profile, including for an old saved reset-on-sign-out preference.
+Sign-out revokes the account immediately, pauses downloads and interrupts setup safely; running
+games continue. Interrupted operations remain recoverable after signing in. Factory Reset discards queue and
 automatic-resume records after their writers stop, while keeping downloaded and installed files.
-If cleanup cannot finish, the account stays signed out and the account menu offers a cleanup retry.
+If reset preparation cannot finish, the account stays signed out; use Factory Reset again to retry.
+Progress and full error details appear beside the Factory Reset button. An unavailable system
+credential store does not block local reset: its external login entry may remain, but a durable
+signed-out marker keeps automatic login disabled until an explicit new sign-in succeeds.
+Ordinary sign-out cleanup failures offer a retry in the account menu.
 If an interrupted installation record could not be saved, its cleanup must finish before a new
 sign-in can remove the sign-out barrier; this prevents old work from restarting under another account.
 A reset already committed for process replacement offers Retry or Close without starting library
 workers. Kept-running games cannot start further cloud synchronization or GOG online services
 under the old account; a cloud request already sent cannot be recalled. The
-next launch starts signed out with default settings, including this toggle off; add any custom
+next launch starts signed out with default settings; add any custom
 game-library paths again to use their preserved installations.
 
 Use isolated state during testing:

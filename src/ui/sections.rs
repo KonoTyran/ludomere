@@ -68,29 +68,12 @@ pub(super) fn current_primary_action(
             .get(&(parent.unwrap_or(id), online::DetailSection::Acquisition)),
         Some(SectionState::Ready)
     );
-    ready_local_action(
-        local,
-        acquisition_ready,
-        matches!(
-            model
-                .section_states
-                .get(&(id, online::DetailSection::Builds)),
-            Some(SectionState::Ready)
-        ),
-    )
+    ready_local_action(local, acquisition_ready)
 }
 
-fn ready_local_action(
-    local: &LocalActionState,
-    acquisition_ready: bool,
-    builds_ready: bool,
-) -> GamePrimaryAction {
+fn ready_local_action(local: &LocalActionState, acquisition_ready: bool) -> GamePrimaryAction {
     if local.depot && local.installed.is_some() {
-        return if local.installed_update && builds_ready {
-            GamePrimaryAction::InstallUpdate
-        } else {
-            GamePrimaryAction::Play
-        };
+        return GamePrimaryAction::Play;
     }
     primary_action_for_state(
         local.installed.is_some(),
@@ -128,7 +111,6 @@ pub(super) fn invalidate_section_requests_ui(model: &mut AppModel) {
     model.account_epoch = model.account_epoch.wrapping_add(1);
     model.organization_pending = false;
     model.hidden_pending.clear();
-    model.policy_saving.clear();
     model.section_states.clear();
     model.section_queue.clear();
     model.section_active.clear();
@@ -417,26 +399,42 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
     let targeted = ids.is_some();
     let session = online::account_session();
     let (sender, receiver) = mpsc::sync_channel(8);
+    let (status_sender, status_receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
             let store = StateStore::open()?;
+            let statuses = crate::storage::inspect_libraries(&config)?;
+            let libraries = config
+                .game_libraries
+                .iter()
+                .filter(|library| {
+                    crate::storage::path_status(&statuses, &library.path)
+                        == Some(&crate::storage::LibraryCompatibility::Compatible)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let _ = status_sender.send(statuses.clone());
             let products = games
                 .iter()
                 .map(|game| (game.product_id, game.slug.clone()))
                 .collect::<Vec<_>>();
-            let installed = if targeted {
+            let mut installed = if targeted {
                 crate::installation::reconcile_installed_products(
-                    &store,
-                    &config.game_libraries,
-                    &products,
-                    &existing,
+                    &store, &libraries, &products, &existing,
                 )?
             } else {
-                crate::installation::reconcile_installed_games(&store, &config.game_libraries)?
+                crate::installation::reconcile_installed_games(&store, &libraries)?
             }
             .into_iter()
             .map(|game| (game.product_id, game))
             .collect::<HashMap<_, _>>();
+            for (id, game) in &existing {
+                if crate::storage::path_status(&statuses, &game.installation_directory)
+                    != Some(&crate::storage::LibraryCompatibility::Compatible)
+                {
+                    installed.entry(*id).or_insert_with(|| game.clone());
+                }
+            }
             let product_ids = games
                 .iter()
                 .flat_map(|game| {
@@ -449,10 +447,16 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
             } else {
                 store.managed_files()?
             };
-            let matches = managed::pending_matches(&config.download_directory, &games, &files)?;
-            if !matches.is_empty() {
+            for status in statuses.iter().filter(|status| {
+                status.kind != crate::config::LibraryKind::GameFiles
+                    && status.compatibility == crate::storage::LibraryCompatibility::Compatible
+            }) {
+                let matches = managed::pending_matches(&status.path, &games, &files)?;
+                if matches.is_empty() {
+                    continue;
+                }
                 online::with_account_session(session, || {
-                    managed::ensure_download_root(&config.download_directory)?;
+                    managed::ensure_download_root(&status.path)?;
                     store.match_managed_files(&matches)
                 })?;
                 files = if targeted {
@@ -463,7 +467,12 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
             }
             let managed_paths = files
                 .iter()
-                .filter(|file| file.present && file.matched)
+                .filter(|file| {
+                    file.present
+                        && file.matched
+                        && crate::storage::path_status(&statuses, &file.path)
+                            == Some(&crate::storage::LibraryCompatibility::Compatible)
+                })
                 .filter_map(|file| {
                     file.provider_file_id
                         .as_ref()
@@ -521,11 +530,22 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                     .iter()
                     .flat_map(|id| files_by_product.get(id).into_iter().flatten().cloned())
                     .collect::<Vec<_>>();
-                if local_files_exist(&game.installers)
-                    || local_files_exist(&game.patches)
-                    || local_files_exist(&game.extras)
+                let available_files = |files: &[LibraryFile]| {
+                    files
+                        .iter()
+                        .filter(|file| {
+                            crate::storage::path_status(&statuses, &file.path)
+                                == Some(&crate::storage::LibraryCompatibility::Compatible)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                if local_files_exist(&available_files(&game.installers))
+                    || local_files_exist(&available_files(&game.patches))
+                    || local_files_exist(&available_files(&game.extras))
                     || game.dlcs.iter().any(|dlc| {
-                        local_files_exist(&dlc.installers) || local_files_exist(&dlc.extras)
+                        local_files_exist(&available_files(&dlc.installers))
+                            || local_files_exist(&available_files(&dlc.extras))
                     })
                 {
                     product_downloaded.insert(root);
@@ -535,6 +555,10 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                     let local = installed.get(&detail.product_id).cloned();
                     let marker = local
                         .as_ref()
+                        .filter(|game| {
+                            crate::storage::path_status(&statuses, &game.installation_directory)
+                                == Some(&crate::storage::LibraryCompatibility::Compatible)
+                        })
                         .map(|game| {
                             crate::installation::load_installation_marker(
                                 &game.installation_directory,
@@ -589,7 +613,9 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                     .iter()
                     .filter(|(_, state)| {
                         state.installed.as_ref().is_some_and(|game| {
-                            window::sidebar_game_is_playable(game, &config.game_libraries)
+                            crate::storage::path_status(&statuses, &game.installation_directory)
+                                == Some(&crate::storage::LibraryCompatibility::Compatible)
+                                && window::sidebar_game_is_playable(game, &libraries)
                         })
                     })
                     .map(|(&id, _)| id)
@@ -634,6 +660,12 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
         let stale_preferences = local_preferences(&model.borrow().config) != preferences;
         let mut complete = false;
         let mut changed = false;
+        if let Ok(statuses) = status_receiver.try_recv()
+            && !stale_preferences
+        {
+            model.borrow_mut().library_statuses = statuses;
+            changed = true;
+        }
         let mut error = None;
         for _ in 0..16 {
             match receiver.try_recv() {
@@ -765,7 +797,8 @@ fn replace_product_presence(
 fn local_preferences(config: &Config) -> String {
     serde_json::to_string(&(
         &config.game_libraries,
-        &config.download_directory,
+        &config.offline_libraries,
+        &config.extras_libraries,
         &config.installer_language,
         config.installer_windows,
         config.installer_linux,
@@ -825,11 +858,11 @@ mod tests {
             })
             .collect::<HashMap<_, _>>();
         assert_eq!(
-            ready_local_action(&actions[&2], false, false),
+            ready_local_action(&actions[&2], false),
             GamePrimaryAction::Install
         );
         assert_eq!(
-            ready_local_action(&actions[&1], false, false),
+            ready_local_action(&actions[&1], false),
             GamePrimaryAction::Download
         );
         assert!(!actions.contains_key(&3));
@@ -914,11 +947,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            ready_local_action(&local, false, false),
+            ready_local_action(&local, false),
             GamePrimaryAction::Install
         );
         assert_eq!(
-            ready_local_action(&local, true, false),
+            ready_local_action(&local, true),
             GamePrimaryAction::DownloadUpdate
         );
     }
@@ -952,28 +985,13 @@ mod tests {
             installed_update: true,
             ..Default::default()
         };
-        assert_eq!(
-            ready_local_action(&local, false, false),
-            GamePrimaryAction::Play
-        );
-        assert_eq!(
-            ready_local_action(&local, true, false),
-            GamePrimaryAction::DownloadUpdate
-        );
+        assert_eq!(ready_local_action(&local, false), GamePrimaryAction::Play);
+        assert_eq!(ready_local_action(&local, true), GamePrimaryAction::Play);
         local.depot = true;
         local.backup_update = true;
-        assert_eq!(
-            ready_local_action(&local, true, false),
-            GamePrimaryAction::Play
-        );
-        assert_eq!(
-            ready_local_action(&local, false, true),
-            GamePrimaryAction::InstallUpdate
-        );
+        assert_eq!(ready_local_action(&local, true), GamePrimaryAction::Play);
+        assert_eq!(ready_local_action(&local, false), GamePrimaryAction::Play);
         local.installed_update = false;
-        assert_eq!(
-            ready_local_action(&local, true, true),
-            GamePrimaryAction::Play
-        );
+        assert_eq!(ready_local_action(&local, true), GamePrimaryAction::Play);
     }
 }

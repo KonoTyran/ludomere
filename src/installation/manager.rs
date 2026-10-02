@@ -73,6 +73,13 @@ impl std::fmt::Debug for DepotOperationRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepotSetupProgress {
+    pub component: String,
+    pub completed: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepotOperationSnapshot {
     pub operation_id: String,
     pub product_id: i64,
@@ -84,6 +91,7 @@ pub struct DepotOperationSnapshot {
     pub total_bytes: u64,
     pub download_total_bytes: Option<u64>,
     pub error: Option<String>,
+    pub setup: Option<DepotSetupProgress>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +340,8 @@ pub struct InstallationOperationSnapshot {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedInstallationPlan {
     #[serde(skip)]
+    tracking: Option<InstallationTracking>,
+    #[serde(skip)]
     recovery_generation: u64,
     game: InstalledGame,
     additional_installers: Vec<AdditionalInstaller>,
@@ -339,6 +349,38 @@ struct PersistedInstallationPlan {
     interactive_prompts: bool,
     #[serde(default)]
     download_intent_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InstallationTracking {
+    sender: mpsc::Sender<InstallationEvent>,
+    control: TrackedInstallationControl,
+}
+
+pub struct TrackedInstallation {
+    pub events: mpsc::Receiver<InstallationEvent>,
+    control: TrackedInstallationControl,
+}
+
+impl TrackedInstallation {
+    pub fn control(&self) -> TrackedInstallationControl {
+        self.control.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackedInstallationControl {
+    product_id: i64,
+    generation: u64,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TrackedInstallationControl {
+    pub fn cancel(&self) -> bool {
+        self.cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
+        cancel_operation_checked(self.product_id, Some(self))
+    }
 }
 
 #[derive(Clone)]
@@ -511,6 +553,7 @@ pub fn recover_depot_operations() -> anyhow::Result<usize> {
             super::operation_journal::write_depot(&path, &operation)?;
         }
         publish_depot(DepotOperationSnapshot {
+            setup: None,
             operation_id: operation.operation_id,
             product_id: operation.product_id,
             state: operation.state,
@@ -588,6 +631,7 @@ pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
         (request.product_id, request.destination.clone()),
     );
     let snapshot = DepotOperationSnapshot {
+        setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
         state: "queued".into(),
@@ -643,6 +687,7 @@ pub fn resume_depot_operation(operation_id: String, access_token: String) -> boo
         Ok(request) => enqueue_depot_operation(request),
         Err(error) => {
             publish_depot(DepotOperationSnapshot {
+                setup: None,
                 operation_id,
                 product_id: 0,
                 state: "failed".into(),
@@ -691,6 +736,11 @@ pub fn prepare_depot_resume(
                 access_token,
             })
         })?;
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &request.library_id,
+        &request.destination,
+    )?;
     prepare_required_dependencies(&mut request, &std::sync::atomic::AtomicBool::new(false))?;
     Ok(request)
 }
@@ -778,6 +828,7 @@ fn run_depot_operation(
             !was_cancelled,
         );
         failure_snapshot = Some(DepotOperationSnapshot {
+            setup: None,
             operation_id: request.operation_id.clone(),
             product_id: request.product_id,
             state: state.into(),
@@ -850,6 +901,7 @@ fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
     super::depot_actions::remove_support_staging(&request.staging_path)?;
     super::operation_journal::remove(&journal_path)?;
     publish_depot(DepotOperationSnapshot {
+        setup: None,
         operation_id: operation_id.to_owned(),
         product_id: request.product_id,
         state: "abandoned".into(),
@@ -931,6 +983,16 @@ fn run_depot_operation_inner(
     request: &DepotOperationRequest,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &request.library_id,
+        &request.destination,
+    )?;
+    super::prefix_recovery::setup_ticket(
+        &request.destination,
+        &request.target_marker,
+        request.kind == crate::domain::DepotOperationKind::Repair,
+    )?;
     let mut request = request.clone();
     let session = request.account_session;
     anyhow::ensure!(
@@ -979,6 +1041,7 @@ fn run_depot_operation_inner(
         crate::compatibility::preflight_windows(Some(request.product_id))?;
     }
     publish_depot(DepotOperationSnapshot {
+        setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
         state: "preparing".into(),
@@ -1022,6 +1085,7 @@ fn run_depot_operation_inner(
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         update_depot_record(&request.operation_id, "cancelled", 0, None, true)?;
         publish_depot(DepotOperationSnapshot {
+            setup: None,
             operation_id: request.operation_id.clone(),
             product_id: request.product_id,
             state: "cancelled".into(),
@@ -1046,6 +1110,7 @@ fn run_depot_operation_inner(
             .try_fold(0_u64, |total, size| total.checked_add(size))
             .ok_or_else(|| anyhow::anyhow!("depot verification size overflows"))?;
         publish_depot(DepotOperationSnapshot {
+            setup: None,
             operation_id: request.operation_id.clone(),
             product_id: request.product_id,
             state: "verifying".into(),
@@ -1085,6 +1150,7 @@ fn run_depot_operation_inner(
     );
     if verification_total > 0 && request.kind != DepotOperationKind::Repair {
         publish_depot(DepotOperationSnapshot {
+            setup: None,
             operation_id: request.operation_id.clone(),
             product_id: request.product_id,
             state: "verifying".into(),
@@ -1118,6 +1184,7 @@ fn run_depot_operation_inner(
                 verification_total.set(total);
                 if total > 0 {
                     publish_depot(DepotOperationSnapshot {
+                        setup: None,
                         operation_id: request.operation_id.clone(),
                         product_id: request.product_id,
                         state: "verifying_existing".into(),
@@ -1146,6 +1213,7 @@ fn run_depot_operation_inner(
         )?);
     }
     publish_depot(DepotOperationSnapshot {
+        setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
         state: "calculating".into(),
@@ -1175,6 +1243,7 @@ fn run_depot_operation_inner(
     let download_total = required_network_bytes(&pending_chunks, &reusable, support_download)?;
     update_depot_record(&request.operation_id, "downloading", completed, None, false)?;
     publish_depot(DepotOperationSnapshot {
+        setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
         state: "downloading".into(),
@@ -1336,6 +1405,7 @@ fn run_depot_operation_inner(
                     false,
                 )?;
                 publish_depot(DepotOperationSnapshot {
+                    setup: None,
                     operation_id: request.operation_id.clone(),
                     product_id: request.product_id,
                     state: "committing".into(),
@@ -1402,6 +1472,7 @@ fn run_depot_operation_inner(
     crate::download::depot::finish_journal(&request.staging_path)?;
     update_depot_record(&request.operation_id, "complete", total, None, true)?;
     publish_depot(DepotOperationSnapshot {
+        setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
         state: "complete".into(),
@@ -1432,6 +1503,7 @@ fn publish_depot_progress(
         .get(&request.operation_id)
         .and_then(|snapshot| snapshot.download_total_bytes);
     publish_depot(DepotOperationSnapshot {
+        setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
         state: state.into(),
@@ -1441,6 +1513,31 @@ fn publish_depot_progress(
         total_write_bytes: write_total,
         total_bytes: total,
         download_total_bytes,
+        error: None,
+    });
+}
+
+fn publish_depot_setup(
+    request: &DepotOperationRequest,
+    component: &str,
+    completed: usize,
+    total: usize,
+) {
+    publish_depot(DepotOperationSnapshot {
+        operation_id: request.operation_id.clone(),
+        product_id: request.product_id,
+        state: "setup".into(),
+        setup: Some(DepotSetupProgress {
+            component: component.into(),
+            completed,
+            total,
+        }),
+        bytes_completed: 0,
+        bytes_downloaded: 0,
+        bytes_written: 0,
+        total_write_bytes: 0,
+        total_bytes: 0,
+        download_total_bytes: None,
         error: None,
     });
 }
@@ -1762,6 +1859,11 @@ fn finalize_depot_metadata(
     prepared: &[crate::gog::dependencies::PreparedDependency],
     session: u64,
 ) -> anyhow::Result<()> {
+    let prefix_recovery = super::prefix_recovery::setup_ticket(
+        &request.destination,
+        &request.target_marker,
+        request.kind == crate::domain::DepotOperationKind::Repair,
+    )?;
     let language = request
         .target_marker
         .base
@@ -1827,6 +1929,7 @@ fn finalize_depot_metadata(
                 || crate::online::account_session() != session
                 || !super::recovery::current(request.product_id, request.recovery_generation)
         };
+        publish_depot_setup(request, "Preparing Windows prefix", 0, 0);
         let prefix = backend.initialize_prefix_controlled(
             crate::compatibility::InitializePrefixRequest {
                 library_id: request.library_id.clone(),
@@ -1880,13 +1983,21 @@ fn finalize_depot_metadata(
                 stopped,
             )?;
         }
-        super::dependency_setup::apply(&backend, plan, prepared, &context, stopped, |name| {
-            let _ = crate::compatibility::append_step_log(
-                &context.log_path,
-                &format!("Applying required component: {name}"),
-            );
-            publish_depot_progress(request, "setup", 0, 0, 0, 0, 0);
-        })?;
+        super::dependency_setup::apply(
+            &backend,
+            plan,
+            prepared,
+            &context,
+            stopped,
+            |name, completed, total| {
+                let _ = crate::compatibility::append_step_log(
+                    &context.log_path,
+                    &format!("Applying required component: {name}"),
+                );
+                publish_depot_setup(request, name, completed, total);
+            },
+        )?;
+        publish_depot_setup(request, "Finishing game setup", 0, 0);
         marker.dependencies = request.dependencies.clone();
         for (product_id, actions) in removed_actions {
             let context = super::depot_actions::ActionContext {
@@ -1990,7 +2101,8 @@ fn finalize_depot_metadata(
             "Setup cancelled before publishing installation success"
         );
         super::marker::write(&marker, &request.destination)
-    })
+    })?;
+    super::prefix_recovery::setup_completed(prefix_recovery, &marker, false)
 }
 
 fn setup_repository(
@@ -2845,6 +2957,48 @@ pub fn enqueue_installation(
     install_base: bool,
     interactive_prompts: bool,
 ) -> bool {
+    enqueue_installation_inner(
+        plan,
+        additional_installers,
+        install_base,
+        interactive_prompts,
+        None,
+    )
+}
+
+/// Receive only this accepted operation's events, with attempt-scoped cancellation.
+pub fn enqueue_installation_tracked(
+    plan: InstalledGame,
+    additional_installers: Vec<AdditionalInstaller>,
+    install_base: bool,
+    interactive_prompts: bool,
+) -> Option<TrackedInstallation> {
+    let (sender, events) = mpsc::channel();
+    let control = TrackedInstallationControl {
+        product_id: plan.product_id,
+        generation: super::recovery::generation(plan.product_id),
+        cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    enqueue_installation_inner(
+        plan,
+        additional_installers,
+        install_base,
+        interactive_prompts,
+        Some(InstallationTracking {
+            sender,
+            control: control.clone(),
+        }),
+    )
+    .then_some(TrackedInstallation { events, control })
+}
+
+fn enqueue_installation_inner(
+    plan: InstalledGame,
+    additional_installers: Vec<AdditionalInstaller>,
+    install_base: bool,
+    interactive_prompts: bool,
+    tracking: Option<InstallationTracking>,
+) -> bool {
     if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire) {
         return false;
     }
@@ -2855,11 +3009,15 @@ pub fn enqueue_installation(
     if super::recovery::pending(&plan.installation_directory, product_id).unwrap_or(true) {
         return false;
     }
-    let generation = super::recovery::generation(product_id);
+    let generation = tracking
+        .as_ref()
+        .map(|tracking| tracking.control.generation)
+        .unwrap_or_else(|| super::recovery::generation(product_id));
     let Ok(admission) = super::recovery::admit_generation(product_id, generation) else {
         return false;
     };
     let persisted_plan = PersistedInstallationPlan {
+        tracking,
         recovery_generation: generation,
         game: plan.clone(),
         additional_installers: additional_installers.clone(),
@@ -2876,6 +3034,11 @@ pub fn enqueue_installation(
                 .any(|queued| queued.product_id() == product_id)
         {
             return false;
+        }
+        if let Some(tracking) = &persisted_plan.tracking {
+            let _ = tracking.sender.send(InstallationEvent::Starting {
+                message: "Queued for installation".into(),
+            });
         }
         manager.next_queue_position += 1;
         let position = manager.next_queue_position;
@@ -2931,6 +3094,7 @@ pub fn enqueue_downloaded_installation(
     let generation = super::recovery::generation(product_id);
     let admission = super::recovery::admit_generation(product_id, generation)?;
     let plan = PersistedInstallationPlan {
+        tracking: None,
         recovery_generation: generation,
         game,
         additional_installers,
@@ -3143,6 +3307,11 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session:
         persisted_plan.game.product_id,
         persisted_plan.recovery_generation,
     ) else {
+        if let Some(tracking) = &persisted_plan.tracking {
+            let _ = tracking.sender.send(InstallationEvent::Failed(
+                "This game's recovery state changed; reopen setup and retry".into(),
+            ));
+        }
         schedule_next();
         return;
     };
@@ -3152,6 +3321,11 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session:
         Ok(true)
     };
     if !matches!(authorization, Ok(true)) {
+        if let Some(tracking) = &persisted_plan.tracking {
+            let _ = tracking.sender.send(InstallationEvent::Failed(
+                "The installation request could not be authorized; reopen setup and retry".into(),
+            ));
+        }
         persist_existing_operation(
             persisted_plan.game.product_id,
             if authorization.is_err() {
@@ -3196,6 +3370,9 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session:
         || manager.shutting_down
     {
         drop(manager);
+        if let Some(tracking) = &persisted_plan.tracking {
+            let _ = tracking.sender.send(InstallationEvent::Cancelled);
+        }
         persist_existing_operation(
             product_id,
             "paused",
@@ -3205,11 +3382,16 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session:
         );
         return;
     }
-    let handle = super::executor::start_installation(
+    let handle = super::executor::start_installation_with_cancellation(
         persisted_plan.game.clone(),
         persisted_plan.additional_installers.clone(),
         persisted_plan.install_base,
         persisted_plan.interactive_prompts,
+        persisted_plan
+            .tracking
+            .as_ref()
+            .map(|tracking| tracking.control.cancellation.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
     );
     manager
         .active
@@ -3232,6 +3414,9 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session:
     }
     thread::spawn(move || {
         while let Ok(event) = handle.events.recv() {
+            if let Some(tracking) = &persisted_plan.tracking {
+                let _ = tracking.sender.send(event.clone());
+            }
             let terminal = matches!(
                 event,
                 InstallationEvent::Complete { .. }
@@ -3415,9 +3600,30 @@ pub fn respond_to_installation(product_id: i64, response: String) -> bool {
 }
 
 pub fn cancel_operation(product_id: i64) -> bool {
-    let queued_snapshot = {
+    cancel_operation_checked(product_id, None)
+}
+
+fn cancel_operation_checked(
+    product_id: i64,
+    expected: Option<&TrackedInstallationControl>,
+) -> bool {
+    // Enqueue holds this same admission through journal publication. Do not let
+    // a new attempt replace the journal while retiring this exact queued plan.
+    let admission = if let Some(expected) = expected {
+        let Ok(admission) = super::recovery::admit_generation(product_id, expected.generation)
+        else {
+            return false;
+        };
+        Some(admission)
+    } else {
+        None
+    };
+    let (mut queued_snapshot, removed) = {
         let mut manager = MANAGER.lock().unwrap();
         if let Some(control) = manager.active.get(&product_id) {
+            if expected.is_some_and(|expected| !matches!(control, OperationControl::Installation(control) if control.uses_cancellation(&expected.cancellation))) {
+                return false;
+            }
             match control {
                 OperationControl::Installation(control) => control.cancel(),
                 OperationControl::Uninstallation(control) => control.cancel(),
@@ -3427,11 +3633,11 @@ pub fn cancel_operation(product_id: i64) -> bool {
         let Some(index) = manager
             .queue
             .iter()
-            .position(|operation| operation.product_id() == product_id)
+            .position(|operation| operation.product_id() == product_id && expected.is_none_or(|expected| matches!(operation, QueuedOperation::Installation(plan) if plan.tracking.as_ref().is_some_and(|tracking| std::sync::Arc::ptr_eq(&tracking.control.cancellation, &expected.cancellation)))))
         else {
             return false;
         };
-        manager.queue.remove(index);
+        let removed = manager.queue.remove(index);
         let snapshot = InstallationOperationSnapshot {
             product_id,
             state: crate::domain::InstallationState::Failed,
@@ -3440,18 +3646,71 @@ pub fn cancel_operation(product_id: i64) -> bool {
             queued: false,
         };
         manager.snapshots.insert(product_id, snapshot.clone());
-        snapshot
+        (snapshot, removed)
     };
-    persist_existing_operation(
-        product_id,
-        "cancelled",
-        Some("Operation cancelled"),
-        None,
-        Some(chrono::Utc::now().timestamp()),
-    );
+    let terminal = if expected.is_some() {
+        let Some(QueuedOperation::Installation(plan)) = &removed else {
+            unreachable!()
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let directory = &plan.game.installation_directory;
+            let path = super::operation_journal::path(
+                directory.parent().context("Missing installation library")?,
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("Invalid installation slug")?,
+            )?;
+            if let Some(value) = super::recovery::read_json(&path)? {
+                let super::operation_journal::OperationJournal::Offline { record, .. } =
+                    serde_json::from_value(value)?
+                else {
+                    anyhow::bail!("The saved installation operation changed; it was retained");
+                };
+                anyhow::ensure!(
+                    record.product_id == product_id
+                        && serde_json::from_str::<serde_json::Value>(&record.plan_json)?
+                            == serde_json::to_value(plan)?,
+                    "The saved installation operation changed; it was retained"
+                );
+                super::recovery::remove_control_file(&path)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => InstallationEvent::Cancelled,
+            Err(error) => {
+                let message = format!(
+                    "Setup stopped, but its saved operation could not be cleared: {error:#}. Review this game's saved operation before retrying."
+                );
+                queued_snapshot.message = Some(message.clone());
+                MANAGER
+                    .lock()
+                    .unwrap()
+                    .snapshots
+                    .insert(product_id, queued_snapshot.clone());
+                InstallationEvent::Failed(message)
+            }
+        }
+    } else {
+        persist_existing_operation(
+            product_id,
+            "cancelled",
+            Some("Operation cancelled"),
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        );
+        InstallationEvent::Cancelled
+    };
+    if let Some(QueuedOperation::Installation(plan)) = removed
+        && let Some(tracking) = plan.tracking
+    {
+        let _ = tracking.sender.send(terminal);
+    }
     publish(InstallationManagerEvent::OperationCancelled(
         queued_snapshot,
     ));
+    drop(admission);
     schedule_next();
     true
 }
@@ -3703,6 +3962,11 @@ pub fn pause_for_sign_out() -> anyhow::Result<()> {
         queued
     };
     for operation in queued {
+        if let QueuedOperation::Installation(plan) = &operation
+            && let Some(tracking) = &plan.tracking
+        {
+            let _ = tracking.sender.send(InstallationEvent::Cancelled);
+        }
         let game = match &operation {
             QueuedOperation::Installation(plan) => &plan.game,
             QueuedOperation::Uninstallation(plan) => &plan.game,
@@ -4058,6 +4322,147 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tracked_setup_excludes_prior_events_and_cancellation_without_serializing_tracking() {
+        const CHILD: &str = "LUDOMERE_TRACKED_SETUP_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "installation::manager::tests::tracked_setup_excludes_prior_events_and_cancellation_without_serializing_tracking", "--nocapture"])
+                .env(CHILD, "1");
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+            ] {
+                let path = root.path().join(key);
+                std::fs::create_dir(&path).unwrap();
+                command.env(key, path);
+            }
+            assert!(command.status().unwrap().success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let game = super::super::marker::game_from_marker(
+            &marker(false),
+            "fixture".into(),
+            root.path().join("game"),
+            None,
+        );
+        // Keep the inert queue from dispatching; no installer or helper is executed.
+        MANAGER.lock().unwrap().shutting_down = true;
+        let old = enqueue_installation_tracked(game.clone(), vec![], true, false).unwrap();
+        assert!(matches!(
+            old.events.try_recv(),
+            Ok(InstallationEvent::Starting { .. })
+        ));
+        assert!(enqueue_installation_tracked(game.clone(), vec![], true, false).is_none());
+        // Reproduce the dequeue-to-active interval without spawning the operation.
+        let QueuedOperation::Installation(popped) =
+            MANAGER.lock().unwrap().queue.pop_front().unwrap()
+        else {
+            panic!("installation expected")
+        };
+        let encoded = serde_json::to_value(&popped).unwrap();
+        assert!(encoded.get("tracking").is_none());
+        assert!(
+            serde_json::from_value::<PersistedInstallationPlan>(encoded)
+                .unwrap()
+                .tracking
+                .is_none()
+        );
+        let current = enqueue_installation_tracked(game.clone(), vec![], true, false).unwrap();
+        assert!(matches!(
+            current.events.try_recv(),
+            Ok(InstallationEvent::Starting { .. })
+        ));
+        let journal = root.path().join(".ludomere/staging/game.operation.json");
+        let current_journal = std::fs::read(&journal).unwrap();
+        assert!(!old.control().cancel());
+        assert_eq!(std::fs::read(&journal).unwrap(), current_journal);
+        assert!(
+            !current
+                .control
+                .cancellation
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        popped
+            .tracking
+            .unwrap()
+            .sender
+            .send(InstallationEvent::Failed("older attempt".into()))
+            .unwrap();
+        assert!(matches!(
+            old.events.try_recv(),
+            Ok(InstallationEvent::Failed(_))
+        ));
+        assert!(matches!(
+            current.events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(current.control().cancel());
+        assert!(matches!(
+            current.events.try_recv(),
+            Ok(InstallationEvent::Cancelled)
+        ));
+        assert!(MANAGER.lock().unwrap().queue.is_empty());
+        assert!(!journal.exists());
+        let failed_cleanup = enqueue_installation_tracked(game, vec![], true, false).unwrap();
+        assert!(matches!(
+            failed_cleanup.events.try_recv(),
+            Ok(InstallationEvent::Starting { .. })
+        ));
+        std::fs::write(&journal, b"inert malformed saved operation").unwrap();
+        assert!(failed_cleanup.control().cancel());
+        assert!(
+            matches!(failed_cleanup.events.try_recv(), Ok(InstallationEvent::Failed(message)) if message.contains("saved operation could not be cleared"))
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            b"inert malformed saved operation"
+        );
+    }
+
+    #[test]
+    fn setup_snapshot_resets_component_progress_before_other_phases() {
+        let mut request = request(false);
+        request.operation_id = "setup-progress-fixture".into();
+        publish_depot_setup(&request, "OpenAL", 1, 3);
+        let snapshot = depot_operation_snapshot(&request.operation_id).unwrap();
+        assert_eq!(
+            snapshot.setup.unwrap(),
+            DepotSetupProgress {
+                component: "OpenAL".into(),
+                completed: 1,
+                total: 3
+            }
+        );
+        publish_depot_setup(&request, "Finishing game setup", 0, 0);
+        assert_eq!(
+            depot_operation_snapshot(&request.operation_id)
+                .unwrap()
+                .setup
+                .unwrap()
+                .total,
+            0
+        );
+        for phase in ["verifying", "failed", "cancelled", "complete"] {
+            publish_depot_setup(&request, "Cached prerequisite", 3, 3);
+            publish_depot_progress(&request, phase, 0, 0, 0, 0, 0);
+            let snapshot = depot_operation_snapshot(&request.operation_id).unwrap();
+            assert_eq!(snapshot.state, phase);
+            assert!(snapshot.setup.is_none());
+        }
+        let mut manager = DEPOT_MANAGER.lock().unwrap();
+        manager.snapshots.remove(&request.operation_id);
+        manager.snapshot_sequence.remove(&request.operation_id);
+        manager.last_event_at.remove(&request.operation_id);
+    }
+
+    #[test]
     fn signed_out_native_journal_is_retained_without_automatic_replay() {
         let root = tempfile::tempdir().unwrap();
         let previous = std::fs::read(crate::config::Config::path()).ok();
@@ -4078,6 +4483,7 @@ mod tests {
             None,
         );
         let plan = PersistedInstallationPlan {
+            tracking: None,
             recovery_generation: super::super::recovery::generation(game.product_id),
             game,
             additional_installers: vec![],
@@ -4230,6 +4636,7 @@ mod tests {
         let database = root.path().join("state.db");
         let store = StateStore::open_at(&database).unwrap();
         let plan = PersistedInstallationPlan {
+            tracking: None,
             recovery_generation: 0,
             game: super::super::marker::game_from_marker(
                 &marker(false),
@@ -4314,6 +4721,7 @@ mod tests {
         );
         game.product_id = 910010;
         let plan = PersistedInstallationPlan {
+            tracking: None,
             recovery_generation: super::super::recovery::generation(game.product_id),
             game: game.clone(),
             additional_installers: vec![],
@@ -4354,6 +4762,7 @@ mod tests {
         std::fs::create_dir_all(&library).unwrap();
         std::fs::write(library.join(".ludomere"), b"preserve").unwrap();
         let plan = PersistedInstallationPlan {
+            tracking: None,
             recovery_generation: 0,
             game: super::super::marker::game_from_marker(
                 &marker(false),

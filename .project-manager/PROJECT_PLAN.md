@@ -1,5 +1,299 @@
 # Project plan
 
+## P227–P228 R86 version and publication
+
+- P227 ui owns0.2.2 Cargo/lock/package/metainfo synchronization and scoped metadata checks.
+- P228 compatibility read-only accumulated-diff inventory/release-note accuracy review. Root
+  prepares descriptive commit and concise upstream PR6 comment, commits/pushes after checks,
+  verifies remote head and comment. User explicitly authorizes both external mutations. No new
+  product changes or full suite/package build; attribution Codex (GPT-6).
+
+## P225–P226 R85 repair feedback and setup details
+
+- Complete: manager reviewed source/counter semantics, nonempty Details/preparation screenshots,
+  P226 independent scoped PASS with11 private assertions and cleanup. Final fmt/diff, all-target
+  Clippy and production debug pass. No live repair/helper or full suite/package/publication claim.
+
+- P225 ui in_progress owns download_chooser.rs and narrowly necessary UI/README: investigate
+  empty Details and repair feedback gaps, populate useful stage detail and retain progress across
+  preparation/accepted repair. Relevant checks, no backend expansion without evidence/coordination.
+- P226 security independent review of truthful progress/nonempty details, consent/account/close
+  behavior, bounded private physical GUI. No product writes; root records only. Reports
+  /tmp/ludomere-p225-report.md and p226-review.md. Routine scoped tools/private tests/build allowed,
+  preserve all work, no real logs/profile/helper/network execution/full suite/package/publication.
+
+## P223–P224 R84 manual update progress
+
+- Complete: manager reviewed scoped UI change and owner checks, P224 independent no-material-
+  finding disposition and all12 isolated physical assertions, plus process cleanup. Confirmation
+  hands accepted work to current detail stages; cached offline consent preserved. Relevant test,
+  fmt/diff, Clippy and production debug build pass. No live update/helper or publication claimed.
+
+- P223 ui in_progress: trace manual update confirmation/admission and detail operation rendering;
+  close accepted dialog, retain actionable refusal, show download and final setup in current detail
+  view. Own narrow UI paths and README, relevant regressions; backend edits only if evidenced
+  necessary and coordinated. Preserve accumulated work/R83 recovery modal. No full suite/live data.
+- P224 security independent review: admission/close/error/session lifetime and actual private GUI
+  confirmation→detail stages→completion/failure. Review only, no source edits; report findings to
+  P223. Reports /tmp/ludomere-p223-report.md and p224-review.md. Root records only. Routine scoped
+  inspection, isolated fixture/tests and build allowed; no real credentials/helpers/publication.
+
+## P220–P222 R83 recovery dialog and progress
+
+- Complete within requested scope: root reviewed P220/P221 reports, three focused backend
+  regressions, P222's 22 isolated physical UI assertions and independent no-material-finding
+  disposition. Final fmt/diff, all-target Clippy and production debug build pass. Real-game
+  recovery remains user verification; no real prefix/helper, full suite, package or publication.
+
+- P220 ui owns recovery dialog/copy/progress continuation in ui/proton.rs, launch receivers and
+  narrowly needed download_chooser/README. Replace footer-only interaction with launch-request
+  modal, preserve backup consent/stale guards, show current component and honest progress through
+  setup completion/errors. Relevant checks only, no real helper/file mutation.
+- P221 compatibility traces existing setup progress/snapshots/cancel/result APIs, supplies precise
+  UI contract; owns backend changes only if essential missing progress, coordinate first.
+- P222 security independently reviews focus/session/consent/progress semantics and exercises
+  bounded isolated GUI states. No product edits; root records only. Reports /tmp/ludomere-p220-
+  report.md, p221-report.md, p222-review.md. Preserve all prior edits; no publication/full suite.
+
+## P218–P219 R82 missing prefix recovery offer
+
+- Complete: actual ownerless scaffold diagnosis, narrow marker-proven backed-up recovery,
+  pre-cloud prefix validation and actionable refusal implemented. Root reconciled actual-launch
+  regression, prefix7, final format/lint/debug and P219 independent PASS. No live recovery claim.
+
+- P218 compatibility in_progress: trace typed launch errors and preparation rejection, minimally
+  fix backend with focused actual-error regression; own installation/compatibility, no UI unless
+  coordinated. P219 security independent review of cause, regression and preserved safety.
+  Read-only structural metadata for reported prefix allowed, no saves/registry contents/secrets
+  or real mutation/helper execution. Root records only; tests and debug verification scoped.
+
+## P215–P217 R81 prefix recovery
+
+- Complete within requested scope: manager reviewed backend6 + guard7 tests, P217 independent
+  source/private-GUI PASS, final offline-DLC retry correction, documentation and P216 production
+  fmt/Clippy/debug/provenance. No real game/helper execution, full suite, package or publication.
+
+- P215 in_progress on focused lifecycle tests; P216 review (source landed, combined compile pass);
+  P217 in_progress independent source and private GUI review. User explicitly confirmed backups.
+  Final production checks follow fixture build with crate-only artifact clean.
+
+- Minimal staged design authorized: typed failure→confirmed backed-up managed-prefix rebuild→
+  durable SetupRequired→direct existing Repair continuation. Clear receipt only correct prefix/
+  setup successful completion. Depot uses installedbuild repair, not update; offline needs explicit
+  installer repair. No bare-prefix-ready claim, autolaunch or background dialog. Backup default
+  communicated; no actual user data mutations by agents. Review path/process/crash guards.
+
+- P215 compatibility investigates/owns minimal managed-prefix recovery backend in compatibility/
+  installation paths and typed launch failure metadata. Define contract with UI, reuses locks/
+  source identity/process tracking, preserve installed payload/user prefs. Investigate prerequisite
+  replay needed for fresh prefix; no incomplete success claims. No real profile/helper execution.
+- P216 ui owns launch-failure recovery offer, explicit confirmation/progress/results and README;
+  no background focus/window changes, no error-string parsing for ownership. Await backend contract
+  and user old-prefix disposition before dependent implementation.
+- P217 security independently reviews destructive/path/process boundaries and private synthetic
+  regression + relevant UI action controls. Review only, no product edits. Reports
+  /tmp/ludomere-p215-report.md, p216-report.md, p217-review.md. Root records only; preserve work.
+
+## R80 manual per-game update follow-up
+
+- Complete for requested scope: root reviewed P212/P214 reports, corrected revision/cache-identity
+  findings, targeted tests and P213 independent scoped PASS. Manual UI boundary checks and actual
+  backend safety tests are distinct; no live GOG transfer claim. Final format/Clippy/build pass.
+
+- P214 acquisition after initial-language fix owns backend manual Depot check→offer→confirmed
+  queue contract, reuse existing update/discovery/validation without changing automatic policy.
+- P212 ui after autosave owns Play availability and arrow action/check status/confirmation,
+  worker-only IO and immediate in-place state; coordinate stable backend contract with P214.
+- P213 independent review extends only to changed update flow/safety. User confirms both Depot
+  and offline-installer sources; reuse installed source and supported acquisition paths. Relevant
+  tests only, no real downloads or account access.
+
+## P212–P213 R79 policy autosave
+
+- Complete including P214 initial-language routing: autosave private UI persistence/failure/close
+  checks, selector4 tests and independent source review pass; Save/Apply buttons removed.
+  Final combined checks recorded with R80; no schema/package/publication changes.
+
+- P212 ui owns update_policies.rs and narrow README; reuse existing persistence, serialize or
+  coalesce async writes so latest choice wins, suppress initialization saves, retain account guards,
+  surface failures; user steering removes the immediate language reconciliation button. No schema
+  changes. Focused regression/build checks only. Report /tmp/ludomere-p212-report.md.
+- P213 security independently checks autosave ordering/load/close/error and account protections,
+  private synthetic GUI change/reopen/inheritance including rapid edits. No actual credentials,
+  libraries/network/downloads; reviewer no product edits, root records only. Report p213-review.md.
+  Coordinate Cargo and isolated fixture provenance; no full suite/package/publication.
+- P214 acquisition traces initial Depot language selection, corrects any missing per-game override
+  using existing global/default fallback and worker persistence reads. Own download_chooser.rs
+  and narrowly necessary acquisition code/tests; no overlapping update_policies.rs/README.
+  Report /tmp/ludomere-p214-report.md; P213 review includes this bounded acquisition selection.
+
+## P210–P211 R78 sidebar remap crash
+
+- Complete: manager reviewed narrow files.rs diff, exact pre-fix crash/fixed callback regression,
+  latest hidden-label evidence and independent P211 PASS. Final format, Clippy10.17s, clean debug
+  build23.77s and shipping artifact provenance pass. No broad GTK/full-suite claim.
+
+- P210 ui owns files.rs/library.rs narrowly as necessary, identify reentrant map callback and
+  fix without stale menu labels or silently lost updates. Preserve all accumulated edits; relevant
+  regression, format/lint/compile only. Report /tmp/ludomere-p210-report.md.
+- P211 security independently reviews exact fix and private synthetic remap reproduction, including
+  hidden-label freshness and safe borrow lifetime. Reviewer reports findings, no product edits.
+  Private isolated GTK fixture only, no live account/game/download; report p211-review.md.
+  Coordinate Cargo artifact isolation; root records only. No package/publication/full suite.
+
+## P207–P208 R77 Properties update controls
+
+- P207/P208 complete: manager reviewed focused policy test, source/backend trace and private
+  GUI override/Inherit save/reopen persistence with no duplicate controls or queued work.
+  P209 complete: source and checkbox/Next/Back/discard review pass; final source build22.79s,
+  post-clean Clippy9.00s and artifact provenance pass. No live GOG update tested.
+
+- P209 ui additionally owns setup.rs and narrow README: checkbox on Game Files step for existing
+  global auto_update_galaxy_installations, default-on/existing-value preserved, normal wizard draft
+  save/discard behavior. P208 independently verifies wiring and visible checkbox. Relevant setup
+  tests plus formatting/compilation only; no full suite or package/publication.
+
+- P207 ui owns game_settings.rs/update_policies.rs and narrow README correction: replace Updates
+  placeholder with single working existing per-game group, remove duplicate Installation location,
+  accurately explain Inherit/On/Off scope/schedule, retain language feature. Preserve async saves
+  and account guards. Relevant existing policy test and combined format/Clippy/debug only.
+- P208 security independently traces persistence→policy resolver→automatic queue and checks
+  isolated Properties Updates selection/save/reopen/inheritance without real account/downloads.
+  No backend/schema changes absent concrete necessary defect; no unrelated cleanup. Reports
+  /tmp/ludomere-p207-report.md and p208-review.md. Root records only, no publication/package.
+
+## P205–P206 R76 sign-in credential-store investigation
+
+- Complete for scoped implementation/verification: final P205 evidence and P206 PASS reviewed.
+  Real credential persistence/login remains an explicit user-retry limit, not a passed live test.
+
+- P205 implementation authorized after source evidence: worker-only standard Secret Service
+  owner/activatable detection at explicit sign-in save; only if neither exists, bounded normal
+  activation of advertised KDE compat name then standard-interface readiness verification.
+  Standard providers take precedence; never override disabled settings/refusal or weaken secure
+  persistence/session/tombstones. Fixed-safe error categories, relevant synthetic tests and README.
+  Own auth.rs plus direct gio0.22 declaration using already-locked graph only. P206 independently
+  reviews final code/tests; no actual session activation or credential probes by agents.
+
+- P205 acquisition owns auth/keyring source diagnosis, minimal safe diagnostic recommendation,
+  and relevant synthetic reproduction; no implementation until evidence/contract reviewed.
+- P206 security independently reviews provider/error classification and permitted metadata checks;
+  no actual credential reads/writes or desktop security changes. Root coordinates user clarification.
+- Preserve all previous changes. No full suite/package/publication or fallback storage authorized.
+
+## P202–P204 R75 onboarding and Storage sections
+
+- Complete for requested scope: root reviewed implementation, focused test/build evidence and
+  independent P204 scoped PASS. All requested UI/default/preservation behavior accounted for;
+  physical checks and source-only limits documented in /tmp/ludomere-p204-review.md. No publication.
+
+- P202 compatibility owns setup.rs and necessary narrow default config changes plus README.
+  One plain editable path+browse per typed page; sensible suggestions, optional skip, preserved
+  existing extras/default identities, worker validation, correct Back/Next/Proton/runtime/login.
+- P203 ui owns settings.rs/settings/storage.rs: expandable Storage navigation with Game Library
+  default and typed archive sections, retaining per-type management. Preserve existing storage
+  deep links and selection indication; no backend/schema changes.
+- P204 security independently reviews exact R75 diffs and isolated GUI changed controls after
+  freeze. Use prior private fixture tooling only when needed, no real profile/account/network/
+  game execution; keep fixture artifact separate and rebuild production after copy-out. Owners
+  run relevant setup/storage/config tests and combined fmt/Clippy/debug only, not full suite.
+  All owners return paths/evidence/limits in /tmp/ludomere-p202/203/204 reports; root alone records.
+
+## P201 independent R73/R74 review
+
+- Complete for scoped review: manager reviewed /tmp/ludomere-p201-review.md, concrete private
+  deletion/sentinel evidence and final build provenance. P195/P196/P198/P199/P200 implementation
+  and relevant tests complete. Review findings returned to owners and corrected; final literal
+  title checks passed. No material scoped finding remains. Live account/game and unexercised UI
+  permutations are explicit limits, not passes; no broad Prototype-ready or publication claim.
+
+- Security owns read-only source review and isolated GTK/sourcecopy fixtures after P198/P200 handoff.
+  Scope all new library controls, typed enforcement/migration/copy identity/update/deletion protection;
+  no real profiles, credentials, accounts, game/helper execution or network. Synthetic deletion only
+  under asserted private /tmp root. Report control evidence, exact source snapshot, cleanup and any
+  blockers in /tmp/ludomere-p201-review.md. Known UI-owner finding: move per-file resolve_job_id off
+  GTK before final acceptance. Final shipping binary rebuilt after instrumentation copied out.
+
+## R74 archive deletion steering
+
+- P199 compatibility additionally owns uninstall.rs default-off archive-deletion checkbox verification
+  and corresponding recovery behavior. P198/P200 ui additionally owns game_settings.rs Properties
+  buttons and existing files.rs/cleanup.rs type-filtered confirmation/removal workflow. Controls are
+  independent of installedness; preserve other archive type, game files/saves and unrelated products.
+  Explicit confirmation lists affected file scope. Private focused regression fixtures only.
+
+## P195–P197 — R73 storage discovery and implementation preparation
+
+- Discovery complete; implementation authorized after all user choices. P195 acquisition owns
+  config/storage authoritative type+compatibility guards, managed/download identity, state migration,
+  installation/update/reset protection and sections/window snapshots. Retain schema25, devrev8 only
+  for necessary multi-copy managed identity; update canonical baseline24 migration and retained steps.
+  P196 compatibility owns setup/settings/storage/update_policies/README. P198 ui owns chooser/files/
+  details and DownloadDialogWidgets in mod.rs. P197 security returns for independent review later.
+  Contracts: LibraryKind and three Vec<GameLibrary> sets, independent defaults; one opt-in per
+  optional type; worker-only storage inspection/action validation. No optional fallback to Game
+  Files, no file moves/deletes. Incompatible blocks all use until corrected; preserve root protection.
+  Artifact category LanguagePack/Patch/Installer routes offline; Bonus routes extras. Install target
+  stays Game Files. New jobs and file matching retain separate destination identity. Tests include
+  focused config/schema/routing/updates/protection and private UI controls; no fullsuite/package.
+  Required UI-B glue also owns AppModel.library_statuses and widgets/file_open.rs guarded content
+  opens; preserve nonlibrary log access and Settings correction controls. Backend snapshots publish
+  worker results. Strict unknown root content is incompatible, unreadable/missing is unavailable;
+  use marker/journal/managed layout evidence without recursively traversing installed game payloads.
+- Backend follow-on split after UI source completion: P199 compatibility owns installation planning,
+  execution/launch/recovery gates plus profile_reset and download/auto_install protection; P200 ui
+  owns updates.rs and download/cleanup.rs per-root eligibility/retention. P195 retains config/storage/
+  state/managed/download.rs+manager and shared snapshots. Preserve existing explicit per-game offline
+  policy overrides; new optional-type flags set defaults, membership restriction always applies.
+
+- P195 acquisition: read-only backend inventory of typed storage/config, download routing, install
+  from offline files, update selection and necessary persistence changes. Return minimal proposed
+  contract/tests, not implementation, while user migration/update-scope answers are pending.
+- P196 compatibility: read-only UI inventory of onboarding, Storage, destination prompts and
+  missing-folder list states. Identify exact owned surfaces and acceptance checks; preserve R70–R72.
+- P197 security: read-only storage safety/migration/cleanup/reset review; propose path separation
+  rules and risks without accessing user profiles or libraries. Root records only.
+- Authorized: source/record inspection and reports in /tmp; no product edits, real account/files,
+  downloads or execution needed for discovery. Implementation ownership follows user clarifications.
+
+## P192–P193 — Factory reset failure follow-up
+
+- P192/P194 complete; P193 independently verified actual private reset with failed credential
+  deletion in both workers, retained marker and fresh-process restore refusal, visible error/retry
+  and preservation checks. Manager reviewed reset-result.json: profile removed, seven sentinels
+  preserved, cleanup/fresh restore exit0. Focused auth8/reset9, fmt/Clippy/fresh debug pass. Actual
+  desktop credential-store failure cause remains unknown; no real profile accessed or reset.
+
+- P194 acquisition owns auth.rs reset-only cleanup contract/tests; P192 owns inline Settings
+  progress/errors and profile_reset integration. P193 independently checks confirmed durable marker,
+  credential failure/restart and full private cleanup. Actual reported blocker is credential delete;
+  allow only that best-effort external cleanup, preserve other safety gates. No real keyring access.
+- P192 compatibility owns reset diagnosis/minimal correction and focused tests/docs; retain all
+  uncommitted R70/R71 changes. Investigate actual error once supplied; do not assume the cause.
+  P193 security independently reviews lifecycle/path protection and private failure controls.
+  Root records only. No live profile reset, credential access, full suite/package/publication.
+- Acceptance: preparation failures visible in Settings, successful existing close/cleanup preserved,
+  evidenced root cause corrected without weakening protection. Return scoped reports in /tmp/
+  ludomere-p192-report.md and -p193-review.md; distinguish simulated checks from user incident.
+
+## P189–P191 — Explicit factory reset and sign-in investigation
+
+- Implementation and scoped verification complete: 17 focused cases, fmt/Clippy/fresh debug and
+  independent P191 private controls/reset process-replacement PASS. No material scoped finding;
+  actual user login cause still requires retry with new diagnostic source. Preserve this limitation
+  in handoff, no claim of live GOG authentication success. No publication requested.
+- P189 acquisition owns auth source investigation, bounded evidenced fixes and relevant tests;
+  source/public diagnostics only while user symptom/build reply pending. Coordinate window.rs
+  overlap before edits. No real logs/profile/credentials/account interaction or speculative fixes.
+- P190 compatibility owns settings reset control, config option retirement, window/reset integration,
+  safe existing backend reuse, README and focused fixture checks. Preserve all library payloads and
+  protected paths, close writers before cleanup, errors actionable. No actual user reset/deletion.
+- P191 security independently reviews safety and affected private inert controls; reviewers do not
+  edit product. Root owns records. P190 proposes lifecycle/legacy-option contract before edits.
+  Owners coordinate shared files/serialized checks. Focused tests/fmt/Clippy/debug as appropriate;
+  no full suite/package/publication or dependency/schema changes. Reports /tmp/ludomere-p189-report.md,
+  -p190-report.md, -p191-review.md. User login symptom/build question is pending.
+
 ## P187–P188 — Version 0.2.1
 
 - Metadata/checks and independent review complete; manager approves seven-path publication.

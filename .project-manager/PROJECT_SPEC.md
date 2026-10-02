@@ -1,5 +1,196 @@
 # Project specification
 
+## R86 version 0.2.2 and publication — 2026-10-02
+
+User requests committing and pushing current accumulated changes, adding an upstream PR comment
+describing new features/fixes with Codex/model attribution, and bumping version to0.2.2. Include
+all reviewed R70–R85 work; synchronize project/package/application metadata. No new package build
+or full-suite run requested. Existing focused evidence and final source checks remain applicable.
+
+## R85 setup Details and repair feedback — 2026-10-02
+
+User reports Details in Game setup progress is empty and requests visible repair feedback such
+as a progress bar. Populate useful current-operation detail during normal work, not only errors;
+show activity during repair preparation/verification/download/setup with measured progress where
+available and indeterminate progress otherwise. Preserve consent, backup safety, R84 update close
+behavior and background focus/session rules. Scoped tests/private UI only, no real game/account/
+helper execution, full suite, package or publication requested.
+
+## R84 manual update confirmation and detail progress — 2026-10-01
+
+User reports Check for Updates modal appears frozen after Download and apply update. Close the
+modal after accepted update admission and show download plus post-installation/setup stages in
+the game detail view. Preserve consent, failure reporting, source/session protections and R83's
+distinct prefix recovery flow. Update the current view in place; no background navigation/window
+presentation. Focused tests/private UI only; no real account, game/helper, package or publication.
+
+## R83 recovery modal and setup progress — 2026-10-01
+
+User rejects footer-only recovery, requests a modal, clearer user-friendly text, and visible
+progress bars during dependency installation. Present recovery as a response to the user's active
+launch request, retain confirmed old-prefix backup and existing recovery safety, explain stages
+plainly, and keep setup/dependency progress visible through the repair continuation. Show measured
+progress only where available and indeterminate activity otherwise. Background jobs must not
+spontaneously present windows; stale launch/account callbacks must not present. Relevant tests and
+isolated UI verification only; no real prefix/helper/game, full suite, package or publication.
+
+## R82 prefix recovery offer regression — 2026-10-01
+
+User retried Witcher 3 using cargo run after closing the app; PrefixCorrupt persists with no
+recovery offer. Investigate real error-to-offer path and correct evidenced suppression; retain
+R81 backup, ownership, source and concurrency protections. Surface an actionable reason if safe
+rebuild is unavailable rather than silently dropping eligibility errors. Relevant tests only;
+no real prefix mutation, game/helper execution, full suite, package or publication.
+
+Investigation confirms the reported path is an owned incomplete scaffold with drive_c but no
+ownership/dosdevices/registries, paired with an exact managed installed Windows marker. Permit
+backup-only recovery of this narrowly proven state; do not adopt populated unowned Wine prefixes
+or ignore a present conflicting ownership record. Validate Windows prefix before cloud-save writes.
+
+## R81 offer prefix rebuilding after launch failure — 2026-10-01
+
+User reports Witcher 3 PrefixCorrupt at managed compatibility path and requests offering prefix
+rebuild recovery for this class of failure. Detect structured recoverable Windows prefix errors;
+offer a direct user-confirmed recovery action, keep installed game payload/preferences intact,
+and perform process/filesystem work off GTK. Refuse ambiguous/unmanaged paths, concurrent game/
+installation activity and stale account/source identity. User explicitly chose retaining the old
+prefix as a recovery backup. Recovery must not claim a bare fresh prefix is ready: use staged rebuild plus explicit
+existing Repair/setup continuation, pinned to installed Depot build, and retain a durable incomplete
+state until required setup succeeds. Installed payload is reused/verified by existing repair,
+with repair downloads only as required; no silent version update. No actual user prefix mutation or
+real UMU/game execution by agents; relevant isolated tests only, no package/publication/full suite.
+
+## R80 play without updating and manual per-game check — 2026-10-01
+
+User requests ability to play without updating. When automatic updates are disabled by effective
+per-game/global policy, the down-arrow beside Play should include Check for Updates. Check must
+offer a discovered update for user confirmation, not queue it automatically or change auto policy.
+Preserve playable installed payload when an update exists; active modifying operations remain
+subject to existing concurrency protection. User explicitly chooses both Depot and offline-installer
+installations for manual checks/offers. No live account/network tests authorized.
+
+## R79 per-game policy autosave — 2026-10-01
+
+User requests removing Save Policies from Properties Updates and applying each option change
+automatically; also asks what Apply Depot Language does. Persist policy/language edits without
+a Save button, with existing global-inheritance semantics and async/session protections. Initial
+load must not write defaults; rapid edits must retain final values, and closing Properties must
+not lose an accepted edit. User subsequently requests removing Apply Depot Language entirely:
+the initial Depot download must select language-specific content using the current language.
+Per-game override falls back to global preference, and editing settings alone triggers no download.
+Verify initial acquisition honors the selected language; retain existing update semantics otherwise.
+
+## R78 sidebar remap RefCell crash — 2026-10-01
+
+User supplies main-thread abort at files.rs:108, hidden-action connect_map model.borrow while
+library.rs rebuild_sidebar_presentation appends rows under model.borrow_mut. Fix this synchronous
+GTK reentry crash with a narrow borrow-lifetime/callback correction; preserve fresh menu state,
+hidden actions, selection and sidebar behavior. Focused reproduction/regression only, no full
+suite/package/publication or access to actual accounts/libraries required.
+
+## R77 per-game automatic updates in Properties — 2026-10-01
+
+User: “Per-game automatic update is currently a placeholder in the properties UI. Implement that
+feature.” Existing real per-game Inherit/On/Off policies are under Installation; Updates still has
+stale placeholder text. Put functional policy controls in Updates, preserve existing stored values,
+offline-backup/retention opt-ins and Depot language capability, and verify automatic updater honors
+per-game choices. Reuse existing backend/schema/schedule; no new acquisition behavior implied by
+opening/saving Properties. No package/publication/full suite requested.
+
+User addition: expose automatically updating Depot builds on the Game Files onboarding step.
+Reuse existing global setting, enabled by default for new profiles and preserve existing value;
+draft commits with setup completion, without triggering downloads from the checkbox itself.
+
+## R76 credential-store sign-in failure — 2026-10-01
+
+User reports the fixed diagnostic “GOG sign-in could not save your login in the system credential
+store. Unlock or enable your desktop keyring, then try signing in again.” Investigate the actual
+credential-save boundary/provider availability and correct evidenced application deficiencies.
+No permission to read/write real credentials, change desktop wallet settings, or introduce
+plaintext/session-only credential fallback. Desktop/build clarification requested. Read-only
+package/service metadata and isolated synthetic diagnostics are within investigation scope.
+User confirmed cargo run and requested detection for differing user keyring setups. Detect the
+standard credential-service capability and report unavailable versus locked/rejected save causes
+without assuming GNOME/KDE or changing desktop settings. No credential-storage fallback requested.
+
+## R75 simplified library onboarding and Storage navigation — 2026-10-01
+
+User supersedes R73's shared onboarding page: show Game Files, Offline Installers, and Goodies &
+Extras on separate pages, each prompting for one directory with a normal text field and browse
+button. No Add Directory/multiple-directory controls in onboarding; explain additional libraries
+may be added afterward in Settings. Provide reasonable defaults; preserve existing configured
+paths and additional libraries. Optional archive pages and update opt-ins remain optional.
+Settings Storage becomes an expandable sidebar section; selecting it opens Game Library by
+default, with Offline Installers and Goodies & Extras sections. User corrected “tabs” to “sections”.
+User additionally requests a clearer name for the existing Library settings section. Use Game
+Display for its tile-size/sidebar-icon/status-color controls, keeping existing internal navigation.
+Implementation assumption communicated: fresh suggestions are ~/Games/Ludomere/{games,installers,
+extras}, separate nonoverlapping roots; existing defaults prefilled. Preserve typed validation,
+deferred Windows setup, GOG login last, and all unrelated uncommitted work. No schema/package/
+publication or full-suite changes requested.
+
+## Archive deletion controls — 2026-10-01
+
+R74 user steering during R73: uninstalling/deleting a game must preserve Offline Installers and
+Goodies & Extras by default; the uninstall checkbox offers explicit opt-in deletion. Game Properties
+also provides deletion buttons for those files even when the game is not installed. Reuse confirmed,
+identity-checked deletion, distinguish the two archive types and preserve unrelated files/payloads.
+R73's incompatible-library all-use restriction remains; no actual user-file deletion by agents.
+
+## Three distinct storage library types — 2026-10-01
+
+R73 user supplies the clarified Kono workflow, superseding the earlier deferral of installer-directory
+work: provide Game Files, Offline Installers, and Goodies & Extras library types. Game Files holds
+installed games and receives Depot installations only. Offline Installers must be configured before
+installer downloads, stores only installers, and supports installing them into Game Files. Goodies &
+Extras stores only goodies/extras. Destination selection must reject mismatched library types.
+Present all three types on one onboarding page with only Game Files mandatory. Settings Storage
+lists them in that same order. Offline-installer and extras game lists show a message if the relevant
+directory is missing. Both optional types have opt-in keep-up-to-date checkboxes in onboarding and
+Storage. Their downloads prompt for the appropriate library as Depot downloads already do.
+Preserve all prior uncommitted reset/auth work. No real-user file migration, package build,
+publication or full-suite run authorized by this request.
+
+User clarifications: support multiple directories per type, each with its own default and typed
+destination chooser. Optional keep-up-to-date applies only to games whose files have already been
+downloaded to that library, not every owned game. Enforce the new structure: selected nonconforming
+libraries are marked Incompatible and ALL use is disabled until corrected, including existing
+launch/read actions in Ludomere. Do not automatically move or delete existing files. Keep library
+configuration/removal/recheck available so users can correct the paths/content. Required internal
+.ludomere prefix/staging metadata remains infrastructure, not an extra payload library type.
+
+## Factory reset appears to do nothing — 2026-10-01
+
+User error confirms stored credential cleanup failed, aborting reset. Correct local reset so an
+unavailable desktop credential store does not block cache/database clearing, while the existing
+durable sign-out marker remains and prevents automatic reuse of any retained credential. Required
+marker/path/quiescence failures still stop reset; ordinary sign-out semantics stay unchanged.
+Explain retained external-keyring credentials honestly; never fall back to plaintext storage.
+
+R72 user reports Factory Reset flickers the window, does not close, and apparently leaves data.
+Investigate and fix evidenced preparation/shutdown/cleanup failures; keep errors visible where the
+action was started. Preserve all library files and existing safeguards. Request notification error
+and build details; no actual user profile reset or private credential access authorized.
+
+## Explicit factory reset and failing sign-in — 2026-10-01
+
+- User clarification: login page closes apparently successfully but the client does not change,
+  using newly built installed 0.2.1. Separately, the PR may refer to a distinct offline-installer
+  directory workflow; user will clarify with Kono. Do not extend installer-directory behavior now.
+
+User: "GOG sign-in seems to be failing now. More importantly, replace the toggle in settings for
+deleting the cache with a button that closes ludomere, deletes the cache and database, and effectively
+factory resets the software. It should not delete library files."
+- R70: Replace reset-on-sign-out preference with an explicit confirmed Factory Reset action. Clear
+  application profile/settings/login/database/images/metadata, then finish with Ludomere closed;
+  preserve game libraries, downloaded payloads and existing protected components/saves. Normal sign
+  out must no longer trigger profile deletion, including profiles with the former option enabled.
+  Reuse safe close-before-cleanup lifecycle, off-GTK preparation, protected paths and error handling.
+  Implement/test behavior only; do not reset the user's real profile or library.
+- R71: Investigate reported GOG sign-in failure and correct evidenced application defects. Ask for
+  symptom/error/build details while inspecting source. No credential/token/login-URL collection,
+  real-account access or authentication attempts. No publication, package or full-suite run requested.
+
 ## Version 0.2.1 — 2026-10-01
 
 R69 user: "Bump the version to 0.2.1, commit, and push". Synchronize Cargo, own lockfile entry,

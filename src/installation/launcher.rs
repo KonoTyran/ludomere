@@ -53,6 +53,11 @@ pub enum LaunchEvent {
         exit_code: Option<i32>,
     },
     Failed(String),
+    PrefixRecoveryRequired {
+        message: String,
+        game: Box<InstalledGame>,
+        setup_required: bool,
+    },
 }
 
 pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
@@ -132,7 +137,29 @@ pub fn launch_game(game: InstalledGame) -> mpsc::Receiver<LaunchEvent> {
                 });
             }
             Err(error) => {
-                let _ = sender.send(LaunchEvent::Failed(format!("{error:#}")));
+                let pending = error.downcast_ref::<super::prefix_recovery::Pending>();
+                let prefix_error = matches!(
+                    error.downcast_ref::<crate::compatibility::CompatibilityFailure>(),
+                    Some(
+                        crate::compatibility::CompatibilityFailure::PrefixCorrupt(_)
+                            | crate::compatibility::CompatibilityFailure::PrefixMissing(_)
+                    )
+                );
+                let event = if pending.is_some() || prefix_error {
+                    match super::prefix_recovery::prepare_prefix_rebuild(&game) {
+                        Ok(plan) => LaunchEvent::PrefixRecoveryRequired {
+                            message: format!("{error:#}"),
+                            game: Box::new(game.clone()),
+                            setup_required: plan.setup_required,
+                        },
+                        Err(reason) => LaunchEvent::Failed(format!(
+                            "{error:#}\n\nPrefix recovery is unavailable: {reason:#}\nNo prefix files were changed. Correct the reported issue, then launch again to retry recovery."
+                        )),
+                    }
+                } else {
+                    LaunchEvent::Failed(format!("{error:#}"))
+                };
+                let _ = sender.send(event);
             }
         }
         running_games().lock().unwrap().remove(&product_id);
@@ -192,6 +219,22 @@ fn run_game(
     session: u64,
     activity: &mut crate::profile_reset::ActivityGuard,
 ) -> Result<(i64, u64, Option<i32>)> {
+    super::validate_game_library(
+        &crate::storage::read_config()?,
+        &game.library_id,
+        &game.installation_directory,
+    )?;
+    super::prefix_recovery::ensure_ready(game)?;
+    if let Some(compatibility) = &game.compatibility {
+        let library = game
+            .installation_directory
+            .parent()
+            .context("installation has no library root")?;
+        crate::compatibility::configure_library_drive(
+            &crate::compatibility::prefix_path(library, &compatibility.prefix_slug),
+            library,
+        )?;
+    }
     let mut game = game.clone();
     let backend = game
         .compatibility
@@ -242,8 +285,6 @@ fn run_game(
             .parent()
             .context("installation has no library root")?;
         let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
-        crate::compatibility::configure_library_drive(&prefix, library)
-            .map_err(|error| anyhow::anyhow!(error))?;
         let defaults = match super::dependency_setup::legacy_xinput_recipe(&prefix) {
             Ok(true) => {
                 super::runtime_logs::diagnostic(

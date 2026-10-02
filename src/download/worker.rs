@@ -1,5 +1,5 @@
 use super::{
-    DownloadEvent, DownloadFailure, DownloadFailureKind, job_id,
+    DownloadEvent, DownloadFailure, DownloadFailureKind,
     transfer::{DownloadSnapshot, downloaded_on_disk, persist, run},
 };
 use crate::{domain::RemoteArtifact, state::DownloadState};
@@ -16,7 +16,9 @@ use std::{
 
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start_worker(
+    active_job_id: String,
     artifacts: Vec<RemoteArtifact>,
     title: String,
     access_token: String,
@@ -26,8 +28,6 @@ pub(super) fn start_worker(
     sender: mpsc::Sender<DownloadEvent>,
 ) -> Arc<AtomicBool> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let refs = artifacts.iter().collect::<Vec<_>>();
-    let active_job_id = job_id(&refs);
     {
         let mut downloads = ACTIVE_DOWNLOADS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -42,16 +42,22 @@ pub(super) fn start_worker(
     std::thread::spawn(move || {
         let permit = crate::operation_gate::acquire(|| worker_cancelled.load(Ordering::Relaxed));
         let result = match permit {
-            Some(_permit) => Some(run(
-                &artifacts,
-                &title,
-                &access_token,
-                &destination,
-                &worker_cancelled,
-                &sender,
-                part_concurrency,
-                session,
-            )),
+            Some(_permit) => Some(
+                super::manager::validate_destination(&artifacts, &destination, None).and_then(
+                    |()| {
+                        run(
+                            &artifacts,
+                            &title,
+                            &access_token,
+                            &destination,
+                            &worker_cancelled,
+                            &sender,
+                            part_concurrency,
+                            session,
+                        )
+                    },
+                ),
+            ),
             None => {
                 let _ = sender.send(DownloadEvent::Cancelled);
                 None

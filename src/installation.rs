@@ -21,6 +21,10 @@ mod manager;
 mod marker;
 pub(crate) mod operation_journal;
 mod patch;
+mod prefix_recovery;
+pub use prefix_recovery::{
+    PrefixRebuildPlan, PrefixRebuildResult, prepare_prefix_rebuild, rebuild_prefix,
+};
 pub mod recovery;
 pub use recovery::{
     GameResetPlan, GameResetResult, UninstallPreparation, prepare_uninstall, reset_game,
@@ -40,15 +44,16 @@ pub use launcher::{
     stop_all_games, stop_game,
 };
 pub use manager::{
-    DepotManagerEvent, DepotOperationRequest, DepotOperationSnapshot, DepotSource,
-    InstallationManagerEvent, InstallationOperationSnapshot, abandon_depot_operation,
-    cancel_depot_operation, cancel_operation, depot_operation_snapshot,
-    depot_operation_snapshot_for_product, depot_operation_snapshots, enqueue_depot_operation,
-    enqueue_downloaded_installation, enqueue_installation, enqueue_uninstallation,
-    enqueue_uninstallation_with_cleanup, installation_operation_snapshot, pause_for_sign_out,
-    prepare_depot_resume, recover_depot_operations, recover_interrupted_operations,
-    respond_to_installation, resume_depot_operation, shutdown, start_recovered_operations,
-    subscribe_depot_events, subscribe_installation_events, wait_for_paused,
+    DepotManagerEvent, DepotOperationRequest, DepotOperationSnapshot, DepotSetupProgress,
+    DepotSource, InstallationManagerEvent, InstallationOperationSnapshot, TrackedInstallation,
+    TrackedInstallationControl, abandon_depot_operation, cancel_depot_operation, cancel_operation,
+    depot_operation_snapshot, depot_operation_snapshot_for_product, depot_operation_snapshots,
+    enqueue_depot_operation, enqueue_downloaded_installation, enqueue_installation,
+    enqueue_installation_tracked, enqueue_uninstallation, enqueue_uninstallation_with_cleanup,
+    installation_operation_snapshot, pause_for_sign_out, prepare_depot_resume,
+    recover_depot_operations, recover_interrupted_operations, respond_to_installation,
+    resume_depot_operation, shutdown, start_recovered_operations, subscribe_depot_events,
+    subscribe_installation_events, wait_for_paused,
 };
 pub use marker::{
     InstallationMarker, InstalledDlc, from_game as installation_marker_from_game,
@@ -63,6 +68,42 @@ pub fn recover_backend_operations() -> anyhow::Result<(usize, usize)> {
     let installers = recover_interrupted_operations()?;
     let depots = recover_depot_operations()?;
     Ok((installers, depots))
+}
+
+pub(crate) fn validate_game_library(
+    config: &Config,
+    library_id: &str,
+    directory: &std::path::Path,
+) -> anyhow::Result<()> {
+    prefix_recovery::ensure_quiescent(directory)?;
+    let library = crate::storage::validate_library(
+        config,
+        crate::config::LibraryKind::GameFiles,
+        library_id,
+    )?;
+    anyhow::ensure!(
+        directory.parent() == Some(library.path.as_path()),
+        "The game's configured library changed; reopen this action."
+    );
+    crate::storage::validate_path(config, crate::config::LibraryKind::GameFiles, directory)?;
+    Ok(())
+}
+
+pub(crate) fn validate_offline_sources(config: &Config, files: &[PathBuf]) -> anyhow::Result<()> {
+    let mut selected = None;
+    for path in files {
+        let library = crate::storage::validate_path(
+            config,
+            crate::config::LibraryKind::OfflineInstallers,
+            path,
+        )?;
+        anyhow::ensure!(
+            selected.as_ref().is_none_or(|id| id == &library.id),
+            "Select an installer set from one compatible Offline Installers library."
+        );
+        selected = Some(library.id);
+    }
+    Ok(())
 }
 
 pub fn patch_log_path(product_id: i64) -> anyhow::Result<PathBuf> {
@@ -499,98 +540,119 @@ pub fn detect_installer_candidates(
         .iter()
         .filter(|revision| revision.provider_category == DownloadCategory::Installer)
     {
-        let mut complete = true;
-        let mut paths = Vec::with_capacity(revision.parts.len());
-        let mut total_size = 0_u64;
-        let mut missing_parts = 0;
-        let mut invalid_parts = 0;
-        for part in &revision.parts {
-            let matching_files = managed_files
-                .iter()
-                .filter(|file| {
-                    file.product_id == revision.product_id
-                        && (file.part_id == Some(part.part_id)
+        // Resolve each physical installer set independently. A partial copy in one
+        // library must not borrow parts from another or hide its complete copy.
+        let mut directories = managed_files
+            .iter()
+            .filter(|file| {
+                file.product_id == revision.product_id
+                    && revision.parts.iter().any(|part| {
+                        file.part_id == Some(part.part_id)
                             || (file.revision_id == Some(revision.revision_id)
                                 && file.provider_file_id.as_deref()
-                                    == Some(part.provider_file_id.as_str())))
-                })
-                .collect::<Vec<_>>();
-            revision_paths.extend(matching_files.iter().map(|file| file.path.clone()));
-            let local = matching_files
-                .into_iter()
-                .filter_map(|file| {
-                    let metadata = file.path.metadata().ok()?;
-                    metadata.is_file().then_some((file, metadata.len()))
-                })
-                .max_by_key(|(file, size)| {
-                    (
-                        part.expected_size == Some(*size),
-                        launcher_matches(
-                            &file.path,
-                            installation_method(revision.operating_system.as_deref()),
-                        ),
-                        *size,
-                    )
-                })
-                .map(|(file, _)| file);
-            let Some(local) = local else {
-                missing_parts += 1;
-                continue;
-            };
-            // A file associated with a known revision must never fall through to
-            // preserved-file discovery when that revision proves it incomplete.
-            let Ok(metadata) = local.path.metadata() else {
-                missing_parts += 1;
-                continue;
-            };
-            if !metadata.is_file() {
-                invalid_parts += 1;
-                continue;
-            }
-            // GOG's product manifest commonly reports rounded part sizes. The
-            // managed-file size is captured from the completed response and is
-            // therefore the exact local identity to validate here.
-            if local.size != metadata.len() || unresolved_download_descriptor(&local.path) {
-                invalid_parts += 1;
-            }
-            total_size += metadata.len();
-            paths.push(local.path.clone());
+                                    == Some(part.provider_file_id.as_str()))
+                    })
+            })
+            .filter_map(|file| file.path.parent().map(std::path::Path::to_path_buf))
+            .collect::<std::collections::BTreeSet<_>>();
+        if directories.is_empty() {
+            directories.insert(PathBuf::new());
         }
-        if missing_parts > 0 || invalid_parts > 0 || revision.parts.is_empty() {
-            complete = false;
-            result.incomplete.push(IncompleteInstaller {
-                revision_id: revision.revision_id,
-                version: revision.version.clone(),
-                missing_parts: missing_parts + usize::from(revision.parts.is_empty()),
-                invalid_parts,
-            });
+        for directory in directories {
+            let mut complete = true;
+            let mut paths = Vec::with_capacity(revision.parts.len());
+            let mut total_size = 0_u64;
+            let mut missing_parts = 0;
+            let mut invalid_parts = 0;
+            for part in &revision.parts {
+                let matching_files = managed_files
+                    .iter()
+                    .filter(|file| {
+                        file.product_id == revision.product_id
+                            && file.path.parent() == Some(directory.as_path())
+                            && (file.part_id == Some(part.part_id)
+                                || (file.revision_id == Some(revision.revision_id)
+                                    && file.provider_file_id.as_deref()
+                                        == Some(part.provider_file_id.as_str())))
+                    })
+                    .collect::<Vec<_>>();
+                revision_paths.extend(matching_files.iter().map(|file| file.path.clone()));
+                let local = matching_files
+                    .into_iter()
+                    .filter_map(|file| {
+                        let metadata = file.path.metadata().ok()?;
+                        metadata.is_file().then_some((file, metadata.len()))
+                    })
+                    .max_by_key(|(file, size)| {
+                        (
+                            part.expected_size == Some(*size),
+                            launcher_matches(
+                                &file.path,
+                                installation_method(revision.operating_system.as_deref()),
+                            ),
+                            *size,
+                        )
+                    })
+                    .map(|(file, _)| file);
+                let Some(local) = local else {
+                    missing_parts += 1;
+                    continue;
+                };
+                // A file associated with a known revision must never fall through to
+                // preserved-file discovery when that revision proves it incomplete.
+                let Ok(metadata) = local.path.metadata() else {
+                    missing_parts += 1;
+                    continue;
+                };
+                if !metadata.is_file() {
+                    invalid_parts += 1;
+                    continue;
+                }
+                // GOG's product manifest commonly reports rounded part sizes. The
+                // managed-file size is captured from the completed response and is
+                // therefore the exact local identity to validate here.
+                if local.size != metadata.len() || unresolved_download_descriptor(&local.path) {
+                    invalid_parts += 1;
+                }
+                total_size += metadata.len();
+                paths.push(local.path.clone());
+            }
+            if missing_parts > 0 || invalid_parts > 0 || revision.parts.is_empty() {
+                complete = false;
+                result.incomplete.push(IncompleteInstaller {
+                    revision_id: revision.revision_id,
+                    version: revision.version.clone(),
+                    missing_parts: missing_parts + usize::from(revision.parts.is_empty()),
+                    invalid_parts,
+                });
+                let method = installation_method(revision.operating_system.as_deref());
+                let has_launcher = paths.iter().any(|path| launcher_matches(path, method));
+                if revision.parts.is_empty() || !has_launcher {
+                    continue;
+                }
+            }
             let method = installation_method(revision.operating_system.as_deref());
-            let has_launcher = paths.iter().any(|path| launcher_matches(path, method));
-            if revision.parts.is_empty() || !has_launcher {
-                continue;
-            }
+            let launcher = paths
+                .iter()
+                .find(|path| launcher_matches(path, method))
+                .cloned();
+            result.usable.push(InstallerCandidate {
+                product_id: revision.product_id,
+                revision_id: Some(revision.revision_id),
+                version: revision.version.clone(),
+                operating_system: revision.operating_system.clone(),
+                language: revision
+                    .language_name
+                    .clone()
+                    .or_else(|| revision.language_code.clone()),
+                paths,
+                launcher,
+                method,
+                total_size,
+                currently_offered: revision.currently_offered,
+                complete,
+            });
         }
-        let method = installation_method(revision.operating_system.as_deref());
-        let launcher = paths
-            .iter()
-            .find(|path| launcher_matches(path, method))
-            .cloned();
-        result.usable.push(InstallerCandidate {
-            product_id: revision.product_id,
-            revision_id: Some(revision.revision_id),
-            version: revision.version.clone(),
-            operating_system: revision.operating_system.clone(),
-            language: revision
-                .language_name
-                .clone()
-                .or_else(|| revision.language_code.clone()),
-            paths,
-            launcher,
-            method,
-            total_size,
-            currently_offered: revision.currently_offered,
-            complete,
-        });
     }
 
     let mut preserved = BTreeMap::<
@@ -774,6 +836,102 @@ mod tests {
     use super::*;
     use crate::domain::{DownloadPart, DownloadRevision};
     use std::{fs, time::SystemTime};
+
+    #[test]
+    fn typed_library_operation_gates_preserve_mixed_content_and_separate_copies() {
+        if std::env::var_os("LUDOMERE_TYPED_GATE_TEST").is_none() {
+            let profile = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "installation::tests::typed_library_operation_gates_preserve_mixed_content_and_separate_copies"])
+                .env("LUDOMERE_TYPED_GATE_TEST", "1");
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+            ] {
+                let path = profile.path().join(key);
+                fs::create_dir(&path).unwrap();
+                child.env(key, path);
+            }
+            assert!(child.status().unwrap().success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            game_libraries: vec![],
+            ..Default::default()
+        };
+        for (kind, name) in [
+            (crate::config::LibraryKind::GameFiles, "games"),
+            (crate::config::LibraryKind::OfflineInstallers, "first"),
+            (crate::config::LibraryKind::OfflineInstallers, "second"),
+        ] {
+            let path = root.path().join(name);
+            fs::create_dir(&path).unwrap();
+            config.libraries_mut(kind).push(GameLibrary {
+                id: name.into(),
+                name: name.into(),
+                path,
+                default: name != "second",
+            });
+        }
+        validate_game_library(&config, "games", &root.path().join("games/game")).unwrap();
+        assert!(validate_game_library(&config, "first", &root.path().join("first/game")).is_err());
+        let mut files = Vec::new();
+        for name in ["first", "second"] {
+            let path = root
+                .path()
+                .join(name)
+                .join("game/installer/windows/en/setup.exe");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"inert").unwrap();
+            files.push(path);
+        }
+        validate_offline_sources(&config, &files[..1]).unwrap();
+        assert!(validate_offline_sources(&config, &files).is_err());
+        let mixed = root.path().join("games/installer.zip");
+        fs::write(&mixed, b"preserved").unwrap();
+        assert!(validate_game_library(&config, "games", &root.path().join("games/game")).is_err());
+        assert_eq!(fs::read(mixed).unwrap(), b"preserved");
+        assert!(files.iter().all(|path| path.is_file()));
+    }
+
+    #[test]
+    fn typed_library_operation_gates_choose_complete_copy_without_cross_root_parts() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let first = root.path().join("first/setup.exe");
+        fs::write(&first, b"data").unwrap();
+        let second = root.path().join("second/setup.exe");
+        fs::write(&second, b"data").unwrap();
+        let companion = root.path().join("second/setup.bin");
+        fs::write(&companion, b"data").unwrap();
+        let files = vec![
+            managed(first, 3, 30, "part-0"),
+            managed(second.clone(), 3, 30, "part-0"),
+            managed(companion.clone(), 3, 31, "part-1"),
+        ];
+        let candidates = detect_installer_candidates(
+            7,
+            &[revision(3, "windows", true, 2)],
+            &files,
+            &Config::default(),
+        );
+        let preferred = &candidates.usable[candidates.preferred.unwrap()];
+        assert!(preferred.complete);
+        assert_eq!(preferred.paths, vec![second, companion]);
+        assert!(
+            candidates
+                .usable
+                .iter()
+                .any(|candidate| !candidate.complete)
+        );
+    }
 
     fn revision(id: i64, os: &str, current: bool, part_count: usize) -> DownloadRevision {
         DownloadRevision {

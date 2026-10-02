@@ -54,12 +54,16 @@ pub(super) fn check_updates(w: &Widgets, model: &Rc<RefCell<AppModel>>, manual: 
                 if !report.already_running
                     && (manual
                         || !report.failures.is_empty()
-                        || report.galaxy_updates_queued + report.offline_installers_queued > 0)
+                        || report.galaxy_updates_queued
+                            + report.offline_installers_queued
+                            + report.extras_queued
+                            > 0)
                 {
                     let message = format!(
-                        "Queued {} Depot update(s), {} offline backup(s); {} busy/running; {} failed",
+                        "Queued {} Depot update(s), {} installer update(s), {} extras update(s); {} busy/running; {} failed",
                         report.galaxy_updates_queued,
                         report.offline_installers_queued,
+                        report.extras_queued,
                         report.skipped_running + report.skipped_busy,
                         report.failures.len()
                     );
@@ -112,12 +116,6 @@ pub(super) fn global_group(
             model.borrow().config.auto_update_galaxy_installations,
         ),
         (
-            1,
-            "Automatically download offline backups",
-            "Opt in to new offline installer revisions",
-            model.borrow().config.auto_download_offline_installers,
-        ),
-        (
             2,
             "Clean up superseded offline installers",
             "Move old managed revisions to Trash only after their replacements are verified",
@@ -136,7 +134,6 @@ pub(super) fn global_group(
             let mut state = model.borrow_mut();
             match index {
                 0 => state.config.auto_update_galaxy_installations = row.is_active(),
-                1 => state.config.auto_download_offline_installers = row.is_active(),
                 _ => state.config.prune_superseded_offline_installers = row.is_active(),
             }
             if state.config.save().is_err() {
@@ -160,24 +157,57 @@ pub(super) fn global_group(
     group
 }
 
+// Reads share the write queue so reopening Properties cannot observe an older pending save.
+pub(super) fn policy_request<T: Send + 'static>(
+    operation: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> mpsc::Receiver<anyhow::Result<T>> {
+    static REQUESTS: std::sync::LazyLock<mpsc::Sender<Box<dyn FnOnce() + Send>>> =
+        std::sync::LazyLock::new(|| {
+            let (sender, receiver) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+            std::thread::spawn(move || {
+                for request in receiver {
+                    request();
+                }
+            });
+            sender
+        });
+    let (sender, receiver) = mpsc::channel();
+    let _ = REQUESTS.send(Box::new(move || {
+        let _ = sender.send(operation());
+    }));
+    receiver
+}
+
 pub(super) fn game_group(
-    window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
     game: &DetailPageModel,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Update policy and Depot language");
+    group.set_description(Some("Inherit uses the global setting; On or Off overrides it for this game. Checks run after library synchronization and every six hours while signed in and online. Changes save automatically for future checks without starting downloads."));
     let status = gtk::Label::new(Some("Loading saved policies…"));
     status.set_wrap(true);
     status.set_xalign(0.0);
     group.add(&status);
     let mut selectors = Vec::new();
-    for title in [
-        "Depot updates",
-        "Offline backup downloads",
-        "Old-installer cleanup",
+    for (title, subtitle) in [
+        (
+            "Depot updates",
+            "Download and apply updates to supported installed Depot games. Running and busy games are skipped.",
+        ),
+        (
+            "Keep downloaded installers up to date",
+            "Update existing installer copies in their current Offline Installers libraries.",
+        ),
+        (
+            "Old-installer cleanup",
+            "Move superseded installers to Trash after a replacement is verified in the same library.",
+        ),
     ] {
-        let row = adw::ActionRow::builder().title(title).build();
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .build();
         let choice = gtk::DropDown::from_strings(&["Inherit global setting", "On", "Off"]);
         choice.set_valign(gtk::Align::Center);
         choice.set_sensitive(false);
@@ -190,31 +220,13 @@ pub(super) fn game_group(
         .build();
     language.set_sensitive(false);
     group.add(&language);
-    let apply = gtk::Button::with_label("Save policies");
-    apply.set_sensitive(false);
-    group.add(&apply);
-    let reconcile = gtk::Button::with_label("Apply Depot language…");
-    reconcile.set_sensitive(false);
-    group.add(&reconcile);
     let id = game.product_id;
-    let depot_installed = Rc::new(std::cell::Cell::new(false));
-    let installed = model.borrow().installed_games.get(&id).cloned();
     let epoch = model.borrow().account_epoch;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let depot = installed.as_ref().is_some_and(|game| {
-            crate::installation::load_installation_marker(&game.installation_directory)
-                .ok()
-                .flatten()
-                .is_some_and(|marker| {
-                    marker.source == crate::domain::InstallationSource::GalaxyDepot
-                })
-        });
-        let _ = sender.send(
-            StateStore::open()
-                .and_then(|s| s.game_preferences(id))
-                .map(|preferences| (preferences, depot)),
-        );
+    let session = online::account_session();
+    let loaded = Rc::new(std::cell::Cell::new(false));
+    let receiver = policy_request(move || {
+        let _activity = crate::profile_reset::begin_activity("loading update preferences")?;
+        online::with_account_session(session, || StateStore::open()?.game_preferences(id))
     });
     {
         let model = model.clone();
@@ -222,9 +234,7 @@ pub(super) fn game_group(
         let selectors = selectors.clone();
         let language = language.clone();
         let status = status.clone();
-        let apply = apply.clone();
-        let reconcile = reconcile.clone();
-        let depot_installed = depot_installed.clone();
+        let loaded = loaded.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
             if group.upgrade().is_none()
                 || model.borrow().account_epoch != epoch
@@ -233,8 +243,7 @@ pub(super) fn game_group(
                 return glib::ControlFlow::Break;
             }
             match receiver.try_recv() {
-                Ok(Ok((preferences, depot))) => {
-                    depot_installed.set(depot);
+                Ok(Ok(preferences)) => {
                     let p = preferences.unwrap_or_default();
                     for (choice, value) in selectors.iter().zip([
                         p.auto_update_galaxy,
@@ -250,13 +259,8 @@ pub(super) fn game_group(
                     }
                     language.set_text(p.galaxy_language.as_deref().unwrap_or(""));
                     language.set_sensitive(true);
-                    apply.set_sensitive(true);
-                    reconcile.set_sensitive(depot);
-                    reconcile
-                        .set_tooltip_text((!depot).then_some(
-                            "Install this game from Depot before applying its language",
-                        ));
-                    status.set_label("Policies inherit global values unless overridden. Save stores the language override for future updates; Apply Depot language reconciles it now.");
+                    loaded.set(true);
+                    status.set_label("Changes save automatically. Blank language inherits the default; editing it does not start a download.");
                     glib::ControlFlow::Break
                 }
                 Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -267,19 +271,27 @@ pub(super) fn game_group(
             }
         });
     }
-    let save: Rc<dyn Fn(bool)> = Rc::new({
+    let save: Rc<dyn Fn()> = Rc::new({
         let model = model.clone();
         let status = status.downgrade();
-        let language = language.clone();
-        let selectors = selectors.clone();
-        let window = window.downgrade();
-        let apply = apply.downgrade();
-        let reconcile_button = reconcile.downgrade();
-        move |reconcile| {
-            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+        let language = language.downgrade();
+        let selectors = selectors.iter().map(|s| s.downgrade()).collect::<Vec<_>>();
+        let revision = Rc::new(std::cell::Cell::new(0_u64));
+        move || {
+            if !loaded.get()
+                || model.borrow().account_epoch != epoch
+                || model.borrow().logout_pending
+            {
                 return;
             }
-            let Some(window) = window.upgrade() else {
+            let Some(language) = language.upgrade() else {
+                return;
+            };
+            let Some(selectors) = selectors
+                .iter()
+                .map(|s| s.upgrade())
+                .collect::<Option<Vec<_>>>()
+            else {
                 return;
             };
             let policies = selectors
@@ -291,130 +303,52 @@ pub(super) fn game_group(
                 })
                 .collect::<Vec<_>>();
             let language = language.text().trim().to_owned();
-            let (config, game, token, session) = {
-                let state = model.borrow();
-                (
-                    state.config.clone(),
-                    state.games.iter().find(|g| g.product_id == id).cloned(),
-                    state.account_token.clone(),
-                    online::account_session(),
-                )
-            };
+            revision.set(revision.get() + 1);
+            let saved_revision = revision.get();
+            if let Some(status) = status.upgrade() {
+                status.set_label("Saving preferences…");
+            }
+            let receiver = policy_request(move || {
+                let _activity = crate::profile_reset::begin_activity("saving update preferences")?;
+                online::with_account_session(session, || {
+                    StateStore::open()?.set_game_update_preferences(
+                        id,
+                        policies[0],
+                        policies[1],
+                        policies[2],
+                        (!language.is_empty()).then_some(language.as_str()),
+                    )
+                })
+            });
             let status = status.clone();
             let completion_model = model.clone();
-            let apply = apply.clone();
-            let reconcile_button = reconcile_button.clone();
-            let depot_installed = depot_installed.clone();
-            let run = move || {
-                let (Some(apply), Some(reconcile_button)) =
-                    (apply.upgrade(), reconcile_button.upgrade())
-                else {
-                    return;
+            let revision = revision.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if completion_model.borrow().account_epoch != epoch
+                    || completion_model.borrow().logout_pending
+                    || revision.get() != saved_revision
+                {
+                    return glib::ControlFlow::Break;
+                }
+                let Some(status) = status.upgrade() else {
+                    return glib::ControlFlow::Break;
                 };
-                if !completion_model.borrow_mut().policy_saving.insert(id) {
-                    if let Some(status) = status.upgrade() {
-                        status.set_label(
-                            "Wait for the current policy save to finish, then try again.",
-                        );
-                    }
-                    return;
+                match receiver.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Ok(Ok(())) => status.set_label("Preferences saved. No download was started."),
+                    Ok(Err(error)) => status.set_label(&format!(
+                        "Could not save preferences: {error}. Change the option again to retry."
+                    )),
+                    Err(_) => status.set_label("Saving stopped. Reopen Properties and try again."),
                 }
-                apply.set_sensitive(false);
-                reconcile_button.set_sensitive(false);
-                if let Some(status) = status.upgrade() {
-                    status.set_label("Saving preferences…");
-                }
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let result = (|| -> anyhow::Result<String> {
-                        online::with_account_session(session, || {
-                            StateStore::open()?.set_game_update_preferences(
-                                id,
-                                policies[0],
-                                policies[1],
-                                policies[2],
-                                (!language.is_empty()).then_some(language.as_str()),
-                            )
-                        })?;
-                        if reconcile {
-                            let token = token.ok_or_else(|| {
-                                anyhow::anyhow!("Sign in to apply the Depot language")
-                            })?;
-                            let game = game.ok_or_else(|| {
-                                anyhow::anyhow!("Reopen the game to apply its language")
-                            })?;
-                            let queued = crate::updates::queue_language_reconciliation(
-                                &config, &game, &token, session,
-                            )?;
-                            Ok(if queued {
-                                "Language reconciliation queued"
-                            } else {
-                                "No language change was required"
-                            }
-                            .into())
-                        } else {
-                            Ok("Policies saved".into())
-                        }
-                    })();
-                    let _ = sender.send(result);
-                });
-                glib::timeout_add_local(Duration::from_millis(50), move || {
-                    if completion_model.borrow().account_epoch != epoch
-                        || completion_model.borrow().logout_pending
-                    {
-                        return glib::ControlFlow::Break;
-                    }
-                    let result = match receiver.try_recv() {
-                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                        result => result,
-                    };
-                    completion_model.borrow_mut().policy_saving.remove(&id);
-                    let Some(status) = status.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    apply.set_sensitive(true);
-                    reconcile_button.set_sensitive(depot_installed.get());
-                    match result {
-                        Ok(Ok(message)) => {
-                            status.set_label(&message);
-                            glib::ControlFlow::Break
-                        }
-                        Ok(Err(error)) => {
-                            status.set_label(&error.to_string());
-                            glib::ControlFlow::Break
-                        }
-                        Err(_) => {
-                            status.set_label("Saving stopped. Try again.");
-                            glib::ControlFlow::Break
-                        }
-                    }
-                });
-            };
-            if reconcile {
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Apply Depot language?")
-                    .body("Save these preferences and reconcile the Depot language now. This may download language files and update to the latest available build on the same branch.")
-                    .build();
-                dialog.add_responses(&[("cancel", "Cancel"), ("apply", "Apply language")]);
-                dialog.set_close_response("cancel");
-                let model = model.clone();
-                dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                    if response == "apply"
-                        && model.borrow().account_epoch == epoch
-                        && !model.borrow().logout_pending
-                    {
-                        run();
-                    }
-                });
-            } else {
-                run();
-            }
+                glib::ControlFlow::Break
+            });
         }
     });
-    apply.connect_clicked({
+    for choice in selectors {
         let save = save.clone();
-        move |_| save(false)
-    });
-    reconcile.connect_clicked(move |_| save(true));
+        choice.connect_selected_notify(move |_| save());
+    }
+    language.connect_changed(move |_| save());
     group
 }

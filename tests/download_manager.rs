@@ -20,6 +20,19 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     // This integration-test executable contains one test. Set the isolated XDG path before the
     // manager or any other application thread is created, and never mutate it afterward.
     unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", root.join("config")) };
+    fs::create_dir_all(root.join("downloads")).unwrap();
+    ludomere::config::Config {
+        offline_libraries: vec![ludomere::config::GameLibrary {
+            id: "offline".into(),
+            name: "Offline".into(),
+            path: root.join("downloads"),
+            default: true,
+        }],
+        ..Default::default()
+    }
+    .save()
+    .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -84,6 +97,7 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     second_part.part_count = Some(2);
     let (first_events, first_receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![first_part, second_part],
         title: "Multipart game".into(),
         access_token: "integration-test-token".into(),
@@ -92,6 +106,7 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     });
     let (second_events, second_receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact(2, format!("http://{address}/2"))],
         title: "Next game".into(),
         access_token: "integration-test-token".into(),
@@ -136,6 +151,7 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     exercise_connectivity_change_resets_backoff(&root);
     exercise_manual_retry_resets_backoff(&root);
     exercise_active_recovery(&root);
+    exercise_independent_library_copies(&root);
     download::shutdown();
     server.join().unwrap();
 
@@ -152,12 +168,86 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     fs::remove_dir_all(root).unwrap();
 }
 
+fn exercise_independent_library_copies(root: &std::path::Path) {
+    let second = root.join("second-offline");
+    fs::create_dir_all(&second).unwrap();
+    let mut config = ludomere::storage::read_config().unwrap();
+    config
+        .offline_libraries
+        .push(ludomere::config::GameLibrary {
+            id: "second".into(),
+            name: "Second".into(),
+            path: second.clone(),
+            default: false,
+        });
+    config.save().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let id = read_request_id(&mut stream);
+            assert_eq!(id, 12);
+            send_download(&mut stream, id);
+        }
+    });
+    let artifact = artifact(12, format!("http://{address}/12"));
+    let mut destinations = Vec::new();
+    for (library_id, library) in [("offline", root.join("downloads")), ("second", second)] {
+        let destination = library.join("game-12/installer/windows/english");
+        let (events, receiver) = mpsc::channel();
+        download::enqueue(DownloadRequest {
+            library_id: library_id.into(),
+            artifacts: vec![artifact.clone()],
+            title: "Independent copy".into(),
+            access_token: "inert".into(),
+            destination: destination.clone(),
+            events,
+        });
+        wait_for_completion(receiver);
+        destinations.push(destination);
+    }
+    server.join().unwrap();
+    let store = StateStore::open().unwrap();
+    let jobs = store
+        .download_jobs()
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.product_id == artifact.product_id)
+        .collect::<Vec<_>>();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().all(|job| job.state == DownloadState::Complete));
+    assert_ne!(jobs[0].job_id, jobs[1].job_id);
+    for destination in destinations {
+        assert_eq!(
+            fs::read(destination.join("setup_12.bin")).unwrap(),
+            b"download-12"
+        );
+    }
+    assert_eq!(
+        store
+            .managed_files()
+            .unwrap()
+            .iter()
+            .filter(|file| file.product_id == artifact.product_id && file.present && file.matched)
+            .count(),
+        2
+    );
+}
+
 fn exercise_connectivity_change_resets_backoff(root: &std::path::Path) {
     let (address, failed, retried, server) = retry_reset_server(8);
     let artifact = artifact(8, format!("http://{address}/8"));
-    let id = download::job_id(&[&artifact]);
+    let id = download::job_id_at(
+        &[&artifact],
+        &root.join(format!(
+            "downloads/game-{}/installer/windows/english",
+            artifact.product_id - 10_000
+        )),
+    );
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact],
         title: "Connectivity retry reset".into(),
         access_token: "integration-test-token".into(),
@@ -182,9 +272,16 @@ fn exercise_connectivity_change_resets_backoff(root: &std::path::Path) {
 fn exercise_manual_retry_resets_backoff(root: &std::path::Path) {
     let (address, failed, retried, server) = retry_reset_server(9);
     let artifact = artifact(9, format!("http://{address}/9"));
-    let id = download::job_id(&[&artifact]);
+    let id = download::job_id_at(
+        &[&artifact],
+        &root.join(format!(
+            "downloads/game-{}/installer/windows/english",
+            artifact.product_id - 10_000
+        )),
+    );
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact],
         title: "Manual retry reset".into(),
         access_token: "integration-test-token".into(),
@@ -274,6 +371,7 @@ fn exercise_transient_retry(root: &std::path::Path) {
     let artifact = artifact(7, format!("http://{address}/7"));
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact],
         title: "Transient retry test".into(),
         access_token: "integration-test-token".into(),
@@ -343,9 +441,16 @@ fn exercise_active_pause_and_resume(root: &std::path::Path) {
     download::set_concurrency(1);
     let mut artifact = artifact(5, format!("http://{address}/5"));
     artifact.size_bytes = Some(body.len() as u64);
-    let id = download::job_id(&[&artifact]);
+    let id = download::job_id_at(
+        &[&artifact],
+        &root.join(format!(
+            "downloads/game-{}/installer/windows/english",
+            artifact.product_id - 10_000
+        )),
+    );
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact],
         title: "Active pause test".into(),
         access_token: "integration-test-token".into(),
@@ -402,11 +507,18 @@ fn exercise_active_removal(root: &std::path::Path) {
     });
 
     let artifact = artifact(6, format!("http://{address}/6"));
-    let id = download::job_id(&[&artifact]);
+    let id = download::job_id_at(
+        &[&artifact],
+        &root.join(format!(
+            "downloads/game-{}/installer/windows/english",
+            artifact.product_id - 10_000
+        )),
+    );
     let destination = root.join("downloads/game-6/installer/windows/english");
     let staging = root.join("downloads/.ludomere-staging").join(&id);
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact],
         title: "Active removal test".into(),
         access_token: "integration-test-token".into(),
@@ -445,6 +557,14 @@ fn exercise_active_recovery(root: &std::path::Path) {
         b"remove only after worker stops",
     )
     .unwrap();
+    ludomere::installation::write_installation_marker(
+        &serde_json::from_value(serde_json::json!({
+            "schema_version":1,"product_id":10010,"slug":"game-10","base":{"installed_at":1}
+        }))
+        .unwrap(),
+        &directory,
+    )
+    .unwrap();
     let config = Config {
         game_libraries: vec![GameLibrary {
             id: "recovery".into(),
@@ -453,12 +573,19 @@ fn exercise_active_recovery(root: &std::path::Path) {
             default: true,
         }],
         download_directory: root.join("downloads"),
+        offline_libraries: vec![GameLibrary {
+            id: "offline".into(),
+            name: "Offline".into(),
+            path: root.join("downloads"),
+            default: true,
+        }],
         ..Default::default()
     };
     config.save().unwrap();
     let retained = config
         .download_directory
-        .join("previously-downloaded-extra.zip");
+        .join("previous/installer/linux/en/setup.sh");
+    fs::create_dir_all(retained.parent().unwrap()).unwrap();
     fs::write(&retained, b"keep without cleanup consent").unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -481,10 +608,14 @@ fn exercise_active_recovery(root: &std::path::Path) {
     });
     let mut affected = artifact(10, format!("http://{address}/10"));
     affected.size_bytes = Some(600_000);
-    let id = download::job_id(&[&affected]);
+    let id = download::job_id_at(
+        &[&affected],
+        &root.join("downloads/game-10/installer/windows/english"),
+    );
     let staging = root.join("downloads/.ludomere-staging").join(&id);
     let (events, receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![affected],
         title: "Recovery active transfer".into(),
         access_token: "inert-test-token".into(),
@@ -512,6 +643,7 @@ fn exercise_active_recovery(root: &std::path::Path) {
     thread::sleep(Duration::from_millis(50));
     let (other_events, other_receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![artifact(11, format!("http://{address}/11"))],
         title: "Unaffected queued game".into(),
         access_token: "inert-test-token".into(),
@@ -659,10 +791,14 @@ fn exercise_queued_pause_and_resume(root: &std::path::Path) {
     download::set_concurrency(1);
     let first_artifact = artifact(3, format!("http://{address}/3"));
     let second_artifact = artifact(4, format!("http://{address}/4"));
-    let second_id = download::job_id(&[&second_artifact]);
+    let second_id = download::job_id_at(
+        &[&second_artifact],
+        &root.join("downloads/game-4/installer/windows/english"),
+    );
     let (first_events, first_receiver) = mpsc::channel();
     let (second_events, second_receiver) = mpsc::channel();
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![first_artifact],
         title: "First queued test".into(),
         access_token: "integration-test-token".into(),
@@ -670,6 +806,7 @@ fn exercise_queued_pause_and_resume(root: &std::path::Path) {
         events: first_events,
     });
     download::enqueue(DownloadRequest {
+        library_id: "offline".into(),
         artifacts: vec![second_artifact],
         title: "Paused queued test".into(),
         access_token: "integration-test-token".into(),

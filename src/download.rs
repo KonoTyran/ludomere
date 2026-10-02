@@ -45,7 +45,7 @@ mod trash;
 mod verify;
 mod worker;
 
-pub use cleanup::{CleanupResult, ManagedDownloads, managed_downloads};
+pub use cleanup::{CleanupResult, ManagedDownloads, managed_downloads, managed_downloads_for_kind};
 pub use files::{delete_completed_files, prune_empty_directories};
 
 pub fn delete_managed_downloads(files: ManagedDownloads) -> anyhow::Result<CleanupResult> {
@@ -93,6 +93,7 @@ impl std::fmt::Display for DownloadFailure {
 }
 
 pub struct DownloadRequest {
+    pub library_id: String,
     pub artifacts: Vec<RemoteArtifact>,
     pub title: String,
     pub access_token: String,
@@ -101,6 +102,7 @@ pub struct DownloadRequest {
 }
 
 pub struct AutoInstallRequest {
+    pub library_id: String,
     pub product_id: i64,
     pub slug: String,
     pub title: String,
@@ -193,13 +195,43 @@ pub fn job_id(artifacts: &[&RemoteArtifact]) -> String {
 }
 
 pub fn enqueue(request: DownloadRequest) -> Arc<AtomicBool> {
-    manager::enqueue(
-        request.artifacts,
-        request.title,
-        request.access_token,
-        request.destination,
-        request.events,
+    manager::enqueue(request)
+}
+
+pub fn job_id_at(artifacts: &[&RemoteArtifact], destination: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    format!(
+        "{}-{:x}",
+        job_id(artifacts),
+        md5::compute(destination.as_os_str().as_bytes())
     )
+}
+
+/// Worker-only: reuse an existing queue identity only for this exact revision and destination.
+pub fn resolve_job_id(
+    artifacts: &[&RemoteArtifact],
+    destination: &std::path::Path,
+) -> anyhow::Result<String> {
+    job_id_in(&crate::state::StateStore::open()?, artifacts, destination)
+}
+
+fn job_id_in(
+    store: &crate::state::StateStore,
+    artifacts: &[&RemoteArtifact],
+    destination: &std::path::Path,
+) -> anyhow::Result<String> {
+    let identity = job_id(artifacts);
+    Ok(store
+        .download_jobs()?
+        .into_iter()
+        .filter(|job| {
+            job.destination == destination
+                && !job.artifacts.is_empty()
+                && job_id(&job.artifacts.iter().collect::<Vec<_>>()) == identity
+        })
+        .max_by_key(|job| job.updated_at)
+        .map(|job| job.job_id)
+        .unwrap_or_else(|| job_id_at(artifacts, destination)))
 }
 
 pub fn manager_events() -> mpsc::Receiver<DownloadManagerEvent> {
@@ -511,9 +543,11 @@ mod tests {
     #[test]
     fn automatic_backup_requests_keep_download_and_staging_layout_under_configured_root() {
         let directory = TestDirectory::new("automatic-backup-layout");
-        let config = crate::config::Config {
-            download_directory: directory.0.join("downloads"),
-            ..Default::default()
+        let library = crate::config::GameLibrary {
+            id: "offline".into(),
+            name: "Offline".into(),
+            path: directory.0.join("downloads"),
+            default: true,
         };
         let token = crate::auth::Token {
             access_token: "inert".into(),
@@ -545,7 +579,7 @@ mod tests {
                 provider_category: None,
             }];
             let request = crate::updates::backup_request(
-                &config,
+                &library,
                 &crate::domain::Game {
                     product_id: 123,
                     slug: slug.into(),
@@ -557,8 +591,8 @@ mod tests {
             );
             assert_eq!(
                 request.destination,
-                config
-                    .download_directory
+                library
+                    .path
                     .join(expected_slug)
                     .join("installer/windows/english")
             );
@@ -566,8 +600,8 @@ mod tests {
             let staging = staging_directory(&request.destination, &request.artifacts, &id);
             assert_eq!(
                 staging,
-                config
-                    .download_directory
+                library
+                    .path
                     .join(crate::identity::STAGING_DIRECTORY)
                     .join(key(&id))
             );
@@ -577,9 +611,50 @@ mod tests {
                 staging
                     .canonicalize()
                     .unwrap()
-                    .starts_with(config.download_directory.canonicalize().unwrap())
+                    .starts_with(library.path.canonicalize().unwrap())
             );
         }
+    }
+
+    #[test]
+    fn destination_identity_keeps_independent_copies_and_exact_legacy_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::state::StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
+            {"product_id":7,"kind":"installer","name":"setup","size_bytes":4,"download_path":"/inert"}
+        ])).unwrap();
+        let refs = artifacts.iter().collect::<Vec<_>>();
+        let first = root.path().join("first/game/installer");
+        let second = root.path().join("second/game/installer");
+        assert_ne!(job_id_at(&refs, &first), job_id_at(&refs, &second));
+        let legacy = job_id(&refs);
+        store
+            .save_download_job(&crate::state::DownloadJobUpdate {
+                job_id: &legacy,
+                product_id: 7,
+                title: "Fixture",
+                artifacts: &artifacts,
+                destination: &first,
+                state: crate::state::DownloadState::Paused,
+                bytes_downloaded: 2,
+                total_bytes: Some(4),
+                completed_files: &[],
+                error: None,
+            })
+            .unwrap();
+        assert_eq!(job_id_in(&store, &refs, &first).unwrap(), legacy);
+        assert_eq!(
+            job_id_in(&store, &refs, &second).unwrap(),
+            job_id_at(&refs, &second)
+        );
+        assert_eq!(
+            store
+                .download_job(&legacy)
+                .unwrap()
+                .unwrap()
+                .bytes_downloaded,
+            2
+        );
     }
 
     #[test]

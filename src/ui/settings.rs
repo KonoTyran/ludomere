@@ -22,6 +22,7 @@ pub(super) fn show_settings_page(
     {
         if let Some(stack) = find_settings_stack(&existing.clone().upcast()) {
             stack.set_visible_child_name(initial_page);
+            stack.notify("visible-child-name");
         }
         existing.present();
         return;
@@ -47,11 +48,10 @@ pub(super) fn show_settings_page(
     downloads_page.set_title("Downloads");
     downloads_page.set_icon_name(Some("folder-download-symbolic"));
     let library_page = adw::PreferencesPage::new();
-    library_page.set_title("Library");
+    library_page.set_title("Game Display");
     library_page.set_icon_name(Some("view-grid-symbolic"));
     let library_display = adw::PreferencesGroup::new();
     library_display.set_title("Library display");
-    let storage_page = build_storage_page(&settings_window, w, model);
     let appearance_page = adw::PreferencesPage::new();
     appearance_page.set_title("Appearance");
     appearance_page.set_icon_name(Some("applications-graphics-symbolic"));
@@ -70,8 +70,9 @@ pub(super) fn show_settings_page(
     downloads.add(&concurrency_row);
 
     let rebuild_row = adw::ActionRow::new();
+    rebuild_row.set_use_markup(false);
     rebuild_row.set_title("Rebuild downloaded-file index");
-    rebuild_row.set_subtitle("Inspect the managed download directory without changing any files");
+    rebuild_row.set_subtitle("Inspect compatible Offline Installers and Goodies & Extras libraries without changing files");
     let rebuild_button = gtk::Button::with_label("Rebuild");
     rebuild_button.set_valign(gtk::Align::Center);
     rebuild_row.add_suffix(&rebuild_button);
@@ -163,7 +164,7 @@ pub(super) fn show_settings_page(
     let maintenance = adw::PreferencesGroup::new();
     maintenance.set_title("Storage and synchronization");
     let open_downloads = adw::ActionRow::new();
-    open_downloads.set_title("Open download directory");
+    open_downloads.set_title("Open a downloaded-file library");
     let open_downloads_button = gtk::Button::with_label("Open");
     open_downloads_button.set_valign(gtk::Align::Center);
     open_downloads.add_suffix(&open_downloads_button);
@@ -266,6 +267,19 @@ pub(super) fn show_settings_page(
     let stack = gtk::Stack::new();
     stack.set_widget_name("ludomere-settings-stack");
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    let storage_header =
+        settings_navigation_row("storage-section", "Storage", "drive-harddisk-symbolic");
+    let storage_expanded = gtk::ToggleButton::new();
+    storage_expanded.set_icon_name("pan-end-symbolic");
+    storage_expanded.set_tooltip_text(Some("Expand Storage sections"));
+    storage_expanded.add_css_class("flat");
+    storage_header
+        .child()
+        .and_downcast::<gtk::Box>()
+        .expect("navigation row content")
+        .append(&storage_expanded);
+    let mut storage_rows = Vec::new();
+    let mut navigation_rows = Vec::new();
     for (name, title, icon, page) in [
         (
             "account",
@@ -281,15 +295,48 @@ pub(super) fn show_settings_page(
         ),
         (
             "library",
-            "Library",
+            "Game Display",
             "view-grid-symbolic",
             library_page.upcast::<gtk::Widget>(),
         ),
         (
             "storage",
-            "Storage",
+            "Game Library",
             "drive-harddisk-symbolic",
-            storage_page.upcast::<gtk::Widget>(),
+            build_storage_page(
+                &settings_window,
+                w,
+                model,
+                crate::config::LibraryKind::GameFiles,
+                "Game Library",
+            )
+            .upcast::<gtk::Widget>(),
+        ),
+        (
+            "storage-offline",
+            "Offline Installers",
+            "folder-download-symbolic",
+            build_storage_page(
+                &settings_window,
+                w,
+                model,
+                crate::config::LibraryKind::OfflineInstallers,
+                "Offline Installers",
+            )
+            .upcast::<gtk::Widget>(),
+        ),
+        (
+            "storage-extras",
+            "Goodies & Extras",
+            "folder-symbolic",
+            build_storage_page(
+                &settings_window,
+                w,
+                model,
+                crate::config::LibraryKind::Extras,
+                "Goodies & Extras",
+            )
+            .upcast::<gtk::Widget>(),
         ),
         (
             "maintenance",
@@ -316,8 +363,19 @@ pub(super) fn show_settings_page(
             comet::comet_page(&settings_window).upcast::<gtk::Widget>(),
         ),
     ] {
+        if name == "storage" {
+            navigation.append(&storage_header);
+        }
         let row = settings_navigation_row(name, title, icon);
+        if name == "storage" || name.starts_with("storage-") {
+            row.child()
+                .expect("navigation row content")
+                .set_margin_start(24);
+            row.set_visible(false);
+            storage_rows.push(row.clone());
+        }
         navigation.append(&row);
+        navigation_rows.push(row);
         stack.add_named(&page, Some(name));
     }
     navigation_shell.append(&navigation);
@@ -332,36 +390,138 @@ pub(super) fn show_settings_page(
     stack.set_vexpand(true);
     content.set_vexpand(true);
     root.append(&content);
-    navigation.connect_row_selected({
+    let syncing_navigation = Rc::new(std::cell::Cell::new(false));
+    storage_expanded.connect_toggled({
+        let navigation = navigation.clone();
+        let storage_header = storage_header.clone();
+        let storage_rows = storage_rows.clone();
         let stack = stack.clone();
-        move |_, row| {
-            if let Some(row) = row {
-                stack.set_visible_child_name(row.widget_name().as_str());
+        let syncing = syncing_navigation.clone();
+        move |expanded| {
+            for row in &storage_rows {
+                row.set_visible(expanded.is_active());
+            }
+            expanded.set_icon_name(if expanded.is_active() {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            });
+            expanded.set_tooltip_text(Some(if expanded.is_active() {
+                "Collapse Storage sections"
+            } else {
+                "Expand Storage sections"
+            }));
+            if expanded.is_active() && !syncing.get() {
+                navigation.select_row(Some(&storage_rows[0]));
+            }
+            if !expanded.is_active()
+                && navigation
+                    .selected_row()
+                    .is_some_and(|row| storage_rows.contains(&row))
+            {
+                syncing.set(true);
+                navigation.select_row(Some(&storage_header));
+                stack.set_visible_child_name("storage");
+                syncing.set(false);
             }
         }
     });
-    let initial_index = [
-        "account",
-        "downloads",
-        "library",
-        "storage",
-        "maintenance",
-        "proton",
-        "appearance",
-        "comet",
-    ]
-    .iter()
-    .position(|page| *page == initial_page)
-    .unwrap_or(0) as i32;
-    navigation.select_row(navigation.row_at_index(initial_index).as_ref());
+    navigation.connect_row_selected({
+        let stack = stack.clone();
+        let storage_expanded = storage_expanded.clone();
+        let storage_header = storage_header.clone();
+        let storage_default = storage_rows[0].clone();
+        let syncing = syncing_navigation.clone();
+        move |navigation, row| {
+            if syncing.get() {
+                return;
+            }
+            if let Some(row) = row {
+                syncing.set(true);
+                if row == &storage_header {
+                    storage_expanded.set_active(true);
+                    stack.set_visible_child_name("storage");
+                    navigation.select_row(Some(&storage_default));
+                } else {
+                    stack.set_visible_child_name(row.widget_name().as_str());
+                }
+                syncing.set(false);
+            }
+        }
+    });
+    navigation.connect_row_activated({
+        let storage_header = storage_header.clone();
+        let storage_default = storage_rows[0].clone();
+        let storage_expanded = storage_expanded.clone();
+        move |navigation, row| {
+            if row == &storage_header {
+                storage_expanded.set_active(true);
+                navigation.select_row(Some(&storage_default));
+            }
+        }
+    });
+    stack.connect_visible_child_name_notify({
+        let navigation = navigation.clone();
+        let storage_expanded = storage_expanded.clone();
+        let syncing = syncing_navigation.clone();
+        move |stack| {
+            if syncing.get() {
+                return;
+            }
+            let Some(name) = stack.visible_child_name() else {
+                return;
+            };
+            let Some(row) = navigation_rows.iter().find(|row| row.widget_name() == name) else {
+                return;
+            };
+            syncing.set(true);
+            if storage_rows.contains(row) {
+                storage_expanded.set_active(true);
+            }
+            navigation.select_row(Some(row));
+            syncing.set(false);
+        }
+    });
+    stack.set_visible_child_name(if stack.child_by_name(initial_page).is_some() {
+        initial_page
+    } else {
+        "account"
+    });
+    stack.notify("visible-child-name");
     settings_window.set_content(Some(&root));
 
     {
         let window = settings_window.clone();
         let model = model.clone();
         open_downloads_button.connect_clicked(move |_| {
-            let path = model.borrow().config.download_directory.clone();
-            super::widgets::file_open::open_directory(&path, &window, "download directory");
+            let config = model.borrow().config.clone();
+            let dialog = adw::AlertDialog::builder().heading("Open a library").body("Choose a configured Offline Installers or Goodies & Extras directory. Incompatible libraries cannot be opened here.").build();
+            dialog.add_response("cancel", "Cancel");
+            let libraries = [crate::config::LibraryKind::OfflineInstallers, crate::config::LibraryKind::Extras].into_iter()
+                .flat_map(|kind| config.libraries(kind).iter().cloned().map(move |library| (kind, library))).collect::<Vec<_>>();
+            for (index, (kind, library)) in libraries.iter().enumerate() {
+                dialog.add_response(&index.to_string(), &format!("{} — {}", kind.label(), library.path.display()));
+            }
+            let window = window.clone(); let epoch = model.borrow().account_epoch; let model = model.clone();
+            dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
+                if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
+                let Some((kind, library)) = response.parse::<usize>().ok().and_then(|index| libraries.get(index)).cloned() else { return; };
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || { let _ = sender.send(crate::storage::read_config().and_then(|current| {
+                    let found = crate::storage::validate_library(&current, kind, &library.id)?;
+                    anyhow::ensure!(found.path == library.path, "Library changed; choose it again."); Ok(found)
+                })); });
+                let window = window.clone();
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { return glib::ControlFlow::Break; }
+                    match receiver.try_recv() {
+                        Ok(Ok(library)) => super::widgets::file_open::open_directory(&library.path, &window, "library directory"),
+                        Ok(Err(error)) => { let alert = adw::AlertDialog::builder().heading("Library unavailable").body(format!("{error:#}")).build(); alert.add_response("close", "Close"); alert.present(Some(&window)); },
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(_) => {},
+                    } glib::ControlFlow::Break
+                });
+            });
         });
     }
     {
@@ -478,21 +638,31 @@ pub(super) fn show_settings_page(
         rebuild_button.connect_clicked(move |button| {
             button.set_sensitive(false);
             rebuild_row.set_subtitle("Inspecting managed files…");
-            let (root, games, epoch) = {
+            let (config, games, epoch) = {
                 let state = model.borrow();
                 (
-                    state.config.download_directory.clone(),
+                    state.config.clone(),
                     state.games.clone(),
                     state.account_epoch,
                 )
             };
             let (sender, receiver) = mpsc::channel();
             let session = online::account_session();
-            let scanned_root = root.clone();
+            let scanned_roots = [config.offline_libraries.clone(), config.extras_libraries.clone()];
             std::thread::spawn(move || {
                 let result = StateStore::open().and_then(|mut store| {
-                    let summary = managed::rebuild_for_session(&mut store, &root, &games, session)?;
-                    Ok((summary, store.managed_files()?, store.download_jobs()?))
+                    let mut summary = managed::RebuildSummary::default();
+                    let statuses = crate::storage::inspect_libraries(&config)?;
+                    let mut skipped = 0usize;
+                    for kind in [crate::config::LibraryKind::OfflineInstallers, crate::config::LibraryKind::Extras] {
+                        for library in config.libraries(kind) {
+                            if !statuses.iter().any(|status| status.kind == kind && status.library_id == library.id && status.compatibility == crate::storage::LibraryCompatibility::Compatible) { skipped += 1; continue; }
+                            let found = managed::rebuild_for_session(&mut store, &library.path, &games, session)?;
+                            summary.files += found.files; summary.matched += found.matched; summary.unmatched += found.unmatched;
+                            summary.partials += found.partials; summary.ignored += found.ignored;
+                        }
+                    }
+                    Ok((summary, skipped, store.managed_files()?, store.download_jobs()?))
                 });
                 let _ = sender.send(result);
             });
@@ -502,22 +672,20 @@ pub(super) fn show_settings_page(
             let button = button.clone();
             glib::timeout_add_local(Duration::from_millis(50), move || {
                 if model.borrow().account_epoch != epoch
-                    || model.borrow().config.download_directory != scanned_root
+                    || [model.borrow().config.offline_libraries.clone(), model.borrow().config.extras_libraries.clone()] != scanned_roots
                 {
                     button.set_sensitive(true);
                     return glib::ControlFlow::Break;
                 }
                 match receiver.try_recv() {
-                    Ok(Ok((summary, files, jobs))) => {
+                    Ok(Ok((summary, skipped, files, jobs))) => {
                         let mut state = model.borrow_mut();
                         managed::apply_to_games(&mut state.games, &files);
-                        let directory = state.config.download_directory.clone();
-                        managed::set_locations(&mut state.games, &directory);
                         state.download_jobs = jobs;
                         drop(state);
                         row.set_subtitle(&format!(
-                            "Indexed {} files ({} matched, {} unmatched)",
-                            summary.files, summary.matched, summary.unmatched
+                            "Indexed {} files ({} matched, {} unmatched); {} incompatible or unavailable libraries skipped",
+                            summary.files, summary.matched, summary.unmatched, skipped
                         ));
                         refresh_local_action_state(&w, &model);
                     }
@@ -835,35 +1003,61 @@ fn settings_account_page(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) -> adw:
     page.add(&profile_group);
 
     let privacy = adw::PreferencesGroup::new();
-    privacy.set_title("Signing out");
-    let clear_profile = adw::SwitchRow::new();
-    clear_profile.set_title("Clear full profile when signing out");
-    const RESET_DESCRIPTION: &str = "Clears settings, favorites, tags, playtime, queue records, login data, images and metadata. Ludomere then closes. Games, downloaded installers, Proton versions and runtimes are kept. Turning this on does not clear anything now.";
-    clear_profile.set_subtitle(RESET_DESCRIPTION);
-    clear_profile.set_active(model.borrow().config.clear_profile_on_sign_out);
-    clear_profile.connect_active_notify({
+    privacy.set_title("Factory Reset");
+    let reset_row = adw::ActionRow::builder()
+        .title("Reset Ludomere")
+        .subtitle("Delete this application's profile and cache, then close Ludomere. Library files are kept.")
+        .build();
+    let reset = gtk::Button::with_label("Factory Reset…");
+    reset.add_css_class("destructive-action");
+    reset.set_valign(gtk::Align::Center);
+    let reset_status = gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    reset_status.set_widget_name("factory-reset-status");
+    let reset_status_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .max_content_height(160)
+        .propagate_natural_height(true)
+        .child(&reset_status)
+        .build();
+    reset.connect_clicked({
+        let w = w.clone();
         let model = model.clone();
-        move |row| {
-            let mut state = model.borrow_mut();
-            let previous = state.config.clear_profile_on_sign_out;
-            if previous == row.is_active() {
-                return;
-            }
-            state.config.clear_profile_on_sign_out = row.is_active();
-            if let Err(error) = state.config.save() {
-                state.config.clear_profile_on_sign_out = previous;
-                drop(state);
-                row.set_active(previous);
-                row.set_subtitle(&format!(
-                    "Could not save this setting: {error}. {RESET_DESCRIPTION}"
-                ));
-            } else {
-                drop(state);
-                row.set_subtitle(RESET_DESCRIPTION);
-            }
+        let reset_status = reset_status.clone();
+        move |button| {
+            if model.borrow().logout_pending { return; }
+            let Some(parent) = button.root().and_downcast::<gtk::Window>() else { return; };
+            let epoch = model.borrow().account_epoch;
+            let confirmation = adw::AlertDialog::builder()
+                .heading("Factory reset Ludomere?")
+                .body("This deletes Ludomere's database, settings, favorites, tags, playtime, queue and automatic-resume records, local login data, cached metadata, images and logs. Ludomere will close. If the system credential store is unavailable, its saved entry may remain; automatic login stays disabled.\n\nGames, downloaded files, game prefixes and their saves, Proton versions, runtimes and cloud recovery copies are kept. Running games continue; background downloads and setup are stopped safely. Custom library folders must be added again afterward.")
+                .build();
+            confirmation.add_responses(&[("cancel", "Cancel"), ("reset", "Factory Reset")]);
+            confirmation.set_default_response(Some("cancel"));
+            confirmation.set_close_response("cancel");
+            confirmation.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            let w = w.clone();
+            let model = model.clone();
+            let reset_status = reset_status.clone();
+            let parent_lifetime = parent.downgrade();
+            confirmation.choose(Some(&parent), gio::Cancellable::NONE, move |response| {
+                if response == "reset" && parent_lifetime.upgrade().is_some_and(|window| window.is_visible())
+                    && model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
+                    super::window::sign_out(&w, &model, true, Some(reset_status));
+                }
+            });
         }
     });
-    privacy.add(&clear_profile);
+    reset_row.add_suffix(&reset);
+    reset_row.set_activatable_widget(Some(&reset));
+    privacy.add(&reset_row);
+    privacy.add(&reset_status_scroll);
     page.add(&privacy);
 
     let connection = adw::PreferencesGroup::new();

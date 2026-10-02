@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, GameLibrary, LibraryKind},
     state::{DownloadJobUpdate, DownloadState, ManagedFileRecord, StateStore},
 };
 use anyhow::{Result, ensure};
@@ -18,6 +18,8 @@ use std::{
 pub struct ManagedDownloads {
     pub(super) product_id: i64,
     files: Vec<DownloadFile>,
+    #[serde(default)]
+    blocked_libraries: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +41,12 @@ impl ManagedDownloads {
     pub fn bytes(&self) -> u64 {
         self.files.iter().map(|file| file.size).sum()
     }
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files.iter().map(|file| file.path.as_path())
+    }
+    pub fn blocked_libraries(&self) -> &[String] {
+        &self.blocked_libraries
+    }
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +59,7 @@ pub(super) struct Retention {
     snapshot: ManagedDownloads,
     replacement: ManagedDownloads,
     revision: i64,
+    library: GameLibrary,
     trash: Vec<super::trash::PreparedTrash>,
 }
 
@@ -100,7 +109,14 @@ pub(super) fn prepare_retention(
     {
         return Ok(None);
     }
-    let mut replacement = inspect(&store, &read_config(&Config::path())?, product_id)?;
+    let config = read_config(&Config::path())?;
+    let library =
+        crate::storage::validate_path(&config, LibraryKind::OfflineInstallers, &paths[0])?;
+    ensure!(
+        paths.iter().all(|path| path.starts_with(&library.path)),
+        "The replacement must be complete in one Offline Installers library"
+    );
+    let mut replacement = inspect(&store, &config, product_id)?;
     replacement.files.retain(|file| paths.contains(&file.path));
     ensure!(
         replacement.files.len() == paths.len(),
@@ -149,7 +165,9 @@ pub(super) fn prepare_retention(
         })?;
     let older = store.superseded_installer_files(product_id, revision)?;
     let mut snapshot = inspect(&store, &read_config(&Config::path())?, product_id)?;
-    snapshot.files.retain(|file| older.contains(&file.path));
+    snapshot
+        .files
+        .retain(|file| older.contains(&file.path) && file.path.starts_with(&library.path));
     if snapshot.files.is_empty() {
         return Ok(None);
     }
@@ -168,6 +186,7 @@ pub(super) fn prepare_retention(
         snapshot,
         replacement,
         revision,
+        library,
         trash,
     }))
 }
@@ -212,16 +231,41 @@ pub(super) fn commit_retention(
     job_id: &str,
 ) -> Result<CleanupResult> {
     let _permit = crate::operation_gate::try_acquire()?;
+    commit_retention_with_config(store, retention, job_id, &read_config(&Config::path())?)
+}
+
+fn commit_retention_with_config(
+    store: &StateStore,
+    retention: Retention,
+    job_id: &str,
+    config: &Config,
+) -> Result<CleanupResult> {
     let id = retention.snapshot.product_id;
     ensure!(
-        crate::updates::UpdatePolicy::resolve(
-            &read_config(&Config::path())?,
-            store.game_preferences(id)?.as_ref()
-        )
-        .prune_superseded_installers,
+        crate::updates::UpdatePolicy::resolve(config, store.game_preferences(id)?.as_ref())
+            .prune_superseded_installers,
         "Installer cleanup was disabled; the original files were retained"
     );
     ensure_no_install_intent(store, id)?;
+    let statuses = crate::storage::inspect_libraries_with_store(config, store)?;
+    ensure!(
+        statuses
+            .iter()
+            .any(|status| status.kind == LibraryKind::OfflineInstallers
+                && status.library_id == retention.library.id
+                && status.path == retention.library.path
+                && status.compatibility == crate::storage::LibraryCompatibility::Compatible),
+        "The replacement library changed or is incompatible; older installers were retained"
+    );
+    ensure!(
+        retention
+            .snapshot
+            .files
+            .iter()
+            .chain(&retention.replacement.files)
+            .all(|file| file.path.starts_with(&retention.library.path)),
+        "Installer retention requires a verified replacement in the same library"
+    );
     ensure!(
         store.verified_installer_revision_for_job(job_id)? == Some(retention.revision),
         "The offered replacement changed; the original files were retained"
@@ -233,7 +277,13 @@ pub(super) fn commit_retention(
             "The verified replacement changed; the original files were retained"
         );
     }
-    delete_locked_with_trash(store, retention.snapshot, false, Some(retention.trash))
+    delete_locked_with_trash(
+        store,
+        retention.snapshot,
+        false,
+        Some(retention.trash),
+        config,
+    )
 }
 
 fn ensure_no_install_intent(store: &StateStore, product_id: i64) -> Result<()> {
@@ -274,6 +324,41 @@ pub fn managed_downloads(product_id: i64) -> Result<ManagedDownloads> {
     )
 }
 
+pub fn managed_downloads_for_kind(product_id: i64, kind: LibraryKind) -> Result<ManagedDownloads> {
+    inspect_kind(
+        &StateStore::open()?,
+        &read_config(&Config::path())?,
+        product_id,
+        kind,
+    )
+}
+
+fn inspect_kind(
+    store: &StateStore,
+    config: &Config,
+    product_id: i64,
+    kind: LibraryKind,
+) -> Result<ManagedDownloads> {
+    ensure!(
+        kind != LibraryKind::GameFiles,
+        "Installed payloads are not downloaded archives"
+    );
+    let mut snapshot = inspect(store, config, product_id)?;
+    snapshot.files.retain(|file| {
+        config
+            .libraries(kind)
+            .iter()
+            .any(|library| file.path.starts_with(&library.path))
+    });
+    snapshot.blocked_libraries.retain(|message| {
+        config
+            .libraries(kind)
+            .iter()
+            .any(|library| message.starts_with(&format!("{}:", library.path.display())))
+    });
+    Ok(snapshot)
+}
+
 fn read_config(path: &Path) -> Result<Config> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(toml::from_str(&text)?),
@@ -283,6 +368,7 @@ fn read_config(path: &Path) -> Result<Config> {
 }
 
 fn inspect(store: &StateStore, config: &Config, product_id: i64) -> Result<ManagedDownloads> {
+    let statuses = crate::storage::inspect_libraries_with_store(config, store)?;
     let game = store.cached_product_game(product_id)?;
     let mut ids = vec![product_id];
     if let Some(game) = &game {
@@ -295,11 +381,21 @@ fn inspect(store: &StateStore, config: &Config, product_id: i64) -> Result<Manag
     }
     let jobs = store.download_jobs()?;
     let mut files = Vec::new();
+    let mut blocked_libraries = std::collections::BTreeSet::new();
     for file in store
         .managed_files_for_products(&ids)?
         .into_iter()
         .filter(|file| file.present && file.matched && ids.contains(&file.product_id))
     {
+        for status in statuses.iter().filter(|status| {
+            status.kind != LibraryKind::GameFiles && file.path.starts_with(&status.path)
+        }) {
+            if let crate::storage::LibraryCompatibility::Incompatible(reason)
+            | crate::storage::LibraryCompatibility::Unavailable(reason) = &status.compatibility
+            {
+                blocked_libraries.insert(format!("{}: {reason}", status.path.display()));
+            }
+        }
         let base = game
             .as_ref()
             .map_or(file.product_slug.as_str(), |game| game.slug.as_str());
@@ -331,7 +427,14 @@ fn inspect(store: &StateStore, config: &Config, product_id: i64) -> Result<Manag
             continue;
         }
         relative.push(&file.filename);
-        let current = config.download_directory.join(&relative) == file.path;
+        let Some(library) = statuses.iter().find(|status| {
+            status.kind != LibraryKind::GameFiles
+                && status.compatibility == crate::storage::LibraryCompatibility::Compatible
+                && file.path.starts_with(&status.path)
+        }) else {
+            continue;
+        };
+        let current = library.path.join(&relative) == file.path;
         let recorded = jobs.iter().any(|job| {
             job.product_id == file.product_id
                 && job.completed_files.contains(&file.path)
@@ -359,7 +462,11 @@ fn inspect(store: &StateStore, config: &Config, product_id: i64) -> Result<Manag
             modified_ns: metadata.mtime_nsec(),
         });
     }
-    Ok(ManagedDownloads { product_id, files })
+    Ok(ManagedDownloads {
+        product_id,
+        files,
+        blocked_libraries: blocked_libraries.into_iter().collect(),
+    })
 }
 
 /// Directory descriptors anchor every component; no parent or final symlink is followed.
@@ -411,15 +518,21 @@ pub(super) fn delete(
     after_uninstall: bool,
 ) -> Result<CleanupResult> {
     let _permit = crate::operation_gate::try_acquire()?;
-    delete_locked(store, snapshot, after_uninstall)
+    delete_locked(
+        store,
+        snapshot,
+        after_uninstall,
+        &read_config(&Config::path())?,
+    )
 }
 
 fn delete_locked(
     store: &StateStore,
     snapshot: ManagedDownloads,
     after_uninstall: bool,
+    config: &Config,
 ) -> Result<CleanupResult> {
-    delete_locked_with_trash(store, snapshot, after_uninstall, None)
+    delete_locked_with_trash(store, snapshot, after_uninstall, None, config)
 }
 
 fn delete_locked_with_trash(
@@ -427,6 +540,7 @@ fn delete_locked_with_trash(
     snapshot: ManagedDownloads,
     after_uninstall: bool,
     mut trash: Option<Vec<super::trash::PreparedTrash>>,
+    config: &Config,
 ) -> Result<CleanupResult> {
     let ids = snapshot
         .files
@@ -462,7 +576,7 @@ fn delete_locked_with_trash(
         "Pause or finish this game's downloads before deleting files"
     );
     let indexed = store.managed_files()?;
-    let current = inspect(store, &read_config(&Config::path())?, snapshot.product_id)?;
+    let current = inspect(store, config, snapshot.product_id)?;
     // Revocation is checked and completed before any unlink, serialized by the queue manager.
     for job in &jobs {
         if trash.is_some() {
@@ -485,6 +599,13 @@ fn delete_locked_with_trash(
         let mut removed_payload = false;
         let removed = (|| -> Result<()> {
             ensure!(
+                current
+                    .files
+                    .iter()
+                    .any(|candidate| candidate.path == file.path),
+                "This file is no longer in a compatible managed library; inspect it again"
+            );
+            ensure!(
                 indexed.iter().any(|current| same_record(current, &file)),
                 "The downloaded file changed in the index; inspect it again"
             );
@@ -500,13 +621,6 @@ fn delete_locked_with_trash(
                 Err(error) => return Err(error),
             };
             if let Some((parent, name, handle)) = opened {
-                ensure!(
-                    current
-                        .files
-                        .iter()
-                        .any(|candidate| candidate.path == file.path),
-                    "This file is no longer a recognized managed download; inspect it again"
-                );
                 let metadata = handle.metadata()?;
                 ensure!(
                     matches_identity(&metadata, &file),
@@ -672,6 +786,7 @@ mod tests {
                 snapshot,
                 replacement: replacement_snapshot,
                 revision,
+                library: config.offline_libraries[0].clone(),
                 trash,
             }
         };
@@ -688,20 +803,31 @@ mod tests {
                 error: None,
             })
             .unwrap();
-        assert!(commit_retention(&store, prepare(), "replacement").is_err());
+        assert!(commit_retention_with_config(&store, prepare(), "replacement", &config).is_err());
         assert!(older.iter().all(|path| path.exists()));
         assert_eq!(
             store.download_install_intents().unwrap()[0].intent_id,
             "consent"
         );
         store.clear_download_install_intent(7).unwrap();
+        let mut changed = config.clone();
+        let other = GameLibrary {
+            id: "another-root".into(),
+            name: "Another root".into(),
+            path: root.path().join("another-root"),
+            default: false,
+        };
+        std::fs::create_dir(&other.path).unwrap();
+        changed.offline_libraries.push(other.clone());
+        let mut cross_root = prepare();
+        cross_root.library = other;
+        assert!(commit_retention_with_config(&store, cross_root, "replacement", &changed).is_err());
+        assert!(older.iter().all(|path| path.is_file()));
         let pending = prepare();
         std::fs::remove_file(&older[1]).unwrap();
         symlink(&replacement[1], &older[1]).unwrap();
-        let result = commit_retention(&store, pending, "replacement").unwrap();
-        assert_eq!(result.deleted, 1);
-        assert_eq!(result.failures.len(), 1);
-        assert!(!older[0].exists());
+        assert!(commit_retention_with_config(&store, pending, "replacement", &config).is_err());
+        assert!(older[0].exists());
         assert!(
             replacement
                 .iter()
@@ -709,7 +835,7 @@ mod tests {
         );
         assert_eq!(
             store.download_job("job").unwrap().unwrap().completed_files,
-            vec![older[1].clone()]
+            older
         );
         assert_eq!(
             store
@@ -760,7 +886,8 @@ mod tests {
             .collect::<Vec<_>>();
         let database = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
         database.execute_batch("CREATE TRIGGER fail_mark BEFORE UPDATE OF present ON managed_files WHEN NEW.present=0 BEGIN SELECT RAISE(ABORT,'fixture index failure'); END;").unwrap();
-        let result = delete_locked_with_trash(&store, snapshot, false, Some(trash)).unwrap();
+        let result =
+            delete_locked_with_trash(&store, snapshot, false, Some(trash), &config).unwrap();
         assert_eq!(result.deleted, 2);
         assert_eq!(result.failures.len(), 2);
         assert!(files.iter().all(|file| !file.exists()));
@@ -792,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_includes_recorded_owned_dlc_in_an_old_download_root() {
+    fn cleanup_includes_recorded_owned_dlc_in_a_configured_extras_root() {
         let root = tempfile::tempdir().unwrap();
         let (store, mut config, _) = fixture(root.path());
         store
@@ -840,11 +967,16 @@ mod tests {
         store
             .record_completed_artifacts("child", "child", &[artifact], std::slice::from_ref(&path))
             .unwrap();
-        config.download_directory = root.path().join("new-download-root");
+        config.extras_libraries.push(GameLibrary {
+            id: "extras".into(),
+            name: "Extras".into(),
+            path: root.path().join("old-downloads"),
+            default: true,
+        });
         let snapshot = inspect(&store, &config, 7).unwrap();
         assert_eq!(snapshot.count(), 3);
         assert!(snapshot.files.iter().any(|file| file.path == path));
-        let result = delete_locked(&store, snapshot, false).unwrap();
+        let result = delete_locked(&store, snapshot, false, &config).unwrap();
         assert_eq!(result.deleted, 3);
         assert!(result.failures.is_empty());
         assert!(!path.exists());
@@ -905,29 +1037,90 @@ mod tests {
             .record_completed_artifacts("job", "game", &artifacts, &files)
             .unwrap();
         let config = Config {
-            download_directory: download,
+            download_directory: download.clone(),
+            game_libraries: Vec::new(),
+            offline_libraries: vec![GameLibrary {
+                id: "offline".into(),
+                name: "Offline".into(),
+                path: download,
+                default: true,
+            }],
             ..Default::default()
         };
         (store, config, files)
     }
 
     #[test]
+    fn typed_deletion_preserves_other_category_and_payload_and_explains_blocked_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, mut config, installers) = fixture(root.path());
+        let extras_root = root.path().join("extras");
+        let destination = extras_root.join("game/extra");
+        std::fs::create_dir_all(&destination).unwrap();
+        let extra = destination.join("bonus.zip");
+        std::fs::write(&extra, b"inert fixture").unwrap();
+        let mut artifact = store
+            .download_job("job")
+            .unwrap()
+            .unwrap()
+            .artifacts
+            .remove(0);
+        artifact.kind = ArtifactKind::Extra;
+        artifact.operating_system = None;
+        artifact.language = None;
+        artifact.part_count = Some(1);
+        artifact.part_number = Some(1);
+        artifact.download_path = "/bonus".into();
+        store
+            .record_completed_artifacts("bonus", "game", &[artifact], std::slice::from_ref(&extra))
+            .unwrap();
+        config.extras_libraries.push(GameLibrary {
+            id: "extras".into(),
+            name: "Extras".into(),
+            path: extras_root.clone(),
+            default: true,
+        });
+        let payload = root.path().join("payload/save.dat");
+        std::fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, b"preserve").unwrap();
+        let offline = inspect_kind(&store, &config, 7, LibraryKind::OfflineInstallers).unwrap();
+        assert_eq!(offline.count(), 2);
+        assert_eq!(
+            inspect_kind(&store, &config, 7, LibraryKind::Extras)
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::write(extras_root.join("unrecognized.txt"), b"preserve").unwrap();
+        let blocked = inspect_kind(&store, &config, 7, LibraryKind::Extras).unwrap();
+        assert_eq!(blocked.count(), 0);
+        assert_eq!(blocked.blocked_libraries().len(), 1);
+        assert_eq!(
+            delete_locked(&store, offline, false, &config)
+                .unwrap()
+                .deleted,
+            2
+        );
+        assert!(installers.iter().all(|path| !path.exists()));
+        assert_eq!(std::fs::read(extra).unwrap(), b"inert fixture");
+        assert_eq!(std::fs::read(payload).unwrap(), b"preserve");
+    }
+
+    #[test]
     fn exact_cleanup_preserves_payload_preferences_and_retries_partial_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let (store, config, files) = fixture(root.path());
+        let payload = root.path().join("installed-game");
+        std::fs::create_dir_all(&payload).unwrap();
         for name in [
             "start.sh",
             "save.dat",
             ".ludomere-install.json",
             "notes.txt",
         ] {
-            std::fs::write(
-                config.download_directory.join("game").join(name),
-                b"preserve",
-            )
-            .unwrap();
+            std::fs::write(payload.join(name), b"preserve").unwrap();
         }
-        let outside = config.download_directory.join("other/save.dat");
+        let outside = root.path().join("other/save.dat");
         std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
         std::fs::write(&outside, b"preserve other").unwrap();
         store.set_favorite(7, true).unwrap();
@@ -948,19 +1141,19 @@ mod tests {
         assert_eq!(store.download_install_intents().unwrap().len(), 1);
         std::fs::rename(&files[1], files[1].with_extension("held")).unwrap();
         symlink(&outside, &files[1]).unwrap();
-        let result = delete_locked(&store, snapshot.clone(), false).unwrap();
-        assert_eq!(result.deleted, 1);
-        assert_eq!(result.failures.len(), 1);
+        let result = delete_locked(&store, snapshot.clone(), false, &config).unwrap();
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.failures.len(), 2);
         assert!(store.download_install_intents().unwrap().is_empty());
         assert_eq!(
             store.download_job("job").unwrap().unwrap().completed_files,
-            vec![files[1].clone()]
+            files
         );
         std::fs::remove_file(&files[1]).unwrap();
         std::fs::rename(files[1].with_extension("held"), &files[1]).unwrap();
-        let retried = delete_locked(&store, snapshot, false).unwrap();
+        let retried = delete_locked(&store, snapshot, false, &config).unwrap();
         assert!(retried.failures.is_empty());
-        assert_eq!(retried.deleted, 1);
+        assert_eq!(retried.deleted, 2);
         assert!(!files[1].exists());
         assert!(store.download_job("job").unwrap().is_none());
         assert!(store.favorites().unwrap().contains(&7));
@@ -971,10 +1164,7 @@ mod tests {
             ".ludomere-install.json",
             "notes.txt",
         ] {
-            assert_eq!(
-                std::fs::read(config.download_directory.join("game").join(name)).unwrap(),
-                b"preserve"
-            );
+            assert_eq!(std::fs::read(payload.join(name)).unwrap(), b"preserve");
         }
         assert_eq!(inspect(&store, &config, 7).unwrap().count(), 0);
     }
@@ -1000,7 +1190,7 @@ mod tests {
                 error: None,
             })
             .unwrap();
-        assert!(delete_locked(&store, snapshot.clone(), false).is_err());
+        assert!(delete_locked(&store, snapshot.clone(), false, &config).is_err());
         assert!(files.iter().all(|path| path.is_file()));
         store
             .save_download_job(&DownloadJobUpdate {
@@ -1023,7 +1213,7 @@ mod tests {
         symlink(&renamed, parent).unwrap();
         assert_eq!(inspect(&store, &config, 7).unwrap().count(), 0);
         assert_eq!(
-            delete_locked(&store, snapshot.clone(), false)
+            delete_locked(&store, snapshot.clone(), false, &config)
                 .unwrap()
                 .failures
                 .len(),
@@ -1031,7 +1221,7 @@ mod tests {
         );
         std::fs::remove_file(parent).unwrap();
         std::fs::rename(&renamed, parent).unwrap();
-        let result = delete_locked(&store, snapshot, false).unwrap();
+        let result = delete_locked(&store, snapshot, false, &config).unwrap();
         assert_eq!(result.failures.len(), 1);
         assert_eq!(std::fs::read(&files[0]).unwrap(), b"replacement bytes");
     }

@@ -87,8 +87,19 @@ fn restart_helper_process() {
     let root = PathBuf::from(std::env::var_os("LUDOMERE_TEST_ROOT").unwrap());
     let url = std::env::var("LUDOMERE_TEST_URL").unwrap();
     let artifact = artifact(url);
-    let id = download::job_id(&[&artifact]);
     let destination = root.join("downloads/game/installer/windows/english");
+    let id = download::job_id_at(&[&artifact], &destination);
+    fs::create_dir_all(root.join("downloads")).unwrap();
+    let config = ludomere::config::Config {
+        offline_libraries: vec![ludomere::config::GameLibrary {
+            id: "offline".into(),
+            name: "Offline".into(),
+            path: root.join("downloads"),
+            default: true,
+        }],
+        ..Default::default()
+    };
+    config.save().unwrap();
 
     match phase.as_str() {
         "interrupt" => {
@@ -97,6 +108,7 @@ fn restart_helper_process() {
             download::set_authenticated(true);
             let (events, _receiver) = mpsc::channel();
             download::enqueue(DownloadRequest {
+                library_id: "offline".into(),
                 artifacts: vec![artifact],
                 title: "Restart recovery test".into(),
                 access_token: "integration-test-token".into(),
@@ -130,6 +142,7 @@ fn run_helper(phase: &str, root: &Path, url: &str) {
             "--nocapture",
         ])
         .env("XDG_DATA_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("LUDOMERE_TEST_PHASE", phase)
         .env("LUDOMERE_TEST_ROOT", root)
         .env("LUDOMERE_TEST_URL", url)

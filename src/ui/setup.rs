@@ -1,10 +1,11 @@
 use super::*;
 use std::cell::Cell;
 
-const STEPS: [&str; 5] = [
+const STEPS: [&str; 6] = [
     "Welcome",
-    "Game folder",
-    "Download folder",
+    "Game Files",
+    "Offline Installers",
+    "Goodies & Extras",
     "Select Proton Version",
     "Verify Steam Linux Runtime",
 ];
@@ -25,6 +26,231 @@ fn validate_folder(path: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     anyhow::bail!("The folder location is unavailable.")
+}
+
+fn set_setup_library(
+    config: &mut Config,
+    kind: crate::config::LibraryKind,
+    path: &std::path::Path,
+) {
+    let libraries = config.libraries_mut(kind);
+    if let Some(index) = libraries
+        .iter()
+        .position(|item| item.default)
+        .or_else(|| (!libraries.is_empty()).then_some(0))
+    {
+        libraries[index].path = path.to_owned();
+    } else {
+        libraries.push(crate::config::GameLibrary {
+            id: crate::config::game_library_id(path),
+            name: kind.label().into(),
+            path: path.to_owned(),
+            default: true,
+        });
+    }
+}
+
+fn prepare_setup_library(
+    original: &Config,
+    draft: &mut Config,
+    kind: crate::config::LibraryKind,
+    path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    *draft.libraries_mut(kind) = original.libraries(kind).to_vec();
+    if path.as_os_str().is_empty() {
+        anyhow::ensure!(
+            kind != crate::config::LibraryKind::GameFiles,
+            "Choose a Game Files directory."
+        );
+        match kind {
+            crate::config::LibraryKind::OfflineInstallers => {
+                draft.auto_download_offline_installers = original.auto_download_offline_installers
+            }
+            crate::config::LibraryKind::Extras => {
+                draft.auto_download_extras = original.auto_download_extras
+            }
+            crate::config::LibraryKind::GameFiles => unreachable!(),
+        }
+        return Ok(false);
+    }
+    set_setup_library(draft, kind, path);
+    validate_setup_library(draft, kind, false)?;
+    Ok(true)
+}
+
+fn validate_setup_library(
+    config: &Config,
+    kind: crate::config::LibraryKind,
+    create: bool,
+) -> anyhow::Result<()> {
+    let Some(library) = config.default_library(kind) else {
+        anyhow::ensure!(
+            kind != crate::config::LibraryKind::GameFiles,
+            "Choose a Game Files directory."
+        );
+        return Ok(());
+    };
+    validate_folder(&library.path)?;
+    anyhow::ensure!(
+        library.path.components().all(|part| matches!(
+            part,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )),
+        "Choose an absolute directory without parent-directory components."
+    );
+    for other in crate::config::LibraryKind::ALL
+        .into_iter()
+        .flat_map(|kind| config.libraries(kind))
+    {
+        anyhow::ensure!(
+            std::ptr::eq(other, library)
+                || (other.id != library.id
+                    && !other.path.starts_with(&library.path)
+                    && !library.path.starts_with(&other.path)),
+            "Library directories must be separate and cannot contain one another. Choose another directory, or manage existing libraries in Settings."
+        );
+    }
+    if create {
+        std::fs::create_dir_all(&library.path)?;
+    }
+    if library.path.exists() {
+        crate::storage::validate_library(config, kind, &library.id)?;
+    }
+    Ok(())
+}
+
+struct SetupLibrary {
+    group: adw::PreferencesGroup,
+    entry: gtk::Entry,
+    picking: Rc<Cell<bool>>,
+    update: gtk::CheckButton,
+}
+
+fn setup_library(
+    kind: crate::config::LibraryKind,
+    draft: &Rc<RefCell<Config>>,
+    window: &adw::ApplicationWindow,
+    active: Rc<dyn Fn() -> bool>,
+) -> SetupLibrary {
+    let group = adw::PreferencesGroup::new();
+    group.set_title(&glib::markup_escape_text(kind.label()));
+    group.set_description(Some(match kind {
+        crate::config::LibraryKind::GameFiles => "Choose the directory for installed game files. This directory is required. You can add more libraries afterward in Settings.",
+        crate::config::LibraryKind::OfflineInstallers => "Choose a directory for offline installers, or skip this step. You can add more libraries afterward in Settings.",
+        crate::config::LibraryKind::Extras => "Choose a directory for goodies and extras, or skip this step. You can add more libraries afterward in Settings.",
+    }));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let entry = gtk::Entry::new();
+    entry.set_hexpand(true);
+    entry.set_placeholder_text(Some("Directory (absolute path)"));
+    entry.set_widget_name(match kind {
+        crate::config::LibraryKind::GameFiles => "setup-game-directory",
+        crate::config::LibraryKind::OfflineInstallers => "setup-installer-directory",
+        crate::config::LibraryKind::Extras => "setup-extras-directory",
+    });
+    let path = draft
+        .borrow()
+        .default_library(kind)
+        .map(|library| library.path.clone())
+        .unwrap_or_else(|| {
+            crate::config::default_game_directory()
+                .parent()
+                .unwrap()
+                .join(match kind {
+                    crate::config::LibraryKind::GameFiles => "games",
+                    crate::config::LibraryKind::OfflineInstallers => "installers",
+                    crate::config::LibraryKind::Extras => "extras",
+                })
+        });
+    entry.set_text(&path.to_string_lossy());
+    let choose = gtk::Button::with_label("Browse…");
+    row.append(&entry);
+    row.append(&choose);
+    group.add(&row);
+    let status = gtk::Label::new(None);
+    status.set_wrap(true);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    status.set_xalign(0.0);
+    group.add(&status);
+    let picking = Rc::new(Cell::new(false));
+    choose.connect_clicked({
+        let window = window.clone();
+        let entry = entry.clone();
+        let picking = picking.clone();
+        move |button| {
+            if !active() || picking.replace(true) {
+                return;
+            }
+            button.set_sensitive(false);
+            let picker = gtk::FileDialog::builder()
+                .title("Choose library directory")
+                .build();
+            let entry = entry.clone();
+            let active = active.clone();
+            let status = status.clone();
+            let button = button.clone();
+            let picking = picking.clone();
+            picker.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
+                picking.set(false);
+                if !active() {
+                    return;
+                }
+                button.set_sensitive(true);
+                match result {
+                    Ok(file) => {
+                        if let Some(path) = file.path() {
+                            entry.set_text(&path.to_string_lossy());
+                            status.set_label("");
+                        }
+                    }
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) => {}
+                    Err(_) => status.set_label(
+                        "The folder picker could not open. Enter an absolute path or try again.",
+                    ),
+                }
+            });
+        }
+    });
+    let update = gtk::CheckButton::with_label(if kind == crate::config::LibraryKind::GameFiles {
+        "Automatically update Depot builds"
+    } else {
+        "Keep downloaded files up to date"
+    });
+    update.set_tooltip_text(Some(if kind == crate::config::LibraryKind::GameFiles {
+        "Download and apply available updates to installed Depot games during scheduled checks."
+    } else {
+        "Update existing downloads in these libraries only. This does not download games you have never backed up."
+    }));
+    update.set_active(match kind {
+        crate::config::LibraryKind::GameFiles => draft.borrow().auto_update_galaxy_installations,
+        crate::config::LibraryKind::OfflineInstallers => {
+            draft.borrow().auto_download_offline_installers
+        }
+        crate::config::LibraryKind::Extras => draft.borrow().auto_download_extras,
+    });
+    group.add(&update);
+    {
+        let draft = draft.clone();
+        update.connect_toggled(move |button| match kind {
+            crate::config::LibraryKind::GameFiles => {
+                draft.borrow_mut().auto_update_galaxy_installations = button.is_active()
+            }
+            crate::config::LibraryKind::OfflineInstallers => {
+                draft.borrow_mut().auto_download_offline_installers = button.is_active()
+            }
+            crate::config::LibraryKind::Extras => {
+                draft.borrow_mut().auto_download_extras = button.is_active()
+            }
+        });
+    }
+    SetupLibrary {
+        group,
+        entry,
+        picking,
+        update,
+    }
 }
 
 pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product_id: Option<i64>) {
@@ -56,55 +282,13 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         .icon_name("applications-games-symbolic")
         .build();
     pages.add_named(&welcome, Some("0"));
-    let game_page = adw::PreferencesPage::new();
-    pages.add_named(&game_page, Some("1"));
-    let download_page = adw::PreferencesPage::new();
-    pages.add_named(&download_page, Some("2"));
     let proton_page = adw::PreferencesPage::new();
-    pages.add_named(&proton_page, Some("3"));
+    pages.add_named(&proton_page, Some("4"));
     let runtime_page = adw::PreferencesPage::new();
-    pages.add_named(&runtime_page, Some("4"));
-    let folders = adw::PreferencesGroup::new();
-    folders.set_title("Where should your games live?");
-    folders.set_description(Some(
-        "Choose the directory where your games will be installed.",
-    ));
-    let games = adw::EntryRow::new();
-    games.set_title("Game folder (absolute path)");
-    let downloads = adw::EntryRow::new();
-    downloads.set_title("Download folder (absolute path)");
-    games.set_widget_name("setup-game-folder");
-    downloads.set_widget_name("setup-download-folder");
-    {
-        let state = model.borrow();
-        games.set_text(
-            &state
-                .config
-                .installer_library()
-                .map(|library| library.path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        );
-        downloads.set_text(&state.config.download_directory.to_string_lossy());
-    }
-    folders.add(&games);
-    game_page.add(&folders);
-    let download_folders = adw::PreferencesGroup::new();
-    download_folders.set_title("Where should downloads go?");
-    download_folders.set_description(Some(
-        "Keep installers and extras here. Changing this folder won't change your game folder.",
-    ));
-    download_folders.add(&downloads);
-    download_page.add(&download_folders);
-    {
-        let downloads = downloads.clone();
-        games.connect_changed(move |games| {
-            downloads.set_text(
-                &std::path::Path::new(games.text().as_str())
-                    .join("downloads")
-                    .to_string_lossy(),
-            );
-        });
-    }
+    pages.add_named(&runtime_page, Some("5"));
+    let original_libraries = Rc::new(model.borrow().config.clone());
+    let library_draft = Rc::new(RefCell::new(original_libraries.as_ref().clone()));
+    let accepted_libraries = Rc::new(Cell::new([false; 3]));
     let active: Rc<dyn Fn() -> bool> = Rc::new({
         let model = model.clone();
         let closed = closed.clone();
@@ -112,6 +296,15 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             !closed.get() && model.borrow().account_epoch == epoch && !model.borrow().logout_pending
         }
     });
+    let mut library_steps = Vec::new();
+    for (index, kind) in crate::config::LibraryKind::ALL.into_iter().enumerate() {
+        let page = adw::PreferencesPage::new();
+        let controls = setup_library(kind, &library_draft, &w.window, active.clone());
+        page.add(&controls.group);
+        pages.add_named(&page, Some(&(index + 1).to_string()));
+        library_steps.push(controls);
+    }
+    let library_steps = Rc::new(library_steps);
     let acquisition_busy = Rc::new(Cell::new(false));
     let proton::ProtonSelection {
         group: selection,
@@ -159,61 +352,14 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
     status.set_selectable(true);
     status.set_margin_start(18);
     status.set_margin_end(18);
-    for (entry, title, name) in [
-        (&games, "Choose game folder", "setup-choose-games"),
-        (
-            &downloads,
-            "Choose download folder",
-            "setup-choose-downloads",
-        ),
-    ] {
-        let choose = gtk::Button::with_label("Choose…");
-        choose.set_widget_name(name);
-        choose.set_tooltip_text(Some(title));
-        choose.set_valign(gtk::Align::Center);
-        entry.add_suffix(&choose);
-        let entry = entry.clone();
-        let window = w.window.clone();
-        let model = model.clone();
-        let closed = closed.clone();
-        let status = status.clone();
-        choose.connect_clicked(move |button| {
-            let epoch = model.borrow().account_epoch;
-            let chooser = gtk::FileDialog::builder().title(title).build();
-            if std::path::Path::new(entry.text().as_str()).is_absolute() {
-                chooser.set_initial_folder(Some(&gio::File::for_path(entry.text().as_str())));
-            }
-            button.set_sensitive(false);
-            let button = button.clone();
-            let entry = entry.clone();
-            let closed = closed.clone();
-            let model = model.clone();
-            let status = status.clone();
-            chooser.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
-                button.set_sensitive(true);
-                if closed.get()
-                    || model.borrow().account_epoch != epoch
-                    || model.borrow().logout_pending
-                {
-                    return;
-                }
-                match result {
-                    Ok(folder) => match folder.path() {
-                        Some(path) => entry.set_text(&path.to_string_lossy()),
-                        None => status.set_label("Choose a local folder."),
-                    },
-                    Err(error)
-                        if error.matches(gtk::DialogError::Dismissed)
-                            || error.matches(gtk::DialogError::Cancelled) => {}
-                    Err(_) => status.set_label(
-                        "The folder picker could not open. Try again or enter an absolute path.",
-                    ),
-                }
-            });
-        });
-    }
     root.append(&pages);
-    root.append(&status);
+    let status_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .max_content_height(110)
+        .propagate_natural_height(true)
+        .child(&status)
+        .build();
+    root.append(&status_scroll);
     let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     navigation.set_margin_top(12);
     navigation.set_margin_start(18);
@@ -223,6 +369,8 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
     skip.set_widget_name("setup-skip");
     let back = gtk::Button::with_label("Back");
     back.set_widget_name("setup-back");
+    let skip_library = gtk::Button::with_label("Skip this step");
+    skip_library.set_widget_name("setup-skip-library");
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     let finish = gtk::Button::with_label("Save settings and continue");
@@ -231,6 +379,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
     navigation.append(&skip);
     navigation.append(&spacer);
     navigation.append(&back);
+    navigation.append(&skip_library);
     navigation.append(&finish);
     root.append(&navigation);
     dialog.set_child(Some(&root));
@@ -240,6 +389,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         let position = position.clone();
         let finish = finish.clone();
         let back = back.clone();
+        let skip_library = skip_library.clone();
         let status = status.clone();
         move || {
             pages.set_visible_child_name(&step.get().to_string());
@@ -250,6 +400,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                 STEPS[step.get()]
             ));
             back.set_visible(step.get() > 0);
+            skip_library.set_visible(matches!(step.get(), 2 | 3));
             finish.set_label(if step.get() == 0 {
                 "Let's get started"
             } else if step.get() == STEPS.len() - 1 {
@@ -267,7 +418,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         Rc::new({
             let active = active.clone();
             let step = step.clone();
-            move || active() && step.get() == 4
+            move || active() && step.get() == 5
         }),
     );
     let components_busy: Rc<dyn Fn() -> bool> = Rc::new({
@@ -276,17 +427,55 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         let step = step.clone();
         let checking = checking_runtime.clone();
         let selection_busy = selection_busy.clone();
+        let library_steps = library_steps.clone();
         move || {
             proton_busy.get()
                 || runtime_busy.get()
                 || checking.get()
-                || (step.get() == 3 && selection_busy.get())
+                || (step.get() == 4 && selection_busy.get())
+                || library_steps.iter().any(|controls| controls.picking.get())
         }
     });
     skip.connect_clicked({
         let dialog = dialog.clone();
         move |_| {
             dialog.close();
+        }
+    });
+    skip_library.connect_clicked({
+        let original = original_libraries.clone();
+        let draft = library_draft.clone();
+        let accepted = accepted_libraries.clone();
+        let library_steps = library_steps.clone();
+        let step = step.clone();
+        let busy = busy.clone();
+        let active = active.clone();
+        let components_busy = components_busy.clone();
+        let render = render.clone();
+        move |_| {
+            if !active() || busy.get() || components_busy() || !matches!(step.get(), 2 | 3) {
+                return;
+            }
+            let index = step.get() - 1;
+            let kind = crate::config::LibraryKind::ALL[index];
+            // Empty optional input is the same non-destructive choice as this button.
+            prepare_setup_library(
+                &original,
+                &mut draft.borrow_mut(),
+                kind,
+                std::path::Path::new(""),
+            )
+            .expect("only optional library steps can be skipped");
+            library_steps[index].update.set_active(if index == 1 {
+                original.auto_download_offline_installers
+            } else {
+                original.auto_download_extras
+            });
+            let mut choices = accepted.get();
+            choices[index] = false;
+            accepted.set(choices);
+            step.set(step.get() + 1);
+            render();
         }
     });
     back.connect_clicked({
@@ -311,6 +500,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         let finish = finish.clone();
         let back = back.clone();
         let skip = skip.clone();
+        let skip_library = skip_library.clone();
         let step = step.clone();
         let proton_group = proton_download.group.clone();
         let runtime_busy = runtime_download.busy.clone();
@@ -327,8 +517,8 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             selection.set_sensitive(!proton_busy.get());
             proton_group.set_sensitive(!selection_busy.get());
             proton_group.set_visible(proton_busy.get() || detected.get() == Some(false));
-            if step.get() == 4
-                && (last_step != 4
+            if step.get() == 5
+                && (last_step != 5
                     || (was_downloading && !runtime_busy.get() && runtime_succeeded.get()))
             {
                 check_runtime();
@@ -343,6 +533,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             let enabled = !busy.get() && !components_busy();
             finish.set_sensitive(enabled);
             back.set_sensitive(enabled);
+            skip_library.set_sensitive(enabled);
             skip.set_sensitive(!busy.get());
             glib::ControlFlow::Continue
         }
@@ -366,7 +557,11 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             }
             if step.get() < STEPS.len() - 1 {
                 let current = step.get();
-                let path = std::path::PathBuf::from(if current == 1 { games.text() } else { downloads.text() }.as_str());
+                let mut draft = library_draft.borrow().clone();
+                let original = original_libraries.as_ref().clone();
+                let path = (current <= 3).then(|| {
+                    std::path::PathBuf::from(library_steps[current - 1].entry.text().as_str())
+                });
                 let proton_path = selected_path();
                 busy.set(true);
                 pages.set_sensitive(false);
@@ -374,8 +569,14 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                 status.set_label("Checking your choice…");
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || {
-                    let result = if current < 3 {
-                        validate_folder(&path)
+                    let result = if let Some(path) = path {
+                        prepare_setup_library(
+                            &original,
+                            &mut draft,
+                            crate::config::LibraryKind::ALL[current - 1],
+                            &path,
+                        )
+                        .map(|accepted| Some((draft, accepted)))
                     } else {
                         (|| -> anyhow::Result<()> {
                             if let Some(path) = proton_path? {
@@ -385,41 +586,84 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                                     .or(preferences.default.as_ref());
                                 if saved != Some(&path) {
                                     match product_id {
-                                        Some(id) => crate::compatibility::set_game_proton(id, Some(&path))?,
+                                        Some(id) => {
+                                            crate::compatibility::set_game_proton(id, Some(&path))?
+                                        }
                                         None => crate::compatibility::set_default_proton(&path)?,
                                     }
                                 }
                             }
                             proton::saved_proton(product_id).map(|_| ())
                         })()
+                        .map(|()| None)
                     };
                     let _ = sender.send(result);
                 });
-                let active = active.clone(); let busy = busy.clone(); let pages = pages.clone();
-                let status = status.clone(); let step = step.clone(); let render = render.clone();
+                let active = active.clone();
+                let busy = busy.clone();
+                let pages = pages.clone();
+                let status = status.clone();
+                let step = step.clone();
+                let render = render.clone();
+                let library_draft = library_draft.clone();
+                let accepted_libraries = accepted_libraries.clone();
+                let library_steps = library_steps.clone();
                 glib::timeout_add_local(Duration::from_millis(50), move || {
-                    if !active() { return glib::ControlFlow::Break; }
+                    if !active() {
+                        return glib::ControlFlow::Break;
+                    }
                     match receiver.try_recv() {
                         Ok(result) => {
-                            busy.set(false); pages.set_sensitive(true);
+                            busy.set(false);
+                            pages.set_sensitive(true);
                             match result {
-                                Ok(()) => { step.set(current + 1); render(); }
-                                Err(error) => status.set_label(&format!("Please check this step: {error}")),
+                                Ok(library) => {
+                                    if let Some((draft, accepted)) = library {
+                                        let mut choices = accepted_libraries.get();
+                                        choices[current - 1] = accepted;
+                                        accepted_libraries.set(choices);
+                                        library_steps[current - 1].update.set_active(
+                                            match current {
+                                                1 => draft.auto_update_galaxy_installations,
+                                                2 => draft.auto_download_offline_installers,
+                                                _ => draft.auto_download_extras,
+                                            },
+                                        );
+                                        *library_draft.borrow_mut() = draft;
+                                    }
+                                    step.set(current + 1);
+                                    render();
+                                }
+                                Err(error) => {
+                                    status.set_label(&format!("Please check this step: {error}"))
+                                }
                             }
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                         Err(_) => {
-                            busy.set(false); pages.set_sensitive(true);
-                            status.set_label("The check stopped. Your choices are still here; try again.");
+                            busy.set(false);
+                            pages.set_sensitive(true);
+                            status.set_label(
+                                "The check stopped. Your choices are still here; try again.",
+                            );
                             glib::ControlFlow::Break
                         }
                     }
                 });
                 return;
             }
-            let games = std::path::PathBuf::from(games.text().as_str());
-            let downloads = std::path::PathBuf::from(downloads.text().as_str());
+            let mut config = model.borrow().config.clone();
+            for kind in crate::config::LibraryKind::ALL {
+                *config.libraries_mut(kind) = library_draft.borrow().libraries(kind).to_vec();
+            }
+            config.auto_update_galaxy_installations =
+                library_draft.borrow().auto_update_galaxy_installations;
+            config.auto_download_offline_installers =
+                library_draft.borrow().auto_download_offline_installers;
+            config.auto_download_extras = library_draft.borrow().auto_download_extras;
+            let session = online::account_session();
+            let accepted = accepted_libraries.get();
             button.set_sensitive(false);
             busy.set(true);
             pages.set_sensitive(false);
@@ -427,15 +671,29 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             status.set_label("Saving setup…");
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = (|| -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
-                    validate_folder(&games)?;
-                    validate_folder(&downloads)?;
-                    crate::compatibility::preflight_windows(product_id).map_err(|error| {
-                        anyhow::anyhow!(proton::compatibility_message(&error))
+                let result = (|| -> anyhow::Result<Config> {
+                    let _activity = crate::profile_reset::begin_activity("saving setup libraries")?;
+                    let _permit = crate::operation_gate::try_acquire().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Finish or pause downloads and installations before changing libraries."
+                        )
                     })?;
-                    std::fs::create_dir_all(&games)?;
-                    std::fs::create_dir_all(&downloads)?;
-                    Ok((games, downloads))
+                    online::with_account_session(session, || {
+                        for (index, kind) in crate::config::LibraryKind::ALL.into_iter().enumerate()
+                        {
+                            if accepted[index] {
+                                validate_setup_library(&config, kind, true)?;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    crate::compatibility::preflight_windows(product_id)
+                        .map_err(|error| anyhow::anyhow!(proton::compatibility_message(&error)))?;
+                    config.setup_seen = true;
+                    config.setup_completed = true;
+                    config.windows_setup_deferred = false;
+                    online::with_account_session(session, || config.save())?;
+                    Ok(config)
                 })();
                 let _ = sender.send(result);
             });
@@ -449,53 +707,25 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             let busy = busy.clone();
             let pages = pages.clone();
             glib::timeout_add_local(Duration::from_millis(50), move || {
-                if closed.get() || model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                if closed.get()
+                    || model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                {
                     dialog.set_can_close(true);
                     dialog.close();
                     return glib::ControlFlow::Break;
                 }
                 match receiver.try_recv() {
-                    Ok(Ok((games, downloads))) => {
-                        let mut config = model.borrow().config.clone();
-                        let id = config
-                            .game_libraries
-                            .iter()
-                            .find(|library| library.path == games)
-                            .map(|library| library.id.clone())
-                            .unwrap_or_else(|| crate::config::game_library_id(&games));
-                        if !config
-                            .game_libraries
-                            .iter()
-                            .any(|library| library.id == id)
-                        {
-                            config
-                                .game_libraries
-                                .push(crate::config::GameLibrary {
-                                    id: id.clone(),
-                                    name: "Games".to_string(),
-                                    path: games,
-                                    default: false,
-                                });
-                        }
-                        config.installer_library_id = Some(id);
-                        config.download_directory = downloads;
-                        config.setup_seen = true;
-                        config.setup_completed = true;
-                        config.windows_setup_deferred = false;
-                        if let Err(error) = config.save() {
-                            status.set_label(&format!("Settings could not be saved: {error}. Your edits are still here; try again."));
-                            button.set_sensitive(true);
-                            busy.set(false);
-                            pages.set_sensitive(true);
-                            dialog.set_can_close(true);
-                            return glib::ControlFlow::Break;
-                        }
+                    Ok(Ok(config)) => {
                         model.borrow_mut().config = config;
                         completed.set(true);
                         w.finish_setup.set_visible(false);
                         dialog.set_can_close(true);
                         dialog.close();
-                        let signed_in = model.borrow().account_token.as_ref().is_some_and(|token| token.expires_at > chrono::Utc::now().timestamp());
+                        let signed_in =
+                            model.borrow().account_token.as_ref().is_some_and(|token| {
+                                token.expires_at > chrono::Utc::now().timestamp()
+                            });
                         if !signed_in {
                             show_gog_login(&w, &model);
                         }
@@ -547,12 +777,30 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         if !config.setup_completed || config.windows_setup_deferred {
             w.finish_setup.set_visible(true);
         }
-        if config.save().is_err() {
-            w.status.set_label(
-                "Setup preferences could not be saved. Open Finish setup and try again.",
-            );
-            w.finish_setup.set_visible(true);
-        }
+        let session = online::account_session();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(online::with_account_session(session, || config.save()));
+        });
+        let model = model.clone();
+        let w = w.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                return glib::ControlFlow::Break;
+            }
+            match receiver.try_recv() {
+                Ok(Ok(())) => {}
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                _ => {
+                    show_status(
+                        &w,
+                        "Setup preferences could not be saved. Open Finish setup and try again.",
+                    );
+                    w.finish_setup.set_visible(true);
+                }
+            }
+            glib::ControlFlow::Break
+        });
     });
     dialog.present(Some(&window));
 }
@@ -633,5 +881,174 @@ mod tests {
         assert!(validate_folder(&file).is_err());
         assert!(validate_folder(&file.join("games")).is_err());
         assert_eq!(std::fs::read(file).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn typed_library_drafts_require_games_but_not_optional_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.game_libraries.clear();
+        assert!(
+            validate_setup_library(&config, crate::config::LibraryKind::GameFiles, false).is_err()
+        );
+        config.game_libraries.push(crate::config::GameLibrary {
+            id: "draft-game".into(),
+            name: "Games".into(),
+            path: root.path().join("new-games"),
+            default: true,
+        });
+        validate_setup_library(&config, crate::config::LibraryKind::GameFiles, false).unwrap();
+        assert!(!config.game_libraries[0].path.exists());
+        assert!(config.offline_libraries.is_empty() && config.extras_libraries.is_empty());
+        config.extras_libraries.push(crate::config::GameLibrary {
+            id: "draft-extra".into(),
+            name: "Extras".into(),
+            path: "relative-extras".into(),
+            default: true,
+        });
+        assert!(
+            validate_setup_library(&config, crate::config::LibraryKind::Extras, false).is_err()
+        );
+        assert!(!config.game_libraries[0].path.exists());
+    }
+
+    #[test]
+    fn library_steps_preserve_unseen_libraries_and_restore_skipped_drafts() {
+        use crate::config::{GameLibrary, LibraryKind};
+        let root = tempfile::tempdir().unwrap();
+        let original = Config {
+            game_libraries: vec![
+                GameLibrary {
+                    id: "extra-game".into(),
+                    name: "Other games".into(),
+                    path: root.path().join("other"),
+                    default: false,
+                },
+                GameLibrary {
+                    id: "selected-game".into(),
+                    name: "Chosen games".into(),
+                    path: root.path().join("games"),
+                    default: true,
+                },
+            ],
+            offline_libraries: vec![
+                GameLibrary {
+                    id: "selected-installer".into(),
+                    name: "Installer default".into(),
+                    path: root.path().join("installers"),
+                    default: true,
+                },
+                GameLibrary {
+                    id: "extra-installer".into(),
+                    name: "Other installers".into(),
+                    path: root.path().join("other-installers"),
+                    default: false,
+                },
+            ],
+            ..Config::default()
+        };
+        let mut draft = original.clone();
+        assert!(
+            prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::GameFiles,
+                &root.path().join("changed-games")
+            )
+            .unwrap()
+        );
+        assert_eq!(draft.game_libraries[0], original.game_libraries[0]);
+        assert_eq!(draft.game_libraries[1].id, "selected-game");
+        assert_eq!(draft.game_libraries[1].name, "Chosen games");
+        assert!(draft.game_libraries[1].default);
+        // Next accepts one optional suggestion. Back and Skip must undo only that draft.
+        assert!(
+            prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::OfflineInstallers,
+                &root.path().join("changed-installers")
+            )
+            .unwrap()
+        );
+        draft.auto_download_offline_installers = true;
+        assert!(
+            !prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::OfflineInstallers,
+                std::path::Path::new("")
+            )
+            .unwrap()
+        );
+        assert_eq!(draft.offline_libraries, original.offline_libraries);
+        assert!(!draft.auto_download_offline_installers);
+        assert_eq!(
+            draft.game_libraries[1].path,
+            root.path().join("changed-games")
+        );
+        // A later explicit Next can accept the retained entry draft without dropping other copies.
+        assert!(
+            prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::OfflineInstallers,
+                &root.path().join("changed-installers")
+            )
+            .unwrap()
+        );
+        assert_eq!(draft.offline_libraries[1], original.offline_libraries[1]);
+        assert_eq!(draft.offline_libraries[0].id, "selected-installer");
+        assert!(
+            !prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::Extras,
+                std::path::Path::new("")
+            )
+            .unwrap()
+        );
+        assert!(draft.extras_libraries.is_empty());
+        assert!(
+            prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::GameFiles,
+                std::path::Path::new("")
+            )
+            .is_err()
+        );
+        assert!(!root.path().join("changed-games").exists());
+        assert!(!root.path().join("changed-installers").exists());
+    }
+
+    #[test]
+    fn missing_library_paths_reject_cross_type_overlap_before_creation() {
+        use crate::config::LibraryKind;
+        let root = tempfile::tempdir().unwrap();
+        let mut original = Config::default();
+        original.game_libraries[0].path = root.path().join("games");
+        for path in [
+            root.path().join("games"),
+            root.path().join("games/extras"),
+            root.path().to_owned(),
+        ] {
+            let mut draft = original.clone();
+            assert!(
+                prepare_setup_library(&original, &mut draft, LibraryKind::Extras, &path).is_err()
+            );
+        }
+        assert!(!original.game_libraries[0].path.exists());
+        let mut draft = original.clone();
+        assert!(
+            prepare_setup_library(
+                &original,
+                &mut draft,
+                LibraryKind::Extras,
+                &root.path().join("extras")
+            )
+            .unwrap()
+        );
+        assert!(!root.path().join("extras").exists());
     }
 }

@@ -1021,6 +1021,393 @@ pub(super) fn with_windows_components(
     pending
 }
 
+pub(super) fn offer_prefix_recovery(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    game: crate::domain::InstalledGame,
+    title: &str,
+    message: &str,
+    setup_required: bool,
+    launch_generation: u64,
+) {
+    let Some(status) = find_named_descendant(window.upcast_ref(), "application-status-message")
+        .and_downcast::<gtk::Label>()
+    else {
+        return;
+    };
+    let Some(parent) = status.parent().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    if let Some(old) = find_named_descendant(parent.upcast_ref(), "prefix-recovery-offer") {
+        parent.remove(&old);
+    }
+    status.set_label(&format!("{title}: {message}"));
+    let label = format!(
+        "{}: {title}",
+        if setup_required {
+            "Continue Windows setup"
+        } else {
+            "Repair Windows setup"
+        }
+    );
+    let button = gtk::Button::with_label(&label);
+    button.set_widget_name("prefix-recovery-offer");
+    button.set_tooltip_text(Some(&label));
+    if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+        label.set_max_width_chars(28);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    }
+    let epoch = model.borrow().account_epoch;
+    let session = online::account_session();
+    let auth_session = auth::session();
+    let current: Rc<dyn Fn() -> bool> = Rc::new({
+        let model = model.clone();
+        let game = game.clone();
+        move || {
+            let state = model.borrow();
+            state.account_epoch == epoch
+                && !state.logout_pending
+                && online::account_session() == session
+                && auth::session() == auth_session
+                && state
+                    .installed_games
+                    .get(&game.product_id)
+                    .is_some_and(|installed| {
+                        installed.library_id == game.library_id
+                            && installed.installation_directory == game.installation_directory
+                    })
+        }
+    });
+    button.connect_clicked({
+        let window = window.downgrade();
+        let model = model.clone();
+        let title = title.to_owned();
+        let message = message.to_owned();
+        let current = current.clone();
+        move |button| {
+            if !current() {
+                button.set_sensitive(false);
+                return;
+            }
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            button.set_sensitive(false);
+            show_prefix_recovery(
+                &window,
+                &model,
+                &game,
+                &title,
+                &message,
+                button,
+                current.clone(),
+            );
+        }
+    });
+    parent.append(&button);
+    if model.borrow().detail_generation == launch_generation
+        && window.is_visible()
+        && window.is_active()
+    {
+        button.emit_clicked();
+    }
+    let button = button.downgrade();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        let Some(button) = button.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if !current() {
+            if let Some(parent) = button.parent().and_downcast::<gtk::Box>() {
+                parent.remove(&button);
+            }
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn show_prefix_recovery(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    game: &crate::domain::InstalledGame,
+    title: &str,
+    diagnostic: &str,
+    offer_button: &gtk::Button,
+    current: Rc<dyn Fn() -> bool>,
+) {
+    let dialog = adw::Dialog::builder()
+        .title(format!("Repair Windows setup — {title}"))
+        .content_width(560)
+        .build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.append(&adw::HeaderBar::new());
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_start(20);
+    body.set_margin_end(20);
+    body.set_margin_bottom(20);
+    let explanation = gtk::Label::new(Some(
+        "This game needs its Windows setup repaired. Ludomere will keep your installed game files, back up the old setup, and create a fresh environment.\n\nThe backup keeps your saves and settings, but you may need to restore them manually.",
+    ));
+    explanation.set_wrap(true);
+    explanation.set_xalign(0.0);
+    body.append(&explanation);
+    let paths = gtk::Label::new(None);
+    paths.set_wrap(true);
+    paths.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    paths.set_selectable(true);
+    paths.set_xalign(0.0);
+    let diagnostic = gtk::Label::builder()
+        .label(diagnostic)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .build();
+    let details = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    details.append(&paths);
+    details.append(&diagnostic);
+    let expander = gtk::Expander::builder()
+        .label("Details")
+        .child(&details)
+        .build();
+    body.append(&expander);
+    let status = gtk::Label::new(Some("Checking Windows setup…"));
+    status.set_wrap(true);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    status.set_xalign(0.0);
+    body.append(&status);
+    let progress = gtk::ProgressBar::new();
+    body.append(&progress);
+    let busy = Rc::new(std::cell::Cell::new(true));
+    let backup = Rc::new(RefCell::new(None::<PathBuf>));
+    let open_backup = gtk::Button::with_label("Open backup folder");
+    open_backup.set_visible(false);
+    open_backup.connect_clicked({
+        let backup = backup.clone();
+        let window = window.downgrade();
+        let current = current.clone();
+        move |_| {
+            if current()
+                && let (Some(path), Some(window)) = (backup.borrow().clone(), window.upgrade())
+            {
+                widgets::file_open::open_directory(&path, &window, "prefix backup");
+            }
+        }
+    });
+    body.append(&open_backup);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let cancel = gtk::Button::with_label("Cancel");
+    let confirm = gtk::Button::with_label("Repair Windows setup");
+    confirm.set_sensitive(false);
+    confirm.add_css_class("suggested-action");
+    actions.append(&cancel);
+    actions.append(&confirm);
+    actions.set_margin_start(20);
+    actions.set_margin_end(20);
+    actions.set_margin_bottom(20);
+    root.append(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(560)
+            .child(&body)
+            .build(),
+    );
+    root.append(&actions);
+    dialog.set_child(Some(&root));
+    let closed = Rc::new(std::cell::Cell::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    dialog.connect_closed({
+        let closed = closed.clone();
+        let cancelled = cancelled.clone();
+        let offer_button = offer_button.downgrade();
+        let current = current.clone();
+        move |_| {
+            closed.set(true);
+            cancelled.store(true, Ordering::Release);
+            if let Some(button) = offer_button.upgrade() {
+                button.set_sensitive(current());
+            }
+        }
+    });
+    {
+        let dialog = dialog.downgrade();
+        let current = current.clone();
+        let cancelled = cancelled.clone();
+        let closed = closed.clone();
+        let progress = progress.downgrade();
+        let busy = busy.clone();
+        glib::timeout_add_local(Duration::from_millis(250), move || {
+            if closed.get() {
+                return glib::ControlFlow::Break;
+            }
+            let Some(dialog) = dialog.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !current() {
+                cancelled.store(true, Ordering::Release);
+                dialog.close();
+                return glib::ControlFlow::Break;
+            }
+            if let Some(progress) = progress.upgrade() {
+                progress.set_visible(busy.get());
+                if busy.get() {
+                    progress.pulse();
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    let plan = Rc::new(RefCell::new(None::<crate::installation::PrefixRebuildPlan>));
+    let setup_required = Rc::new(std::cell::Cell::new(false));
+    confirm.connect_clicked({
+        let plan = plan.clone();
+        let setup_required = setup_required.clone();
+        let current = current.clone();
+        let closed = closed.clone();
+        let cancelled = cancelled.clone();
+        let dialog = dialog.downgrade();
+        let window = window.downgrade();
+        let model = model.clone();
+        let id = game.product_id;
+        let title = title.to_owned();
+        let offer_button = offer_button.downgrade();
+        let status = status.downgrade();
+        let busy = busy.clone();
+        let diagnostic = diagnostic.downgrade();
+        let expander = expander.downgrade();
+        let paths = paths.downgrade();
+        let open_backup = open_backup.downgrade();
+        let backup = backup.clone();
+        let cancel = cancel.downgrade();
+        move |button| {
+            if !current() || closed.get() { return; }
+            let (Some(dialog), Some(window), Some(status)) = (dialog.upgrade(), window.upgrade(), status.upgrade()) else { return; };
+            if setup_required.get() {
+                let detail = current_detail(&model.borrow(), id, None);
+                if let Some(detail) = detail {
+                    dialog.close();
+                    if let Some(button) = offer_button.upgrade() && let Some(parent) = button.parent().and_downcast::<gtk::Box>() { parent.remove(&button); }
+                    show_repair_dialog(&window, &model, &detail);
+                } else { status.set_label("Game details changed. Close and launch the game again to review recovery."); }
+                return;
+            }
+            let Some(plan) = plan.borrow_mut().take() else { return; };
+            button.set_sensitive(false);
+            if let Some(cancel) = cancel.upgrade() { cancel.set_label("Stop repair"); }
+            busy.set(true);
+            status.set_label("Preparing a fresh Windows environment… Closing this dialog stops repair; the backup remains safe.");
+            let (sender, receiver) = mpsc::channel();
+            let (progress, updates) = mpsc::sync_channel(16);
+            let worker_cancelled = cancelled.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(crate::installation::rebuild_prefix(plan, &worker_cancelled, |message| { let _ = progress.try_send(message.to_owned()); }));
+            });
+            let closed = closed.clone();
+            let current = current.clone();
+            let cancelled = cancelled.clone();
+            let button = button.downgrade();
+            let paths = paths.clone();
+            let open_backup = open_backup.clone();
+            let backup = backup.clone();
+            let setup_required = setup_required.clone();
+            let offer_button = offer_button.clone();
+            let title = title.clone();
+            let cancel = cancel.clone();
+            let busy = busy.clone();
+            let diagnostic = diagnostic.clone();
+            let expander = expander.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if closed.get() || !current() { cancelled.store(true, Ordering::Release); return glib::ControlFlow::Break; }
+                if let Some(message) = updates.try_iter().last() { status.set_label(&message); }
+                let result = match receiver.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    result => result,
+                };
+                busy.set(false);
+                if let Some(cancel) = cancel.upgrade() { cancel.set_label("Close"); }
+                match result {
+                    Ok(Ok(result)) => {
+                        backup.replace(result.backup.clone());
+                        if let Some(paths) = paths.upgrade() { paths.set_label(&format!("New prefix: {}\nRetained backup: {}", result.prefix.display(), result.backup.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "No previous prefix existed".into()))); }
+                        if let Some(open) = open_backup.upgrade() { open.set_visible(result.backup.is_some()); }
+                        status.set_label("The Windows environment is ready for required components. Continue setup to finish repairing the game. Nothing has been launched.");
+                        setup_required.set(true);
+                        if let Some(button) = button.upgrade() { button.set_label("Continue setup"); button.set_sensitive(true); }
+                        if let Some(button) = offer_button.upgrade() { let label = format!("Continue Windows setup: {title}"); button.set_label(&label); button.set_tooltip_text(Some(&label)); }
+                        if let Some(notification) = find_named_descendant(window.upcast_ref(), "application-status-message").and_downcast::<gtk::Label>() { notification.set_label(&format!("{title}: Prefix rebuilt; game setup still required. Retained backup: {}", result.backup.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (prefix was missing)".into()))); }
+                    }
+                    Ok(Err(error)) => {
+                        status.set_label("Repair did not finish. Review the saved state below before retrying.");
+                        if let Some(diagnostic) = diagnostic.upgrade() { diagnostic.set_label(&format!("{error:#}")); }
+                        if let Some(expander)=expander.upgrade() { expander.set_expanded(true); }
+                    },
+                    Err(_) => status.set_label("The recovery worker stopped. Close and reopen recovery to inspect its saved state before retrying."),
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    let (sender, receiver) = mpsc::channel();
+    let game = game.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(crate::installation::prepare_prefix_rebuild(&game));
+    });
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if closed.get() || !current() {
+            cancelled.store(true, Ordering::Release);
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Ok(Ok(preview)) => {
+                paths.set_label(&format!(
+                    "Managed prefix: {}\nBackup location: {}",
+                    preview.prefix.display(),
+                    preview
+                        .backup
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "No previous prefix exists".into())
+                ));
+                backup.replace(preview.backup.clone());
+                setup_required.set(preview.setup_required);
+                open_backup.set_visible(preview.setup_required && preview.backup.is_some());
+                if preview.setup_required {
+                    cancel.set_label("Close");
+                    confirm.set_label("Continue setup");
+                    status.set_label("The Windows environment has been rebuilt. Continue setup to install the required components and finish repair.");
+                } else {
+                    status.set_label(
+                        "Ready to repair. Required components will be installed in the next step.",
+                    );
+                }
+                plan.replace(Some(preview));
+                confirm.set_sensitive(true);
+            }
+            Ok(Err(error)) => {
+                status.set_label(
+                    "Windows setup cannot be repaired safely. The reason is shown below.",
+                );
+                diagnostic.set_label(&format!("{error:#}"));
+                expander.set_expanded(true);
+            }
+            Err(_) => status.set_label("The recovery preview stopped. Close and try again."),
+        }
+        busy.set(false);
+        glib::ControlFlow::Break
+    });
+    dialog.present(Some(window));
+}
+
 pub(super) fn launch_with_components(
     window: &adw::ApplicationWindow,
     game: crate::domain::InstalledGame,

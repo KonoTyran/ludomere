@@ -34,9 +34,20 @@ pub(super) fn intent(
     requests: &[DownloadRequest],
     choice: &AutoInstallRequest,
 ) -> Result<Option<DownloadInstallIntent>> {
+    let job_ids = requests
+        .iter()
+        .map(|request| {
+            super::job_id_in(
+                store,
+                &request.artifacts.iter().collect::<Vec<_>>(),
+                &request.destination,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     let groups = requests
         .iter()
-        .filter_map(|request| {
+        .zip(&job_ids)
+        .filter_map(|(request, job_id)| {
             let first = request.artifacts.first()?;
             if first.kind != ArtifactKind::Installer
                 || !request.artifacts.iter().all(|artifact| {
@@ -51,7 +62,7 @@ pub(super) fn intent(
                 return None;
             }
             Some(SelectedInstaller {
-                job_id: super::job_id(&request.artifacts.iter().collect::<Vec<_>>()),
+                job_id: job_id.clone(),
                 product_id: first.product_id,
                 title: request.title.clone(),
                 operating_system: os,
@@ -104,11 +115,20 @@ pub(super) fn intent(
             && !matches!(choice.slug.as_str(), "." | ".."),
         "Invalid installation directory name"
     );
-    let library = choice
-        .config
-        .installer_library()
-        .context("Choose a default game library before installing automatically")?
-        .clone();
+    let config = crate::storage::read_config()?;
+    let library = crate::storage::validate_library(
+        &config,
+        crate::config::LibraryKind::GameFiles,
+        &choice.library_id,
+    )?;
+    ensure!(
+        choice
+            .config
+            .game_libraries
+            .iter()
+            .any(|selected| selected.id == library.id && selected.path == library.path),
+        "The chosen Game Files library changed; review the download and installation choices again."
+    );
     ensure!(
         library.path.is_absolute(),
         "The default game library must be an absolute path"
@@ -136,7 +156,7 @@ pub(super) fn intent(
         slug: choice.slug.clone(),
         title: choice.title.clone(),
         library,
-        libraries: choice.config.game_libraries.clone(),
+        libraries: config.game_libraries.clone(),
         base: (*base).clone(),
         dlcs,
         interactive_prompts: choice.config.interactive_installer_prompts,
@@ -148,7 +168,12 @@ pub(super) fn intent(
         let request = requests
             .iter()
             .find(|request| {
-                super::job_id(&request.artifacts.iter().collect::<Vec<_>>()) == selected.job_id
+                super::job_id_in(
+                    store,
+                    &request.artifacts.iter().collect::<Vec<_>>(),
+                    &request.destination,
+                )
+                .is_ok_and(|id| id == selected.job_id)
             })
             .unwrap();
         ensure!(
@@ -220,6 +245,16 @@ fn prepare(
     store: &StateStore,
     plan: &InstallPlan,
 ) -> Result<Option<(InstalledGame, Vec<crate::installation::AdditionalInstaller>)>> {
+    let config = crate::storage::read_config()?;
+    let library = crate::storage::validate_library(
+        &config,
+        crate::config::LibraryKind::GameFiles,
+        &plan.library.id,
+    )?;
+    ensure!(
+        library.path == plan.library.path,
+        "The installation library changed; select Install again."
+    );
     let Some(base) = completed_job(store, &plan.base)? else {
         return Ok(None);
     };
@@ -237,7 +272,20 @@ fn prepare(
         });
     }
     let directory = plan.library.path.join(&plan.slug);
-    ensure_target_available(store, plan, &directory)?;
+    crate::installation::validate_offline_sources(
+        &config,
+        &base
+            .completed_files
+            .iter()
+            .cloned()
+            .chain(
+                additional
+                    .iter()
+                    .flat_map(|installer| installer.files.clone()),
+            )
+            .collect::<Vec<_>>(),
+    )?;
+    ensure_target_available(store, plan, &directory, &config)?;
     ensure!(
         !plan.interactive_prompts,
         "Automatic installation cannot display installer prompts. Disable interactive installer prompts or install this game manually"
@@ -292,8 +340,14 @@ fn ensure_target_available(
     store: &StateStore,
     plan: &InstallPlan,
     directory: &std::path::Path,
+    config: &crate::config::Config,
 ) -> Result<()> {
-    for library in &plan.libraries {
+    for library in &config.game_libraries {
+        crate::storage::validate_library(
+            config,
+            crate::config::LibraryKind::GameFiles,
+            &library.id,
+        )?;
         let entries = match std::fs::read_dir(&library.path) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -433,9 +487,11 @@ pub(super) fn clear_for_requests(store: &StateStore, requests: &[DownloadRequest
             store.clear_download_install_intent(artifact.product_id)?;
         }
         if !request.artifacts.is_empty() {
-            store.clear_download_install_intent_for_job(&super::job_id(
+            store.clear_download_install_intent_for_job(&super::job_id_in(
+                store,
                 &request.artifacts.iter().collect::<Vec<_>>(),
-            ))?;
+                &request.destination,
+            )?)?;
         }
     }
     Ok(())
@@ -475,8 +531,34 @@ mod tests {
     };
     use std::{cell::Cell, path::Path, sync::mpsc};
 
+    fn isolated(name: &str) -> bool {
+        if std::env::var("LUDOMERE_AUTO_INSTALL_TEST").as_deref() == Ok(name) {
+            return true;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &format!("download::auto_install::tests::{name}")])
+            .env("LUDOMERE_AUTO_INSTALL_TEST", name);
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            let path = root.path().join(key);
+            std::fs::create_dir(&path).unwrap();
+            command.env(key, path);
+        }
+        assert!(command.status().unwrap().success());
+        false
+    }
+
     fn request(root: &Path, id: i64, os: &str) -> DownloadRequest {
         DownloadRequest {
+            library_id: "offline".into(),
             artifacts: vec![RemoteArtifact {
                 product_id: id,
                 kind: ArtifactKind::Installer,
@@ -496,7 +578,11 @@ mod tests {
             }],
             title: format!("Game {id}"),
             access_token: String::new(),
-            destination: root.join("game/installer").join(os).join(id.to_string()),
+            destination: root
+                .with_file_name("offline")
+                .join("game/installer")
+                .join(os)
+                .join(id.to_string()),
             events: mpsc::channel().0,
         }
     }
@@ -508,12 +594,19 @@ mod tests {
             path: root.into(),
             default: true,
         };
-        AutoInstallRequest {
+        let choice = AutoInstallRequest {
+            library_id: "test".into(),
             product_id: 7,
             slug: "game".into(),
             title: "Game".into(),
             config: crate::config::Config {
                 game_libraries: vec![library],
+                offline_libraries: vec![GameLibrary {
+                    id: "offline".into(),
+                    name: "Offline".into(),
+                    path: root.with_file_name("offline"),
+                    default: true,
+                }],
                 installer_library_id: Some("test".into()),
                 installation_source_order: vec![
                     PreferredInstallationSource::LinuxOffline,
@@ -521,7 +614,15 @@ mod tests {
                 ],
                 ..Default::default()
             },
+        };
+        for kind in crate::config::LibraryKind::ALL {
+            for library in choice.config.libraries(kind) {
+                std::fs::create_dir_all(&library.path).unwrap();
+            }
         }
+        std::fs::create_dir_all(crate::config::Config::path().parent().unwrap()).unwrap();
+        choice.config.save().unwrap();
+        choice
     }
 
     fn save_job(store: &StateStore, request: &DownloadRequest, complete: bool) {
@@ -538,7 +639,12 @@ mod tests {
             .collect::<Vec<_>>();
         store
             .save_download_job(&DownloadJobUpdate {
-                job_id: &super::super::job_id(&request.artifacts.iter().collect::<Vec<_>>()),
+                job_id: &super::super::job_id_in(
+                    store,
+                    &request.artifacts.iter().collect::<Vec<_>>(),
+                    &request.destination,
+                )
+                .unwrap(),
                 product_id: request.artifacts[0].product_id,
                 title: &request.title,
                 artifacts: &request.artifacts,
@@ -558,6 +664,9 @@ mod tests {
 
     #[test]
     fn selection_uses_defaults_and_requires_complete_matching_base_and_dlc() {
+        if !isolated("selection_uses_defaults_and_requires_complete_matching_base_and_dlc") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
         let choice = choice(&root.path().join("library"));
@@ -608,6 +717,9 @@ mod tests {
 
     #[test]
     fn completion_waits_for_all_parts_and_dlc_then_dispatches_once_across_reopen() {
+        if !isolated("completion_waits_for_all_parts_and_dlc_then_dispatches_once_across_reopen") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("state.db");
         let store = StateStore::open_at(&database).unwrap();
@@ -671,6 +783,11 @@ mod tests {
 
     #[test]
     fn blocked_prerequisite_retries_explicitly_and_unchecked_or_removed_clears_consent() {
+        if !isolated(
+            "blocked_prerequisite_retries_explicitly_and_unchecked_or_removed_clears_consent",
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
         let choice = choice(&root.path().join("library"));
@@ -720,6 +837,9 @@ mod tests {
 
     #[test]
     fn existing_payload_elsewhere_and_untracked_target_files_are_preserved() {
+        if !isolated("existing_payload_elsewhere_and_untracked_target_files_are_preserved") {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
         let mut choice = choice(&root.path().join("library"));
@@ -729,10 +849,12 @@ mod tests {
         let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
         let (mut game, _) = prepare(&store, &plan).unwrap().unwrap();
         let sentinel = plan.library.path.join("game/keep.dat");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
         std::fs::write(&sentinel, b"preserve").unwrap();
         assert!(prepare(&store, &plan).is_err());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
-        std::fs::remove_file(sentinel).unwrap();
+        std::fs::remove_file(&sentinel).unwrap();
+        std::fs::remove_dir(sentinel.parent().unwrap()).unwrap();
         let other = root.path().join("other");
         let target = other.join("renamed-game");
         std::fs::create_dir_all(&target).unwrap();
@@ -755,6 +877,7 @@ mod tests {
             path: other,
             default: false,
         });
+        choice.config.save().unwrap();
         let record = intent(&store, &requests, &choice).unwrap().unwrap();
         let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
         assert!(prepare(&store, &plan).is_err());

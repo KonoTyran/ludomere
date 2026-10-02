@@ -31,6 +31,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | 4ed3ee3 | P269 | Batch catalog evidence used to classify stored files without changing validation. |
 | b2a7c99 | P264 | Load Compatibility preferences asynchronously with error details and Retry. |
 | 1511b83 | P270 | Guard hidden-game and tag saves across sign-out/reset and report save failures. |
+| 95b2f0f | P272 | Keep verification results inline, distinguish unavailable checksums and reject stale repairs. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -61,6 +62,11 @@ hidden/tag writes are source-ready under independent review and coordinated priv
   Existing repair choices retained. `/tmp/ludomere-p272-report.md` and
   `/tmp/ludomere-p275-verification-review.md`. Wave6c shipping compile/all-target Clippy PASS after
   a style-only collapsible-if correction. Committing set17; no real verification/repair executed.
+  Commit95b2f0f exact post-commit build PASS.
+- P274 owner and independent offline private GTK1 each PASS: cache error/Retry/empty/cached/reset
+  reservation/account-change behavior. Worker activity and original-session guard, sanitized useful
+  diagnostics and truthful offline cache status preserved. Review
+  `/tmp/ludomere-p274-independent-review.md`; committing set18.
 
 ## Completed sets
 

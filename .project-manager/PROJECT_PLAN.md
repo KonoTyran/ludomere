@@ -20,6 +20,10 @@
   dot/dotdot, separators, controls and non-single-normal components; retain accepted original name.
   Invalid explicit XML must not fall back to a safe name. Pure valid Unicode/space/multipart and
   traversal/absolute/control rejection tables; existing protocol fallback normalization unchanged.
+- Root review also confirms malformed MD5 currently counts as a corrupt payload and can trigger
+  repair deletion. Same bounded parser set must reject non-32-hex MD5 before exposing authoritative
+  checksum metadata; accept upper/lowercase valid hashes, preserve original value. No hashing or
+  deletion test required; parser fixtures use valid hashes when testing names.
 
 ## P275 R94 installation status-log efficiency audit
 

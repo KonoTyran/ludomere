@@ -34,6 +34,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | 95b2f0f | P272 | Keep verification results inline, distinguish unavailable checksums and reject stale repairs. |
 | a5752fb | P274 | Report achievement cache failures accurately and guard loading sessions. |
 | 7a305df | P275 | Read installation-status logs incrementally with bounded memory. |
+| e431fae | P276 | Reject unsafe authoritative checksum filenames and malformed MD5 values. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -85,6 +86,16 @@ hidden/tag writes are source-ready under independent review and coordinated priv
   repair decisions; valid Unicode/spacing/multipart names and upper/lower hashes preserved exactly.
   Owner and independent parser3 each PASS, source/security review PASS
   `/tmp/ludomere-p278-checksum-review.md`. No network or deletion tests. Committing set20.
+  Commite431fae exact post-commit build PASS.
+- P277 removes migration-dialog Close/Continue reference cycles and guards initial inspection
+  with original account/profile activity. Owner and independent extended private GTK1 each PASS,
+  including weak destruction and stale/reset rejection before database creation. Review
+  `/tmp/ludomere-p276-migration-review.md`; committing set21.
+- P273 title-map optimization deferred: repeated synthetic GTK fixture selection assertions failed,
+  including when exercising the unchanged sidebar finalizer and registering the production filter.
+  This is insufficient evidence of a production defect or safe full-control regression pass.
+  Owner removes only the uncommitted P273 delta; previously verified P253/P260 remain. Do not claim
+  the proposed title optimization or a sidebar-selection fix as delivered.
 
 ## Completed sets
 

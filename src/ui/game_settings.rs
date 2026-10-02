@@ -1269,7 +1269,7 @@ fn present_source_migration(
         let game = game.clone();
         let installed = installed.clone();
         move || {
-            let _ = sender.send(prepare_migration_choices(&game, &installed));
+            let _ = sender.send(prepare_migration_choices(&game, &installed, session));
         }
     });
     let parent = parent.clone();
@@ -1348,9 +1348,11 @@ impl MigrationView {
         root.append(&body);
         dialog.set_child(Some(&root));
         close.connect_clicked({
-            let dialog = dialog.clone();
+            let dialog = dialog.downgrade();
             move |_| {
-                dialog.close();
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
             }
         });
         let closed = Rc::new(std::cell::Cell::new(false));
@@ -1406,9 +1408,12 @@ struct MigrationChoices {
 fn prepare_migration_choices(
     game: &DetailPageModel,
     installed: &crate::domain::InstalledGame,
+    session: u64,
 ) -> anyhow::Result<MigrationChoices> {
+    online::with_account_session(session, || Ok(()))?;
+    let _activity = crate::profile_reset::begin_activity("inspecting installation sources")?;
     let config = crate::storage::read_config()?;
-    let store = StateStore::open()?;
+    let store = online::with_account_session(session, StateStore::open)?;
     let marker = crate::installation::load_installation_marker(&installed.installation_directory)?
         .ok_or_else(|| anyhow::anyhow!("The installation record is missing. Use Repair or Review File Reset from the game's Manage menu."))?;
     let galaxy_preflight = super::download_chooser::cached_galaxy_available(game, &config);
@@ -1533,8 +1538,13 @@ fn wire_migration_choices(
     let game = game.clone();
     let installed = installed.clone();
     let choice_parent = parent.clone();
-    let view = view.clone();
     let proceed = view.proceed.clone();
+    let dialog = view.dialog.downgrade();
+    let status = view.status.clone();
+    let progress = view.progress.clone();
+    let close = view.close.clone();
+    let closed = view.closed.clone();
+    let started = view.started.clone();
     let model = model.clone();
     let windows_product = {
         let selector = selector.clone();
@@ -1556,7 +1566,20 @@ fn wire_migration_choices(
             .then_some(product_id)
         }
     };
-    connect_windows_action(&proceed, parent, false, windows_product, move |_| {
+    connect_windows_action(&proceed, parent, false, windows_product, move |button| {
+        let Some(dialog) = dialog.upgrade() else {
+            return;
+        };
+        let view = MigrationView {
+            dialog,
+            selector: selector.clone(),
+            status: status.clone(),
+            progress: progress.clone(),
+            proceed: button.clone(),
+            close: close.clone(),
+            closed: closed.clone(),
+            started: started.clone(),
+        };
         if view.closed.get() || view.started.get() {
             return;
         }
@@ -2935,6 +2958,9 @@ mod control_tests {
         );
         view.close.emit_clicked();
         wait_until(|| view.closed.get());
+        let closed_dialog = view.dialog.downgrade();
+        drop(view);
+        wait_until(|| closed_dialog.upgrade().is_none());
 
         for change_account in [false, true] {
             let view = MigrationView::new();
@@ -3001,6 +3027,40 @@ mod control_tests {
             created_at: 0,
             updated_at: 0,
         };
+        assert!(prepare_migration_choices(&game, &installed, session.wrapping_add(1)).is_err());
+        let reservation = crate::profile_reset::reserve().unwrap();
+        assert!(prepare_migration_choices(&game, &installed, session).is_err());
+        drop(reservation);
+        assert!(!crate::identity::database().exists());
+
+        let ready = MigrationView::new();
+        ready.dialog.present(Some(&window));
+        wire_migration_choices(
+            &window,
+            &model,
+            &game,
+            &installed,
+            &ready,
+            MigrationChoices {
+                config: Config::default(),
+                marker: crate::installation::installation_marker_from_game(&installed, vec![]),
+                candidates: crate::installation::InstallerCandidates::default(),
+                choices: vec![crate::installation::FreshInstallSource::GalaxyWindows],
+                current: Some(crate::config::PreferredInstallationSource::LinuxOffline),
+                locations: vec![],
+                galaxy_preflight: Ok(()),
+            },
+            model.borrow().account_epoch,
+            session,
+        );
+        assert!(ready.proceed.is_sensitive());
+        let ready_dialog = ready.dialog.downgrade();
+        let ready_button = ready.proceed.downgrade();
+        ready.close.emit_clicked();
+        wait_until(|| ready.closed.get());
+        drop(ready);
+        wait_until(|| ready_dialog.upgrade().is_none() && ready_button.upgrade().is_none());
+
         let view = MigrationView::new();
         view.dialog.present(Some(&window));
         let config = Config {

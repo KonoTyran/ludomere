@@ -4,6 +4,10 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- Twenty commits throughe431fae and20 exact builds PASS. P277 independently tested and committing;
+  P273 deferred/owner reverting its uncommitted delta because GTK fixture selection could not be
+  verified reliably. Other earlier library improvements stay. Final full build process starts after
+  source cleanup; no further feature work planned, only evidence review and any required fixes.
 - Eighteen commits througha5752fb, all18 exact post-commit builds PASS. Final implementation wave:
   P273 title lookup (post-idle GTK selection discrepancy being isolated), P275 incremental logs,
   P276 checksum filename/hash safety and P277 migration references/preflight guard. Independent

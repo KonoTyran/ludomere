@@ -974,7 +974,7 @@ const CSS: &str = r#"
 .download-section-heading separator { margin-top: 10px; }
 .downloads-empty { padding: 6px 14px 24px; color: alpha(@window_fg_color, .60); }
 .download-active-card { padding: 18px; background: alpha(@card_bg_color, .75); border: 1px solid alpha(@borders, .55); border-radius: 10px; }
-.active-transfer-header { min-height: 174px; background: #08121d; border: 1px solid alpha(@borders, .55); border-radius: 10px; overflow: hidden; }
+.active-transfer-header { min-height: 174px; background: #08121d; border: 1px solid alpha(@borders, .55); border-radius: 10px; }
 .active-transfer-background { background: #08121d; }
 .active-transfer-fade { background: linear-gradient(to right, transparent 0%, rgba(8, 18, 29, .18) 32%, rgba(8, 18, 29, .82) 62%, #08121d 75%); }
 .active-transfer-logo { background: transparent; }

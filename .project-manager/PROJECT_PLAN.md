@@ -1,5 +1,13 @@
 # Project plan
 
+## P259 R94 automatic-install planning efficiency
+
+- Depot approved next separate set after P256 commit: reuse request job IDs already resolved by
+  intent and read base DLC membership once; preserve selection ordering, validation and consent.
+  Own src/download/auto_install.rs and relevant existing tests only. Synthetic queue/DLC/legacy
+  identity fixtures, focused intent/completion/reopen tests and independent review required.
+  No schema, filesystem policy, helper or real profile actions. Await wave2 commit before edits.
+
 ## P255–P258 R94 second wave
 
 - P255 ui_review owns details.rs operation-log loading/error/Retry: preserve available sources,

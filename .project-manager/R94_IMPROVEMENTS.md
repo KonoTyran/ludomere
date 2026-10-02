@@ -21,7 +21,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   build PASS at0dd8af8 (/tmp/ludomere-r94-set1-build.log). Evidence /tmp/ludomere-p253-gtk.log and
   /tmp/ludomere-p254-sidebar-review.md.
 
-## Approved sets in progress
+## Further completed sets
 
 - P251 cache loading (reviewed, committing): batch selected product catalogs in400-ID groups and
   index DLC parents; one deferred read snapshot, narrow lookup/order/error semantics retained.
@@ -35,8 +35,21 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   duplicate prevention, Close explanation, terminal results, stopped-worker/branch errors and
   account-change feedback. Existing migration/saves policy retained. Private actual GTK test and
   independent P254 review PASS; final account callback correction source-reviewed. Reports
-  /tmp/ludomere-p252-report.md and /tmp/ludomere-p254-migration-review.md; exact build pending.
-- Follow-ons queued separately: efficient image FIFO; GOG login page loading/error/retry feedback.
+  /tmp/ludomere-p252-report.md and /tmp/ludomere-p254-migration-review.md. Commit30fdce4 exact
+  build PASS (/tmp/ludomere-r94-set3-build.log).
+## Approved sets in progress
+
+- P255 operation logs: named loading state, explicit partial-read failures and Retry, retained
+  successful log sources, installation failures without a log file, disconnected-worker errors,
+  stale request/account guards and profile-reset activity guard. Shipping private GTK1+pure3
+  PASS; independent source review PASS, independent execution pending. Report p255-report.md.
+- P256 image scheduling: FIFO VecDeque removes repeated shifting of all pending jobs under the
+  queue mutex; explicit priority ordering, four workers and cancellation behavior unchanged.
+- P257 sign-in: loading indicator, generic safe failure with Retry, stopped-browser feedback,
+  canceled-navigation/redirect teardown handling. Retry starts the public login URL; no raw OAuth
+  URLs/errors displayed. Independent synthetic GTK1 PASS; no WebView/account/network execution.
+- Wave2 shipping compilation, fmt/diff and all-target Clippy PASS. Each set gets its own commit
+  and exact post-commit build. P259 request/DLC lookup reuse approved next, awaiting P256 commit.
 
 ## Deferred findings and verification limits
 

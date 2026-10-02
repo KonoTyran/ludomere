@@ -4,6 +4,9 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- Sets1–3 committed as0dd8af8/0e69cd7/30fdce4; each exact-commit build PASS. Wave2 shipping
+  compilation/fmt/all-target Clippy PASS. P255 log GTK1+pure3 and P257 independent login GTK1
+  PASS; P258 final image/log review executions pending. No real WebView/network/account used.
 - Commits0dd8af8 sidebar and0e69cd7 batched cache reads independently reviewed and exact-commit
   cargo build --locked PASS (r94-set1/set2-build.log). P252 source migration reviewed with private
   GTK PASS, committing next. P255 operation-log feedback/P256 image FIFO/P257 login page feedback

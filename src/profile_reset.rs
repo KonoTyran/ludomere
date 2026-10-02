@@ -737,6 +737,7 @@ fn remove_profile(plan: &Plan) -> Result<()> {
                 journal_hash(&journal.path)? == journal.hash,
                 "Saved operation changed; cleanup remains incomplete"
             );
+            retain_payload_identity(&journal.path, &journal.hash)?;
             remove_owned(&journal.path)?;
         }
     }
@@ -746,6 +747,90 @@ fn remove_profile(plan: &Plan) -> Result<()> {
     for name in [FAILURE, MANIFEST] {
         remove_owned(&plan.config.join(name))?;
     }
+    Ok(())
+}
+
+// Keep only enough filesystem identity to recognize an incomplete Game Files library
+// after reset. This contains no credentials, executable plan, or automatic resume record.
+fn retain_payload_identity(journal: &Path, expected_hash: &str) -> Result<()> {
+    use crate::installation::operation_journal::OperationJournal;
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(journal)?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 16 * 1024 * 1024 && digest(&bytes) == expected_hash,
+        "Saved operation changed; cleanup remains incomplete"
+    );
+    let (product_id, directory) = match serde_json::from_slice::<OperationJournal>(&bytes)? {
+        OperationJournal::Depot { version: 1, record } => (record.product_id, record.destination),
+        OperationJournal::Offline { version: 1, record } => {
+            let plan: serde_json::Value = serde_json::from_str(&record.plan_json)?;
+            let directory = plan
+                .get("game")
+                .unwrap_or(&plan)
+                .get("installation_directory")
+                .and_then(serde_json::Value::as_str)
+                .context("Saved installation has no destination")?;
+            (record.product_id, PathBuf::from(directory))
+        }
+        _ => bail!("Unsupported saved operation version"),
+    };
+    let staging = journal.parent().context("Missing operation directory")?;
+    let library = staging
+        .parent()
+        .and_then(Path::parent)
+        .context("Missing game library")?;
+    let slug = journal
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".operation.json"))
+        .context("Invalid operation filename")?;
+    ensure!(
+        product_id > 0 && directory == library.join(slug),
+        "Saved operation does not match its game directory"
+    );
+    validate_path(&directory)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_dir(),
+        "Retained game payload is not a directory"
+    );
+    // Anchor the writer to the already validated control directory. Replacement is atomic;
+    // an interrupted reset can repeat this before it deletes the original operation.
+    let mut parent = File::open("/")?;
+    for component in staging.components() {
+        if let Component::Normal(name) = component {
+            let name = std::ffi::CString::new(name.as_encoded_bytes())?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            parent = unsafe { File::from_raw_fd(fd) };
+        }
+    }
+    let anchored = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
+    let mut temporary = tempfile::NamedTempFile::new_in(&anchored)?;
+    temporary.write_all(&serde_json::to_vec(&serde_json::json!({
+        "version": 1, "product_id": product_id, "directory": directory,
+        "identity": [metadata.dev(), metadata.ino()]
+    }))?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(anchored.join(format!("{slug}.retained.json")))?;
+    parent.sync_all()?;
     Ok(())
 }
 
@@ -956,6 +1041,23 @@ mod tests {
                 .is_file()
         );
         assert!(record.staging_path.join("partial").is_file());
+        let receipt = library.join(".ludomere/staging/fixture.retained.json");
+        let identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(identity["product_id"], 9);
+        assert!(identity.get("plan_json").is_none());
+        let mut config = crate::config::Config::default();
+        config.game_libraries = vec![crate::config::GameLibrary {
+            id: "retained".into(),
+            name: "Retained".into(),
+            path: library.clone(),
+            default: true,
+        }];
+        let store = crate::state::StateStore::open_at(&_root.path().join("fresh.sqlite3")).unwrap();
+        assert_eq!(
+            crate::storage::inspect_libraries_with_store(&config, &store).unwrap()[0].compatibility,
+            crate::storage::LibraryCompatibility::Compatible
+        );
         remove_profile(&plan).unwrap();
     }
 

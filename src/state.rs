@@ -2042,14 +2042,15 @@ impl StateStore {
     }
 
     pub fn cached_pack_entitlements(&self, packs: &[i64]) -> Result<Vec<i64>> {
-        let mut statement = self.connection.prepare("SELECT parent_product_id, child_product_id FROM product_relationships WHERE relationship = 'pack_entitlement'")?;
-        let rows =
-            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
-        Ok(rows
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .filter_map(|(pack, child)| packs.contains(&pack).then_some(child))
-            .collect())
+        let mut statement = self.connection.prepare(
+            "SELECT child_product_id FROM product_relationships
+             WHERE relationship = 'pack_entitlement'
+               AND parent_product_id IN (SELECT value FROM json_each(?1))
+             ORDER BY parent_product_id, child_product_id",
+        )?;
+        Ok(statement
+            .query_map([serde_json::to_string(packs)?], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Scoped writes never change entitlement or replace another product's relationships.
@@ -2570,7 +2571,6 @@ impl StateStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    #[allow(dead_code)]
     pub fn load_current_download_revisions(
         &self,
         product_id: i64,
@@ -2596,7 +2596,7 @@ impl StateStore {
              WHERE s.product_id = ?1 AND (?2 = 0 OR r.currently_offered = 1)
              ORDER BY s.provider_category, s.slot_id",
         )?;
-        let rows = statement.query_map(params![product_id, current_only], |row| {
+        let mut rows = statement.query_map(params![product_id, current_only], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -2615,8 +2615,40 @@ impl StateStore {
                 row.get::<_, Option<i64>>(14)?,
             ))
         })?;
+        let Some(first) = rows.next().transpose()? else {
+            return Ok(Vec::new());
+        };
+        // Keep the revision cursor active while reading parts so both queries share
+        // the same SQLite read snapshot, even during a manifest refresh.
+        let mut parts_statement = self.connection.prepare(
+            "SELECT p.part_id, p.revision_id, p.provider_file_id, p.part_index,
+                    p.expected_size, p.downlink, p.checksum, p.checksum_fetched_at
+             FROM download_parts p
+             JOIN download_revisions r USING(revision_id)
+             JOIN download_slots s USING(slot_id)
+             WHERE s.product_id = ?1 AND (?2 = 0 OR r.currently_offered = 1)
+             ORDER BY p.revision_id, p.part_index",
+        )?;
+        let mut parts = HashMap::<i64, Vec<crate::domain::DownloadPart>>::new();
+        for part in parts_statement
+            .query_map(params![product_id, current_only], |row| {
+                Ok(crate::domain::DownloadPart {
+                    part_id: row.get(0)?,
+                    revision_id: row.get(1)?,
+                    provider_file_id: row.get(2)?,
+                    part_index: row.get::<_, i64>(3)? as u32,
+                    expected_size: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    downlink: row.get(5)?,
+                    checksum: row.get(6)?,
+                    checksum_fetched_at: row.get(7)?,
+                })
+            })?
+            .filter_map(Result::ok)
+        {
+            parts.entry(part.revision_id).or_default().push(part);
+        }
         let mut revisions = Vec::new();
-        for row in rows {
+        for row in std::iter::once(Ok(first)).chain(rows) {
             let (
                 revision_id,
                 slot_id,
@@ -2634,26 +2666,6 @@ impl StateStore {
                 last_seen,
                 retired_at,
             ) = row?;
-            let mut parts_statement = self.connection.prepare(
-                "SELECT part_id, provider_file_id, part_index, expected_size, downlink,
-                        checksum, checksum_fetched_at
-                 FROM download_parts WHERE revision_id = ?1 ORDER BY part_index",
-            )?;
-            let parts = parts_statement
-                .query_map(params![revision_id], |row| {
-                    Ok(crate::domain::DownloadPart {
-                        part_id: row.get(0)?,
-                        revision_id,
-                        provider_file_id: row.get(1)?,
-                        part_index: row.get::<_, i64>(2)? as u32,
-                        expected_size: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                        downlink: row.get(4)?,
-                        checksum: row.get(5)?,
-                        checksum_fetched_at: row.get(6)?,
-                    })
-                })?
-                .filter_map(Result::ok)
-                .collect();
             revisions.push(DownloadRevision {
                 revision_id,
                 slot_id,
@@ -2671,7 +2683,7 @@ impl StateStore {
                 first_seen_at: first_seen,
                 last_seen_at: last_seen,
                 retired_at,
-                parts,
+                parts: parts.remove(&revision_id).unwrap_or_default(),
             });
         }
         Ok(revisions)
@@ -3666,7 +3678,6 @@ fn language_code(name: &str) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn parse_download_category(value: &str) -> DownloadCategory {
     match value {
         "patch" => DownloadCategory::Patch,
@@ -5411,6 +5422,89 @@ mod tests {
             && file.gog_checksum.as_deref() == Some("keep-checksum")));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pack_entitlements_preserve_filtered_order_and_shared_children() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        for (pack, child, kind) in [
+            (30, 300, "pack_entitlement"),
+            (10, 200, "pack_entitlement"),
+            (20, 100, "pack_entitlement"),
+            (10, 100, "pack_entitlement"),
+            (10, 400, "dlc"),
+        ] {
+            store.connection.execute("INSERT INTO product_relationships(parent_product_id,child_product_id,relationship,source) VALUES(?1,?2,?3,'fixture')", params![pack, child, kind]).unwrap();
+        }
+        let requested = [20, 10, 10, 999];
+        let expected = store.connection.prepare("SELECT parent_product_id,child_product_id FROM product_relationships WHERE relationship='pack_entitlement'").unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap().into_iter()
+            .filter_map(|(pack, child)| requested.contains(&pack).then_some(child)).collect::<Vec<_>>();
+        assert_eq!(expected, vec![100, 200, 100]);
+        assert_eq!(
+            store.cached_pack_entitlements(&requested).unwrap(),
+            expected
+        );
+        assert!(store.cached_pack_entitlements(&[]).unwrap().is_empty());
+        assert_eq!(store.cached_pack_entitlements(&[30]).unwrap(), vec![300]);
+    }
+
+    #[test]
+    fn revision_loading_preserves_parts_history_and_product_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for slot in 1..=129 {
+            transaction.execute("INSERT INTO download_slots(slot_id,product_id,provider_group_id,provider_category,name,first_seen_at,last_seen_at) VALUES(?1,?2,?3,'installer','Fixture',1,1)", params![slot, if slot == 129 {43} else {42}, format!("slot-{slot}")]).unwrap();
+            for current in [false, true] {
+                let revision = slot * 2 + i64::from(current);
+                transaction.execute("INSERT INTO download_revisions(revision_id,slot_id,version,total_size,manifest_fingerprint,currently_offered,first_seen_at,last_seen_at,retired_at) VALUES(?1,?2,?3,40,?3,?4,1,1,CASE WHEN ?4 THEN NULL ELSE 2 END)", params![revision, slot, format!("version-{revision}"), current]).unwrap();
+                // One revision deliberately has no parts; reverse insertion checks part ordering.
+                if slot != 128 {
+                    for part in (0..4).rev() {
+                        transaction.execute("INSERT INTO download_parts(revision_id,provider_file_id,part_index,expected_size,downlink,checksum,checksum_fetched_at) VALUES(?1,?2,?3,10,?4,'checksum',3)", params![revision, format!("part-{revision}-{part}"), part, format!("/file/{revision}/{part}")]).unwrap();
+                    }
+                }
+            }
+        }
+        transaction.commit().unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(store.load_all_download_revisions(42).unwrap().len(), 256);
+        }
+        eprintln!(
+            "20 loads of 256 revisions/1016 parts: {:?}",
+            started.elapsed()
+        );
+        let current = store.load_current_download_revisions(42).unwrap();
+        assert_eq!(current.len(), 128);
+        assert!(
+            current
+                .iter()
+                .all(|revision| revision.currently_offered && revision.product_id == 42)
+        );
+        assert!(
+            current
+                .windows(2)
+                .all(|pair| pair[0].slot_id < pair[1].slot_id)
+        );
+        for revision in store.load_all_download_revisions(42).unwrap() {
+            assert_eq!(
+                revision.parts.len(),
+                if revision.slot_id == 128 { 0 } else { 4 }
+            );
+            for (index, part) in revision.parts.iter().enumerate() {
+                assert_eq!(part.revision_id, revision.revision_id);
+                assert_eq!(part.part_index, index as u32);
+                assert_eq!(part.expected_size, Some(10));
+                assert_eq!(part.checksum.as_deref(), Some("checksum"));
+                assert_eq!(part.checksum_fetched_at, Some(3));
+            }
+        }
+        assert!(store.load_all_download_revisions(404).unwrap().is_empty());
+        assert_eq!(store.load_all_download_revisions(43).unwrap().len(), 2);
     }
 
     #[test]

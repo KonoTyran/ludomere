@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::config::GameLibrary;
+use crate::installation;
 use anyhow::Context;
 use std::{
     collections::HashMap,
@@ -445,6 +446,9 @@ fn build_storage_section(
     footer.append(&move_button);
     footer.set_visible(kind == crate::config::LibraryKind::GameFiles);
     root.append(&footer);
+    let move_progress = gtk::ProgressBar::new();
+    move_progress.set_visible(false);
+    root.append(&move_progress);
 
     let items = Rc::new(RefCell::new(Vec::<InstalledStorageItem>::new()));
     let checks = Rc::new(RefCell::new(HashMap::<i64, gtk::CheckButton>::new()));
@@ -480,6 +484,9 @@ fn build_storage_section(
         let items = items.clone();
         let refresh = refresh.clone();
         let footer = footer.clone();
+        let manage_library = manage_library.clone();
+        let remove_library = remove_library.clone();
+        let default_games = default_games.clone();
         let request = Rc::new(std::cell::Cell::new(0u64));
         Rc::new(move || {
             request.set(request.get().wrapping_add(1));
@@ -489,6 +496,7 @@ fn build_storage_section(
             let Some(selected_library) =
                 libraries.borrow().get(library.selected() as usize).cloned()
             else {
+                manage_library.set_sensitive(false);
                 selected_mount.set_label("Choose or add a directory");
                 path_label
                     .set_label("No library configured. Add a directory to use this library type.");
@@ -498,6 +506,19 @@ fn build_storage_section(
                 footer.set_sensitive(false);
                 return;
             };
+            manage_library.set_sensitive(true);
+            let removable =
+                kind != crate::config::LibraryKind::GameFiles || libraries.borrow().len() > 1;
+            remove_library.set_sensitive(removable);
+            remove_library.set_tooltip_text(
+                (!removable).then_some("Add another Game Files library before removing this one."),
+            );
+            default_games.set_sensitive(!selected_library.default);
+            default_games.set_tooltip_text(
+                selected_library
+                    .default
+                    .then_some("This is already the default library."),
+            );
             let mount = selected_library.path.to_string_lossy().into_owned();
             selected_mount.set_label(&mount);
             path_label.set_label(&selected_library.path.display().to_string());
@@ -514,15 +535,9 @@ fn build_storage_section(
                 let result = (|| -> anyhow::Result<_> {
                     crate::storage::validate_library(&config, kind, &selected_library.id)?;
                     let storage = filesystem_storage(&selected_library.path);
+                    let store = StateStore::open()?;
                     let games = if kind == crate::config::LibraryKind::GameFiles {
-                        StateStore::open()
-                            .and_then(|store| {
-                                crate::installation::reconcile_installed_games(
-                                    &store,
-                                    &all_libraries,
-                                )
-                            })
-                            .unwrap_or_default()
+                        crate::installation::reconcile_installed_games(&store, &all_libraries)?
                             .into_iter()
                             .filter_map(|mut game| {
                                 let (library_id, directory) =
@@ -551,9 +566,7 @@ fn build_storage_section(
                     } else {
                         Vec::new()
                     };
-                    let managed = StateStore::open()
-                        .and_then(|store| store.managed_files())
-                        .unwrap_or_default();
+                    let managed = store.managed_files()?;
                     let installers = managed
                         .iter()
                         .filter(|file| {
@@ -636,7 +649,12 @@ fn build_storage_section(
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        path_label.set_label("Library inspection stopped unexpectedly. Click Recheck library to try again.");
+                        capacity.set_label("Storage information unavailable");
+                        footer.set_sensitive(false);
+                        glib::ControlFlow::Break
+                    }
                 }
             });
         })
@@ -656,6 +674,7 @@ fn build_storage_section(
         let libraries = libraries.clone();
         let library = library.clone();
         let rebuild = rebuild_library_choices.clone();
+        let update = update_library.clone();
         let popover = manage_popover.clone();
         move |_| {
             let Some(selected) = libraries.borrow().get(library.selected() as usize).cloned()
@@ -670,10 +689,12 @@ fn build_storage_section(
             let model = model.clone();
             let libraries = libraries.clone();
             let rebuild = rebuild.clone();
+            let update = update.clone();
             save_storage_config(&root, &status, &model.clone(), config, move |config| {
                 *libraries.borrow_mut() = config.libraries(kind).to_vec();
                 model.borrow_mut().config = config;
                 rebuild();
+                update();
             });
             popover.popdown();
         }
@@ -822,9 +843,30 @@ fn build_storage_section(
                 if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
                     return;
                 }
-                let Ok(folder) = result else { return };
-                let Some(path) = folder.path() else { return };
-                if libraries.borrow().iter().any(|entry| entry.path == path) {
+                let folder = match result {
+                    Ok(folder) => folder,
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) =>
+                    {
+                        return;
+                    }
+                    Err(error) => {
+                        status.set_label(&format!("Could not choose a library directory: {error}"));
+                        return;
+                    }
+                };
+                let Some(path) = folder.path() else {
+                    status.set_label("Choose a local directory for this library.");
+                    return;
+                };
+                let existing = libraries
+                    .borrow()
+                    .iter()
+                    .position(|entry| entry.path == path);
+                if let Some(index) = existing {
+                    library.set_selected(index as u32);
+                    status.set_label("This directory is already configured and has been selected.");
                     return;
                 }
                 let entry = GameLibrary {
@@ -851,6 +893,7 @@ fn build_storage_section(
         }
     });
     move_button.connect_clicked({
+        let w = w.clone();
         let model = model.clone();
         let window = window.clone();
         let items = items.clone();
@@ -858,7 +901,14 @@ fn build_storage_section(
         let libraries = libraries.clone();
         let target = target.clone();
         let update_library = update_library.clone();
+        let status = path_label.clone();
+        let progress = move_progress.clone();
+        let moving = Rc::new(std::cell::Cell::new(false));
         move |button| {
+            if moving.get() {
+                status.set_label("Moving game files… Please wait for the current move to finish.");
+                return;
+            }
             let selected_games = items
                 .borrow()
                 .iter()
@@ -870,8 +920,19 @@ fn build_storage_section(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            if let Some(item) = selected_games.iter().find(|item|
+                item.game.compatibility.is_some() || item.game.installer_operating_system.as_deref()
+                    .is_some_and(|os| os.eq_ignore_ascii_case("windows"))) {
+                status.set_label(&format!("{} cannot be moved here: moving Windows games also requires migrating their Proton prefix. Keep this installation in its current library, or uninstall and reinstall into the other library.", item.title));
+                return;
+            }
+            if selected_games.iter().any(|item| installation::is_game_running(item.game.product_id)) {
+                status.set_label("Stop the selected games before moving their files.");
+                return;
+            }
             let Some(target_library) = libraries.borrow().get(target.selected() as usize).cloned()
             else {
+                status.set_label("Choose a destination library before moving games.");
                 return;
             };
             if selected_games.is_empty()
@@ -879,6 +940,7 @@ fn build_storage_section(
                     .iter()
                     .all(|item| item.game.library_id == target_library.id)
             {
+                status.set_label("Select games and choose a different destination library to move them.");
                 return;
             }
             let confirmation = adw::AlertDialog::builder()
@@ -897,16 +959,42 @@ fn build_storage_section(
             let update_library = update_library.clone();
             let model = model.clone();
             let epoch = model.borrow().account_epoch;
+            let status = status.clone();
+            let progress = progress.clone();
+            let moving = moving.clone();
+            let w = w.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response != "move" || model.borrow().account_epoch != epoch || model.borrow().logout_pending {
                     return;
                 }
                 button.set_sensitive(false);
+                moving.set(true);
+                status.set_label("Moving game files… This may take several minutes.");
+                progress.set_visible(true);
+                progress.pulse();
                 let (sender, receiver) = mpsc::channel();
                 let config = model.borrow().config.clone();
                 std::thread::spawn(move || {
                     let result = (|| {
+                        let _activity = crate::profile_reset::begin_activity("moving installed games")?;
                         let _permit = crate::operation_gate::try_acquire()?;
+                        let _reservation = crate::installation::recovery::Reservation::reserve(
+                            &selected_games.iter().map(|game| game.game.product_id).collect::<Vec<_>>())?;
+                        for item in &selected_games {
+                            let directory = &item.game.installation_directory;
+                            let journal = installation::operation_journal::path(
+                                directory.parent().context("Game has no library directory")?,
+                                directory.file_name().and_then(|name| name.to_str()).context("Invalid game directory name")?)?;
+                            anyhow::ensure!(!journal.try_exists()?,
+                                "Finish or discard the saved installation operation for {} before moving it.", item.title);
+                            anyhow::ensure!(!installation::installation_operation_snapshot(item.game.product_id)
+                                .is_some_and(|snapshot| snapshot.queued || matches!(snapshot.state,
+                                    crate::domain::InstallationState::Pending | crate::domain::InstallationState::Installing | crate::domain::InstallationState::Uninstalling)),
+                                "Finish or cancel installation work for {} before moving it.", item.title);
+                            anyhow::ensure!(!installation::depot_operation_snapshot_for_product(item.game.product_id)
+                                .is_some_and(|snapshot| !matches!(snapshot.state.as_str(), "complete" | "abandoned")),
+                                "Finish or discard the saved Depot operation for {} before moving it.", item.title);
+                        }
                         crate::storage::validate_library(&config, crate::config::LibraryKind::GameFiles, &target_library.id)?;
                         for game in &selected_games { crate::storage::validate_library(&config, crate::config::LibraryKind::GameFiles, &game.game.library_id)?; }
                         move_installed_games(&selected_games, &target_library)
@@ -916,20 +1004,39 @@ fn build_storage_section(
                 let button = button.clone();
                 let update_library = update_library.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
+                    if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                        moving.set(false); progress.set_visible(false); button.set_sensitive(true);
+                        return glib::ControlFlow::Break;
+                    }
                     match receiver.try_recv() {
                         Ok(Ok(())) => {
+                            moving.set(false); progress.set_visible(false);
                             button.set_sensitive(true);
                             update_library();
+                            super::refresh_installed_state_after_library_change(&w, &model);
+                            status.set_label("Games moved successfully. Refreshing the library…");
+                            show_status(&w, "Selected games moved successfully.");
                             glib::ControlFlow::Break
                         }
                         Ok(Err(error)) => {
+                            moving.set(false); progress.set_visible(false);
                             tracing::warn!(%error, "could not move installed games");
-                            button.set_tooltip_text(Some(&format!("Move failed: {error:#}")));
+                            status.set_label(&format!("Could not move games: {error:#}"));
+                            update_library();
+                            super::refresh_installed_state_after_library_change(&w, &model);
+                            show_status(&w, &format!("Could not move all selected games: {error:#}. Some files may have moved; both libraries have been refreshed."));
                             button.set_sensitive(true);
                             glib::ControlFlow::Break
                         }
-                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                        Err(mpsc::TryRecvError::Empty) => { progress.pulse(); glib::ControlFlow::Continue },
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            moving.set(false); progress.set_visible(false); button.set_sensitive(true);
+                            status.set_label("Moving stopped unexpectedly. Recheck both libraries before trying again.");
+                            update_library();
+                            super::refresh_installed_state_after_library_change(&w, &model);
+                            show_status(&w, "Moving stopped unexpectedly. Recheck both libraries before trying again.");
+                            glib::ControlFlow::Break
+                        },
                     }
                 });
             });
@@ -1140,6 +1247,7 @@ fn move_installed_games(
     target: &GameLibrary,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(&target.path)?;
+    let mut moves = Vec::new();
     for item in items {
         if item.game.library_id == target.id {
             continue;
@@ -1150,12 +1258,24 @@ fn move_installed_games(
             .file_name()
             .context("installed game has no directory name")?;
         let destination = target.path.join(directory_name);
+        let source = fs::symlink_metadata(&item.game.installation_directory)?;
         anyhow::ensure!(
-            !destination.exists(),
+            source.is_dir() && !source.file_type().is_symlink(),
+            "The source game directory changed; recheck its library."
+        );
+        anyhow::ensure!(
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.into()),
+            },
             "destination already exists: {}",
             destination.display()
         );
-        move_directory(&item.game.installation_directory, &destination)?;
+        moves.push((&item.game.installation_directory, destination));
+    }
+    for (source, destination) in moves {
+        move_directory(source, &destination)?;
     }
     Ok(())
 }
@@ -1171,45 +1291,149 @@ fn present_library_rename_dialog(
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Rename library")
-        .body("Choose the name displayed for this library. Its directory will not change.")
+        .body("Choose the name displayed for this library. Valid names save automatically; its directory will not change.")
         .build();
     let entry = gtk::Entry::new();
     entry.set_text(&selected.name);
     entry.set_activates_default(true);
-    dialog.set_extra_child(Some(&entry));
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("rename", "Rename");
-    dialog.set_default_response(Some("rename"));
-    dialog.set_close_response("cancel");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let local_status = gtk::Label::new(None);
+    local_status.set_wrap(true);
+    content.append(&entry);
+    content.append(&local_status);
+    dialog.set_extra_child(Some(&content));
+    dialog.add_response("done", "Done");
+    dialog.set_default_response(Some("done"));
+    dialog.set_close_response("done");
     let id = selected.id.clone();
-    let page = feedback.0.clone();
     let status = feedback.1.clone();
     let epoch = model.borrow().account_epoch;
-    dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
-        if response != "rename"
-            || model.borrow().account_epoch != epoch
-            || model.borrow().logout_pending
-        {
-            return;
+    let session = online::account_session();
+    let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+    let draft_status = local_status.clone();
+    let save: Rc<dyn Fn()> = Rc::new({
+        let entry = entry.clone();
+        move || {
+            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                return;
+            }
+            let name = entry.text().trim().to_owned();
+            if name.is_empty() {
+                local_status.set_label("Enter a name. The previous name is unchanged.");
+                return;
+            }
+            local_status.set_label("Saving name…");
+            let id_worker = id.clone();
+            let name_worker = name.clone();
+            let receiver = update_policies::policy_request(move || {
+                let _activity = crate::profile_reset::begin_activity("renaming library")?;
+                online::with_account_session(session, || {
+                    let mut config = Config::load_or_create()?;
+                    let library = config
+                        .libraries_mut(kind)
+                        .iter_mut()
+                        .find(|library| library.id == id_worker)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "This library is no longer configured. Reopen Settings."
+                            )
+                        })?;
+                    library.name = name_worker;
+                    config.save()
+                })
+            });
+            let model = model.clone();
+            let libraries = libraries.clone();
+            let rebuild = rebuild.clone();
+            let local_status = local_status.clone();
+            let entry = entry.clone();
+            let status = status.clone();
+            let id = id.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!("The settings worker stopped.")),
+                };
+                if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                    return glib::ControlFlow::Break;
+                }
+                match result {
+                    Ok(()) => {
+                        if let Some(library) = model
+                            .borrow_mut()
+                            .config
+                            .libraries_mut(kind)
+                            .iter_mut()
+                            .find(|library| library.id == id)
+                        {
+                            library.name = name.clone();
+                        }
+                        if let Some(library) = libraries
+                            .borrow_mut()
+                            .iter_mut()
+                            .find(|library| library.id == id)
+                        {
+                            library.name = name.clone();
+                        }
+                        if entry.text().trim() == name {
+                            local_status.set_label("Saved automatically.");
+                        }
+                        rebuild();
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Library name was not saved: {error}. Edit the name to retry.");
+                        if entry.text().trim() == name {
+                            local_status.set_label(&message);
+                        }
+                        status.set_label(&message);
+                    }
+                }
+                glib::ControlFlow::Break
+            });
         }
-        let name = entry.text().trim().to_owned();
-        if name.is_empty() {
-            return;
-        }
-        let mut config = model.borrow().config.clone();
-        if let Some(library) = config
-            .libraries_mut(kind)
-            .iter_mut()
-            .find(|library| library.id == id)
-        {
-            library.name = name;
-        }
-        save_storage_config(&page, &status, &model.clone(), config, move |config| {
-            *libraries.borrow_mut() = config.libraries(kind).to_vec();
-            model.borrow_mut().config = config;
-            rebuild();
-        });
     });
+    entry.connect_changed({
+        let pending = pending.clone();
+        let save = save.clone();
+        move |entry| {
+            draft_status.set_label(if entry.text().trim().is_empty() {
+                "Enter a name. The previous name is unchanged."
+            } else {
+                "Waiting to save the latest name…"
+            });
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let inner = pending.clone();
+            let save = save.clone();
+            *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                Duration::from_millis(400),
+                move || {
+                    inner.borrow_mut().take();
+                    save();
+                },
+            ));
+        }
+    });
+    let flush: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(source) = pending.borrow_mut().take() {
+            source.remove();
+            save();
+        }
+    });
+    entry.connect_activate({
+        let flush = flush.clone();
+        move |_| flush()
+    });
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave({
+        let flush = flush.clone();
+        move |_| flush()
+    });
+    entry.add_controller(focus);
+    dialog.choose(Some(window), gio::Cancellable::NONE, move |_| flush());
 }
 
 fn move_directory(source: &Path, destination: &Path) -> anyhow::Result<()> {
@@ -1266,5 +1490,47 @@ mod tests {
         copy_directory(&source, &destination).unwrap();
         assert_eq!(directory_size(&destination), 6);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_preflights_all_destinations_before_moving_any_native_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let target = GameLibrary {
+            id: "target".into(),
+            name: "Target".into(),
+            path: root.path().join("target"),
+            default: false,
+        };
+        fs::create_dir_all(&target.path).unwrap();
+        let items = ["first", "second"].into_iter().enumerate().map(|(index, name)| {
+            let directory = root.path().join("source").join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("payload"), name).unwrap();
+            InstalledStorageItem {
+                game: serde_json::from_value(serde_json::json!({
+                    "product_id":index as i64 + 1,"library_id":"source","installation_directory":directory,
+                    "installer_files":[],"installer_complete":true,"installer_operating_system":"linux",
+                    "launch_arguments":[],"state":"installed","playtime_seconds":0,"created_at":1,"updated_at":1
+                })).unwrap(), title:name.into(), artwork:None, size:0,
+            }
+        }).collect::<Vec<_>>();
+        std::os::unix::fs::symlink(root.path().join("missing"), target.path.join("second"))
+            .unwrap();
+        assert!(move_installed_games(&items, &target).is_err());
+        assert!(
+            items
+                .iter()
+                .all(|item| item.game.installation_directory.join("payload").is_file())
+        );
+        assert!(!target.path.join("first").exists());
+        fs::remove_file(target.path.join("second")).unwrap();
+        move_installed_games(&items, &target).unwrap();
+        for name in ["first", "second"] {
+            assert_eq!(
+                fs::read_to_string(target.path.join(name).join("payload")).unwrap(),
+                name
+            );
+            assert!(!root.path().join("source").join(name).exists());
+        }
     }
 }

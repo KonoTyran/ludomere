@@ -151,6 +151,13 @@ pub(super) fn update_streamed_media(
     hero_logo: Option<std::path::PathBuf>,
     icon: Option<std::path::PathBuf>,
 ) {
+    // Refresh a replaced icon even if its cache path has not changed. Ordinary
+    // download progress reuses the current paintable instead of decoding it again.
+    if let Some(path) = &icon
+        && w.download_artwork.file().as_deref() == path.to_str()
+    {
+        w.download_artwork.set_from_file(Some(path));
+    }
     let selected_product = model.borrow().detail_target.map(|(id, _)| id);
     let mut state = model.borrow_mut();
     let Some(game) = state

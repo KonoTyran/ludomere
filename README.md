@@ -22,6 +22,11 @@ Ludomere can install native Linux offline builds, Windows offline installers, or
 ready-to-run Windows Galaxy builds. Downloads and installations can be paused, resumed after an
 interruption, cancelled, and repaired from the unified Downloads page.
 Completion refreshes the affected game's actions and library state without reopening its page.
+Depot extraction and file verification show their own progress instead of a stalled download
+counter. Batched journal checkpoints reduce repeated disk writes during extraction and resume.
+Finishing setup pulses when the installer cannot report a percentage. Executable
+discovery and saving cloud-save choices run in the background with visible activity and retryable
+errors; closing executable selection prevents a late launch.
 Transfer progress does not rescan downloaded files. If local-state inspection fails, Ludomere
 keeps the previous state and reports the error; use **Manage → Refresh local state** to retry. Uninstall checks the
 current downloaded files before offering optional cleanup, with a separate retry control.
@@ -111,6 +116,10 @@ Already indexed files in configured archive libraries are rematched as game/DLC 
 using unambiguous filename, OS, language and known-size matches. Arbitrary flat folders are not
 imported; previously unknown directories need an explicit index rebuild after their games are known.
 Changing folders does not move files or erase other download roots' records and receipts.
+Storage's **Move** action supports stopped native Linux games and reports progress and failures.
+Windows moves are unavailable because their Proton prefixes also need migration; keep the existing
+library or uninstall and reinstall into the new one. Pending installation work must finish or be
+discarded before moving a game.
 Uninstall keeps downloaded installers and goodies by default. Removing those files requires the
 explicit, initially unchecked option in the uninstall confirmation. Game Properties → General also
 provides separate **Delete Offline Installers** and **Delete Goodies & Extras** buttons, even when
@@ -168,25 +177,25 @@ Cloud recovery copies are preserved by full profile reset, while account-scoped 
 and deletion tracking are reset; preserved local saves can upload again afterward.
 
 The one-time setup wizard welcomes you, then shows separate Game Files, Offline Installers,
-Goodies & Extras, Proton choice, and Windows runtime steps. Back retains your drafts; Next checks the relevant
-choice before advancing. Skip for now keeps existing folder defaults and leaves Finish setup
+Goodies & Extras, Proton choice, and Windows runtime steps. Valid edits save automatically; Next accepts the displayed
+choice before advancing. Skip for now retains saved choices and leaves Finish setup
 available; completed profiles are not automatically taken through setup again. Each library step
 has one directory field and Browse button; existing defaults are prefilled and additional libraries
 are preserved. Game Files also offers **Automatically update Depot builds** for installed Depot
-games; it defaults on for new profiles and preserves an existing choice. This checkbox is saved
-with setup completion and does not start downloads. Skip an optional archive step or leave its
-field empty to keep its saved configuration.
+games; it defaults on for new profiles and preserves an existing choice. This checkbox saves automatically
+without starting downloads. Untouched optional archive suggestions are only accepted with Next;
+Skip leaves their saved configuration unchanged. Invalid or empty edits do not replace valid saved paths.
 Add further libraries afterward in Settings: expand Storage to choose Game Library, Offline Installers,
 or Goodies & Extras. Game Display contains the separate display preferences.
 New profiles suggest `~/Games/Ludomere/{games,installers,extras}`. Chosen new directories are created
-only on Save; incompatible selections remain visible for correction. Proton choices
+after a valid edit or Next; incompatible selections remain visible for correction. Proton choices
 show their full paths, including a selectable wrapping path below the version selector. Choosing a
 version saves it automatically; Custom Proton Directory reveals the folder picker. Proton downloads
 are offered when no valid existing versions are detected. The next step automatically checks the
-selected Proton's Steam Linux Runtime and enables its download only when missing. Save the settings
+selected Proton's Steam Linux Runtime and enables its download only when missing. Finish setup
 before optional GOG sign-in opens in its own modal. Close the
 sign-in modal to skip; already signed-in users do not need to sign in again. Failed saves keep your
-edits in the wizard for retry. Skip or close the wizard to finish later without saving folder drafts;
+edits in the wizard for retry. Skip or close the wizard to finish later, retaining valid edits;
 Finish setup remains available without repeatedly opening it.
 Closing the login window after GOG redirects does not itself mean sign-in succeeded: token exchange,
 account verification and secure credential storage must finish first. Failures appear in Notifications
@@ -285,8 +294,8 @@ or return to inheriting it. These preferences survive uninstall. If a saved dire
 choose a replacement: Ludomere does not silently switch versions.
 
 Game Settings → Compatibility → DLL overrides provides per-game DLL names with Native, Builtin,
-Native then Builtin, Builtin then Native, or Disabled load order. Save applies the rows to the next
-Windows game launch; Cancel Changes restores the saved rows. Removing a row restores existing
+Native then Builtin, Builtin then Native, or Disabled load order. Valid rows save automatically for the next
+Windows game launch; invalid drafts leave saved overrides unchanged. Removing a row restores existing
 defaults. These preferences survive uninstall and prefix recreation. They do not download DLLs,
 change the prefix registry, or affect native games and installer/setup commands. Explicit choices
 override matching Ludomere defaults and incoming DLL selections; Proton can still apply its own
@@ -367,6 +376,10 @@ Normal sign-out never resets the profile, including for an old saved reset-on-si
 Sign-out revokes the account immediately, pauses downloads and interrupts setup safely; running
 games continue. Interrupted operations remain recoverable after signing in. Factory Reset discards queue and
 automatic-resume records after their writers stop, while keeping downloaded and installed files.
+Reset retains a small identity receipt so incomplete game files remain recognizable without
+restoring automatic resume. Older partial Depot folders can also be recognized when a surviving
+journal matches their files. Unidentified folders and content in the wrong library type still
+require correction before the library can be used.
 If reset preparation cannot finish, the account stays signed out; use Factory Reset again to retry.
 Progress and full error details appear beside the Factory Reset button. An unavailable system
 credential store does not block local reset: its external login entry may remain, but a durable

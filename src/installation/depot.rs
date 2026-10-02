@@ -157,7 +157,7 @@ where
             }
             Ok(())
         },
-        cancelled,
+        (cancelled, |_| {}),
         || Ok(()),
         if fail_before_marker {
             CommitFailure::BeforeMarker
@@ -167,13 +167,13 @@ where
     )
 }
 
-pub(crate) fn execute_streamed_forward<F, C, P>(
+pub(crate) fn execute_streamed_forward<F, C, P, E>(
     plan: &DepotInstallPlan<'_>,
     staging: &Path,
     forced_remove_paths: &BTreeSet<String>,
     trusted_files: &std::collections::HashSet<String>,
     fetch: F,
-    cancelled: C,
+    callbacks: (C, E),
     before_commit: P,
 ) -> Result<()>
 where
@@ -183,6 +183,7 @@ where
         &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<()>,
     C: FnMut() -> bool,
+    E: FnMut(crate::download::depot::ExtractionProgress),
     P: FnMut() -> Result<()>,
 {
     for path in forced_remove_paths {
@@ -193,7 +194,7 @@ where
         Some(staging),
         (forced_remove_paths, trusted_files),
         fetch,
-        cancelled,
+        callbacks,
         before_commit,
         CommitFailure::None,
     )
@@ -224,18 +225,18 @@ where
             }
             Ok(())
         },
-        cancelled,
+        (cancelled, |_| {}),
         || Ok(()),
     )?;
     crate::download::depot::finish_journal(staging)
 }
 
-fn execute_streamed_inner<F, C, P>(
+fn execute_streamed_inner<F, C, P, E>(
     plan: &DepotInstallPlan<'_>,
     supplied_staging: Option<&Path>,
     paths: (&BTreeSet<String>, &std::collections::HashSet<String>),
     fetch: F,
-    mut cancelled: C,
+    callbacks: (C, E),
     mut before_commit: P,
     failure: CommitFailure,
 ) -> Result<()>
@@ -246,8 +247,10 @@ where
         &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<()>,
     C: FnMut() -> bool,
+    E: FnMut(crate::download::depot::ExtractionProgress),
     P: FnMut() -> Result<()>,
 {
+    let (mut cancelled, extracted) = callbacks;
     let (forced_remove_paths, trusted_files) = paths;
     plan.validate()?;
     let generated = plan.target.with_extension("ludomere-depot.json");
@@ -267,13 +270,14 @@ where
     };
     let result = (|| {
         preflight_live_tree(plan, forced_remove_paths)?;
-        crate::download::depot::materialize_streamed_controlled(
+        crate::download::depot::materialize_streamed_with_progress(
             plan.target_manifest,
             &plan.target,
             journal,
             trusted_files,
             fetch,
             &mut cancelled,
+            extracted,
         )
         .context("materializing depot build")?;
         if cancelled() {
@@ -1473,7 +1477,7 @@ mod tests {
                         }
                         Ok(())
                     },
-                    || false,
+                    (|| false, |_| {}),
                     || Ok(()),
                     failure,
                 )

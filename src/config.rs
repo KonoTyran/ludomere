@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub theme: Theme,
@@ -118,7 +118,7 @@ impl LibraryKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
     #[default]
@@ -249,12 +249,15 @@ impl Config {
                 fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let mut config: Self =
                 toml::from_str(&text).context("parsing Ludomere configuration")?;
+            let stored = config.clone();
             config.max_concurrent_downloads = config.max_concurrent_downloads.clamp(1, 4);
             config.library_card_size = config.library_card_size.min(3);
             config.normalize_libraries();
             config.migrate_source_default();
             config.normalize_installation_source_order();
-            write_config(&path, &config)?;
+            if config != stored {
+                write_config(&path, &config)?;
+            }
             return Ok(config);
         }
 
@@ -646,6 +649,8 @@ enabled = true
             let download_directory = root.join("Independent Downloads");
             let library = root.join("Game Library");
             let config = Config {
+                max_concurrent_downloads: 99,
+                library_card_size: 99,
                 download_directory: download_directory.clone(),
                 game_libraries: vec![GameLibrary {
                     id: String::new(),
@@ -657,8 +662,28 @@ enabled = true
                 ..Config::default()
             };
             config.save().unwrap();
-            for _ in 0..2 {
+            for attempt in 0..2 {
+                let partial = Config::path().with_extension("toml.part");
+                if attempt == 1 {
+                    fs::write(&partial, "another writer's pending settings").unwrap();
+                }
+                let before = fs::metadata(Config::path()).unwrap().modified().unwrap();
                 let loaded = Config::load_or_create().unwrap();
+                assert_eq!(loaded.max_concurrent_downloads, 4);
+                assert_eq!(loaded.library_card_size, 3);
+                let persisted: Config =
+                    toml::from_str(&fs::read_to_string(Config::path()).unwrap()).unwrap();
+                assert_eq!(persisted, loaded, "normalization must persist once");
+                if attempt == 1 {
+                    assert_eq!(
+                        fs::metadata(Config::path()).unwrap().modified().unwrap(),
+                        before
+                    );
+                    assert_eq!(
+                        fs::read_to_string(&partial).unwrap(),
+                        "another writer's pending settings"
+                    );
+                }
                 assert_eq!(loaded.download_directory, download_directory);
                 assert_eq!(loaded.installer_library().unwrap().path, library);
                 assert_eq!(

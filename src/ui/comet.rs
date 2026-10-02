@@ -178,11 +178,13 @@ pub(super) fn comet_page(window: &adw::ApplicationWindow) -> adw::PreferencesPag
     let running: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::new(RefCell::new(None));
     cancel.connect_clicked({
         let running = running.clone();
+        let message = message.clone();
         move |button| {
             if let Some(cancel) = running.borrow().as_ref() {
                 cancel.store(true, Ordering::Relaxed);
             }
             button.set_sensitive(false);
+            message.set_label("Stopping the Comet download…");
         }
     });
     page.connect_unrealize({

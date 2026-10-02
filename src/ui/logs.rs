@@ -13,6 +13,7 @@ struct Viewer {
     follow: gtk::CheckButton,
     copy: gtk::Button,
     refresh: gtk::Button,
+    reading: gtk::Spinner,
     folder: gtk::Button,
     status: gtk::Label,
     text: gtk::TextView,
@@ -32,8 +33,17 @@ impl Viewer {
         model.account_epoch == self.epoch && !model.logout_pending
     }
 
-    fn request(self: &Rc<Self>) {
-        if !self.valid() || self.running.replace(true) {
+    fn request(self: &Rc<Self>, explicit: bool) {
+        if !self.valid() {
+            return;
+        }
+        if explicit {
+            self.status.set_label("Reading game logs…");
+            self.refresh.set_sensitive(false);
+            self.reading.set_visible(true);
+            self.reading.start();
+        }
+        if self.running.replace(true) {
             return;
         }
         let requested = self.selected.borrow().clone();
@@ -70,11 +80,9 @@ impl Viewer {
             }
             match receiver.try_recv() {
                 Ok(result) => {
-                    viewer.running.set(false);
-                    viewer
-                        .next_read
-                        .set(Instant::now() + Duration::from_secs(1));
+                    viewer.read_finished();
                     if *viewer.selected.borrow() != selection {
+                        viewer.request(true);
                         return glib::ControlFlow::Break;
                     }
                     match result {
@@ -88,7 +96,7 @@ impl Viewer {
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    viewer.running.set(false);
+                    viewer.read_finished();
                     viewer
                         .status
                         .set_label("Log reader stopped. Refresh to retry.");
@@ -96,6 +104,14 @@ impl Viewer {
                 }
             }
         });
+    }
+
+    fn read_finished(&self) {
+        self.running.set(false);
+        self.next_read.set(Instant::now() + Duration::from_secs(1));
+        self.reading.stop();
+        self.reading.set_visible(false);
+        self.refresh.set_sensitive(true);
     }
 
     fn apply(&self, logs: Vec<RuntimeLog>, name: Option<String>, tail: Option<RuntimeLogTail>) {
@@ -180,6 +196,8 @@ impl Viewer {
     }
 
     fn clear(&self) {
+        self.reading.stop();
+        self.reading.set_visible(false);
         self.text.buffer().set_text("");
         self.logs.borrow_mut().clear();
         self.selector.set_model(None::<&gtk::StringList>);
@@ -225,6 +243,10 @@ pub(super) fn runtime_log_view(
     selector.set_sensitive(false);
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     controls.append(&selector);
+    let reading = gtk::Spinner::new();
+    reading.set_widget_name("runtime-log-reading");
+    reading.set_visible(false);
+    controls.append(&reading);
     let refresh = gtk::Button::with_label("Refresh");
     let copy = gtk::Button::with_label("Copy");
     copy.set_sensitive(false);
@@ -272,6 +294,7 @@ pub(super) fn runtime_log_view(
         follow,
         copy,
         refresh,
+        reading,
         folder,
         status,
         text,
@@ -300,7 +323,7 @@ pub(super) fn runtime_log_view(
                 .map(|log| log.name.clone());
             viewer.force.set(true);
             viewer.next_read.set(Instant::now());
-            viewer.request();
+            viewer.request(true);
         }
     });
     viewer.refresh.connect_clicked({
@@ -308,7 +331,7 @@ pub(super) fn runtime_log_view(
         move |_| {
             if let Some(viewer) = viewer.upgrade() {
                 viewer.force.set(true);
-                viewer.request();
+                viewer.request(true);
             }
         }
     });
@@ -321,7 +344,7 @@ pub(super) fn runtime_log_view(
                 let buffer = viewer.text.buffer();
                 buffer.place_cursor(&buffer.end_iter());
                 viewer.force.set(true);
-                viewer.request();
+                viewer.request(true);
             }
         }
     });
@@ -423,7 +446,7 @@ pub(super) fn runtime_log_view(
             return glib::ControlFlow::Break;
         }
         if root.is_mapped() && Instant::now() >= viewer.next_read.get() {
-            viewer.request();
+            viewer.request(false);
         }
         glib::ControlFlow::Continue
     });

@@ -278,7 +278,7 @@ pub fn build_window(app: &adw::Application) {
     download::set_concurrency(model.borrow().config.max_concurrent_downloads);
     let widgets = Rc::new(create_widgets(app, &model.borrow().config));
 
-    connect_actions(&widgets, &model, &store);
+    connect_actions(&widgets, &model);
     organization::initialize(&widgets, &model);
     {
         let widgets = Rc::downgrade(&widgets);
@@ -1381,11 +1381,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     }
 }
 
-pub(super) fn connect_actions(
-    w: &Rc<Widgets>,
-    model: &Rc<RefCell<AppModel>>,
-    store: &Rc<StateStore>,
-) {
+pub(super) fn connect_actions(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     let offline = gio::SimpleAction::new("offline-download", Some(&i64::static_variant_type()));
     offline.connect_activate({
         let w = w.clone();
@@ -1548,6 +1544,8 @@ pub(super) fn connect_actions(
                 .is_some_and(|token| token.expires_at > chrono::Utc::now().timestamp());
             if !authenticated && model.borrow().network_available {
                 show_gog_login(&w, &model);
+            } else {
+                w.account_popover.popup();
             }
         });
     }
@@ -1878,31 +1876,79 @@ pub(super) fn connect_actions(
     {
         let w = w.clone();
         let model = model.clone();
-        let store = store.clone();
+        let pending = Rc::new(RefCell::new(HashSet::new()));
         favorite_action.connect_activate(move |_, value| {
             let Some(id) = value.and_then(|v| v.get::<i64>()) else {
                 return;
             };
-            let favorite = {
-                let mut m = model.borrow_mut();
-                if m.favorites.contains(&id) {
-                    m.favorites.remove(&id);
-                    false
-                } else {
-                    m.favorites.insert(id);
-                    true
+            if model.borrow().logout_pending {
+                return;
+            }
+            if !pending.borrow_mut().insert(id) {
+                show_status(&w, "This favorite is still being saved");
+                return;
+            }
+            let favorite = !model.borrow().favorites.contains(&id);
+            let epoch = model.borrow().account_epoch;
+            let session = online::account_session();
+            show_progress(&w, "Saving favorite…");
+            let receiver = update_policies::policy_request(move || {
+                let _activity = crate::profile_reset::begin_activity("saving favorite")?;
+                online::with_account_session(session, || {
+                    StateStore::open()?.set_favorite(id, favorite)
+                })
+            });
+            let pending = pending.clone();
+            let model = model.clone();
+            let w = w.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if model.borrow().account_epoch != epoch
+                    || online::account_session() != session
+                    || model.borrow().logout_pending
+                {
+                    pending.borrow_mut().remove(&id);
+                    return glib::ControlFlow::Break;
                 }
-            };
-            if let Err(error) = store.set_favorite(id, favorite) {
-                tracing::error!(%error, "saving favorite");
-            }
-            update_favorite_widgets(&w, &model.borrow(), id, favorite);
-            refresh_filters(&w, &model.borrow());
-            if model.borrow().selected == Some(id)
-                && w.content.visible_child_name().as_deref() == Some("details")
-            {
-                show_game(&w, &model, id, Some(favorite));
-            }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!("Saving stopped unexpectedly. Try again.")),
+                };
+                pending.borrow_mut().remove(&id);
+                if w.live_status.label() == "Saving favorite…" {
+                    show_progress(&w, "");
+                }
+                match result {
+                    Ok(()) => {
+                        {
+                            let mut state = model.borrow_mut();
+                            if favorite {
+                                state.favorites.insert(id);
+                            } else {
+                                state.favorites.remove(&id);
+                            }
+                        }
+                        update_favorite_widgets(&w, &model.borrow(), id, favorite);
+                        refresh_filters(&w, &model.borrow());
+                        show_status(
+                            &w,
+                            if favorite {
+                                "Added to favorites"
+                            } else {
+                                "Removed from favorites"
+                            },
+                        );
+                    }
+                    Err(error) => show_status(
+                        &w,
+                        &notifications::failure_message(
+                            "Could not save favorite",
+                            &error.to_string(),
+                        ),
+                    ),
+                }
+                glib::ControlFlow::Break
+            });
         });
     }
     w.window.add_action(&favorite_action);

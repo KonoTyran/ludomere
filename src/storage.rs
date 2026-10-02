@@ -61,8 +61,21 @@ pub(crate) fn inspect_libraries_with_store(
     config: &Config,
     store: &crate::state::StateStore,
 ) -> Result<Vec<LibraryStatus>> {
-    let files = store.managed_files()?;
-    let jobs = store.download_jobs()?;
+    Ok(inspect_with_evidence(
+        config,
+        &library_evidence(store, None)?,
+    ))
+}
+
+fn library_evidence(
+    store: &crate::state::StateStore,
+    root: Option<&Path>,
+) -> Result<Vec<(PathBuf, LibraryKind)>> {
+    let files = store
+        .managed_files()?
+        .into_iter()
+        .filter(|file| file.present && root.is_none_or(|root| file.path.starts_with(root)))
+        .collect::<Vec<_>>();
     let mut parts = HashMap::new();
     for product in files
         .iter()
@@ -82,7 +95,6 @@ pub(crate) fn inspect_libraries_with_store(
     }
     let mut evidence = files
         .iter()
-        .filter(|file| file.present)
         .map(|file| {
             (
                 file.path.clone(),
@@ -96,12 +108,15 @@ pub(crate) fn inspect_libraries_with_store(
             )
         })
         .collect::<Vec<_>>();
-    evidence.extend(jobs.iter().filter_map(|job| {
+    evidence.extend(store.download_jobs()?.iter().filter_map(|job| {
+        if root.is_some_and(|root| !job.destination.starts_with(root)) {
+            return None;
+        }
         job.artifacts
             .first()
             .map(|artifact| (job.destination.clone(), artifact_library_kind(artifact)))
     }));
-    Ok(inspect_with_evidence(config, &evidence))
+    Ok(evidence)
 }
 
 fn inspect_with_evidence(
@@ -120,18 +135,27 @@ fn inspect_with_evidence(
             kind,
             library_id: library.id.clone(),
             path: library.path.clone(),
-            compatibility: match inspect_library(config, kind, library, evidence) {
-                Ok(None) => LibraryCompatibility::Compatible,
-                Ok(Some(reason)) => LibraryCompatibility::Incompatible(reason),
-                Err(error) if error.chain().any(|cause| cause.is::<std::io::Error>()) => {
-                    LibraryCompatibility::Unavailable(format!(
-                        "Could not inspect this library: {error}. Recheck after restoring access."
-                    ))
-                }
-                Err(error) => LibraryCompatibility::Incompatible(error.to_string()),
-            },
+            compatibility: library_compatibility(config, kind, library, evidence),
         })
         .collect()
+}
+
+fn library_compatibility(
+    config: &Config,
+    kind: LibraryKind,
+    library: &GameLibrary,
+    evidence: &[(PathBuf, LibraryKind)],
+) -> LibraryCompatibility {
+    match inspect_library(config, kind, library, evidence) {
+        Ok(None) => LibraryCompatibility::Compatible,
+        Ok(Some(reason)) => LibraryCompatibility::Incompatible(reason),
+        Err(error) if error.chain().any(|cause| cause.is::<std::io::Error>()) => {
+            LibraryCompatibility::Unavailable(format!(
+                "Could not inspect this library: {error}. Recheck after restoring access."
+            ))
+        }
+        Err(error) => LibraryCompatibility::Incompatible(error.to_string()),
+    }
 }
 
 pub fn validate_library(config: &Config, kind: LibraryKind, id: &str) -> Result<GameLibrary> {
@@ -140,11 +164,10 @@ pub fn validate_library(config: &Config, kind: LibraryKind, id: &str) -> Result<
         .iter()
         .find(|library| library.id == id)
         .context("The selected library is no longer configured for this type")?;
-    let status = inspect_libraries(config)?
-        .into_iter()
-        .find(|status| status.kind == kind && status.library_id == id)
-        .context("Library inspection did not finish")?;
-    match status.compatibility {
+    // Admission checks the selected root only. Config-wide overlap checks remain in
+    // inspect_library, but unrelated archive trees need not be traversed for every launch.
+    let evidence = library_evidence(&crate::state::StateStore::open()?, Some(&library.path))?;
+    match library_compatibility(config, kind, library, &evidence) {
         LibraryCompatibility::Compatible => Ok(library.clone()),
         LibraryCompatibility::Incompatible(reason) => bail!(
             "{} library is incompatible: {reason}. Correct its contents or choose another directory in Storage.",
@@ -200,34 +223,64 @@ fn contained_path(root: &Path, path: &Path) -> Result<()> {
     }
 }
 
-fn metadata_json<T: serde::de::DeserializeOwned>(root: &Path, path: &Path) -> Result<Option<T>> {
-    let mut current = root.to_path_buf();
-    for component in path.strip_prefix(root)?.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => ensure!(
-                !metadata.file_type().is_symlink(),
-                "Library metadata cannot use symbolic links"
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+fn library_file(root: &Path, path: &Path) -> Result<Option<fs::File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    ensure!(
+        path.starts_with(root) && path.is_absolute(),
+        "Metadata is outside its library"
+    );
+    let mut file = fs::File::open("/")?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => std::ffi::CString::new(name.as_encoded_bytes())?,
+            _ => bail!("Invalid library metadata path"),
+        };
+        let fd = unsafe {
+            libc::openat(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC
+                    | if components.peek().is_some() {
+                        libc::O_DIRECTORY
+                    } else {
+                        0
+                    },
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            ensure!(
+                !matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+                "Library metadata cannot use symbolic links or non-directory ancestors"
+            );
+            return Err(error.into());
         }
+        file = unsafe { fs::File::from_raw_fd(fd) };
     }
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    let limit = if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".operation.json"))
-    {
-        64 * 1024 * 1024
-    } else {
-        4 * 1024 * 1024
+    ensure!(
+        file.metadata()?.is_file(),
+        "Library metadata must be a regular file"
+    );
+    Ok(Some(file))
+}
+
+fn metadata_json<T: serde::de::DeserializeOwned>(
+    root: &Path,
+    path: &Path,
+    limit: u64,
+) -> Result<Option<T>> {
+    let Some(file) = library_file(root, path)? else {
+        return Ok(None);
     };
+    let metadata = file.metadata()?;
     ensure!(
         metadata.is_file() && metadata.len() <= limit,
         "Library metadata must be a bounded regular file"
@@ -355,36 +408,33 @@ fn inspect_library(
             ));
         }
         if kind == LibraryKind::GameFiles {
-            for category in ["installer", "patch", "extra"] {
-                let category = entry.path().join(category);
-                let metadata = match fs::symlink_metadata(&category) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                if !metadata.is_dir() {
-                    continue;
-                }
-                for platform in fs::read_dir(&category)? {
-                    let platform = platform?;
+            let mut archive = managed_archive_layout(&entry.path(), &mut budget)?;
+            let dlc = entry.path().join("dlc");
+            let dlc_directory = match fs::symlink_metadata(&dlc) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if !archive && dlc_directory {
+                for child in fs::read_dir(&dlc)? {
+                    let child = child?;
                     ensure!(
                         budget > 0,
                         "Library inspection exceeds its bounded entry limit"
                     );
                     budget -= 1;
-                    if platform.file_type()?.is_dir()
-                        && matches!(
-                            platform.file_name().to_str(),
-                            Some("windows" | "linux" | "mac" | "macos" | "any")
-                        )
-                    {
-                        return Ok(Some("Contains an archive in the managed platform layout; choose separate typed libraries".into()));
+                    if child.file_type()?.is_dir() {
+                        archive |= managed_archive_layout(&child.path(), &mut budget)?;
                     }
                 }
+            }
+            if archive {
+                return Ok(Some("Contains an archive in the managed platform layout; choose separate typed libraries".into()));
             }
             let marker = metadata_json::<crate::installation::InstallationMarker>(
                 &library.path,
                 &entry.path().join(".ludomere/installation.json"),
+                4 * 1024 * 1024,
             )?;
             if let Some(marker) = &marker {
                 marker.validate()?;
@@ -400,6 +450,7 @@ fn inspect_library(
             let journal = metadata_json::<crate::installation::operation_journal::OperationJournal>(
                 &library.path,
                 &journal,
+                64 * 1024 * 1024,
             )?;
             if let Some(journal) = &journal {
                 use crate::installation::operation_journal::OperationJournal;
@@ -424,35 +475,44 @@ fn inspect_library(
                     }
                 }
             }
-            let recovery = metadata_json::<serde_json::Value>(
-                &library.path,
-                &library
-                    .path
-                    .join(".ludomere/staging")
-                    .join(format!("{}.recovery.json", name.to_string_lossy())),
-            )?;
-            if let Some(recovery) = &recovery {
-                use std::os::unix::fs::MetadataExt;
-                let metadata = fs::symlink_metadata(entry.path())?;
-                let identity: Option<(u64, u64)> =
-                    serde_json::from_value(recovery.get("identity").cloned().unwrap_or_default())
-                        .context("Recovery identity is malformed")?;
-                ensure!(
-                    recovery.get("version").and_then(|value| value.as_u64()) == Some(1)
-                        && recovery
-                            .get("product_id")
-                            .and_then(|value| value.as_i64())
-                            .is_some_and(|id| id > 0)
-                        && recovery
-                            .get("directory")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|path| Path::new(path) == entry.path())
-                        && identity == Some((metadata.dev(), metadata.ino())),
-                    "Recovery receipt does not match its product directory"
-                );
+            let mut retained = false;
+            for suffix in ["recovery", "retained"] {
+                if suffix == "retained" && (marker.is_some() || journal.is_some()) {
+                    continue;
+                }
+                let receipt = metadata_json::<serde_json::Value>(
+                    &library.path,
+                    &library
+                        .path
+                        .join(".ludomere/staging")
+                        .join(format!("{}.{suffix}.json", name.to_string_lossy())),
+                    4 * 1024 * 1024,
+                )?;
+                if let Some(recovery) = &receipt {
+                    use std::os::unix::fs::MetadataExt;
+                    let metadata = fs::symlink_metadata(entry.path())?;
+                    let identity: Option<(u64, u64)> = serde_json::from_value(
+                        recovery.get("identity").cloned().unwrap_or_default(),
+                    )
+                    .context("Recovery identity is malformed")?;
+                    ensure!(
+                        recovery.get("version").and_then(|value| value.as_u64()) == Some(1)
+                            && recovery
+                                .get("product_id")
+                                .and_then(|value| value.as_i64())
+                                .is_some_and(|id| id > 0)
+                            && recovery
+                                .get("directory")
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|path| Path::new(path) == entry.path())
+                            && identity == Some((metadata.dev(), metadata.ino())),
+                        "Retained file identity does not match its product directory"
+                    );
+                    retained = true;
+                }
             }
             let mut gog_info = false;
-            if marker.is_none() && journal.is_none() && recovery.is_none() {
+            if marker.is_none() && journal.is_none() && !retained {
                 for info in fs::read_dir(entry.path())? {
                     let info = info?;
                     ensure!(
@@ -470,8 +530,12 @@ fn inspect_library(
                     else {
                         continue;
                     };
-                    let info = metadata_json::<serde_json::Value>(&library.path, &info.path())?
-                        .context("Game metadata disappeared during inspection")?;
+                    let info = metadata_json::<serde_json::Value>(
+                        &library.path,
+                        &info.path(),
+                        4 * 1024 * 1024,
+                    )?
+                    .context("Game metadata disappeared during inspection")?;
                     ensure!(
                         info.get("gameId")
                             .is_some_and(|value| value.as_i64() == Some(id)
@@ -485,12 +549,13 @@ fn inspect_library(
             }
             if marker.is_none()
                 && journal.is_none()
-                && recovery.is_none()
+                && !retained
                 && !gog_info
+                && !depot_payload_evidence(&library.path, &entry.path())?
                 && !plausible_payload(&entry.path(), 0, &mut budget)?
             {
                 return Ok(Some(format!(
-                    "Product directory {} has no recognized installation or operation",
+                    "Product directory {} has no recognized installation or operation. Move this unrecognized directory out of the library, then recheck; its files have not been changed",
                     name.to_string_lossy()
                 )));
             }
@@ -501,6 +566,137 @@ fn inspect_library(
         }
     }
     Ok(None)
+}
+
+fn managed_archive_layout(directory: &Path, budget: &mut usize) -> Result<bool> {
+    for category in ["installer", "patch", "extra"] {
+        let category = directory.join(category);
+        let metadata = match fs::symlink_metadata(&category) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        for platform in fs::read_dir(&category)? {
+            let platform = platform?;
+            ensure!(
+                *budget > 0,
+                "Library inspection exceeds its bounded entry limit"
+            );
+            *budget -= 1;
+            if platform.file_type()?.is_dir()
+                && matches!(
+                    platform.file_name().to_str(),
+                    Some("windows" | "linux" | "mac" | "macos" | "any")
+                )
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+// A factory reset discards runnable operations, but older builds leave the Depot's
+// materialization journal. One matching chunk establishes category, not installedness,
+// ownership for deletion, or permission to resume its old operation.
+fn depot_payload_evidence(library: &Path, directory: &Path) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Chunk {
+        index: usize,
+        offset: u64,
+        size: u64,
+        md5: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct File {
+        path: String,
+        identity: String,
+        chunks: Vec<Chunk>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Journal {
+        version: u32,
+        manifest_identity: String,
+        files: Vec<File>,
+    }
+    let Some(journal) = metadata_json::<Journal>(
+        library,
+        &library.join(".ludomere/staging").join(format!(
+            "{}.json",
+            directory
+                .file_name()
+                .context("Missing product name")?
+                .to_string_lossy()
+        )),
+        crate::download::depot::JOURNAL_LIMIT,
+    )?
+    else {
+        return Ok(false);
+    };
+    let hash = |value: &str, size| {
+        value.len() == size && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    ensure!(
+        journal.version == 1 && hash(&journal.manifest_identity, 64),
+        "Unrecognized Depot materialization journal"
+    );
+    for file in &journal.files {
+        ensure!(
+            !file.path.is_empty()
+                && Path::new(&file.path)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                && !file.path.contains('\\')
+                && hash(&file.identity, 64),
+            "Unsafe Depot materialization entry"
+        );
+        let mut offset = 0_u64;
+        for (index, chunk) in file.chunks.iter().enumerate() {
+            ensure!(
+                chunk.index == index && chunk.offset == offset && hash(&chunk.md5, 32),
+                "Invalid Depot materialization chunk"
+            );
+            offset = offset
+                .checked_add(chunk.size)
+                .context("Depot materialization size overflow")?;
+        }
+    }
+    let mut budget = 16 * 1024 * 1024;
+    for file in journal.files {
+        let Some(chunk) = file
+            .chunks
+            .first()
+            .filter(|chunk| chunk.size > 0 && chunk.size <= budget)
+        else {
+            continue;
+        };
+        let Some(payload) = library_file(library, &directory.join(&file.path))? else {
+            continue;
+        };
+        if payload.metadata()?.len() < chunk.size {
+            continue;
+        }
+        budget -= chunk.size;
+        let mut digest = md5::Context::new();
+        let mut input = payload.take(chunk.size);
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut read = 0;
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            digest.consume(&buffer[..count]);
+        }
+        if read == chunk.size && format!("{:x}", digest.compute()) == chunk.md5 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn plausible_payload(path: &Path, depth: usize, budget: &mut usize) -> Result<bool> {
@@ -685,6 +881,12 @@ mod tests {
             inspect_with_evidence(&config, &[])[0].compatibility,
             LibraryCompatibility::Incompatible(_)
         ));
+        fs::remove_dir_all(game.join("installer")).unwrap();
+        fs::create_dir_all(game.join("dlc/expansion/extra/any/en")).unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
         fs::create_dir_all(
             config.extras_libraries[0]
                 .path
@@ -784,5 +986,132 @@ mod tests {
             artifact_library_kind(&artifact),
             LibraryKind::OfflineInstallers
         );
+    }
+
+    #[test]
+    fn reset_depot_files_require_matching_bounded_materialization_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let config = configured(root.path());
+        let library = &config.game_libraries[0].path;
+        let game = library.join("partial");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("content.bin"), b"partial payload").unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+        let path = library.join(".ludomere/staging/partial.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut files = (0..16_011)
+            .map(|index| {
+                serde_json::json!({
+                    "path": format!("content/{index}/{}.bin", "x".repeat(200)), "identity": "a".repeat(64), "chunks": []
+                })
+            })
+            .collect::<Vec<_>>();
+        files[0] = serde_json::json!({"path":"content.bin", "identity":"a".repeat(64),
+            "chunks":[{"index":0,"offset":0,"size":15,"md5":format!("{:x}",md5::compute(b"partial payload"))}]});
+        let mut journal =
+            serde_json::json!({"version":1,"manifest_identity":"b".repeat(64),"files":files});
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
+        assert_eq!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Compatible
+        );
+        fs::write(game.join("content.bin"), b"changed payload").unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+        fs::remove_file(game.join("content.bin")).unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"partial payload").unwrap();
+        std::os::unix::fs::symlink(&outside, game.join("content.bin")).unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+        fs::remove_file(game.join("content.bin")).unwrap();
+        fs::write(game.join("content.bin"), b"partial payload").unwrap();
+        journal["files"][1]["path"] = serde_json::json!("../outside");
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+        journal["files"][1]["path"] = serde_json::json!("other.bin");
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        fs::create_dir_all(game.join("installer/windows/en")).unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+    }
+
+    #[test]
+    fn retained_identity_does_not_accept_replaced_or_linked_directories() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let config = configured(root.path());
+        let library = &config.game_libraries[0].path;
+        let game = library.join("partial");
+        fs::create_dir(&game).unwrap();
+        let metadata = fs::metadata(&game).unwrap();
+        let receipt = library.join(".ludomere/staging/partial.retained.json");
+        fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        fs::write(&receipt, serde_json::to_vec(&serde_json::json!({
+            "version":1,"product_id":7,"directory":game,"identity":[metadata.dev(),metadata.ino()]
+        })).unwrap()).unwrap();
+        assert_eq!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Compatible
+        );
+        let outside = root.path().join("prior");
+        fs::rename(&game, &outside).unwrap();
+        fs::create_dir(&game).unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+        // An independently validated new installation supersedes an old reset receipt.
+        marker(&game);
+        assert_eq!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Compatible
+        );
+        fs::remove_dir_all(game.join(".ludomere")).unwrap();
+        fs::remove_dir(&game).unwrap();
+        symlink(&outside, &game).unwrap();
+        assert!(matches!(
+            inspect_with_evidence(&config, &[])[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+    }
+
+    #[test]
+    fn selected_library_inspection_still_checks_other_configured_paths_for_overlap() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = configured(root.path());
+        config.extras_libraries[0].path = root.path().join("unavailable");
+        assert_eq!(
+            library_compatibility(
+                &config,
+                LibraryKind::GameFiles,
+                &config.game_libraries[0],
+                &[]
+            ),
+            LibraryCompatibility::Compatible
+        );
+        config.extras_libraries[0].path = config.game_libraries[0].path.join("extras");
+        assert!(matches!(
+            library_compatibility(
+                &config,
+                LibraryKind::GameFiles,
+                &config.game_libraries[0],
+                &[]
+            ),
+            LibraryCompatibility::Incompatible(_)
+        ));
     }
 }

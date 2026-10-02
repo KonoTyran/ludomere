@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 
 #[derive(Clone)]
 struct Editor {
+    product_id: i64,
+    session: u64,
+    revision: Rc<std::cell::Cell<u64>>,
     group: glib::WeakRef<adw::PreferencesGroup>,
     rows: gtk::ListBox,
     entries: Rc<RefCell<Vec<(adw::ActionRow, gtk::Entry, gtk::DropDown)>>>,
@@ -42,7 +45,26 @@ impl Editor {
         self.rows.append(&row);
         self.entries
             .borrow_mut()
-            .push((row.clone(), entry, order_row));
+            .push((row.clone(), entry.clone(), order_row.clone()));
+        let changed = self.change_handler();
+        entry.connect_changed({
+            let changed = changed.clone();
+            move |_| changed(true)
+        });
+        entry.connect_activate({
+            let changed = changed.clone();
+            move |_| changed(false)
+        });
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave({
+            let changed = changed.clone();
+            move |_| changed(false)
+        });
+        entry.add_controller(focus);
+        order_row.connect_selected_notify({
+            let changed = changed.clone();
+            move |_| changed(false)
+        });
         let rows = self.rows.downgrade();
         let entries = Rc::downgrade(&self.entries);
         let row = row.downgrade();
@@ -54,6 +76,7 @@ impl Editor {
                     .borrow_mut()
                     .retain(|(candidate, _, _)| *candidate != row);
                 rows.remove(&row);
+                changed(false);
             }
         });
     }
@@ -69,6 +92,7 @@ impl Editor {
             .set_label("Changes apply to the next Windows game launch.");
     }
 
+    #[cfg(test)]
     fn values(&self) -> anyhow::Result<BTreeMap<String, DllLoadOrder>> {
         normalize_dll_overrides(self.entries.borrow().iter().map(|(_, name, order)| {
             (
@@ -77,13 +101,108 @@ impl Editor {
             )
         }))
     }
+
+    fn change_handler(&self) -> Rc<dyn Fn(bool)> {
+        let entries = Rc::downgrade(&self.entries);
+        let status = self.status.downgrade();
+        let saved = self.saved.clone();
+        let revision = self.revision.clone();
+        let product_id = self.product_id;
+        let session = self.session;
+        Rc::new(move |debounce| {
+            let (Some(entries), Some(status)) = (entries.upgrade(), status.upgrade()) else {
+                return;
+            };
+            if online::account_session() != session {
+                status.set_label(
+                    "The account changed. Reopen Properties before changing DLL overrides.",
+                );
+                return;
+            }
+            revision.set(revision.get().wrapping_add(1));
+            let current = revision.get();
+            let values =
+                normalize_dll_overrides(entries.borrow().iter().map(|(_, name, order)| {
+                    (
+                        name.text().to_string(),
+                        DllLoadOrder::ALL[order.selected() as usize],
+                    )
+                }));
+            status.set_label("Checking DLL overrides…");
+            let status = status.downgrade();
+            let saved = saved.clone();
+            let revision = revision.clone();
+            glib::timeout_add_local_once(
+                Duration::from_millis(if debounce { 400 } else { 0 }),
+                move || {
+                    if online::account_session() != session {
+                        if let Some(status) = status.upgrade() {
+                            status.set_label("The account changed. Reopen Properties before changing DLL overrides.");
+                        }
+                        return;
+                    }
+                    if revision.get() != current {
+                        return;
+                    }
+                    let values = match values {
+                        Ok(values) => values,
+                        Err(error) => {
+                            if let Some(status) = status.upgrade() {
+                                status.set_label(&format!(
+                                    "Not saved: {error}. Correct the invalid row or remove it."
+                                ));
+                            }
+                            return;
+                        }
+                    };
+                    if let Some(status) = status.upgrade() {
+                        status.set_label("Saving DLL overrides…");
+                    }
+                    let receiver = update_policies::policy_request(move || {
+                        online::with_account_session(session, || {
+                            set_game_dll_overrides(product_id, values.clone())
+                        })?;
+                        Ok(values)
+                    });
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        let result = match receiver.try_recv() {
+                            Ok(result) => result,
+                            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                            Err(_) => Err(anyhow::anyhow!("DLL preference worker stopped")),
+                        };
+                        if online::account_session() != session {
+                            if let Some(status) = status.upgrade() {
+                                status.set_label("The account changed. Reopen Properties before changing DLL overrides.");
+                            }
+                            return glib::ControlFlow::Break;
+                        }
+                        if let Ok(values) = &result {
+                            *saved.borrow_mut() = values.clone();
+                        }
+                        if revision.get() == current
+                            && let Some(status) = status.upgrade()
+                        {
+                            status.set_label(&match result {
+                            Ok(_) => "Saved automatically. Changes apply to the next Windows game launch.".into(),
+                            Err(error) => format!("Could not save DLL overrides: {error}. Edit a row to retry; the last saved overrides are unchanged."),
+                        });
+                        }
+                        glib::ControlFlow::Break
+                    });
+                },
+            );
+        })
+    }
 }
 
 pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("DLL overrides");
-    group.set_description(Some("Windows game launches only. Native uses a Windows DLL; Builtin uses Wine's implementation. Choices override matching Ludomere and inherited settings; Proton may apply its own runtime policy. Removing a row restores existing defaults. No DLLs are downloaded."));
+    group.set_description(Some("Changes save automatically for the next Windows launch. Native uses a Windows DLL; Builtin uses Wine's implementation. Choices override matching Ludomere and inherited settings; Proton may apply its own runtime policy. Removing a row restores existing defaults. No DLLs are downloaded."));
     let editor = Editor {
+        product_id,
+        session: online::account_session(),
+        revision: Rc::new(std::cell::Cell::new(0)),
         group: group.downgrade(),
         rows: gtk::ListBox::new(),
         entries: Rc::new(RefCell::new(Vec::new())),
@@ -97,14 +216,9 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
     editor.status.set_selectable(true);
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let add = gtk::Button::with_label("Add DLL");
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
-    let cancel = gtk::Button::with_label("Cancel Changes");
     let reload = gtk::Button::with_label("Retry Loading");
     reload.set_visible(false);
-    for button in [&add, &save, &cancel] {
-        controls.append(button);
-    }
+    controls.append(&add);
     controls.set_sensitive(false);
     group.add(&editor.rows);
     group.add(&controls);
@@ -113,54 +227,6 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
     add.connect_clicked({
         let editor = editor.clone();
         move |_| editor.add("", DllLoadOrder::NativeThenBuiltin)
-    });
-    cancel.connect_clicked({
-        let editor = editor.clone();
-        move |_| editor.restore()
-    });
-    save.connect_clicked({
-        let editor = editor.clone();
-        let controls = controls.downgrade();
-        move |_| {
-            let values = match editor.values() {
-                Ok(values) => values,
-                Err(error) => { editor.status.set_label(&error.to_string()); return; }
-            };
-            let Some(controls) = controls.upgrade() else { return; };
-            controls.set_sensitive(false);
-            editor.rows.set_sensitive(false);
-            editor.status.set_label("Saving DLL overrides…");
-            let (sender, receiver) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let result = set_game_dll_overrides(product_id, values.clone()).map(|()| values);
-                sender.send(result).ok();
-            });
-            let editor = editor.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                if editor.group.upgrade().is_none() {
-                    return glib::ControlFlow::Break;
-                }
-                match receiver.try_recv() {
-                    Ok(Ok(values)) => {
-                        *editor.saved.borrow_mut() = values;
-                        editor.restore();
-                        editor.status.set_label("Saved. Changes apply to the next Windows game launch.");
-                    }
-                    Ok(Err(error)) => {
-                        if let Some(crate::compatibility::CompatibilityFailure::PreferencesTooLarge) = error.downcast_ref::<crate::compatibility::CompatibilityFailure>() {
-                            editor.status.set_label(&crate::compatibility::CompatibilityFailure::PreferencesTooLarge.to_string());
-                        } else {
-                            editor.status.set_label("Could not save DLL overrides. Your changes are still here; check configuration access and retry Save.");
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(_) => editor.status.set_label("DLL preference worker stopped. Retry Save."),
-                }
-                controls.set_sensitive(true);
-                editor.rows.set_sensitive(true);
-                glib::ControlFlow::Break
-            });
-        }
     });
     reload.connect_clicked({
         let editor = editor.clone();
@@ -185,6 +251,15 @@ fn load(product_id: i64, editor: &Editor, controls: &gtk::Box, reload: &gtk::But
         if editor.group.upgrade().is_none() {
             return glib::ControlFlow::Break;
         }
+        if online::account_session() != editor.session {
+            editor
+                .status
+                .set_label("The account changed. Reopen Properties before changing DLL overrides.");
+            controls.set_sensitive(false);
+            reload.set_sensitive(false);
+            editor.rows.set_sensitive(false);
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
             Ok(Ok(values)) => {
                 *editor.saved.borrow_mut() = values;
@@ -206,11 +281,66 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires an isolated GTK display"]
-    fn dll_editor_keeps_invalid_rows_and_cancel_restores_saved_modes() {
+    #[ignore = "requires private HOME/all XDG and an isolated GTK display"]
+    fn dll_autosave_preserves_invalid_drafts_and_orders_reverted_choices() {
+        assert!(std::env::var("HOME").unwrap().starts_with("/tmp/ludomere-"));
         gtk::init().unwrap();
         let group = adw::PreferencesGroup::new();
         let editor = Editor {
+            product_id: 997,
+            session: online::account_session(),
+            revision: Rc::new(std::cell::Cell::new(0)),
+            group: group.downgrade(),
+            rows: gtk::ListBox::new(),
+            entries: Rc::new(RefCell::new(Vec::new())),
+            saved: Rc::new(RefCell::new(BTreeMap::new())),
+            status: gtk::Label::new(None),
+        };
+        fn wait_until(condition: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(condition());
+        }
+        editor.add("dinput8", DllLoadOrder::Builtin);
+        let (name, order) = {
+            let rows = editor.entries.borrow();
+            (rows[0].1.clone(), rows[0].2.clone())
+        };
+        name.set_text("dinput9");
+        wait_until(|| editor.status.label().starts_with("Saved automatically"));
+        let valid = game_dll_overrides(997).unwrap();
+        name.set_text("../invalid");
+        wait_until(|| editor.status.label().starts_with("Not saved:"));
+        assert_eq!(game_dll_overrides(997).unwrap(), valid);
+        name.set_text("dinput9");
+        name.emit_by_name::<()>("activate", &[]);
+        wait_until(|| editor.status.label().starts_with("Saved automatically"));
+        order.set_selected(4);
+        while glib::MainContext::default().iteration(false) {}
+        order.set_selected(1);
+        wait_until(|| editor.status.label().starts_with("Saved automatically"));
+        assert_eq!(
+            game_dll_overrides(997).unwrap(),
+            valid,
+            "reverting during a queued write must persist the final choice"
+        );
+        name.set_text("dinput10");
+        drop(editor);
+        wait_until(|| game_dll_overrides(997).unwrap().contains_key("dinput10"));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display"]
+    fn dll_editor_keeps_invalid_rows_and_restores_saved_modes() {
+        gtk::init().unwrap();
+        let group = adw::PreferencesGroup::new();
+        let editor = Editor {
+            product_id: 7,
+            session: online::account_session(),
+            revision: Rc::new(std::cell::Cell::new(0)),
             group: group.downgrade(),
             rows: gtk::ListBox::new(),
             entries: Rc::new(RefCell::new(Vec::new())),

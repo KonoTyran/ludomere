@@ -130,9 +130,17 @@ fn collect_candidates(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
             collect_candidates(root, &path, depth + 1, game_name, output);
-        } else if let Some(candidate) = rank_candidate(root, path, game_name) {
+        } else if kind.is_file()
+            && let Some(candidate) = rank_candidate(root, path, game_name)
+        {
             output.push(candidate);
         }
     }
@@ -289,5 +297,24 @@ mod tests {
         assert_eq!(result.selected, None);
         assert_eq!(result.candidates.len(), 2);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fallback_does_not_follow_directory_or_executable_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("one.exe"), b"exe").unwrap();
+        fs::write(outside.path().join("Game.exe"), b"exe").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked-directory")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("Game.exe"),
+            root.path().join("Game.exe"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.path(), root.path().join("cycle")).unwrap();
+        let result = discover_windows_executable(root.path(), 42, "Game");
+        assert_eq!(result.selected, None);
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].path, root.path().join("one.exe"));
     }
 }

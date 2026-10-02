@@ -56,7 +56,19 @@ pub(super) fn cloud_management_group(
                 if state.borrow().account_epoch != epoch || !parent.is_visible() {
                     return;
                 }
-                let Ok(folder) = result else { return };
+                let folder = match result {
+                    Ok(folder) => folder,
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) =>
+                    {
+                        return;
+                    }
+                    Err(error) => {
+                        status.set_label(&format!("Could not choose an export folder: {error}"));
+                        return;
+                    }
+                };
                 let Some(destination) = folder.path() else {
                     status.set_label("Choose a local filesystem directory.");
                     return;

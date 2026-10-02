@@ -11,6 +11,7 @@ pub(super) fn show_game_settings(
         return;
     };
     let window_name = format!("ludomere-game-settings-{}", game.product_id);
+    let session = online::account_session();
     if let Some(existing) = application
         .windows()
         .into_iter()
@@ -156,6 +157,8 @@ pub(super) fn show_game_settings(
         .unwrap_or_default();
     let recommended = crate::compatibility::recommended_fix_ids(game.product_id);
     let resetting = Rc::new(std::cell::Cell::new(false));
+    let fixes_status = gtk::Label::builder().wrap(true).xalign(0.0).build();
+    fixes_group.add(&fixes_status);
     let mut fix_rows = Vec::new();
     for fix in crate::compatibility::available_fixes() {
         let row = adw::SwitchRow::new();
@@ -172,17 +175,37 @@ pub(super) fn show_game_settings(
         let fix_id = fix.id.clone();
         let resetting = resetting.clone();
         let refresh_after_change = refresh_after_change.clone();
+        let status = fixes_status.clone();
+        let group = fixes_group.downgrade();
         row.connect_active_notify(move |row| {
             if resetting.get() {
                 return;
             }
-            if let Ok(store) = crate::state::StateStore::open()
-                && let Err(error) =
-                    store.set_compatibility_fix_override(product_id, &fix_id, row.is_active())
-            {
-                tracing::warn!(%error, product_id, %fix_id, "could not save compatibility fix");
-            }
-            refresh_after_change();
+            let Some(group) = group.upgrade() else {
+                return;
+            };
+            let active = row.is_active();
+            let fix_id = fix_id.clone();
+            let row = row.clone();
+            let resetting = resetting.clone();
+            let refresh = refresh_after_change.clone();
+            save_game_setting(
+                group.upcast(),
+                &status,
+                session,
+                move || {
+                    StateStore::open()?.set_compatibility_fix_override(product_id, &fix_id, active)
+                },
+                move |saved| {
+                    if saved {
+                        refresh();
+                    } else {
+                        resetting.set(true);
+                        row.set_active(!active);
+                        resetting.set(false);
+                    }
+                },
+            );
         });
         fixes_group.add(&row);
         fix_rows.push((fix.id.clone(), row));
@@ -201,20 +224,32 @@ pub(super) fn show_game_settings(
     reset.connect_clicked({
         let resetting = resetting.clone();
         let refresh_after_change = refresh_after_change.clone();
+        let group = fixes_group.downgrade();
+        let status = fixes_status.clone();
         move |_| {
-            if let Ok(store) = crate::state::StateStore::open()
-                && let Err(error) = store.clear_compatibility_fix_overrides(product_id)
-            {
-                tracing::warn!(%error, product_id, "could not reset compatibility fixes");
+            let Some(group) = group.upgrade() else {
                 return;
-            }
-            resetting.set(true);
-            let recommended = crate::compatibility::recommended_fix_ids(product_id);
-            for (fix_id, row) in &fix_rows {
-                row.set_active(recommended.contains(fix_id));
-            }
-            resetting.set(false);
-            refresh_after_change();
+            };
+            let resetting = resetting.clone();
+            let rows = fix_rows.clone();
+            let refresh = refresh_after_change.clone();
+            save_game_setting(
+                group.upcast(),
+                &status,
+                session,
+                move || StateStore::open()?.clear_compatibility_fix_overrides(product_id),
+                move |saved| {
+                    if saved {
+                        resetting.set(true);
+                        let recommended = crate::compatibility::recommended_fix_ids(product_id);
+                        for (fix_id, row) in &rows {
+                            row.set_active(recommended.contains(fix_id));
+                        }
+                        resetting.set(false);
+                        refresh();
+                    }
+                },
+            );
         }
     });
     compatibility_page.add(&fixes_group);
@@ -305,15 +340,33 @@ pub(super) fn show_game_settings(
             let locations_state = Rc::new(RefCell::new(record.locations.clone()));
             enabled.set_sensitive(supported);
             let product_id = installed_game.product_id;
+            let reverting = Rc::new(std::cell::Cell::new(false));
+            let status = cloud_status.clone();
             enabled.connect_active_notify(move |row| {
+                if reverting.get() {
+                    return;
+                }
                 let preference = if row.is_active() {
                     crate::domain::CloudSavePreference::Enabled
                 } else {
                     crate::domain::CloudSavePreference::Disabled
                 };
-                if let Ok(store) = StateStore::open() {
-                    store.set_cloud_save_preference(product_id, preference).ok();
-                }
+                let active = row.is_active();
+                let row = row.clone();
+                let reverting = reverting.clone();
+                save_game_setting(
+                    row.clone().upcast(),
+                    &status,
+                    session,
+                    move || StateStore::open()?.set_cloud_save_preference(product_id, preference),
+                    move |saved| {
+                        if !saved {
+                            reverting.set(true);
+                            row.set_active(!active);
+                            reverting.set(false);
+                        }
+                    },
+                );
             });
             cloud_group.add(&enabled);
             cloud_group.add(&info_row(
@@ -525,6 +578,7 @@ pub(super) fn show_game_settings(
             let override_locations = locations_state.clone();
             let override_locations_row = locations_row.clone();
             let override_open_folder = open_save_folder.clone();
+            let override_model = model.clone();
             choose.connect_clicked(move |_| {
                 let picker = gtk::FileDialog::builder()
                     .title("Choose save directory")
@@ -534,14 +588,37 @@ pub(super) fn show_game_settings(
                 let override_locations = override_locations.clone();
                 let override_locations_row = override_locations_row.clone();
                 let override_open_folder = override_open_folder.clone();
+                let override_model = override_model.clone();
+                let epoch = override_model.borrow().account_epoch;
+                let parent = choose_parent.clone();
                 picker.select_folder(
                     Some(&choose_parent),
                     gio::Cancellable::NONE,
                     move |result| {
-                        let Ok(file) = result else {
+                        if !parent.is_visible()
+                            || override_model.borrow().account_epoch != epoch
+                            || override_model.borrow().logout_pending
+                        {
                             return;
+                        }
+                        let file = match result {
+                            Ok(file) => file,
+                            Err(error)
+                                if error.matches(gtk::DialogError::Dismissed)
+                                    || error.matches(gtk::DialogError::Cancelled) =>
+                            {
+                                return;
+                            }
+                            Err(error) => {
+                                override_status.set_label(&format!(
+                                    "Could not choose a save directory: {error}"
+                                ));
+                                return;
+                            }
                         };
                         let Some(path) = file.path() else {
+                            override_status
+                                .set_label("Choose a local directory for your save files.");
                             return;
                         };
                         let location = crate::domain::CloudSaveLocation {
@@ -914,12 +991,28 @@ pub(super) fn show_game_settings(
             let install_directory = install_directory.clone();
             let save_status = save_status.clone();
             picker.open(Some(&window), gio::Cancellable::NONE, move |result| {
-                let Ok(file) = result else { return };
-                let Some(path) = file.path() else { return };
+                let file = match result {
+                    Ok(file) => file,
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled)
+                            || error.matches(gio::IOErrorEnum::Cancelled) =>
+                    {
+                        return;
+                    }
+                    Err(error) => {
+                        save_status.set_label(&format!("Could not choose executable: {error}"));
+                        return;
+                    }
+                };
+                let Some(path) = file.path() else {
+                    save_status.set_label("Choose an executable on the local filesystem");
+                    return;
+                };
                 match path.strip_prefix(&install_directory) {
                     Ok(relative) if relative.components().next().is_some() => {
                         executable.set_text(&relative.to_string_lossy());
-                        executable.emit_activate();
+                        executable.emit_by_name::<()>("entry-activated", &[]);
                     }
                     _ => save_status.set_label(
                         "Choose an executable inside this game's installation directory",
@@ -931,41 +1024,33 @@ pub(super) fn show_game_settings(
 
     if let Some(installed) = installed {
         let installed = Rc::new(RefCell::new(installed));
+        let save_state = Rc::new(LaunchSaveState::default());
         for entry in [&executable, &launch_options] {
-            entry.connect_notify_local(Some("has-focus"), {
-                let executable = executable.clone();
-                let launch_options = launch_options.clone();
-                let installed = installed.clone();
-                let save_status = save_status.clone();
-                let refresh_after_change = refresh_after_change.clone();
-                move |entry, _| {
-                    if !entry.has_focus() {
-                        persist_launch_settings(
-                            &executable,
-                            &launch_options,
-                            &installed,
-                            &save_status,
-                            &refresh_after_change,
-                        );
-                    }
-                }
-            });
-        }
-        for entry in [&executable, &launch_options] {
-            let executable = executable.clone();
-            let launch_options = launch_options.clone();
+            let executable = executable.downgrade();
+            let launch_options = launch_options.downgrade();
             let installed = installed.clone();
             let save_status = save_status.clone();
             let refresh_after_change = refresh_after_change.clone();
-            entry.connect_apply(move |_| {
-                persist_launch_settings(
-                    &executable,
-                    &launch_options,
-                    &installed,
-                    &save_status,
-                    &refresh_after_change,
-                );
-            });
+            let save_state = save_state.clone();
+            connect_launch_save(
+                entry,
+                Rc::new(move || {
+                    let (Some(executable), Some(launch_options)) =
+                        (executable.upgrade(), launch_options.upgrade())
+                    else {
+                        return;
+                    };
+                    persist_launch_settings(
+                        &executable,
+                        &launch_options,
+                        &installed,
+                        &save_status,
+                        &refresh_after_change,
+                        session,
+                        &save_state,
+                    );
+                }),
+            );
         }
     }
 
@@ -1738,13 +1823,117 @@ fn cloud_location_summary(locations: &[crate::domain::CloudSaveLocation]) -> Str
         .join("\n")
 }
 
+fn connect_launch_save(entry: &adw::EntryRow, save: Rc<dyn Fn()>) {
+    let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+    entry.connect_changed({
+        let pending = pending.clone();
+        let save = save.clone();
+        move |_| {
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let pending_done = pending.clone();
+            let save = save.clone();
+            *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                Duration::from_millis(400),
+                move || {
+                    pending_done.borrow_mut().take();
+                    save();
+                },
+            ));
+        }
+    });
+    let flush: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(source) = pending.borrow_mut().take() {
+            source.remove();
+        }
+        save();
+    });
+    entry.connect_entry_activated({
+        let flush = flush.clone();
+        move |_| flush()
+    });
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave({
+        let flush = flush.clone();
+        move |_| flush()
+    });
+    entry.add_controller(focus);
+    entry.connect_unmap(move |_| flush());
+}
+
+fn save_game_setting(
+    controls: gtk::Widget,
+    status: &gtk::Label,
+    session: u64,
+    operation: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    finish: impl Fn(bool) + 'static,
+) {
+    if online::account_session() != session {
+        status.set_label("The account changed. Reopen Properties before changing settings.");
+        controls.set_sensitive(false);
+        return;
+    }
+    controls.set_sensitive(false);
+    status.set_label("Saving settings…");
+    let receiver = update_policies::policy_request(move || {
+        let _activity = crate::profile_reset::begin_activity("saving game settings")?;
+        online::with_account_session(session, operation)
+    });
+    let status = status.downgrade();
+    let controls = controls.downgrade();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let (Some(status), Some(controls)) = (status.upgrade(), controls.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if online::account_session() != session {
+            controls.set_sensitive(false);
+            status.set_label("The account changed. Reopen Properties before changing settings.");
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!("Saving stopped unexpectedly. Try again.")),
+        };
+        controls.set_sensitive(true);
+        status.set_label(&match &result {
+            Ok(()) => "Settings saved".to_owned(),
+            Err(error) => format!("Could not save settings: {error}"),
+        });
+        finish(result.is_ok());
+        glib::ControlFlow::Break
+    });
+}
+
+#[derive(Default)]
+struct LaunchSaveState {
+    revision: std::cell::Cell<u64>,
+    submitted: RefCell<Option<(glib::GString, glib::GString)>>,
+}
+
 fn persist_launch_settings(
     executable: &adw::EntryRow,
     launch_options: &adw::EntryRow,
     installed: &Rc<RefCell<crate::domain::InstalledGame>>,
     status: &gtk::Label,
     refresh_after_change: &Rc<dyn Fn()>,
+    session: u64,
+    save_state: &Rc<LaunchSaveState>,
 ) {
+    if online::account_session() != session {
+        executable.set_sensitive(false);
+        launch_options.set_sensitive(false);
+        status.set_label("The account changed. Reopen Properties before changing launch settings.");
+        return;
+    }
+    let submitted = (executable.text(), launch_options.text());
+    if save_state.submitted.borrow().as_ref() == Some(&submitted) {
+        return;
+    }
+    save_state.revision.set(save_state.revision.get() + 1);
+    let revision = save_state.revision.get();
+    save_state.submitted.borrow_mut().take();
     let arguments = match shell_words::split(launch_options.text().as_str()) {
         Ok(arguments) => arguments,
         Err(error) => {
@@ -1765,28 +1954,80 @@ fn persist_launch_settings(
     }
     let mut updated = installed.borrow().clone();
     let full_path = updated.installation_directory.join(&relative);
-    if !relative.as_os_str().is_empty() && !full_path.is_file() {
-        status.set_label("The selected executable does not exist inside the game directory");
-        status.add_css_class("error");
-        return;
-    }
     updated.primary_executable = (!relative.as_os_str().is_empty()).then_some(full_path);
     updated.launch_arguments = arguments;
     updated.updated_at = chrono::Utc::now().timestamp();
-    match StateStore::open()
-        .and_then(|store| crate::installation::save_game_preferences(&store, &updated))
-    {
-        Ok(()) => {
-            *installed.borrow_mut() = updated;
+    *save_state.submitted.borrow_mut() = Some(submitted.clone());
+    status.remove_css_class("error");
+    status.set_label("Saving launch settings…");
+    let receiver = update_policies::policy_request(move || {
+        let _activity = crate::profile_reset::begin_activity("saving launch settings")?;
+        if let Some(path) = &updated.primary_executable {
+            anyhow::ensure!(
+                path.is_file()
+                    && path
+                        .canonicalize()?
+                        .starts_with(updated.installation_directory.canonicalize()?),
+                "The selected executable must exist inside the game directory"
+            );
+        }
+        online::with_account_session(session, || {
+            crate::installation::save_game_preferences(&StateStore::open()?, &updated)
+        })?;
+        Ok(updated)
+    });
+    let executable = executable.downgrade();
+    let launch_options = launch_options.downgrade();
+    let status = status.downgrade();
+    let installed = installed.clone();
+    let refresh = refresh_after_change.clone();
+    let save_state = save_state.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let (Some(executable), Some(launch_options), Some(status)) = (
+            executable.upgrade(),
+            launch_options.upgrade(),
+            status.upgrade(),
+        ) else {
+            return glib::ControlFlow::Break;
+        };
+        if online::account_session() != session {
+            executable.set_sensitive(false);
+            launch_options.set_sensitive(false);
+            status.set_label(
+                "The account changed. Reopen Properties before changing launch settings.",
+            );
+            return glib::ControlFlow::Break;
+        }
+        if save_state.revision.get() != revision {
+            return glib::ControlFlow::Break;
+        }
+        if executable.text() != submitted.0 || launch_options.text() != submitted.1 {
+            save_state.submitted.borrow_mut().take();
             status.remove_css_class("error");
-            status.set_label("Saved automatically");
-            refresh_after_change();
+            status.set_label("Waiting to save the latest changes…");
+            return glib::ControlFlow::Break;
         }
-        Err(error) => {
-            status.set_label(&format!("Could not save: {error}"));
-            status.add_css_class("error");
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!(
+                "Saving stopped unexpectedly. Edit the field or press Enter to retry."
+            )),
+        };
+        match result {
+            Ok(updated) => {
+                *installed.borrow_mut() = updated;
+                status.set_label("Saved automatically");
+                refresh();
+            }
+            Err(error) => {
+                save_state.submitted.borrow_mut().take();
+                status.set_label(&format!("Could not save: {error}"));
+                status.add_css_class("error");
+            }
         }
-    }
+        glib::ControlFlow::Break
+    });
 }
 
 fn info_row(title: &str, value: &str) -> adw::ActionRow {
@@ -1799,4 +2040,91 @@ fn info_row(title: &str, value: &str) -> adw::ActionRow {
     value.add_css_class("dim-label");
     row.add_suffix(&value);
     row
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, private GTK display and D-Bus"]
+    fn launch_entry_signals_and_setting_save_results_are_visible() {
+        adw::init().unwrap();
+        let entry = adw::EntryRow::new();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        connect_launch_save(
+            &entry,
+            Rc::new({
+                let calls = calls.clone();
+                move || calls.set(calls.get() + 1)
+            }),
+        );
+        assert!(!entry.shows_apply_button());
+        entry.emit_by_name::<()>("entry-activated", &[]);
+        assert_eq!(
+            calls.get(),
+            1,
+            "Enter and the executable-picker dispatch must reach saving"
+        );
+        let focus = entry
+            .observe_controllers()
+            .iter::<glib::Object>()
+            .filter_map(Result::ok)
+            .find_map(|object| object.downcast::<gtk::EventControllerFocus>().ok())
+            .unwrap();
+        focus.emit_by_name::<()>("leave", &[]);
+        assert_eq!(
+            calls.get(),
+            2,
+            "focus leaving the inner editor must reach saving"
+        );
+        entry.set_text("one");
+        entry.set_text("two");
+        assert_eq!(calls.get(), 2, "typing is debounced");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while calls.get() == 2 && std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.get(), 3, "one save receives the latest text");
+        entry.set_text("close immediately");
+        entry.emit_by_name::<()>("unmap", &[]);
+        assert_eq!(calls.get(), 4, "unmapping flushes a pending edit");
+
+        let status = gtk::Label::new(None);
+        let control = gtk::Button::new();
+        let outcome = Rc::new(std::cell::Cell::new(None));
+        for success in [false, true] {
+            outcome.set(None);
+            save_game_setting(
+                control.clone().upcast(),
+                &status,
+                online::account_session(),
+                move || {
+                    if success {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("synthetic save failure")
+                    }
+                },
+                {
+                    let outcome = outcome.clone();
+                    move |saved| outcome.set(Some(saved))
+                },
+            );
+            assert!(!control.is_sensitive());
+            assert_eq!(status.label(), "Saving settings…");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while outcome.get().is_none() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(outcome.get(), Some(success));
+            assert!(control.is_sensitive());
+            assert_eq!(status.label().contains("Settings saved"), success);
+            if !success {
+                assert!(status.label().contains("synthetic save failure"));
+            }
+        }
+    }
 }

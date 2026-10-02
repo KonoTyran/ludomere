@@ -1,5 +1,123 @@
 # Project plan
 
+## P243–P244 R91 publication
+
+- P243/P244 complete: all four version files consistent, scoped metadata/XML/package syntax and
+  final fmt/diff checks pass; cargo build --locked builds0.2.3. Independent accumulated-diff and
+  commit/PR accuracy review passes. Root proceeds with explicitly authorized commit/push/PR edit;
+  remote publication and CI results are verified separately after commit creation.
+
+- P243 storage_audit owns version metadata0.2.3 in Cargo/lock/PKGBUILD/metainfo and scoped
+  consistency checks, no dependency changes or package build. P244 depot independently inventories
+  accumulated changes/version metadata and reviews release-summary accuracy; no product edits.
+- Root prepares comprehensive commit and concise PR-body additions, verifies existing review and
+  test evidence, commits/pushes to current fork branch and updates upstream PR6 on explicit user
+  authorization. No force push; preserve remote edits/PR text and inspect new CI result.
+
+## P239–P242 R90 autosave and optimization
+
+- Complete for this bounded pass: P239 autosave implementation7 focused tests+4 private shipping
+  GTK tests pass; independent P242 actual wizard/Rename fixture and source/security review pass.
+  P240/P241 performance/dead-code reviews pass. Final fmt/diff, all-target Clippy -D warnings and
+  debug build pass after cleaning the private fixture's Cargo artifacts. No full suite, package,
+  publication, new dependency, schema change or real user profile/helper action performed.
+
+- Approved evidenced P240 fixes: state.rs batch revision-parts queries rather than one per revision,
+  filter cached pack relations in SQL, remove stale dead-code allowances on actively called paths.
+  Approved P241 fixes: remove four cfg(any()) unreachable DLC UI implementations, avoid repeated
+  identical footer-icon loading, index Downloads widgets once per progress update instead of
+  traversing for every operation. Preserve cached-image refresh and widget lookup semantics.
+  P240 also owns config.rs unchanged-read no-write optimization (creation/normalization still
+  persist); P241 owns narrow sync.rs footer-icon invalidation on newly streamed media. P242A
+  depot independently reviews P241; P242B ui_review independently reviews P240 then P239.
+- P239 identified DLL Save, per-game Proton Apply, launch fields Enter-only, onboarding final bulk
+  save and Storage Rename confirmation. Automatic valid field persistence with short debounce,
+  ordered workers and visible failures; optional untouched onboarding suggestions remain opt-in.
+
+- P239 storage_audit owns options/onboarding/Properties autosave inventory and implementation,
+  including setup/settings/proton/dll_overrides/game_settings and relevant config persistence if
+  needed. Confirm before broad backend changes. Reuse current workers; preserve action consent,
+  validate partial fields, order/coalesce writes and show failure/retry. Focused tests/private UI.
+- P240 depot audits backend state/download/installation for concrete bottlenecks and dead/old
+  paths; report evidence before bounded edits, own only approved backend paths. No schema/version
+  changes, no security/data-integrity weakening, no vendor modifications or new dependencies.
+- P241 ui_review audits UI/library refresh/rendering for inefficiencies and dead/obsolete paths,
+  excludes P239-owned controls; report concrete candidates then implement approved bounded fixes.
+  No background focus/navigation or GTK-thread traversal. Coordinate shared paths explicitly.
+- P242 independent cross-review after implementations (review others' owned paths), private
+  changed-control exercise and root integrated fmt/Clippy/build. All workers read AGENTS.md,
+  terse-code/scope-creep, retain previous edits, write reports not project records. Routine scoped
+  terminal/tests/private synthetic fixtures authorized; no full suite per small change, user
+  profile mutation, secrets, real helpers, packages or publication. Escalate policy choices.
+
+## P235–P238 R89 ineffective controls
+
+- Complete for the bounded control audit: independent private GTK matrix passes actual Properties
+  persistence/rollback/retry, favorites without navigation, account invalidation, launch errors,
+  gallery, Logs, tray and Storage controls. Final fmt/diff, all-target Clippy -D warnings and debug
+  build pass after cleaning private fixture Cargo artifacts. All14 reviewed source hashes match;
+  fixture markers absent from shipping executable. No full suite/package/publication performed.
+
+- P235/P236/P238 implementation review with focused passing evidence complete; P237 independent
+  changed-control GUI/source review running. Windows Move is refused with explicit limitation,
+  native Move preflights and reserves games; no unsafe prefix migration. P238 also fixed P237's
+  two stale-account Saving labels in game_settings.rs. Root final integrated checks pending.
+
+- Confirmed inventory: launch EntryRow signal mismatch; silent compatibility/cloud/favorite
+  persistence failures; single-screenshot no-op arrows; silent picker/desktop-launch errors;
+  enabled no-op Storage remove/move/add paths; inert network header; log/tray feedback gaps.
+  P235 additionally owns favorite section window.rs and gallery/URI controls. P236 owns shared
+  file_open helper, cloud export picker and network header section (coordinate window edits).
+  P238 depot will own logs.rs/tray.rs after P237 releases slot, then P237 resumes independent QA.
+  Ordinary Config.save failures get visible feedback only: asynchronous snapshot writer would
+  introduce cross-writer stale overwrites, so no unrelated configuration architecture change.
+
+- P235 ui_audit: audit/fix library, details, game settings, files and Downloads controls;
+  report concrete no-op reproduction and bounded changed-control verification. Own those UI
+  modules and narrow supporting callbacks only; coordinate shared paths before edits.
+- P236 storage_audit: audit/fix Settings/onboarding/account/Proton/Comet controls and narrow README;
+  preserve helper consent/security. Own settings/setup/proton/comet/auth UI surfaces, no backend
+  changes without demonstrated necessity and coordination. No real helper/account execution.
+- P237 ui_review: independent inventory of remaining controls (navigation/actions/notifications/
+  logs/screenshots/cloud/achievements), report findings to owners, then independently verify final
+  fixes with private GTK/source/focused tests. Review only; root owns project records. Routine
+  scoped tools/private fixtures/build allowed; no full suite/package/publication/user files.
+
+## P231–P234 R88 performance and responsiveness
+
+- Complete within the bounded audit: final root-reviewed source/reports, independent backend/
+  storage/GTK reviews and shipping build checks pass. bash tools/check.sh: fmt, Clippy -D warnings,
+  518 unit tests/13 ignored,6 top-level integrations/3 helper opt-ins ignored,5 Python tests.
+  Explicit14088-file probe and private GTK matrix passed separately. cargo build --locked passes;
+  reviewed UI hashes unchanged and fixture markers absent from shipping executable. Real Terraria
+  installation/hardware timing remains user verification. No global Prototype ready declaration.
+
+- P231/P232 implementation and P234A/B independent backend/storage source reviews complete with
+  focused passing evidence; root reviewed reports/diffs. P233 implemented with10 focused tests.
+  P234C independent private GUI interaction review in_progress. Final integrated build waits for
+  fixture Cargo completion/provenance. No package/publication requested.
+
+- P231 depot worker: download/depot.rs and installation/manager.rs; verify small-file journal
+  bottleneck, batch safe checkpoints, eliminate evidenced repeated work, provide measured local
+  progress. Synthetic high-file-count before/after and resume/cancel/integrity tests required.
+- P232 storage worker: storage.rs and directly necessary filesystem evidence helpers; investigate
+  reset/partial-install incompatibility and repeated validation costs. Preserve typed separation,
+  reject ambiguous paths; report any policy choice before implementing it. Focused regressions.
+- P233 UI worker: src/ui and README; audit long-action feedback and GTK blocking, integrate P231
+  materialization progress and fix confirmed silent/stuck interactions. Inventory changed controls
+  and test bounded success/failure/loading states. Coordinate backend interfaces, no backend edits.
+- P234 pending independent QA/security cross-review by non-implementers, plus integrated build
+  checks after workers' focused checks. Root owns records only. Routine scoped tools/isolated
+  fixtures authorized; no real credentials/user-file mutation/helper/package/publication. All
+  implementations report evidence, changed paths, remaining risks and gaps before completion.
+
+Ownership refinements: P231 also owns installation/depot.rs progress plumbing and exact-path
+bounded progress persistence/admission lock review. P232 owns profile_reset.rs retained payload
+identity without resume plans. P233 owns installation/windows_executable.rs narrowly to prevent
+out-of-payload symlink traversal alongside asynchronous chooser. These are evidenced R88 defects,
+not additional features. Cross-review: UI reviews storage/reset; storage reviews depot; independent
+UI reviewer follows when a slot frees. Preserve finite changed-control matrix and build provenance.
+
 ## P229–P230 R87 build failure
 
 - Fix/checks complete: isolated before/after regression confirmed missing persisted config and

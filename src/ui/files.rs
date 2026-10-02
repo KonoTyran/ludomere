@@ -2611,7 +2611,10 @@ fn artifact_download_action(
                             button.set_sensitive(true);
                             return glib::ControlFlow::Break;
                         }
-                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            progress.pulse();
+                            return glib::ControlFlow::Continue;
+                        }
                         Err(mpsc::TryRecvError::Disconnected) => {
                             status.set_label("Download preparation stopped. Retry the download.");
                             progress.set_visible(false);
@@ -2705,7 +2708,15 @@ fn artifact_download_action(
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        *running.borrow_mut() = None;
+                        status.set_label("Download stopped unexpectedly — retry");
+                        progress.set_visible(false);
+                        button.set_icon_name("folder-download-symbolic");
+                        button.set_tooltip_text(Some("Retry download"));
+                        button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
                 }
             });
         });
@@ -3165,57 +3176,6 @@ pub(super) fn language_flag(language: Option<&str>) -> &'static str {
     } else {
         "🌐"
     }
-}
-
-#[cfg(any())]
-pub(super) fn build_dlc_files_page(dlc: &Dlc, window: &adw::ApplicationWindow) -> gtk::Box {
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
-    page.set_margin_top(12);
-    let management = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    management.add_css_class("file-management-card");
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    copy.set_hexpand(true);
-    let title = gtk::Label::new(Some("Manage DLC local copy"));
-    title.set_xalign(0.0);
-    title.add_css_class("section-title");
-    let summary = gtk::Label::new(Some(&format!(
-        "{} installers  ·  {} extras  ·  {} on disk",
-        dlc.installers.len(),
-        dlc.extras.len(),
-        human_size(dlc.disk_usage)
-    )));
-    summary.set_xalign(0.0);
-    summary.add_css_class("dim-label");
-    copy.append(&title);
-    copy.append(&summary);
-    heading.append(&copy);
-    heading.append(&folder_button("Open DLC folder", &dlc.location, window));
-    management.append(&heading);
-    page.append(&management);
-    page.append(&file_collection(
-        "Installers",
-        "application-x-executable-symbolic",
-        &dlc.installers,
-        &dlc.location,
-        window,
-    ));
-    if !dlc.extras.is_empty() {
-        page.append(&file_collection(
-            "Extras",
-            "folder-documents-symbolic",
-            &dlc.extras,
-            &dlc.location.join("extras"),
-            window,
-        ));
-    }
-    if !dlc.changelog.is_empty() {
-        let changelog_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        changelog_card.add_css_class("file-collection");
-        changelog_card.append(&lazy_html_section("Changelog", dlc.changelog.clone()));
-        page.append(&changelog_card);
-    }
-    page
 }
 
 pub(super) fn verification_state(product_id: i64) -> Option<VerificationDisplayState> {

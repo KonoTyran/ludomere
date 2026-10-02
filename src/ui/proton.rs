@@ -218,7 +218,6 @@ pub(super) fn proton_selection_group_guarded(
     acquisition_busy: Option<Rc<std::cell::Cell<bool>>>,
     prompt_without_saved: bool,
 ) -> ProtonSelection {
-    let automatic = active.is_some();
     let group = adw::PreferencesGroup::new();
     group.set_title(if product_id.is_some() {
         "Proton override"
@@ -270,12 +269,9 @@ pub(super) fn proton_selection_group_guarded(
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_widget_name("proton-selection-actions");
     buttons.set_margin_top(8);
-    let apply = gtk::Button::with_label("Use selected version");
-    apply.set_visible(!automatic);
     let browse = gtk::Button::with_label("Choose folder…");
-    browse.set_visible(!automatic);
+    browse.set_visible(false);
     let refresh = gtk::Button::with_label("Refresh");
-    buttons.append(&apply);
     buttons.append(&browse);
     buttons.append(&refresh);
     group.add(&buttons);
@@ -290,13 +286,13 @@ pub(super) fn proton_selection_group_guarded(
     let custom_index = Rc::new(std::cell::Cell::new(gtk::INVALID_LIST_POSITION));
     let saved_index = Rc::new(std::cell::Cell::new(gtk::INVALID_LIST_POSITION));
     let save_error = Rc::new(RefCell::new(None::<String>));
+    let session = online::account_session();
     let reload: Rc<dyn Fn()> = Rc::new({
         let choices = choices.clone();
         let selected = selected.clone();
         let paths = paths.clone();
         let status = status.clone();
         let buttons = buttons.clone();
-        let apply = apply.clone();
         let busy = busy.clone();
         let detected = detected.clone();
         let custom_index = custom_index.clone();
@@ -305,6 +301,13 @@ pub(super) fn proton_selection_group_guarded(
         let browse = browse.clone();
         let save_error = save_error.clone();
         move || {
+            if online::account_session() != session {
+                busy.set(false);
+                status.set_label("The account changed. Reopen settings before selecting Proton.");
+                selected.set_sensitive(false);
+                buttons.set_sensitive(false);
+                return;
+            }
             if active.as_ref().is_some_and(|active| !active()) {
                 return;
             }
@@ -338,7 +341,6 @@ pub(super) fn proton_selection_group_guarded(
             let paths = paths.clone();
             let status = status.clone();
             let buttons = buttons.clone();
-            let apply = apply.clone();
             let busy = busy.clone();
             let detected = detected.clone();
             let custom_index = custom_index.clone();
@@ -347,6 +349,12 @@ pub(super) fn proton_selection_group_guarded(
             let browse = browse.clone();
             let save_error = save_error.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
+                if online::account_session() != session {
+                    busy.set(false);
+                    status
+                        .set_label("The account changed. Reopen settings before selecting Proton.");
+                    return glib::ControlFlow::Break;
+                }
                 if active.as_ref().is_some_and(|active| !active()) {
                     busy.set(false);
                     return glib::ControlFlow::Break;
@@ -359,11 +367,7 @@ pub(super) fn proton_selection_group_guarded(
                             .or(preferences.default.as_ref());
                         let mut entries = Vec::new();
                         let mut labels = Vec::new();
-                        if automatic
-                            && prompt_without_saved
-                            && saved.is_none()
-                            && product_id.is_none()
-                        {
+                        if prompt_without_saved && saved.is_none() && product_id.is_none() {
                             entries.push(None);
                             labels.push("Select a Proton version".to_string());
                         }
@@ -388,51 +392,37 @@ pub(super) fn proton_selection_group_guarded(
                             ));
                             entries.push(Some(saved.clone()));
                         }
-                        if automatic && entries.is_empty() {
+                        if entries.is_empty() {
                             entries.push(None);
                             labels.push("Select a Proton version".into());
                         }
-                        let index = if (automatic
-                            && prompt_without_saved
+                        let index = if (prompt_without_saved
                             && saved.is_none()
                             && product_id.is_none())
                             || (product_id.is_some_and(|id| {
                                 !preferences.overrides.contains_key(&id.to_string())
-                            }) && (!automatic || saved.is_some()))
-                        {
+                            })) {
                             0
                         } else {
                             saved
                                 .and_then(|saved| {
                                     entries.iter().position(|path| path.as_ref() == Some(saved))
                                 })
-                                .or_else(|| {
-                                    if automatic {
-                                        entries.iter().position(Option::is_some)
-                                    } else {
-                                        None
-                                    }
-                                })
+                                .or_else(|| entries.iter().position(Option::is_some))
                                 .unwrap_or(0)
                         };
-                        if automatic {
-                            custom_index.set(entries.len() as u32);
-                            labels.push("Custom Proton Directory".into());
-                        }
+                        custom_index.set(entries.len() as u32);
+                        labels.push("Custom Proton Directory".into());
                         choices.splice(
                             0,
                             choices.n_items(),
                             &labels.iter().map(String::as_str).collect::<Vec<_>>(),
                         );
                         *paths.borrow_mut() = entries;
-                        apply.set_sensitive(!paths.borrow().is_empty());
                         saved_index.set(index as u32);
                         selected.set_selected(index as u32);
-                        browse.set_visible(!automatic || index as u32 == custom_index.get());
-                        status.set_label(&save_error.borrow_mut().take().unwrap_or_else(|| if automatic { String::new() } else { preferences.default.map_or_else(
-                            || "No default saved. Choose a detected version, a folder, or download one below.".into(),
-                            |path| format!("Application default: {}", path.display()),
-                        ) }));
+                        browse.set_visible(index as u32 == custom_index.get());
+                        status.set_label(&save_error.borrow_mut().take().unwrap_or_default());
                         buttons.set_sensitive(true);
                         selected.set_sensitive(true);
                         busy.set(false);
@@ -466,6 +456,10 @@ pub(super) fn proton_selection_group_guarded(
         let active = active.clone();
         let acquisition_busy = acquisition_busy.clone();
         move |path| {
+            if online::account_session() != session {
+                status.set_label("The account changed. Reopen settings before selecting Proton.");
+                return;
+            }
             if busy.get()
                 || acquisition_busy.as_ref().is_some_and(|busy| busy.get())
                 || active.as_ref().is_some_and(|active| !active())
@@ -478,12 +472,15 @@ pub(super) fn proton_selection_group_guarded(
             selected.set_sensitive(false);
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = match product_id {
-                    Some(id) => compatibility::set_game_proton(id, path.as_deref()),
-                    None => compatibility::set_default_proton(
-                        path.as_deref().expect("global selection has a path"),
-                    ),
-                };
+                let result = online::with_account_session(session, || {
+                    match product_id {
+                        Some(id) => compatibility::set_game_proton(id, path.as_deref()),
+                        None => compatibility::set_default_proton(
+                            path.as_deref().expect("global selection has a path"),
+                        ),
+                    }?;
+                    Ok(())
+                });
                 let _ = sender.send(result.map_err(|error| error.to_string()));
             });
             let busy = busy.clone();
@@ -506,18 +503,7 @@ pub(super) fn proton_selection_group_guarded(
             });
         }
     });
-    apply.connect_clicked({
-        let paths = paths.clone();
-        let selected = selected.clone();
-        let save = save.clone();
-        move |_| {
-            let Some(path) = paths.borrow().get(selected.selected() as usize).cloned() else {
-                return;
-            };
-            save(path);
-        }
-    });
-    if automatic {
+    {
         selected.connect_selected_notify({
             let paths = paths.clone();
             let busy = busy.clone();
@@ -551,6 +537,7 @@ pub(super) fn proton_selection_group_guarded(
         let selected = selected.clone();
         let save = save.clone();
         let acquisition_busy = acquisition_busy.clone();
+        let status = status.clone();
         move |_| {
             if busy.get() || acquisition_busy.as_ref().is_some_and(|busy| busy.get()) {
                 return;
@@ -566,6 +553,7 @@ pub(super) fn proton_selection_group_guarded(
             let busy = busy.clone();
             let selected = selected.clone();
             let save = save.clone();
+            let status = status.clone();
             chooser.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
                 busy.set(false);
                 buttons.set_sensitive(true);
@@ -573,10 +561,17 @@ pub(super) fn proton_selection_group_guarded(
                 if active.as_ref().is_some_and(|active| !active()) {
                     return;
                 }
-                if let Ok(folder) = result
-                    && let Some(path) = folder.path()
-                {
-                    save(Some(path));
+                match result {
+                    Ok(folder) => match folder.path() {
+                        Some(path) => save(Some(path)),
+                        None => status.set_label("Choose a local Proton directory."),
+                    },
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) => {}
+                    Err(error) => {
+                        status.set_label(&format!("Could not choose a Proton directory: {error}"))
+                    }
                 }
             });
         }
@@ -1572,7 +1567,12 @@ mod tests {
         assert!(!crate::identity::config_root().join("proton.json").exists());
         assert_eq!(row.selected(), 0);
         assert!(!button("Choose folder…").is_visible());
-        assert!(!button("Use selected version").is_visible());
+        assert!(
+            !widgets
+                .iter()
+                .filter_map(|widget| widget.clone().downcast::<gtk::Button>().ok())
+                .any(|button| button.label().as_deref() == Some("Use selected version"))
+        );
         let choices = row.model().unwrap().downcast::<gtk::StringList>().unwrap();
         assert_eq!(
             choices.string(choices.n_items() - 1).unwrap(),

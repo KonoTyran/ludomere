@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -104,9 +104,10 @@ impl std::fmt::Debug for SecureEndpoint {
     }
 }
 
-const JOURNAL_LIMIT: u64 = 4 * 1024 * 1024;
+pub(crate) const JOURNAL_LIMIT: u64 = 64 * 1024 * 1024;
 pub(crate) const TRANSFER_WORKERS: usize = 8;
 const CHECKPOINT_CHUNKS: usize = 32;
+const CHECKPOINT_FILES: usize = 128;
 const TRANSFER_BUFFER: usize = 512 * 1024;
 
 pub(crate) struct ChunkWrite<'a> {
@@ -174,6 +175,24 @@ struct Journal {
     #[serde(default)]
     container_chunks: Vec<Vec<JournalChunk>>,
     files: Vec<JournalFile>,
+    #[serde(skip)]
+    file_indices: HashMap<String, usize>,
+}
+
+impl Journal {
+    fn file_index(&mut self, file: &DepotFile) -> usize {
+        *self
+            .file_indices
+            .entry(file.path.clone())
+            .or_insert_with(|| {
+                self.files.push(JournalFile {
+                    path: file.path.clone(),
+                    identity: file_identity(file),
+                    chunks: Vec::new(),
+                });
+                self.files.len() - 1
+            })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,7 +202,7 @@ struct JournalFile {
     chunks: Vec<JournalChunk>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct JournalChunk {
     index: usize,
     offset: u64,
@@ -490,12 +509,44 @@ pub(crate) fn materialize_streamed_controlled<F, C>(
     root: &Path,
     journal_path: &Path,
     trusted_files: &HashSet<String>,
-    mut fetch: F,
-    mut cancelled: C,
+    fetch: F,
+    cancelled: C,
 ) -> Result<Vec<PathBuf>>
 where
     F: FnMut(&[ChunkWrite<'_>], &File, &mut dyn FnMut(usize) -> Result<()>) -> Result<()>,
     C: FnMut() -> bool,
+{
+    materialize_streamed_with_progress(
+        manifest,
+        root,
+        journal_path,
+        trusted_files,
+        fetch,
+        cancelled,
+        |_| {},
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtractionProgress {
+    pub completed: u64,
+    pub total: u64,
+    pub written: u64,
+}
+
+pub(crate) fn materialize_streamed_with_progress<F, C, P>(
+    manifest: &DepotManifest,
+    root: &Path,
+    journal_path: &Path,
+    trusted_files: &HashSet<String>,
+    mut fetch: F,
+    mut cancelled: C,
+    mut extracted: P,
+) -> Result<Vec<PathBuf>>
+where
+    F: FnMut(&[ChunkWrite<'_>], &File, &mut dyn FnMut(usize) -> Result<()>) -> Result<()>,
+    C: FnMut() -> bool,
+    P: FnMut(ExtractionProgress),
 {
     manifest.totals()?;
     prepare_root(root, journal_path)?;
@@ -507,6 +558,7 @@ where
             manifest_identity: manifest.identity(),
             container_chunks: Vec::new(),
             files: Vec::new(),
+            file_indices: HashMap::new(),
         }
     };
     write_journal(journal_path, &journal)?;
@@ -518,10 +570,15 @@ where
         trusted_files,
         &mut journal,
         &mut fetch,
-        &mut cancelled,
+        (&mut cancelled, &mut extracted),
     )?;
+    let mut pending_files = 0;
+    let mut checkpoint = std::time::Instant::now();
     for entry in &manifest.entries {
         if cancelled() {
+            if pending_files != 0 {
+                write_journal(journal_path, &journal)?;
+            }
             return Err(DepotCancelled.into());
         }
         match entry {
@@ -531,7 +588,7 @@ where
                     files.push(destination(root, &file.path)?);
                     continue;
                 }
-                materialize_file(
+                match materialize_file(
                     root,
                     journal_path,
                     trusted_files,
@@ -539,11 +596,27 @@ where
                     &mut journal,
                     &mut fetch,
                     &mut cancelled,
-                )?;
+                ) {
+                    Ok(changed) => pending_files += usize::from(changed),
+                    Err(error) => {
+                        write_journal(journal_path, &journal)?;
+                        return Err(error);
+                    }
+                }
+                if pending_files >= CHECKPOINT_FILES
+                    || (pending_files != 0 && checkpoint.elapsed().as_secs() >= 1)
+                {
+                    write_journal(journal_path, &journal)?;
+                    pending_files = 0;
+                    checkpoint = std::time::Instant::now();
+                }
                 files.push(destination(root, &file.path)?);
             }
             DepotEntry::Link { .. } => {}
         }
+    }
+    if pending_files != 0 {
+        write_journal(journal_path, &journal)?;
     }
     for entry in &manifest.entries {
         if let DepotEntry::Link { path, target } = entry {
@@ -570,19 +643,33 @@ where
     Ok(files)
 }
 
-fn materialize_small_files<F, C>(
+fn materialize_small_files<F, C, P>(
     manifest: &DepotManifest,
     root: &Path,
     journal_path: &Path,
     trusted_files: &HashSet<String>,
     journal: &mut Journal,
     fetch: &mut F,
-    cancelled: &mut C,
+    callbacks: (&mut C, &mut P),
 ) -> Result<()>
 where
     F: FnMut(&[ChunkWrite<'_>], &File, &mut dyn FnMut(usize) -> Result<()>) -> Result<()>,
     C: FnMut() -> bool,
+    P: FnMut(ExtractionProgress),
 {
+    let (cancelled, extracted) = callbacks;
+    let mut progress = ExtractionProgress {
+        completed: 0,
+        total: manifest
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                DepotEntry::File(file) if file.small_file.is_some() => Some(file.size),
+                _ => None,
+            })
+            .sum(),
+        written: 0,
+    };
     for (container_index, container) in manifest.small_files_containers.iter().enumerate() {
         materialize_small_files_container(
             manifest,
@@ -591,26 +678,28 @@ where
             (root, journal_path, trusted_files),
             journal,
             fetch,
-            cancelled,
+            (cancelled, extracted, &mut progress),
         )?;
     }
     Ok(())
 }
 
-fn materialize_small_files_container<F, C>(
+fn materialize_small_files_container<F, C, P>(
     manifest: &DepotManifest,
     container_index: usize,
     container: &crate::gog::depot_manifest::SmallFilesContainer,
     paths: (&Path, &Path, &HashSet<String>),
     journal: &mut Journal,
     fetch: &mut F,
-    cancelled: &mut C,
+    callbacks: (&mut C, &mut P, &mut ExtractionProgress),
 ) -> Result<()>
 where
     F: FnMut(&[ChunkWrite<'_>], &File, &mut dyn FnMut(usize) -> Result<()>) -> Result<()>,
     C: FnMut() -> bool,
+    P: FnMut(ExtractionProgress),
 {
     let (root, journal_path, trusted_files) = paths;
+    let (cancelled, extracted, progress) = callbacks;
     let files = manifest
         .entries
         .iter()
@@ -625,7 +714,9 @@ where
             _ => None,
         })
         .collect::<Vec<_>>();
-    if !files.is_empty() && files.iter().all(|file| trusted_files.contains(&file.path)) {
+    if files.iter().all(|file| trusted_files.contains(&file.path)) {
+        progress.completed += files.iter().map(|file| file.size).sum::<u64>();
+        extracted(*progress);
         return Ok(());
     }
     let container_path = root.join(format!(".ludomere-small-files-{container_index}.part"));
@@ -711,68 +802,84 @@ where
             return Err(DepotCancelled.into());
         }
     }
-    for file in files {
-        if cancelled() {
-            return Err(DepotCancelled.into());
+    let mut pending_files = 0;
+    let mut pending_directories = HashSet::new();
+    let mut checkpoint = std::time::Instant::now();
+    extracted(*progress);
+    let result: Result<()> = (|| {
+        for file in files {
+            if cancelled() {
+                return Err(DepotCancelled.into());
+            }
+            let reference = file.small_file.context("small-file reference is missing")?;
+            let final_path = destination(root, &file.path)?;
+            if let Some(parent) = final_path.parent() {
+                safe_create_dir_all(parent)?;
+            }
+            let index = journal.file_index(file);
+            if final_path.is_file()
+                && (trusted_files.contains(&file.path)
+                    || validate_complete_file(&final_path, file).is_ok())
+            {
+                let chunks = completed_chunks(file)?;
+                if journal.files[index].chunks != chunks {
+                    journal.files[index].chunks = chunks;
+                    pending_files += 1;
+                }
+            } else {
+                let temporary = part_path(&final_path)?;
+                reject_symlink(&temporary)?;
+                let mut output = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&temporary)?;
+                source.seek(SeekFrom::Start(reference.offset))?;
+                copy_small_file_range(&mut source, &mut output, reference.size, cancelled)?;
+                output.sync_all()?;
+                validate_complete_file(&temporary, file)?;
+                if fs::symlink_metadata(&final_path)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                {
+                    fs::remove_dir_all(&final_path)?;
+                }
+                fs::rename(&temporary, &final_path)?;
+                #[cfg(unix)]
+                if file.executable {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&final_path, fs::Permissions::from_mode(0o755))?;
+                }
+                journal.files[index].chunks = completed_chunks(file)?;
+                pending_files += 1;
+                if let Some(parent) = final_path.parent() {
+                    pending_directories.insert(parent.to_path_buf());
+                }
+                progress.written += file.size;
+            }
+            progress.completed += file.size;
+            extracted(*progress);
+            if pending_files >= CHECKPOINT_FILES
+                || (pending_files != 0 && checkpoint.elapsed().as_secs() >= 1)
+            {
+                for directory in pending_directories.drain() {
+                    sync_dir(&directory)?;
+                }
+                write_journal(journal_path, journal)?;
+                pending_files = 0;
+                checkpoint = std::time::Instant::now();
+            }
         }
-        let reference = file.small_file.context("small-file reference is missing")?;
-        let final_path = destination(root, &file.path)?;
-        if let Some(parent) = final_path.parent() {
-            safe_create_dir_all(parent)?;
+        Ok(())
+    })();
+    // A crash may lose the last checkpoint, but completed files are revalidated on resume.
+    // Cooperative cancellation and errors retain the verified work done before interruption.
+    if pending_files != 0 {
+        for directory in pending_directories {
+            sync_dir(&directory)?;
         }
-        let identity = file_identity(file);
-        let index = journal
-            .files
-            .iter()
-            .position(|saved| saved.path == file.path)
-            .unwrap_or_else(|| {
-                journal.files.push(JournalFile {
-                    path: file.path.clone(),
-                    identity: identity.clone(),
-                    chunks: Vec::new(),
-                });
-                journal.files.len() - 1
-            });
-        if journal.files[index].identity != identity {
-            journal.files[index] = JournalFile {
-                path: file.path.clone(),
-                identity,
-                chunks: Vec::new(),
-            };
-        }
-        if final_path.is_file()
-            && (trusted_files.contains(&file.path)
-                || validate_complete_file(&final_path, file).is_ok())
-        {
-            journal.files[index].chunks = completed_chunks(file)?;
-            write_journal(journal_path, journal)?;
-            continue;
-        }
-        let temporary = part_path(&final_path)?;
-        reject_symlink(&temporary)?;
-        let mut output = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)?;
-        source.seek(SeekFrom::Start(reference.offset))?;
-        copy_small_file_range(&mut source, &mut output, reference.size, cancelled)?;
-        output.sync_all()?;
-        validate_complete_file(&temporary, file)?;
-        if fs::symlink_metadata(&final_path)
-            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        {
-            fs::remove_dir_all(&final_path)?;
-        }
-        fs::rename(&temporary, &final_path)?;
-        #[cfg(unix)]
-        if file.executable {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&final_path, fs::Permissions::from_mode(0o755))?;
-        }
-        journal.files[index].chunks = completed_chunks(file)?;
         write_journal(journal_path, journal)?;
     }
+    result?;
     fs::remove_file(container_path)?;
     journal.container_chunks[container_index].clear();
     write_journal(journal_path, journal)
@@ -1067,9 +1174,9 @@ where
                 })
                 .all(|file| {
                     journal
-                        .files
-                        .iter()
-                        .find(|saved| saved.path == file.path)
+                        .file_indices
+                        .get(&file.path)
+                        .map(|index| &journal.files[*index])
                         .is_some_and(|saved| {
                             journal_file_complete(&root.join(&file.path), file, saved)
                         })
@@ -1176,9 +1283,12 @@ pub(crate) fn pending_chunks(
         if file.small_file.is_some() || trusted_files.contains(&file.path) {
             continue;
         }
-        let saved = journal
-            .as_ref()
-            .and_then(|journal| journal.files.iter().find(|saved| saved.path == file.path));
+        let saved = journal.as_ref().and_then(|journal| {
+            journal
+                .file_indices
+                .get(&file.path)
+                .map(|index| &journal.files[*index])
+        });
         let valid = saved
             .filter(|saved| saved.identity == file_identity(file))
             .and_then(|saved| {
@@ -1193,7 +1303,6 @@ pub(crate) fn pending_chunks(
     Ok(pending)
 }
 
-#[allow(dead_code)] // consumed by the forward transaction-planning slice
 pub(crate) fn journal_staged_bytes_at(
     manifest: &DepotManifest,
     root: &Path,
@@ -1203,15 +1312,12 @@ pub(crate) fn journal_staged_bytes_at(
         return Ok(0);
     }
     let journal = load_journal(root, journal_path, manifest)?;
+    let files = manifest_file_index(manifest);
     let mut total = 0_u64;
     for saved in &journal.files {
-        let file = manifest
-            .entries
-            .iter()
-            .find_map(|entry| match entry {
-                DepotEntry::File(file) if file.path == saved.path => Some(file),
-                _ => None,
-            })
+        let file = files
+            .get(saved.path.as_str())
+            .copied()
             .context("journal file is absent from manifest")?;
         let final_path = destination(root, &file.path)?;
         let staged = if journal_file_complete(&final_path, file, saved) {
@@ -1243,7 +1349,6 @@ fn journal_staged_bytes(manifest: &DepotManifest, root: &Path) -> Result<u64> {
     journal_staged_bytes_at(manifest, root, &root.join(JOURNAL))
 }
 
-#[allow(dead_code)] // retained separately so overflow behavior remains directly testable
 fn checked_staged_add(total: u64, staged: u64) -> Result<u64> {
     total
         .checked_add(staged)
@@ -1258,7 +1363,7 @@ fn materialize_file<F, C>(
     journal: &mut Journal,
     fetch: &mut F,
     cancelled: &mut C,
-) -> Result<()>
+) -> Result<bool>
 where
     F: FnMut(&[ChunkWrite<'_>], &File, &mut dyn FnMut(usize) -> Result<()>) -> Result<()>,
     C: FnMut() -> bool,
@@ -1269,32 +1374,15 @@ where
     }
     let temporary = part_path(&final_path)?;
     reject_symlink(&temporary)?;
-    let identity = file_identity(file);
-    let position = journal
-        .files
-        .iter()
-        .position(|saved| saved.path == file.path);
-    if position.is_some_and(|index| journal.files[index].identity != identity) {
-        fs::remove_file(&temporary).ok();
-        journal.files.remove(position.unwrap());
-    }
-    let index = journal
-        .files
-        .iter()
-        .position(|saved| saved.path == file.path)
-        .unwrap_or_else(|| {
-            journal.files.push(JournalFile {
-                path: file.path.clone(),
-                identity: identity.clone(),
-                chunks: Vec::new(),
-            });
-            journal.files.len() - 1
-        });
+    let index = journal.file_index(file);
     if final_path.is_file() {
         if trusted_files.contains(&file.path) || validate_complete_file(&final_path, file).is_ok() {
-            journal.files[index].chunks = completed_chunks(file)?;
-            write_journal(journal_path, journal)?;
-            return Ok(());
+            let chunks = completed_chunks(file)?;
+            if journal.files[index].chunks != chunks {
+                journal.files[index].chunks = chunks;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         journal.files[index].chunks.clear();
     }
@@ -1370,7 +1458,6 @@ where
             index,
         )?;
         output.sync_data()?;
-        write_journal(journal_path, journal)?;
     }
     if cancelled() {
         return Err(DepotCancelled.into());
@@ -1386,7 +1473,7 @@ where
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&final_path, fs::Permissions::from_mode(0o755))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn append_journal_chunks(
@@ -1599,12 +1686,12 @@ fn load_journal(root: &Path, path: &Path, manifest: &DepotManifest) -> Result<Jo
     if file.metadata()?.len() > JOURNAL_LIMIT {
         bail!("depot journal exceeds size limit");
     }
-    let journal: Journal = serde_json::from_reader(file)?;
+    let mut journal: Journal = serde_json::from_reader(BufReader::new(file))?;
     if journal.version != 1 || journal.manifest_identity != manifest.identity() {
         bail!("depot journal is incompatible");
     }
     let files = manifest_file_index(manifest);
-    for saved in &journal.files {
+    for (index, saved) in journal.files.iter().enumerate() {
         destination(root, &saved.path)?;
         let file = files
             .get(saved.path.as_str())
@@ -1612,6 +1699,13 @@ fn load_journal(root: &Path, path: &Path, manifest: &DepotManifest) -> Result<Jo
             .context("journal file is absent from manifest")?;
         if saved.identity != file_identity(file) {
             bail!("journal file identity mismatch");
+        }
+        if journal
+            .file_indices
+            .insert(saved.path.clone(), index)
+            .is_some()
+        {
+            bail!("depot journal contains a duplicate file");
         }
     }
     Ok(journal)
@@ -1629,6 +1723,10 @@ fn manifest_file_index(manifest: &DepotManifest) -> HashMap<&str, &DepotFile> {
 }
 
 fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
+    write_journal_bounded(path, journal, JOURNAL_LIMIT)
+}
+
+fn write_journal_bounded(path: &Path, journal: &Journal, limit: u64) -> Result<()> {
     let parent = path.parent().context("depot journal has no parent")?;
     let name = path.file_name().context("depot journal has no file name")?;
     let temporary = parent.join(format!("{}.tmp", name.to_string_lossy()));
@@ -1647,8 +1745,15 @@ fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    serde_json::to_writer(&mut file, journal)?;
-    file.write_all(b"\n")?;
+    {
+        let mut buffer = BufWriter::new(&mut file);
+        serde_json::to_writer(&mut buffer, journal)?;
+        buffer.write_all(b"\n")?;
+        buffer.flush()?;
+    }
+    if file.metadata()?.len() > limit {
+        bail!("depot journal exceeds size limit");
+    }
     file.sync_all()?;
     fs::rename(temporary, path)?;
     #[cfg(unix)]
@@ -1656,7 +1761,18 @@ fn write_journal(path: &Path, journal: &Journal) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
-    sync_dir(parent)
+    sync_dir(parent)?;
+    #[cfg(test)]
+    JOURNAL_WRITES.with(|stats| {
+        let (count, bytes) = stats.get();
+        stats.set((count + 1, bytes + file.metadata().unwrap().len()));
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static JOURNAL_WRITES: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 fn prepare_root(root: &Path, journal_path: &Path) -> Result<()> {
@@ -1955,6 +2071,261 @@ mod tests {
         materialize(&manifest, &root, |chunk| decode_chunk(&compressed, chunk)).unwrap();
         assert_eq!(fs::read(root.join("bin/game")).unwrap(), b"payload");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn small_file_fixture(count: u64) -> (DepotManifest, Vec<u8>) {
+        let (chunk, _) = encoded(b"data");
+        let (container, compressed) = encoded(&b"data".repeat(count as usize));
+        let manifest = DepotManifest {
+            generation: 2,
+            small_files_containers: vec![crate::gog::depot_manifest::SmallFilesContainer {
+                chunks: vec![container],
+            }],
+            entries: (0..count)
+                .map(|index| {
+                    DepotEntry::File(DepotFile {
+                        path: format!("files/{index}"),
+                        size: 4,
+                        executable: false,
+                        support: false,
+                        md5: Some(chunk.md5.clone()),
+                        sha256: None,
+                        chunks: vec![chunk.clone()],
+                        small_file: Some(crate::gog::depot_manifest::SmallFileRef {
+                            container_index: 0,
+                            offset: index * 4,
+                            size: 4,
+                        }),
+                    })
+                })
+                .collect(),
+        };
+        (manifest, compressed)
+    }
+
+    #[test]
+    fn small_file_checkpoint_scaling() {
+        let (manifest, compressed) = small_file_fixture(1024);
+        let root = tempfile::tempdir().unwrap();
+        JOURNAL_WRITES.with(|stats| stats.set((0, 0)));
+        let started = std::time::Instant::now();
+        materialize_journaled(
+            &manifest,
+            root.path(),
+            |chunk| decode_chunk(&compressed, chunk),
+            || false,
+        )
+        .unwrap();
+        let (writes, bytes) = JOURNAL_WRITES.with(|stats| stats.get());
+        eprintln!(
+            "1024 small files: {:?}, {writes} journal checkpoints, {bytes} journal bytes",
+            started.elapsed()
+        );
+        assert_eq!(fs::read(root.path().join("files/1023")).unwrap(), b"data");
+        assert!(
+            writes < 32,
+            "small files should share checkpoints: {writes}"
+        );
+        // Already verified files must not cause a full journal rewrite per file on resume.
+        JOURNAL_WRITES.with(|stats| stats.set((0, 0)));
+        let (_, trusted) =
+            journal_progress(&manifest, root.path(), &root.path().join(JOURNAL), |_| {});
+        assert_eq!(trusted.len(), 1024);
+        materialize_streamed_with_progress(
+            &manifest,
+            root.path(),
+            &root.path().join(JOURNAL),
+            &trusted,
+            |_, _, _| panic!("completed container must not download again"),
+            || false,
+            |progress| {
+                assert_eq!(progress.completed, progress.total);
+                assert_eq!(progress.written, 0);
+            },
+        )
+        .unwrap();
+        assert_eq!(JOURNAL_WRITES.with(|stats| stats.get().0), 1);
+    }
+
+    #[test]
+    fn ordinary_small_files_share_checkpoints_and_resume_without_rewrites() {
+        let (mut manifest, _) = small_file_fixture(1024);
+        manifest.small_files_containers.clear();
+        for entry in &mut manifest.entries {
+            if let DepotEntry::File(file) = entry {
+                file.small_file = None;
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        JOURNAL_WRITES.with(|stats| stats.set((0, 0)));
+        materialize_journaled(&manifest, root.path(), |_| Ok(b"data".to_vec()), || false).unwrap();
+        assert!(JOURNAL_WRITES.with(|stats| stats.get().0) < 32);
+        JOURNAL_WRITES.with(|stats| stats.set((0, 0)));
+        materialize_journaled(
+            &manifest,
+            root.path(),
+            |_| panic!("valid payload must be reused"),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(JOURNAL_WRITES.with(|stats| stats.get().0), 1);
+        assert_eq!(fs::read(root.path().join("files/1023")).unwrap(), b"data");
+    }
+
+    #[test]
+    fn small_file_cancel_crash_and_corruption_resume() {
+        let (manifest, compressed) = small_file_fixture(300);
+        let root = tempfile::tempdir().unwrap();
+        let journal_path = root.path().join(JOURNAL);
+        let completed = std::cell::Cell::new(0);
+        let fetch = |chunks: &[ChunkWrite<'_>],
+                     output: &File,
+                     done: &mut dyn FnMut(usize) -> Result<()>| {
+            for (index, job) in chunks.iter().enumerate() {
+                FileRegionWriter::new(output.try_clone()?, job.offset)
+                    .write_all(&decode_chunk(&compressed, job.chunk)?)?;
+                done(index)?;
+            }
+            Ok(())
+        };
+        let error = materialize_streamed_with_progress(
+            &manifest,
+            root.path(),
+            &journal_path,
+            &HashSet::new(),
+            fetch,
+            || completed.get() >= 17 * 4,
+            |progress| completed.set(progress.completed),
+        )
+        .unwrap_err();
+        assert!(error.is::<DepotCancelled>());
+        assert_eq!(
+            load_journal(root.path(), &journal_path, &manifest)
+                .unwrap()
+                .files
+                .len(),
+            17
+        );
+
+        // Simulate abrupt termination between checkpoint boundaries, bypassing the cooperative flush.
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            materialize_streamed_with_progress(
+                &manifest,
+                root.path(),
+                &journal_path,
+                &HashSet::new(),
+                fetch,
+                || false,
+                |progress| {
+                    if progress.completed == 32 * 4 {
+                        panic!("synthetic process interruption");
+                    }
+                },
+            )
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            load_journal(root.path(), &journal_path, &manifest)
+                .unwrap()
+                .files
+                .len(),
+            17
+        );
+        // Both checkpointed and uncheckpointed final files are hash-checked before reuse.
+        fs::write(root.path().join("files/2"), b"BAD!").unwrap();
+        fs::write(root.path().join("files/25"), b"BAD!").unwrap();
+        let mut final_progress = None;
+        materialize_streamed_with_progress(
+            &manifest,
+            root.path(),
+            &journal_path,
+            &HashSet::new(),
+            |_, _, _| panic!("durable container must be reused"),
+            || false,
+            |progress| final_progress = Some(progress),
+        )
+        .unwrap();
+        for index in 0..300 {
+            assert_eq!(
+                fs::read(root.path().join(format!("files/{index}"))).unwrap(),
+                b"data"
+            );
+        }
+        let progress = final_progress.unwrap();
+        assert_eq!(
+            (progress.completed, progress.total, progress.written),
+            (1200, 1200, (300 - 32 + 2) * 4)
+        );
+        assert!(!root.path().join(".ludomere-small-files-0.part").exists());
+    }
+
+    #[test]
+    #[ignore = "synthetic large-file-count performance probe"]
+    fn small_file_terraria_scale_probe() {
+        let (manifest, compressed) = small_file_fixture(14_088);
+        let root = tempfile::tempdir().unwrap();
+        JOURNAL_WRITES.with(|stats| stats.set((0, 0)));
+        let started = std::time::Instant::now();
+        materialize_journaled(
+            &manifest,
+            root.path(),
+            |chunk| decode_chunk(&compressed, chunk),
+            || false,
+        )
+        .unwrap();
+        let (writes, bytes) = JOURNAL_WRITES.with(|stats| stats.get());
+        eprintln!(
+            "14088 small files: {:?}, {writes} journal checkpoints, {bytes} journal bytes",
+            started.elapsed()
+        );
+        assert!(writes < 200);
+        assert_eq!(
+            load_journal(root.path(), &root.path().join(JOURNAL), &manifest)
+                .unwrap()
+                .files
+                .len(),
+            14_088
+        );
+    }
+
+    #[test]
+    fn large_journal_roundtrip_and_limit_preserve_previous_checkpoint() {
+        let (manifest, _) = small_file_fixture(23_000);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(JOURNAL);
+        let mut journal = Journal {
+            version: 1,
+            manifest_identity: manifest.identity(),
+            container_chunks: vec![],
+            files: vec![],
+            file_indices: HashMap::new(),
+        };
+        for entry in &manifest.entries {
+            let DepotEntry::File(file) = entry else {
+                unreachable!()
+            };
+            let index = journal.file_index(file);
+            journal.files[index].chunks = completed_chunks(file).unwrap();
+        }
+        write_journal(&path, &journal).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
+        assert_eq!(
+            load_journal(root.path(), &path, &manifest)
+                .unwrap()
+                .files
+                .len(),
+            23_000
+        );
+        let previous = fs::read(&path).unwrap();
+        assert!(write_journal_bounded(&path, &journal, 64).is_err());
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert_eq!(
+            load_journal(root.path(), &path, &manifest)
+                .unwrap()
+                .files
+                .len(),
+            23_000
+        );
     }
 
     #[test]
@@ -2292,6 +2663,7 @@ mod tests {
                 manifest_identity: manifest.identity(),
                 container_chunks: Vec::new(),
                 files: Vec::new(),
+                file_indices: HashMap::new(),
             },
         )
         .unwrap();

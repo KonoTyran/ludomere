@@ -504,6 +504,7 @@ fn depot_state_is_active(state: &str) -> bool {
             | "calculating"
             | "downloading"
             | "materializing"
+            | "extracting"
             | "committing"
             | "finalizing"
     )
@@ -570,7 +571,14 @@ pub fn recover_depot_operations() -> anyhow::Result<usize> {
     Ok(recovered)
 }
 
-pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
+pub fn enqueue_depot_operation(request: DepotOperationRequest) -> bool {
+    enqueue_depot_operation_with(request, persist_depot_request)
+}
+
+fn enqueue_depot_operation_with(
+    mut request: DepotOperationRequest,
+    persist: impl FnOnce(&DepotOperationRequest) -> anyhow::Result<()>,
+) -> bool {
     if SIGN_OUT_PAUSE.load(std::sync::atomic::Ordering::Acquire) {
         return false;
     }
@@ -617,7 +625,6 @@ pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
         || MANAGER.lock().unwrap().shutting_down
         || manager.shutting_down
         || (manager.paused_for_sign_out && !crate::auth::session_is_current(crate::auth::session()))
-        || persist_depot_request(&request).is_err()
     {
         return false;
     }
@@ -630,6 +637,16 @@ pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
         request.operation_id.clone(),
         (request.product_id, request.destination.clone()),
     );
+    // Reserve before doing disk work, so competing operations and sign-out can see/cancel
+    // registration without making GTK snapshot polling wait for journal serialization/fsync.
+    drop(manager);
+    if persist(&request).is_err() {
+        let mut manager = DEPOT_MANAGER.lock().unwrap();
+        manager.active.remove(&request.operation_id);
+        manager.reservations.remove(&request.operation_id);
+        manager.abandon_requested.remove(&request.operation_id);
+        return false;
+    }
     let snapshot = DepotOperationSnapshot {
         setup: None,
         operation_id: request.operation_id.clone(),
@@ -643,10 +660,6 @@ pub fn enqueue_depot_operation(mut request: DepotOperationRequest) -> bool {
         download_total_bytes: None,
         error: None,
     };
-    manager
-        .snapshots
-        .insert(request.operation_id.clone(), snapshot.clone());
-    drop(manager);
     publish_depot(snapshot);
     thread::spawn(move || run_depot_operation(request, cancelled));
     true
@@ -1080,6 +1093,13 @@ fn run_depot_operation_inner(
     let write_total = target_totals
         .uncompressed
         .checked_add(support_totals.uncompressed)
+        .and_then(|total| {
+            target
+                .small_files_containers
+                .iter()
+                .flat_map(|container| &container.chunks)
+                .try_fold(total, |sum, chunk| sum.checked_add(chunk.size))
+        })
         .ok_or_else(|| anyhow::anyhow!("depot write size overflows"))?;
     let payload_total = target_totals.compressed;
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1283,7 +1303,10 @@ fn run_depot_operation_inner(
     };
     let forced_remove_paths = forced_dlc_removals(request)?;
     let mut retry_states = HashMap::<usize, SourceRetryState>::new();
+    let mut recorded_progress = std::time::Instant::now();
     loop {
+        let extraction_written = std::cell::Cell::new(0);
+        let mut extraction_reported = std::time::Instant::now();
         let result = super::depot::execute_streamed_forward(
             &plan,
             &request.staging_path,
@@ -1392,10 +1415,45 @@ fn run_depot_operation_inner(
                         Ok(())
                     },
                 )?;
-                update_depot_record(&operation_id, "materializing", completed, None, false)?;
+                if recorded_progress.elapsed().as_secs() >= 1 {
+                    update_depot_record_at(
+                        &super::operation_journal::depot_path(&request.staging_path),
+                        &operation_id,
+                        "materializing",
+                        completed,
+                        None,
+                        false,
+                    )?;
+                    recorded_progress = std::time::Instant::now();
+                }
                 Ok(())
             },
-            || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            (
+                || cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                |progress: crate::download::depot::ExtractionProgress| {
+                    written.fetch_add(
+                        progress
+                            .written
+                            .saturating_sub(extraction_written.replace(progress.written)),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if progress.completed == 0
+                        || progress.completed == progress.total
+                        || extraction_reported.elapsed().as_millis() >= 100
+                    {
+                        publish_depot_progress(
+                            request,
+                            "extracting",
+                            progress.completed,
+                            downloaded.load(std::sync::atomic::Ordering::Relaxed),
+                            written.load(std::sync::atomic::Ordering::Relaxed),
+                            write_total,
+                            progress.total,
+                        );
+                        extraction_reported = std::time::Instant::now();
+                    }
+                },
+            ),
             || {
                 update_depot_record(
                     &request.operation_id,
@@ -2906,17 +2964,36 @@ fn update_depot_record(
     error: Option<&str>,
     terminal: bool,
 ) -> anyhow::Result<()> {
-    let (path, mut record) = super::operation_journal::scan()?
+    let path = super::operation_journal::scan()?
         .into_iter()
         .find_map(|(path, journal)| match journal {
             super::operation_journal::OperationJournal::Depot { record, .. }
                 if record.operation_id == operation_id =>
             {
-                Some((path, record))
+                Some(path)
             }
             _ => None,
         })
         .ok_or_else(|| anyhow::anyhow!("saved depot operation was not found"))?;
+    update_depot_record_at(&path, operation_id, state, bytes_completed, error, terminal)
+}
+
+fn update_depot_record_at(
+    path: &std::path::Path,
+    operation_id: &str,
+    state: &str,
+    bytes_completed: u64,
+    error: Option<&str>,
+    terminal: bool,
+) -> anyhow::Result<()> {
+    let super::operation_journal::OperationJournal::Depot { mut record, .. } =
+        super::operation_journal::read(path)?
+    else {
+        anyhow::bail!("saved operation is not a depot operation");
+    };
+    if record.operation_id != operation_id {
+        anyhow::bail!("saved depot operation identity changed");
+    }
     let now = chrono::Utc::now().timestamp();
     record.state = state.into();
     record.bytes_completed = bytes_completed;
@@ -2924,9 +3001,9 @@ fn update_depot_record(
     record.updated_at = now;
     record.completed_at = terminal.then_some(now);
     if terminal && state == "complete" {
-        super::operation_journal::remove(&path)
+        super::operation_journal::remove(path)
     } else {
-        super::operation_journal::write_depot(&path, &record)
+        super::operation_journal::write_depot(path, &record)
     }
 }
 
@@ -5567,6 +5644,55 @@ mod tests {
     }
 
     #[test]
+    fn depot_registration_releases_snapshot_lock_and_cleans_failed_reservation() {
+        const CHILD: &str = "LUDOMERE_TEST_DEPOT_REGISTRATION";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "installation::manager::tests::depot_registration_releases_snapshot_lock_and_cleans_failed_reservation", "--nocapture"]);
+            command.env(CHILD, "1");
+            for key in [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+            ] {
+                let path = root.path().join(key);
+                std::fs::create_dir(&path).unwrap();
+                command.env(key, path);
+            }
+            assert!(command.status().unwrap().success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut operation = request(false);
+        operation.library_root = root.path().to_owned();
+        operation.destination = root.path().join("game");
+        let mut called = false;
+        assert!(!enqueue_depot_operation_with(operation, |request| {
+            called = true;
+            let manager = DEPOT_MANAGER
+                .try_lock()
+                .expect("disk persistence must not hold UI snapshot lock");
+            assert!(manager.reservations.contains_key(&request.operation_id));
+            let cancelled = manager.active.get(&request.operation_id).unwrap().clone();
+            drop(manager);
+            assert!(cancel_depot_operation(&request.operation_id));
+            assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
+            pause_for_sign_out().unwrap();
+            assert!(DEPOT_MANAGER.lock().unwrap().paused_for_sign_out);
+            anyhow::bail!("synthetic persistence failure")
+        }));
+        assert!(called);
+        let manager = DEPOT_MANAGER.lock().unwrap();
+        assert!(manager.active.is_empty());
+        assert!(manager.reservations.is_empty());
+        assert!(manager.paused_for_sign_out);
+    }
+
+    #[test]
     fn persisted_plan_and_debug_exclude_access_secret() {
         let request = request(false);
         let debug = format!("{request:?}");
@@ -5856,6 +5982,7 @@ mod tests {
     #[test]
     fn interrupted_operation_is_not_prioritized_over_a_newer_failure() {
         assert!(depot_state_is_active("materializing"));
+        assert!(depot_state_is_active("extracting"));
         assert!(!depot_state_is_active("interrupted"));
         assert!(!depot_state_is_active("failed"));
     }

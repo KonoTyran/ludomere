@@ -2,6 +2,128 @@
 
 Last meaningful update: 2026-10-02.
 
+## R91 active publication
+
+- P243 metadata and P244 independent release inventory PASS. Cargo/lock/PKGBUILD/AppStream now
+ 0.2.3; package release remains1 and AppStream history retained. Locked metadata, XML, bash syntax,
+  fmt/diff and final cargo build --locked pass (/tmp/ludomere-r91-build.log). Reviewed commit and
+  PR drafts cover R88–R90, correct stale onboarding/typed-storage/autosave/reset descriptions and
+  preserve prior features. Root publishes current reviewed tree under user authorization; remote
+  head/PR/CI verification follows, without a new package build or installation.
+- User authorized0.2.3 version bump, commit/push and PR update. P243 metadata worker and P244
+  independent release inventory; root publishes reviewed R88–R90 plus metadata after scoped checks.
+
+## R90 active autosave and optimization audit
+
+- Completed within requested bounded scope. Automatic valid edits now cover executable/arguments,
+  DLL rows, per-game Proton, onboarding directories/policies and Storage names;400ms text debounce,
+  close flush, invalid-draft preservation and visible failures. Actual operation confirmations stay.
+  P239 report /tmp/ludomere-p239-report.md: setup5/storage2 plus4 explicitly run shipping GTK tests
+  pass. P242 actual wizard/Rename matrix PASS, final source/security review PASS; reports
+  /tmp/ludomere-p242-autosave-review.md and p242-autosave-source.md. Optional final feedback deltas
+  source-reviewed; real accounts/games/portals/helpers remain outside this synthetic verification.
+- Root final cargo fmt --check, git diff --check, cargo clippy --locked --all-targets -- -D warnings
+  and cargo build --locked pass. Evidence /tmp/ludomere-r90-final-{clippy,build}.log. All5 final
+  autosave-reviewed source hashes match. Private fixture artifacts cleaned before final checks;
+  production executable lacks P242/P237 fixture markers, SHA256
+  2ddb1e19ca15820b552aab1e82a423bba73c29e95df78bf22a1f17919a6ea4d2.
+  README current; R88/R89 retained. No full suite/package/commit/push; no global Prototype ready claim.
+
+- P242A/B independent performance/dead-code reviews pass (/tmp/ludomere-p242-ui-review.md,
+  p242-backend-review.md); reviewer reran shipping-source GTK optimizations. P239 implementation
+  compiles and final fmt/diff pass. Review corrections remove expensive traversal from account
+  commit lock, check current roots before applying validated selections, prevent stale save labels
+  and stale-session Proton/DLL work. Private onboarding/Rename callback verification running;
+  owner launch/DLL/Proton focused checks and final root build remain pending.
+- P240 backend implemented: synthetic20 loads of256 revisions/1016 parts improved81.585→44.202ms,
+  SQL statements257→2; indexed pack filtering, unchanged config reads no longer write, active
+  functions' stale dead-code suppressions removed. State6/config11 focused tests pass. P241 removes
+  318 unreachable DLC lines, reuses footer paintables with stream invalidation and indexes widgets
+  once per progress tick. Focused6 plus2 private shipping-source GTK tests pass;1000-row lookup
+  fixture676.277→2.548ms. Timings are synthetic, not application-wide promises. Both independent
+  cross-reviews running. P239 automatic fields/onboarding remains in_progress.
+- Approved concrete backend query batching/filtering and UI repeated-image/tree-traversal reduction;
+  remove only proven unreachable DLC blocks and stale allowances, retaining actual legacy-data
+  support. P239 implements validated autosave for DLL/Proton/launch/onboarding/rename fields.
+- User requests automatic fields and delegated performance/dead-code review. P239 controls,
+  P240 backend and P241 UI optimization run independently with bounded ownership. Prior R88/R89
+  reviewed changes retained; root remains manager only. P242 cross-review and final checks follow.
+
+## R89 active control audit
+
+- Bounded audit complete. P237 final private GTK run passes actual Properties Enter/focus saves,
+  typing-during-save feedback, compatibility/cloud rollback and retries, stale-account feedback,
+  favorite DB failure/retry/in-place star, header popover, launcher error/cancel, gallery, Logs
+  busy/error/retry, tray preparation/duplicate/missing/DB-error, Storage default/add/rename/remove
+  and incompatible-root feedback. Evidence /tmp/ludomere-p237-ui-run.log and p237-review.md.
+- Root final cargo fmt --check, git diff --check, cargo clippy --locked --all-targets -- -D warnings
+  and cargo build --locked pass. Cleaned ludomere Cargo artifacts after private fixture copied out;
+  all14 reviewed source hashes match and known fixture markers absent. Shipping executable hash:
+  bb5054f56bd9d55f3d3b7658dc4dc0bb2b174189755b2dd84de7ad5f19898ad1.
+  Logs /tmp/ludomere-r89-final-{clippy,build}.log. No full suite/package/publication or real user
+  file/account/game/helper actions; native portal/tray host and actual Windows behavior untested.
+
+- P235/P236/P238 implementations and reports reviewed; targeted Properties/gallery GTK3,
+  Settings3, Comet4 and runtime-log3 plus existing live-log GTK regression pass. Confirmed fixes
+  cover launch-entry autosave, compatibility/cloud/favorite persistence feedback, single-image
+  arrows, folder/desktop launch failures, Storage actions, header status and log/tray activity.
+  Windows payload-only moves are explicitly refused because they strand prefixes; native moves
+  preflight and reserve affected games, report results and refresh state. No prefix migration.
+- P237 independent source/private GTK review in progress against final owner source; it caught
+  account-change branches leaving Saving text, now fixed by P238. Integrated shipping-source
+  fmt/Clippy/build waits for private fixture compilation and artifact cleanup. Reports:
+  /tmp/ludomere-p235-report.md, /tmp/ludomere-p236-report.md, /tmp/ludomere-p238-report.md.
+
+- User requests identifying/fixing ineffective interactables. P235/P236 own bounded UI audits and
+  fixes; P237 independently reviews remaining wiring and changed controls. R88 changes preserved;
+  targeted regression/format/lint/build only, no repeated full suite or real profile/helper actions.
+
+## R88 active audit
+
+- R88 completed for the scoped audit. Final bash tools/check.sh exit0: fmt, all-target Clippy,
+  518 unit passed/13 ignored,6 top-level integration passed/3 helper opt-ins ignored,5 Python passed.
+  cargo build --locked and diff check pass. Evidence /tmp/ludomere-r88-final-{checks,build}.log.
+  All eight reviewed UI/backend containment source hashes match; shipping executable SHA256
+  400d5ed4ff47ec28df083c9eb0b5b3392b87340072db0c61d9c0bb7aefbb5af3 has no checked fixture markers.
+  README reflects checkpoint/progress/reset behavior. No real Terraria installation tested;
+  synthetic timings do not predict hardware performance. No package, commit, push or PR mutation.
+
+- P234A backend and P234B storage independent reviews PASS; P234C private Broadway GTK review
+  PASS with actual extraction bars in Downloads/detail/setup, expanded Details counters, featured
+  operation isolation, cloud busy/error/retry and chooser cancellation/account-change/no late
+  launch. Reviewer source hashes unchanged. Worker-disconnect branches and real installer/pixel
+  behavior retain source-only/unexercised limits; no broad flawless-UI claim. Reports p234-*-review.md.
+- Private fixture copied out; root cleaned only ludomere Cargo artifacts, then started final
+  shipping-source bash tools/check.sh. Initial direct script invocation lacked executable bit;
+  normal Bash invocation proceeds. No package install or host/user-profile actions.
+
+- P232 implementation/report and focused storage7/reset1 pass reviewed; P234B independent source
+  review passes (ui_audit, no storage implementation). P233 focused progress6/executable4 pass;
+  independent P234C ui_review now exercises private GTK states. Report paths /tmp/ludomere-p232-
+  report.md, p233-report.md and p234-storage-review.md. Final integrated checks still pending.
+- P231 comparable1024 tiny-file tmpfs measurements: baseline4.411s/1027 journalwrites/~100MB;
+  patched~48ms/11writes/~1.07MB. Not a real Terraria/disk benchmark. Cancel/crash/corruption
+  focused tests pass; ordinary-file batching and final large-workload checks continue. P234A
+  suspected compound-boolean mutex inversion was disproved by a compiled lifetime probe and
+  retracted; no speculative lock-order change. Admission disk I/O lock reduction is independently
+  tested. Final backend review remains open until latest ordinary-file batching is checked.
+
+- P231 confirms unbuffered JSON writes, linear journal lookup and per-file full synchronization;
+  implementing bounded checkpoints with validation and transient extraction progress. P232
+  confirms reset deletes operation identity while preserving partial payload; recognizes bounded
+  matching legacy materialization evidence and adds non-resumable retained identity for future
+  resets. Unknown/mixed folders stay blocked. Selected-root validation avoids unrelated traversal.
+- P233 confirms misleading extraction labels/fabricated finalization percentages, GTK-thread
+  cloud preference writes with ignored failures, and disconnected-worker busy states in cache/
+  archive controls. Bounded fixes approved under R88; account/focus/safety constraints retained.
+- Prior R87 remote build36967107957 completed successfully for7c4f883.
+
+- Read Kono's latest PR6 comments5953611940/5952562078 and both screenshots. Source confirms
+  full journal writes after each small file and validated resume file. Storage screenshot rejects
+  terraria without recognized installation/operation following reset. Measurements in the comment
+  are Kono's observations, not local benchmarks. P231–233 delegated; independent P234 follows.
+- Baseline clean main7c4f883, version0.2.2. No real game/profile access or publication in this task.
+
 ## Failed 0.2.2 build
 
 - P229 final build gate passes: tools/check.sh exit0, fmt, all-target Clippy -D warnings,

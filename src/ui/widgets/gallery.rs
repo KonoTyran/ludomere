@@ -309,7 +309,7 @@ fn show_screenshot_gallery(
                 .and_then(|index| pictures.get(index))
                 .and_then(glib::WeakRef::upgrade)
                 .is_some_and(|picture| picture.has_css_class("image-ready"));
-            navigation.set_visible(ready);
+            navigation.set_visible(ready && pictures.len() > 1);
         }
     });
     update_hit_areas();
@@ -418,6 +418,11 @@ fn connect_gallery_navigation(
     count: usize,
     forward: bool,
 ) {
+    button.set_visible(count > 1);
+    button.set_sensitive(count > 1);
+    if count < 2 {
+        return;
+    }
     let stack = stack.clone();
     let counter = counter.clone();
     let index = index.clone();
@@ -539,5 +544,25 @@ mod tests {
         assert_eq!(stack.visible_child_name().as_deref(), Some("2"));
         dialog.close();
         window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated GTK display and D-Bus"]
+    fn single_screenshot_navigation_is_not_actionable() {
+        adw::init().unwrap();
+        let button = gtk::Button::new();
+        let stack = gtk::Stack::new();
+        stack.add_named(&gtk::Label::new(None), Some("0"));
+        let counter = gtk::Label::new(None);
+        let index = Rc::new(std::cell::Cell::new(0));
+        connect_gallery_navigation(&button, &stack, &counter, &index, 1, true);
+        assert!(!button.is_visible());
+        assert!(!button.is_sensitive());
+        button.emit_clicked();
+        assert_eq!(index.get(), 0);
+        assert!(
+            counter.label().is_empty(),
+            "single-image arrows must have no callback"
+        );
     }
 }

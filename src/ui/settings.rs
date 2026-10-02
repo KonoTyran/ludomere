@@ -42,6 +42,14 @@ pub(super) fn show_settings_page(
         "Account and application preferences",
     )));
     root.append(&header);
+    let preference_status = gtk::Label::new(None);
+    preference_status.set_wrap(true);
+    preference_status.set_selectable(true);
+    preference_status.set_margin_start(12);
+    preference_status.set_margin_end(12);
+    preference_status.add_css_class("error");
+    preference_status.set_visible(false);
+    root.append(&preference_status);
 
     let account_page = settings_account_page(w, model);
     let downloads_page = adw::PreferencesPage::new();
@@ -157,7 +165,7 @@ pub(super) fn show_settings_page(
     downloads.add(&retired_artifacts);
     downloads_page.add(&downloads);
 
-    let source_order = installation_source_order_group(model);
+    let source_order = installation_source_order_group(model, &preference_status);
     downloads_page.add(&source_order);
     downloads_page.add(&update_policies::global_group(w, model));
 
@@ -493,19 +501,26 @@ pub(super) fn show_settings_page(
     {
         let window = settings_window.clone();
         let model = model.clone();
-        open_downloads_button.connect_clicked(move |_| {
+        let row = open_downloads.clone();
+        open_downloads_button.connect_clicked(move |button| {
             let config = model.borrow().config.clone();
             let dialog = adw::AlertDialog::builder().heading("Open a library").body("Choose a configured Offline Installers or Goodies & Extras directory. Incompatible libraries cannot be opened here.").build();
             dialog.add_response("cancel", "Cancel");
             let libraries = [crate::config::LibraryKind::OfflineInstallers, crate::config::LibraryKind::Extras].into_iter()
                 .flat_map(|kind| config.libraries(kind).iter().cloned().map(move |library| (kind, library))).collect::<Vec<_>>();
+            if libraries.is_empty() {
+                dialog.set_body("No Offline Installers or Goodies & Extras directory is configured. Add a directory in Settings → Storage first.");
+            }
             for (index, (kind, library)) in libraries.iter().enumerate() {
                 dialog.add_response(&index.to_string(), &format!("{} — {}", kind.label(), library.path.display()));
             }
             let window = window.clone(); let epoch = model.borrow().account_epoch; let model = model.clone();
+            let row = row.clone(); let button = button.clone();
             dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
                 if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
                 let Some((kind, library)) = response.parse::<usize>().ok().and_then(|index| libraries.get(index)).cloned() else { return; };
+                row.set_subtitle("Checking library access…");
+                button.set_sensitive(false);
                 let (sender, receiver) = mpsc::channel();
                 std::thread::spawn(move || { let _ = sender.send(crate::storage::read_config().and_then(|current| {
                     let found = crate::storage::validate_library(&current, kind, &library.id)?;
@@ -513,13 +528,13 @@ pub(super) fn show_settings_page(
                 })); });
                 let window = window.clone();
                 glib::timeout_add_local(Duration::from_millis(50), move || {
-                    if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { return glib::ControlFlow::Break; }
+                    if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { button.set_sensitive(true); return glib::ControlFlow::Break; }
                     match receiver.try_recv() {
-                        Ok(Ok(library)) => super::widgets::file_open::open_directory(&library.path, &window, "library directory"),
-                        Ok(Err(error)) => { let alert = adw::AlertDialog::builder().heading("Library unavailable").body(format!("{error:#}")).build(); alert.add_response("close", "Close"); alert.present(Some(&window)); },
+                        Ok(Ok(library)) => { row.set_subtitle("Opening library in your file manager…"); super::widgets::file_open::open_directory(&library.path, &window, "library directory"); },
+                        Ok(Err(error)) => { row.set_subtitle(&format!("Could not open library: {error:#}")); },
                         Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                        Err(_) => {},
-                    } glib::ControlFlow::Break
+                        Err(_) => row.set_subtitle("Library inspection stopped unexpectedly. Try again."),
+                    } button.set_sensitive(true); glib::ControlFlow::Break
                 });
             });
         });
@@ -563,24 +578,34 @@ pub(super) fn show_settings_page(
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        row.set_subtitle("Image cache cleanup stopped unexpectedly. Try again.");
+                        button.set_sensitive(true);
+                        glib::ControlFlow::Break
+                    }
                 }
             });
         });
     }
     {
         let window = w.window.clone();
+        let status = preference_status.clone();
         refresh_metadata_button.connect_clicked(move |_| {
             if let Err(error) =
                 gtk::prelude::WidgetExt::activate_action(&window, "win.refresh", None)
             {
                 tracing::warn!(%error, "could not activate metadata refresh");
+                status.set_label(&format!(
+                    "Could not start synchronization: {error}. Close Settings and try again."
+                ));
+                status.set_visible(true);
             }
         });
     }
     for (index, button) in tile_size_buttons.into_iter().enumerate() {
         let w = w.clone();
         let model = model.clone();
+        let status = preference_status.clone();
         button.connect_toggled(move |button| {
             if !button.is_active() {
                 return;
@@ -594,9 +619,7 @@ pub(super) fn show_settings_page(
                 let mut state = model.borrow_mut();
                 state.card_width = width;
                 state.config.library_card_size = index as u8;
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save library card size");
-                }
+                save_preferences(&state.config, &status);
             }
             rebuild_home_grid(&w, &model);
         });
@@ -604,14 +627,13 @@ pub(super) fn show_settings_page(
     {
         let w = w.clone();
         let model = model.clone();
+        let status = preference_status.clone();
         sidebar_icons.connect_active_notify(move |row| {
             let visible = row.is_active();
             {
                 let mut state = model.borrow_mut();
                 state.config.show_sidebar_game_icons = visible;
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save sidebar icon preference");
-                }
+                save_preferences(&state.config, &status);
             }
             set_sidebar_icons_visible(&w, visible);
         });
@@ -619,13 +641,12 @@ pub(super) fn show_settings_page(
     {
         let w = w.clone();
         let model = model.clone();
+        let status = preference_status.clone();
         backup_status.connect_active_notify(move |row| {
             {
                 let mut state = model.borrow_mut();
                 state.config.show_backup_status = row.is_active();
-                if let Err(error) = state.config.save() {
-                    tracing::warn!(%error, "could not save backup status preference");
-                }
+                save_preferences(&state.config, &status);
             }
             update_sidebar_download_styles(&w, &model.borrow());
         });
@@ -675,6 +696,7 @@ pub(super) fn show_settings_page(
                     || [model.borrow().config.offline_libraries.clone(), model.borrow().config.extras_libraries.clone()] != scanned_roots
                 {
                     button.set_sensitive(true);
+                    row.set_subtitle("Account or library folders changed. Click Rebuild to inspect the current libraries.");
                     return glib::ControlFlow::Break;
                 }
                 match receiver.try_recv() {
@@ -703,6 +725,7 @@ pub(super) fn show_settings_page(
     {
         let model = model.clone();
         let language_list = language_list.clone();
+        let status = preference_status.clone();
         language.connect_selected_notify(move |selector| {
             let selected = selector.selected();
             let mut state = model.borrow_mut();
@@ -713,13 +736,12 @@ pub(super) fn show_settings_page(
                     .string(selected)
                     .map(|value| value.to_string())
             };
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default installer language");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     for (button, update) in [(windows, 0_u8), (linux, 1_u8), (macos, 2_u8)] {
         let model = model.clone();
+        let status = preference_status.clone();
         button.connect_toggled(move |button| {
             let mut state = model.borrow_mut();
             match update {
@@ -727,75 +749,68 @@ pub(super) fn show_settings_page(
                 1 => state.config.installer_linux = button.is_active(),
                 _ => state.config.installer_macos = button.is_active(),
             }
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default installer platforms");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         concurrency.connect_value_changed(move |selector| {
             let limit = selector.value_as_int().clamp(1, 4) as usize;
             let mut state = model.borrow_mut();
             state.config.max_concurrent_downloads = limit;
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save simultaneous download limit");
-            }
+            save_preferences(&state.config, &status);
             download::set_concurrency(limit);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         extras_default.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.download_extras_by_default = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default extras preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         patches_default.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.download_patches_by_default = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save default patches preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         prefer_patch_updates.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.prefer_patch_updates = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save patch update preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         interactive_prompts.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.interactive_installer_prompts = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save interactive installer preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         retired_artifacts.connect_active_notify(move |row| {
             let mut state = model.borrow_mut();
             state.config.show_retired_artifacts = row.is_active();
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save previous-version visibility preference");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     {
         let model = model.clone();
+        let status = preference_status.clone();
         theme.connect_selected_notify(move |selector| {
             let selected = match selector.selected() {
                 1 => crate::config::Theme::Light,
@@ -805,12 +820,20 @@ pub(super) fn show_settings_page(
             apply_theme(selected);
             let mut state = model.borrow_mut();
             state.config.theme = selected;
-            if let Err(error) = state.config.save() {
-                tracing::warn!(%error, "could not save color scheme");
-            }
+            save_preferences(&state.config, &status);
         });
     }
     settings_window.present();
+}
+
+fn save_preferences(config: &Config, status: &gtk::Label) {
+    match config.save() {
+        Ok(()) => status.set_visible(false),
+        Err(error) => {
+            status.set_label(&format!("These changes apply for this session, but could not be saved: {error}. Change the option again to retry."));
+            status.set_visible(true);
+        }
+    }
 }
 
 fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
@@ -827,7 +850,10 @@ fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
     None
 }
 
-fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::PreferencesGroup {
+fn installation_source_order_group(
+    model: &Rc<RefCell<AppModel>>,
+    status: &gtk::Label,
+) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Preferred installation order");
     group.set_description(Some(
@@ -862,11 +888,12 @@ fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::Prefer
         {
             let model = model.clone();
             let labels = labels.clone();
+            let status = status.clone();
             drop_target.connect_drop(move |_, value, _, _| {
                 let Ok(from) = value.get::<u32>() else {
                     return false;
                 };
-                reorder_installation_sources(&model, from as usize, index);
+                reorder_installation_sources(&model, from as usize, index, &status);
                 refresh_installation_source_labels(&model, &labels.borrow());
                 true
             });
@@ -875,16 +902,18 @@ fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::Prefer
         {
             let model = model.clone();
             let labels = labels.clone();
+            let status = status.clone();
             up.connect_clicked(move |_| {
-                reorder_installation_sources(&model, index, index - 1);
+                reorder_installation_sources(&model, index, index - 1, &status);
                 refresh_installation_source_labels(&model, &labels.borrow());
             });
         }
         {
             let model = model.clone();
             let labels = labels.clone();
+            let status = status.clone();
             down.connect_clicked(move |_| {
-                reorder_installation_sources(&model, index, index + 1);
+                reorder_installation_sources(&model, index, index + 1, &status);
                 refresh_installation_source_labels(&model, &labels.borrow());
             });
         }
@@ -895,16 +924,19 @@ fn installation_source_order_group(model: &Rc<RefCell<AppModel>>) -> adw::Prefer
     group
 }
 
-fn reorder_installation_sources(model: &Rc<RefCell<AppModel>>, from: usize, to: usize) {
+fn reorder_installation_sources(
+    model: &Rc<RefCell<AppModel>>,
+    from: usize,
+    to: usize,
+    status: &gtk::Label,
+) {
     if from >= 3 || to >= 3 || from == to {
         return;
     }
     let mut state = model.borrow_mut();
     let source = state.config.installation_source_order.remove(from);
     state.config.installation_source_order.insert(to, source);
-    if let Err(error) = state.config.save() {
-        tracing::warn!(%error, "could not save preferred installation order");
-    }
+    save_preferences(&state.config, status);
 }
 
 fn refresh_installation_source_labels(model: &Rc<RefCell<AppModel>>, rows: &[adw::ActionRow]) {

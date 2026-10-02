@@ -302,13 +302,7 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
             w.download_percent
                 .set_label(&percent.map(|value| format!("{value}%")).unwrap_or_default());
             w.download_percent.set_visible(percent.is_some());
-            if let Some(path) = display.and_then(|(_, icon)| icon) {
-                w.download_artwork.set_from_file(Some(path));
-                w.download_artwork.set_visible(true);
-            } else {
-                w.download_artwork.clear();
-                w.download_artwork.set_visible(false);
-            }
+            update_download_artwork(&w.download_artwork, display.and_then(|(_, icon)| icon));
             w.download_status_progress.set_visible(true);
             if let Some(total) = total.filter(|total| *total > 0) {
                 w.download_status_progress
@@ -353,6 +347,18 @@ pub(super) fn start_download_monitor(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
         }
         glib::ControlFlow::Continue
     });
+}
+
+fn update_download_artwork(image: &gtk::Image, path: Option<&std::path::PathBuf>) {
+    if let Some(path) = path {
+        if image.file().as_deref() != path.to_str() || image.paintable().is_none() {
+            image.set_from_file(Some(path));
+        }
+        image.set_visible(true);
+    } else {
+        image.clear();
+        image.set_visible(false);
+    }
 }
 
 fn sample_transfer_history(model: &mut AppModel) {
@@ -474,11 +480,10 @@ pub(super) fn update_download_page_progress(
             }
         }
     }
-    if let Some(job) = model
-        .download_jobs
-        .iter()
-        .find(|job| active_job_ids.contains(&job.job_id))
-    {
+    if let Some(job) = model.download_jobs.iter().find(|job| {
+        active_job_ids.contains(&job.job_id)
+            && find_named_descendant(&root, &format!("active-download-{}", job.job_id)).is_some()
+    }) {
         let total = job.total_bytes.unwrap_or_default();
         if let Some(progress) = find_named_descendant(&root, "active-download-progress")
             .and_downcast::<gtk::ProgressBar>()
@@ -642,6 +647,7 @@ fn depot_active(state: &str) -> bool {
             | "calculating"
             | "downloading"
             | "materializing"
+            | "extracting"
             | "committing"
             | "finalizing"
     )
@@ -751,12 +757,42 @@ fn format_remaining(seconds: u64) -> String {
 
 fn depot_install_fraction(state: &str, written: u64, total: u64) -> f64 {
     match state {
-        "committing" => 0.94,
-        "finalizing" => 0.97,
         "complete" => 1.0,
-        _ if total > 0 => (written as f64 / total as f64 * 0.9).clamp(0.0, 0.9),
+        _ if total > 0 => (written as f64 / total as f64).clamp(0.0, 1.0),
         _ => 0.0,
     }
+}
+
+fn depot_phase_progress(
+    operation: &crate::installation::DepotOperationSnapshot,
+) -> (&'static str, u64, Option<u64>) {
+    let label = match operation.state.as_str() {
+        "queued" => return ("Waiting to start", 0, None),
+        "preparing" => return ("Preparing download", 0, None),
+        "calculating" => return ("Calculating download size", 0, None),
+        "extracting" => "Extracting game files",
+        "verifying" | "verifying_existing" => "Checking game files",
+        "dependencies" => "Downloading components",
+        _ => {
+            return (
+                if operation
+                    .download_total_bytes
+                    .is_some_and(|total| operation.bytes_downloaded >= total)
+                {
+                    "Download complete"
+                } else {
+                    "Downloading data"
+                },
+                operation.bytes_downloaded,
+                operation.download_total_bytes,
+            );
+        }
+    };
+    (
+        label,
+        operation.bytes_completed,
+        (operation.total_bytes > 0).then_some(operation.total_bytes),
+    )
 }
 
 fn depot_download_fraction(completed: u64, total: u64) -> f64 {
@@ -898,6 +934,11 @@ fn labeled_progress(label: &str, fraction: f64, detail: &str, disk: bool) -> gtk
     let box_ = gtk::Box::new(gtk::Orientation::Vertical, 3);
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let label = gtk::Label::new(Some(label));
+    label.set_widget_name(if disk {
+        "active-disk-label"
+    } else {
+        "active-download-label"
+    });
     label.set_xalign(0.0);
     label.set_hexpand(true);
     heading.append(&label);
@@ -946,6 +987,7 @@ fn active_download_header(job: &DownloadJobRecord, model: &AppModel, w: &Widgets
         },
         model,
     );
+    header.set_widget_name(&format!("active-download-{}", job.job_id));
     details.append(&transfer_stats(model, download::is_active(&job.job_id)));
     let total = job.total_bytes.unwrap_or_default();
     let fraction = if total > 0 {
@@ -1043,11 +1085,13 @@ fn active_depot_header(
         depot_stage_label(&operation.state),
         model,
     );
+    header.set_widget_name(&format!("active-depot-{}", operation.operation_id));
     details.append(&transfer_stats(model, depot_active(&operation.state)));
-    let download_fraction = operation.download_total_bytes.map_or(0.0, |total| {
-        depot_download_fraction(operation.bytes_downloaded, total)
-    });
-    let download_label = if operation.state == "preparing" {
+    let (phase_label, completed, total) = depot_phase_progress(operation);
+    let download_fraction = total.map_or(0.0, |total| depot_download_fraction(completed, total));
+    let download_label = if matches!(operation.state.as_str(), "extracting" | "dependencies") {
+        phase_label
+    } else if operation.state == "preparing" {
         "Preparing download"
     } else if operation.state == "verifying_existing" {
         "Checking existing files"
@@ -1061,20 +1105,14 @@ fn active_depot_header(
     {
         "Download complete"
     } else {
-        "Downloading data"
+        phase_label
     };
     details.append(&labeled_progress(
         download_label,
         download_fraction,
-        &operation.download_total_bytes.map_or_else(
+        &total.map_or_else(
             || "Calculating…".into(),
-            |total| {
-                format!(
-                    "{} / {}",
-                    human_size(operation.bytes_downloaded),
-                    human_size(total)
-                )
-            },
+            |total| format!("{} / {}", human_size(completed), human_size(total)),
         ),
         false,
     ));
@@ -1154,6 +1192,7 @@ fn depot_stage_label(state: &str) -> &'static str {
         "calculating" => "CALCULATING DOWNLOAD SIZE",
         "downloading" => "STARTING DOWNLOAD",
         "materializing" => "DOWNLOADING",
+        "extracting" => "EXTRACTING GAME FILES",
         "committing" => "INSTALLING FILES",
         "finalizing" => "FINALIZING",
         "dependencies" => "DOWNLOADING REQUIRED COMPONENTS",
@@ -1279,9 +1318,29 @@ fn depot_operation_card(
     row
 }
 
+fn download_progress_widgets(root: &gtk::Widget) -> HashMap<glib::GString, gtk::Widget> {
+    let mut named = HashMap::new();
+    let mut pending = vec![root.clone()];
+    while let Some(widget) = pending.pop() {
+        // Match find_named_descendant: omit the root and keep the first
+        // depth-first occurrence when multiple widgets share a name.
+        if widget != *root {
+            named
+                .entry(widget.widget_name())
+                .or_insert_with(|| widget.clone());
+        }
+        let mut child = widget.last_child();
+        while let Some(widget) = child {
+            child = widget.prev_sibling();
+            pending.push(widget);
+        }
+    }
+    named
+}
+
 fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
-    let root: gtk::Widget = w.downloads.clone().upcast();
-    if let Some(graph) = find_named_descendant(&root, "transfer-history-graph") {
+    let named = download_progress_widgets(w.downloads.upcast_ref());
+    if let Some(graph) = named.get("transfer-history-graph") {
         graph.queue_draw();
     }
     if let Some(sample) = model.transfer_history.borrow().back() {
@@ -1294,7 +1353,7 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
                 .iter()
                 .any(|job| download::is_active(&job.job_id));
         update_transfer_metric(
-            &root,
+            &named,
             "active-network-rate",
             if live {
                 sample.download_bytes_per_second
@@ -1303,7 +1362,7 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
             },
         );
         update_transfer_metric(
-            &root,
+            &named,
             "active-disk-rate",
             if live {
                 sample.disk_bytes_per_second
@@ -1317,12 +1376,15 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
             .iter()
             .map(|sample| sample.download_bytes_per_second)
             .fold(0.0_f64, f64::max);
-        update_transfer_metric(&root, "active-peak-rate", peak);
+        update_transfer_metric(&named, "active-peak-rate", peak);
     }
     let remaining = model
         .depot_operations
         .iter()
-        .find(|operation| depot_active(&operation.state))
+        .find(|operation| {
+            depot_active(&operation.state)
+                && named.contains_key(format!("active-depot-{}", operation.operation_id).as_str())
+        })
         .and_then(|operation| {
             operation
                 .download_total_bytes
@@ -1332,15 +1394,20 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
             model
                 .download_jobs
                 .iter()
-                .find(|job| download::is_active(&job.job_id))
+                .find(|job| {
+                    download::is_active(&job.job_id)
+                        && named.contains_key(format!("active-download-{}", job.job_id).as_str())
+                })
                 .map(|job| {
                     job.total_bytes
                         .unwrap_or_default()
                         .saturating_sub(job.bytes_downloaded)
                 })
         });
-    if let Some(eta) =
-        find_named_descendant(&root, "active-transfer-eta").and_downcast::<gtk::Label>()
+    if let Some(eta) = named
+        .get("active-transfer-eta")
+        .cloned()
+        .and_downcast::<gtk::Label>()
     {
         eta.set_label(
             &remaining
@@ -1349,51 +1416,66 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
         );
     }
     for operation in &model.depot_operations {
-        if let Some(detail) =
-            find_named_descendant(&root, &format!("depot-detail-{}", operation.operation_id))
-                .and_downcast::<gtk::Label>()
+        let (phase, completed, total) = depot_phase_progress(operation);
+        if let Some(detail) = named
+            .get(format!("depot-detail-{}", operation.operation_id).as_str())
+            .cloned()
+            .and_downcast::<gtk::Label>()
         {
-            let percent = operation
-                .download_total_bytes
+            let percent = total
                 .filter(|total| *total > 0)
-                .map(|total| operation.bytes_downloaded.saturating_mul(100) / total);
+                .map(|total| completed.saturating_mul(100) / total);
             detail.set_label(&percent.map_or_else(
-                || operation.state.clone(),
-                |percent| format!("{} · {percent}%", operation.state),
+                || depot_stage_label(&operation.state).to_owned(),
+                |percent| {
+                    format!(
+                        "{} · {}%",
+                        depot_stage_label(&operation.state),
+                        percent.min(100)
+                    )
+                },
             ));
         }
-        if let Some(progress) =
-            find_named_descendant(&root, &format!("depot-progress-{}", operation.operation_id))
-                .and_downcast::<gtk::ProgressBar>()
-            && operation.download_total_bytes.is_some()
+        if let Some(progress) = named
+            .get(format!("depot-progress-{}", operation.operation_id).as_str())
+            .cloned()
+            .and_downcast::<gtk::ProgressBar>()
         {
-            progress.set_fraction(depot_download_fraction(
-                operation.bytes_downloaded,
-                operation.download_total_bytes.unwrap_or_default(),
-            ));
-        }
-        if depot_active(&operation.state) {
-            if let Some(progress) = find_named_descendant(&root, "active-download-progress")
-                .and_downcast::<gtk::ProgressBar>()
-                && operation.download_total_bytes.is_some()
-            {
-                progress.set_fraction(depot_download_fraction(
-                    operation.bytes_downloaded,
-                    operation.download_total_bytes.unwrap_or_default(),
-                ));
+            if let Some(total) = total.filter(|total| *total > 0) {
+                progress.set_fraction(depot_download_fraction(completed, total));
+            } else if depot_active(&operation.state) {
+                progress.pulse();
             }
-            if let Some(detail) =
-                find_named_descendant(&root, "active-download-detail").and_downcast::<gtk::Label>()
+        }
+        if depot_active(&operation.state)
+            && named.contains_key(format!("active-depot-{}", operation.operation_id).as_str())
+        {
+            if let Some(label) = named
+                .get("active-download-label")
+                .cloned()
+                .and_downcast::<gtk::Label>()
             {
-                detail.set_label(&operation.download_total_bytes.map_or_else(
-                    || "Calculating…".into(),
-                    |total| {
-                        format!(
-                            "{} / {}",
-                            human_size(operation.bytes_downloaded),
-                            human_size(total)
-                        )
-                    },
+                label.set_label(phase);
+            }
+            if let Some(progress) = named
+                .get("active-download-progress")
+                .cloned()
+                .and_downcast::<gtk::ProgressBar>()
+            {
+                if let Some(total) = total.filter(|total| *total > 0) {
+                    progress.set_fraction(depot_download_fraction(completed, total));
+                } else {
+                    progress.pulse();
+                }
+            }
+            if let Some(detail) = named
+                .get("active-download-detail")
+                .cloned()
+                .and_downcast::<gtk::Label>()
+            {
+                detail.set_label(&total.map_or_else(
+                    || "Working…".into(),
+                    |total| format!("{} / {}", human_size(completed), human_size(total)),
                 ));
             }
             let install_fraction = depot_install_fraction(
@@ -1401,22 +1483,68 @@ fn update_depot_page_progress(w: &Widgets, model: &AppModel) {
                 operation.bytes_written,
                 operation.total_write_bytes,
             );
-            if let Some(progress) = find_named_descendant(&root, "active-disk-progress")
+            let finishing = matches!(
+                operation.state.as_str(),
+                "setup" | "committing" | "finalizing"
+            );
+            if let Some(label) = named
+                .get("active-disk-label")
+                .cloned()
+                .and_downcast::<gtk::Label>()
+            {
+                label.set_label(if finishing {
+                    "Finishing installation"
+                } else {
+                    "Writing game files"
+                });
+            }
+            if let Some(progress) = named
+                .get("active-disk-progress")
+                .cloned()
                 .and_downcast::<gtk::ProgressBar>()
             {
-                progress.set_fraction(install_fraction.clamp(0.0, 1.0));
+                if finishing || operation.total_write_bytes == 0 {
+                    progress.pulse();
+                } else {
+                    progress.set_fraction(install_fraction);
+                }
             }
-            if let Some(detail) =
-                find_named_descendant(&root, "active-disk-detail").and_downcast::<gtk::Label>()
+            if let Some(detail) = named
+                .get("active-disk-detail")
+                .cloned()
+                .and_downcast::<gtk::Label>()
             {
-                detail.set_label(&format!("{:.0}%", install_fraction * 100.0));
+                let text = if let Some(setup) = &operation.setup {
+                    if setup.total > 0 {
+                        format!(
+                            "{} · {} / {}",
+                            setup.component, setup.completed, setup.total
+                        )
+                    } else {
+                        setup.component.clone()
+                    }
+                } else if finishing {
+                    "Working…".to_owned()
+                } else {
+                    format!(
+                        "{} / {}",
+                        human_size(operation.bytes_written),
+                        human_size(operation.total_write_bytes)
+                    )
+                };
+                detail.set_label(&text);
+                detail.set_tooltip_text(Some(&text));
             }
         }
     }
 }
 
-fn update_transfer_metric(root: &gtk::Widget, name: &str, bytes_per_second: f64) {
-    if let Some(label) = find_named_descendant(root, name).and_downcast::<gtk::Label>() {
+fn update_transfer_metric(
+    named: &HashMap<glib::GString, gtk::Widget>,
+    name: &str,
+    bytes_per_second: f64,
+) {
+    if let Some(label) = named.get(name).cloned().and_downcast::<gtk::Label>() {
         label.set_label(&format!("{}/s", human_size(bytes_per_second as u64)));
     }
 }
@@ -1705,6 +1833,86 @@ pub(super) fn download_job_card(
 mod active_transfer_tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, private GTK display and D-Bus"]
+    fn footer_artwork_reuses_loaded_texture_and_retries_missing_image() {
+        gtk::init().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("icon.png");
+        let image = gtk::Image::new();
+        update_download_artwork(&image, Some(&path));
+        assert!(image.paintable().is_none());
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        update_download_artwork(&image, Some(&path));
+        let first = image.paintable().unwrap();
+        for _ in 0..1000 {
+            update_download_artwork(&image, Some(&path));
+            assert_eq!(image.paintable().as_ref(), Some(&first));
+        }
+        let next = directory.path().join("second.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255]))
+            .save(&next)
+            .unwrap();
+        update_download_artwork(&image, Some(&next));
+        assert_ne!(image.paintable().as_ref(), Some(&first));
+        assert_eq!(image.file().as_deref(), next.to_str());
+        update_download_artwork(&image, None);
+        assert!(!image.is_visible());
+        assert!(image.paintable().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, private GTK display and D-Bus"]
+    fn progress_widget_index_preserves_depth_first_lookup_and_rebuilds() {
+        gtk::init().unwrap();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_widget_name("root-only");
+        let nested = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let first = gtk::Label::new(Some("first"));
+        first.set_widget_name("duplicate");
+        nested.append(&first);
+        root.append(&nested);
+        let second = gtk::Label::new(Some("second"));
+        second.set_widget_name("duplicate");
+        root.append(&second);
+        for id in 0..1000 {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let detail = gtk::Label::new(Some("state"));
+            detail.set_widget_name(&format!("depot-detail-{id}"));
+            let progress = gtk::ProgressBar::new();
+            progress.set_widget_name(&format!("depot-progress-{id}"));
+            row.append(&detail);
+            row.append(&progress);
+            root.append(&row);
+        }
+        let names = (0..1000)
+            .flat_map(|id| [format!("depot-detail-{id}"), format!("depot-progress-{id}")])
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let expected = names
+            .iter()
+            .map(|name| find_named_descendant(root.upcast_ref(), name).unwrap())
+            .collect::<Vec<_>>();
+        let repeated = started.elapsed();
+        let started = std::time::Instant::now();
+        let named = download_progress_widgets(root.upcast_ref());
+        for (name, expected) in names.iter().zip(&expected) {
+            assert_eq!(named.get(name.as_str()), Some(expected));
+        }
+        eprintln!(
+            "1000 synthetic Depot rows, 2000 lookups: repeated traversal {repeated:?}; one index plus lookups {:?}",
+            started.elapsed()
+        );
+        assert_eq!(named.get("duplicate"), Some(first.upcast_ref()));
+        assert!(!named.contains_key("root-only"));
+        assert!(!named.contains_key("absent"));
+        nested.remove(&first);
+        let rebuilt = download_progress_widgets(root.upcast_ref());
+        assert_eq!(rebuilt.get("duplicate"), Some(second.upcast_ref()));
+    }
+
     fn job() -> DownloadJobRecord {
         DownloadJobRecord {
             job_id: "fixture".into(),
@@ -1813,12 +2021,46 @@ mod active_transfer_tests {
     }
 
     #[test]
-    fn depot_disk_progress_reserves_final_ten_percent() {
-        assert_eq!(depot_install_fraction("materializing", 50, 100), 0.45);
-        assert_eq!(depot_install_fraction("materializing", 200, 100), 0.9);
-        assert_eq!(depot_install_fraction("committing", 100, 100), 0.94);
-        assert_eq!(depot_install_fraction("finalizing", 100, 100), 0.97);
+    fn depot_disk_progress_uses_measured_bytes() {
+        assert_eq!(depot_install_fraction("materializing", 50, 100), 0.5);
+        assert_eq!(depot_install_fraction("extracting", 200, 100), 1.0);
+        assert_eq!(depot_install_fraction("committing", 100, 100), 1.0);
+        assert_eq!(depot_install_fraction("finalizing", 100, 100), 1.0);
         assert_eq!(depot_install_fraction("complete", 100, 100), 1.0);
+    }
+
+    #[test]
+    fn depot_local_phases_use_processing_counts_instead_of_stalled_network_bytes() {
+        let mut operation = crate::installation::DepotOperationSnapshot {
+            operation_id: "progress-test".into(),
+            product_id: 42,
+            state: "extracting".into(),
+            bytes_completed: 400,
+            total_bytes: 1000,
+            bytes_downloaded: 10,
+            download_total_bytes: Some(100),
+            bytes_written: 400,
+            total_write_bytes: 2000,
+            error: None,
+            setup: None,
+        };
+        assert_eq!(
+            depot_phase_progress(&operation),
+            ("Extracting game files", 400, Some(1000))
+        );
+        assert!(depot_active("extracting"));
+        for phase in ["verifying", "verifying_existing", "dependencies"] {
+            operation.state = phase.into();
+            let (_, completed, total) = depot_phase_progress(&operation);
+            assert_eq!((completed, total), (400, Some(1000)));
+        }
+        operation.total_bytes = 0;
+        assert_eq!(depot_phase_progress(&operation).2, None);
+        operation.state = "materializing".into();
+        assert_eq!(
+            depot_phase_progress(&operation),
+            ("Downloading data", 10, Some(100))
+        );
     }
 
     #[test]

@@ -715,7 +715,7 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
                 .filter(|operation| {
                     matches!(
                         operation.state.as_str(),
-                        "downloading" | "materializing" | "dependencies"
+                        "downloading" | "materializing" | "extracting" | "dependencies"
                     )
                 })
                 .map(|operation| operation.product_id),
@@ -1503,6 +1503,21 @@ pub(super) fn rebuild_metadata_filter_box(
 }
 
 pub(super) fn update_favorite_widgets(w: &Widgets, model: &AppModel, id: i64, favorite: bool) {
+    if let Some(star) =
+        find_named_descendant(&w.window.clone().upcast(), &format!("detail-favorite-{id}"))
+            .and_downcast::<gtk::Button>()
+    {
+        star.set_icon_name(if favorite {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        });
+        star.set_tooltip_text(Some(if favorite {
+            "Remove from favorites"
+        } else {
+            "Add to favorites"
+        }));
+    }
     let id_text = id.to_string();
     let mut row = w.game_list.first_child();
     while let Some(widget) = row {

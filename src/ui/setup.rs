@@ -124,6 +124,197 @@ struct SetupLibrary {
     entry: gtk::Entry,
     picking: Rc<Cell<bool>>,
     update: gtk::CheckButton,
+    status: gtk::Label,
+}
+
+fn save_setup_library(
+    kind: crate::config::LibraryKind,
+    path: &std::path::Path,
+    update: bool,
+    session: u64,
+) -> anyhow::Result<Config> {
+    let _activity = crate::profile_reset::begin_activity("saving setup library")?;
+    let _permit = crate::operation_gate::try_acquire().map_err(|_| {
+        anyhow::anyhow!("Finish or pause downloads and installations before changing libraries.")
+    })?;
+    anyhow::ensure!(
+        online::account_session() == session,
+        "The account changed. Reopen setup."
+    );
+    let mut config = Config::load_or_create()?;
+    let original = config.clone();
+    anyhow::ensure!(
+        !path.as_os_str().is_empty(),
+        "Choose a directory, or skip this optional step to keep the previous setting."
+    );
+    prepare_setup_library(&original, &mut config, kind, path)?;
+    validate_setup_library(&config, kind, true)?;
+    let mut latest = Config::load_or_create()?;
+    anyhow::ensure!(
+        crate::config::LibraryKind::ALL
+            .into_iter()
+            .all(|kind| latest.libraries(kind) == original.libraries(kind)),
+        "Library settings changed while this directory was being checked. Edit the field to retry."
+    );
+    // Validation can inspect many files; preserve preferences changed during that work.
+    *latest.libraries_mut(kind) = config.libraries(kind).to_vec();
+    config = latest;
+    match kind {
+        crate::config::LibraryKind::GameFiles => config.auto_update_galaxy_installations = update,
+        crate::config::LibraryKind::OfflineInstallers => {
+            config.auto_download_offline_installers = update
+        }
+        crate::config::LibraryKind::Extras => config.auto_download_extras = update,
+    }
+    online::with_account_session(session, || config.save())?;
+    Ok(config)
+}
+
+fn merge_setup_library(target: &mut Config, source: &Config, kind: crate::config::LibraryKind) {
+    *target.libraries_mut(kind) = source.libraries(kind).to_vec();
+    match kind {
+        crate::config::LibraryKind::GameFiles => {
+            target.auto_update_galaxy_installations = source.auto_update_galaxy_installations
+        }
+        crate::config::LibraryKind::OfflineInstallers => {
+            target.auto_download_offline_installers = source.auto_download_offline_installers
+        }
+        crate::config::LibraryKind::Extras => {
+            target.auto_download_extras = source.auto_download_extras
+        }
+    }
+}
+
+fn connect_library_autosave(
+    controls: &SetupLibrary,
+    kind: crate::config::LibraryKind,
+    model: &Rc<RefCell<AppModel>>,
+    w: &Rc<Widgets>,
+    draft: &Rc<RefCell<Config>>,
+    saving: &Rc<Cell<usize>>,
+) -> Rc<dyn Fn()> {
+    let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+    let revision = Rc::new(Cell::new(0u64));
+    let session = online::account_session();
+    let epoch = model.borrow().account_epoch;
+    let save: Rc<dyn Fn()> = Rc::new({
+        let entry = controls.entry.clone();
+        let update = controls.update.clone();
+        let status = controls.status.clone();
+        let model = model.clone();
+        let draft = draft.clone();
+        let w = w.clone();
+        let saving = saving.clone();
+        let revision = revision.clone();
+        move || {
+            if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                return;
+            }
+            let path = std::path::PathBuf::from(entry.text().as_str());
+            let submitted_path = path.clone();
+            let update = update.is_active();
+            revision.set(revision.get().wrapping_add(1));
+            let current = revision.get();
+            saving.set(saving.get() + 1);
+            status.set_label("Checking and saving this library…");
+            let receiver = update_policies::policy_request(move || {
+                save_setup_library(kind, &path, update, session)
+            });
+            let model = model.clone();
+            let draft = draft.clone();
+            let status = status.clone();
+            let w = w.clone();
+            let saving = saving.clone();
+            let revision = revision.clone();
+            let entry = entry.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "The settings worker stopped. Edit the field to retry."
+                    )),
+                };
+                saving.set(saving.get().saturating_sub(1));
+                if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+                    return glib::ControlFlow::Break;
+                }
+                match result {
+                    Ok(config) => {
+                        merge_setup_library(&mut model.borrow_mut().config, &config, kind);
+                        merge_setup_library(&mut draft.borrow_mut(), &config, kind);
+                        if revision.get() == current
+                            && entry.text().as_str() == submitted_path.to_string_lossy()
+                        {
+                            status.set_label("Saved automatically.");
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "{} was not saved: {error}. The previous setting is unchanged.",
+                            kind.label()
+                        );
+                        if revision.get() == current
+                            && entry.text().as_str() == submitted_path.to_string_lossy()
+                        {
+                            status.set_label(&message);
+                        }
+                        if !status.is_mapped() {
+                            show_status(&w, &message);
+                        }
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    let flush: Rc<dyn Fn()> = Rc::new({
+        let pending = pending.clone();
+        let save = save.clone();
+        move || {
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+                save();
+            }
+        }
+    });
+    controls.entry.connect_changed({
+        let pending = pending.clone();
+        let save = save.clone();
+        let status = controls.status.clone();
+        move |_| {
+            status.set_label("Waiting to check and save this directory…");
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let pending_inner = pending.clone();
+            let save = save.clone();
+            *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                Duration::from_millis(400),
+                move || {
+                    pending_inner.borrow_mut().take();
+                    save();
+                },
+            ));
+        }
+    });
+    controls.entry.connect_activate({
+        let flush = flush.clone();
+        move |_| flush()
+    });
+    let focus = gtk::EventControllerFocus::new();
+    focus.connect_leave({
+        let flush = flush.clone();
+        move |_| flush()
+    });
+    controls.entry.add_controller(focus);
+    controls.update.connect_toggled(move |_| {
+        if let Some(source) = pending.borrow_mut().take() {
+            source.remove();
+        }
+        save();
+    });
+    flush
 }
 
 fn setup_library(
@@ -177,6 +368,7 @@ fn setup_library(
         let window = window.clone();
         let entry = entry.clone();
         let picking = picking.clone();
+        let status = status.clone();
         move |button| {
             if !active() || picking.replace(true) {
                 return;
@@ -201,6 +393,9 @@ fn setup_library(
                         if let Some(path) = file.path() {
                             entry.set_text(&path.to_string_lossy());
                             status.set_label("");
+                        } else {
+                            status
+                                .set_label("Choose a local directory, or enter its absolute path.");
                         }
                     }
                     Err(error)
@@ -250,6 +445,7 @@ fn setup_library(
         entry,
         picking,
         update,
+        status,
     }
 }
 
@@ -297,9 +493,19 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         }
     });
     let mut library_steps = Vec::new();
+    let mut library_flushes = Vec::new();
+    let library_saving = Rc::new(Cell::new(0usize));
     for (index, kind) in crate::config::LibraryKind::ALL.into_iter().enumerate() {
         let page = adw::PreferencesPage::new();
         let controls = setup_library(kind, &library_draft, &w.window, active.clone());
+        library_flushes.push(connect_library_autosave(
+            &controls,
+            kind,
+            model,
+            w,
+            &library_draft,
+            &library_saving,
+        ));
         page.add(&controls.group);
         pages.add_named(&page, Some(&(index + 1).to_string()));
         library_steps.push(controls);
@@ -373,7 +579,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
     skip_library.set_widget_name("setup-skip-library");
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
-    let finish = gtk::Button::with_label("Save settings and continue");
+    let finish = gtk::Button::with_label("Finish setup");
     finish.set_widget_name("setup-next");
     finish.add_css_class("suggested-action");
     navigation.append(&skip);
@@ -404,7 +610,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             finish.set_label(if step.get() == 0 {
                 "Let's get started"
             } else if step.get() == STEPS.len() - 1 {
-                "Save settings and continue"
+                "Finish setup"
             } else {
                 "Next"
             });
@@ -428,12 +634,14 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         let checking = checking_runtime.clone();
         let selection_busy = selection_busy.clone();
         let library_steps = library_steps.clone();
+        let library_saving = library_saving.clone();
         move || {
             proton_busy.get()
                 || runtime_busy.get()
                 || checking.get()
                 || (step.get() == 4 && selection_busy.get())
                 || library_steps.iter().any(|controls| controls.picking.get())
+                || library_saving.get() != 0
         }
     });
     skip.connect_clicked({
@@ -443,10 +651,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
         }
     });
     skip_library.connect_clicked({
-        let original = original_libraries.clone();
-        let draft = library_draft.clone();
         let accepted = accepted_libraries.clone();
-        let library_steps = library_steps.clone();
         let step = step.clone();
         let busy = busy.clone();
         let active = active.clone();
@@ -457,20 +662,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                 return;
             }
             let index = step.get() - 1;
-            let kind = crate::config::LibraryKind::ALL[index];
-            // Empty optional input is the same non-destructive choice as this button.
-            prepare_setup_library(
-                &original,
-                &mut draft.borrow_mut(),
-                kind,
-                std::path::Path::new(""),
-            )
-            .expect("only optional library steps can be skipped");
-            library_steps[index].update.set_active(if index == 1 {
-                original.auto_download_offline_installers
-            } else {
-                original.auto_download_extras
-            });
+            // Skipping does not undo choices already saved by editing this page.
             let mut choices = accepted.get();
             choices[index] = false;
             accepted.set(choices);
@@ -557,47 +749,45 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             }
             if step.get() < STEPS.len() - 1 {
                 let current = step.get();
-                let mut draft = library_draft.borrow().clone();
-                let original = original_libraries.as_ref().clone();
                 let path = (current <= 3).then(|| {
                     std::path::PathBuf::from(library_steps[current - 1].entry.text().as_str())
                 });
                 let proton_path = selected_path();
+                let update = (current <= 3).then(|| library_steps[current - 1].update.is_active());
+                let session = online::account_session();
                 busy.set(true);
                 pages.set_sensitive(false);
                 button.set_sensitive(false);
                 status.set_label("Checking your choice…");
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let result = if let Some(path) = path {
-                        prepare_setup_library(
-                            &original,
-                            &mut draft,
+                let receiver = update_policies::policy_request(move || {
+                    if let Some(path) = path {
+                        save_setup_library(
                             crate::config::LibraryKind::ALL[current - 1],
                             &path,
+                            update.unwrap(),
+                            session,
                         )
-                        .map(|accepted| Some((draft, accepted)))
+                        .map(|config| Some((config, true)))
                     } else {
                         (|| -> anyhow::Result<()> {
+                            anyhow::ensure!(
+                                online::account_session() == session,
+                                "The account changed. Reopen setup."
+                            );
                             if let Some(path) = proton_path? {
                                 let preferences = crate::compatibility::proton_preferences()?;
                                 let saved = product_id
                                     .and_then(|id| preferences.overrides.get(&id.to_string()))
                                     .or(preferences.default.as_ref());
-                                if saved != Some(&path) {
-                                    match product_id {
-                                        Some(id) => {
-                                            crate::compatibility::set_game_proton(id, Some(&path))?
-                                        }
-                                        None => crate::compatibility::set_default_proton(&path)?,
-                                    }
-                                }
+                                anyhow::ensure!(
+                                    saved == Some(&path),
+                                    "Wait for the Proton selection to save, or select it again."
+                                );
                             }
                             proton::saved_proton(product_id).map(|_| ())
                         })()
                         .map(|()| None)
-                    };
-                    let _ = sender.send(result);
+                    }
                 });
                 let active = active.clone();
                 let busy = busy.clone();
@@ -607,7 +797,7 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                 let render = render.clone();
                 let library_draft = library_draft.clone();
                 let accepted_libraries = accepted_libraries.clone();
-                let library_steps = library_steps.clone();
+                let model = model.clone();
                 glib::timeout_add_local(Duration::from_millis(50), move || {
                     if !active() {
                         return glib::ControlFlow::Break;
@@ -622,14 +812,17 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                                         let mut choices = accepted_libraries.get();
                                         choices[current - 1] = accepted;
                                         accepted_libraries.set(choices);
-                                        library_steps[current - 1].update.set_active(
-                                            match current {
-                                                1 => draft.auto_update_galaxy_installations,
-                                                2 => draft.auto_download_offline_installers,
-                                                _ => draft.auto_download_extras,
-                                            },
+                                        let kind = crate::config::LibraryKind::ALL[current - 1];
+                                        merge_setup_library(
+                                            &mut model.borrow_mut().config,
+                                            &draft,
+                                            kind,
                                         );
-                                        *library_draft.borrow_mut() = draft;
+                                        merge_setup_library(
+                                            &mut library_draft.borrow_mut(),
+                                            &draft,
+                                            kind,
+                                        );
                                     }
                                     step.set(current + 1);
                                     render();
@@ -653,49 +846,38 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                 });
                 return;
             }
-            let mut config = model.borrow().config.clone();
-            for kind in crate::config::LibraryKind::ALL {
-                *config.libraries_mut(kind) = library_draft.borrow().libraries(kind).to_vec();
-            }
-            config.auto_update_galaxy_installations =
-                library_draft.borrow().auto_update_galaxy_installations;
-            config.auto_download_offline_installers =
-                library_draft.borrow().auto_download_offline_installers;
-            config.auto_download_extras = library_draft.borrow().auto_download_extras;
             let session = online::account_session();
             let accepted = accepted_libraries.get();
             button.set_sensitive(false);
             busy.set(true);
             pages.set_sensitive(false);
             dialog.set_can_close(false);
-            status.set_label("Saving setup…");
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = (|| -> anyhow::Result<Config> {
-                    let _activity = crate::profile_reset::begin_activity("saving setup libraries")?;
-                    let _permit = crate::operation_gate::try_acquire().map_err(|_| {
-                        anyhow::anyhow!(
-                            "Finish or pause downloads and installations before changing libraries."
-                        )
-                    })?;
-                    online::with_account_session(session, || {
-                        for (index, kind) in crate::config::LibraryKind::ALL.into_iter().enumerate()
-                        {
-                            if accepted[index] {
-                                validate_setup_library(&config, kind, true)?;
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    crate::compatibility::preflight_windows(product_id)
-                        .map_err(|error| anyhow::anyhow!(proton::compatibility_message(&error)))?;
-                    config.setup_seen = true;
-                    config.setup_completed = true;
-                    config.windows_setup_deferred = false;
-                    online::with_account_session(session, || config.save())?;
-                    Ok(config)
-                })();
-                let _ = sender.send(result);
+            status.set_label("Verifying setup…");
+            let receiver = update_policies::policy_request(move || {
+                let _activity = crate::profile_reset::begin_activity("saving setup libraries")?;
+                let _permit = crate::operation_gate::try_acquire().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Finish or pause downloads and installations before changing libraries."
+                    )
+                })?;
+                anyhow::ensure!(
+                    online::account_session() == session,
+                    "The account changed. Reopen setup."
+                );
+                let config = Config::load_or_create()?;
+                for (index, kind) in crate::config::LibraryKind::ALL.into_iter().enumerate() {
+                    if accepted[index] {
+                        validate_setup_library(&config, kind, true)?;
+                    }
+                }
+                crate::compatibility::preflight_windows(product_id)
+                    .map_err(|error| anyhow::anyhow!(proton::compatibility_message(&error)))?;
+                let mut config = Config::load_or_create()?;
+                config.setup_seen = true;
+                config.setup_completed = true;
+                config.windows_setup_deferred = false;
+                online::with_account_session(session, || config.save())?;
+                Ok(config)
             });
             let w = w.clone();
             let model = model.clone();
@@ -717,7 +899,11 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                 }
                 match receiver.try_recv() {
                     Ok(Ok(config)) => {
-                        model.borrow_mut().config = config;
+                        let mut state = model.borrow_mut();
+                        state.config.setup_seen = config.setup_seen;
+                        state.config.setup_completed = config.setup_completed;
+                        state.config.windows_setup_deferred = config.windows_setup_deferred;
+                        drop(state);
                         completed.set(true);
                         w.finish_setup.set_visible(false);
                         dialog.set_can_close(true);
@@ -732,7 +918,9 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {
-                        status.set_label(&format!("Setup was not saved: {error}"));
+                        status.set_label(&format!(
+                            "Setup is not complete: {error}. Your saved choices are retained."
+                        ));
                         button.set_sensitive(true);
                         busy.set(false);
                         pages.set_sensitive(true);
@@ -756,6 +944,9 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
     let model = model.clone();
     let w = w.clone();
     dialog.connect_closed(move |_| {
+        for flush in &library_flushes {
+            flush();
+        }
         closed.set(true);
         proton_download
             .cancelled
@@ -778,9 +969,12 @@ pub(super) fn show_setup(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>, product
             w.finish_setup.set_visible(true);
         }
         let session = online::account_session();
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(online::with_account_session(session, || config.save()));
+        let receiver = update_policies::policy_request(move || {
+            online::with_account_session(session, || {
+                let mut config = Config::load_or_create()?;
+                config.setup_seen = true;
+                config.save()
+            })
         });
         let model = model.clone();
         let w = w.clone();

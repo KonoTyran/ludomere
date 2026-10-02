@@ -1,5 +1,43 @@
 # Project specification
 
+## R91 version 0.2.3 and publication — 2026-10-02
+
+User requests bumping to0.2.3, committing/pushing accumulated R88–R90 changes and updating the
+existing upstream PR with the new features/fixes/improvements. Preserve the PR's existing scope
+and mention all newly implemented behavior concisely. No package build or installation requested.
+
+## R90 automatic settings and optimization audit — 2026-10-02
+
+User requests options/onboarding fields apply on change instead of requiring Save or similar,
+plus several delegated audits for inefficiencies, dead/old code and bottlenecks with appropriate
+corrections. Preserve intentional confirmations for consequential actions (download/install/delete),
+input validation, session/reset safety and typed-library separation. Text edits should persist
+valid completed input automatically with bounded write frequency and visible failure feedback;
+invalid/incomplete input must not overwrite valid settings. Preserve R88/R89 working-tree work.
+Optimize evidenced waste and remove demonstrably unused paths without speculative rewrites or
+feature removal. Scoped verification, synthetic/private profiles only; no publication/package or
+real game/account/helper operation requested.
+
+## R89 ineffective UI controls audit — 2026-10-02
+
+User requests finding and fixing buttons/interactables that do nothing when clicked. Audit
+handler/action wiring and ineffective or silently failing control paths; implement confirmed
+fixes with clear results, loading/error feedback and safe session/lifetime behavior. Preserve R88
+working-tree changes, existing consent/data boundaries and background-focus policy. No new
+unrelated features, actual account/game actions, package build or publication requested. Use
+focused tests and independent changed-control verification, not another full suite by default.
+
+## R88 PR feedback and performance/responsiveness audit — 2026-10-02
+
+User requests addressing Kono's two latest PR6 comments, delegating several focused audits for
+bottlenecks, inconsistencies, inefficiencies and breakages, and fixing confirmed issues. Long
+operations must show activity and useful stages/results/errors without GTK blocking or focus theft.
+PR comments5953611940/5952562078 report excessive per-file journal synchronization during Terraria
+small-file extraction and rejection of a partial game directory after profile reset. Preserve strict
+typed-library separation, data safety and recoverable operations; do not silently accept arbitrary
+mixed folders. Use synthetic fixtures for performance/resume/cancellation and UI verification, not
+real accounts/games/helpers. No publication or package build requested for this audit.
+
 ## R87 failed 0.2.2 build — 2026-10-02
 
 User requests fixing the failed build, committing and pushing. Diagnose actual failed build

@@ -685,7 +685,7 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
                     if snapshot.total_bytes > 0
                         && matches!(
                             snapshot.state.as_str(),
-                            "verifying" | "verifying_existing" | "dependencies"
+                            "verifying" | "verifying_existing" | "dependencies" | "extracting"
                         )
                     {
                         stage_details.push_str(&format!(
@@ -730,8 +730,8 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
                         } else { status.set_label("Applying game setup…"); }
                     }
                     phase => {
-                        status.set_label(match phase { "queued"=>"Waiting to start setup…", "preparing"=>"Reading game download information…", "calculating"=>"Calculating required downloads…", "dependencies"=>"Downloading required components…", "downloading"|"materializing"=>"Downloading game files…", "verifying"|"verifying_existing"=>"Checking installed files…", "committing"=>"Saving repaired files…", "finalizing"=>"Finishing game installation…", _=>"Preparing game setup…" });
-                        if matches!(phase,"verifying"|"verifying_existing"|"dependencies") && snapshot.total_bytes>0 {
+                        status.set_label(match phase { "queued"=>"Waiting to start setup…", "preparing"=>"Reading game download information…", "calculating"=>"Calculating required downloads…", "dependencies"=>"Downloading required components…", "downloading"|"materializing"=>"Downloading game files…", "extracting"=>"Extracting game files…", "verifying"|"verifying_existing"=>"Checking installed files…", "committing"=>"Saving repaired files…", "finalizing"=>"Finishing game installation…", _=>"Preparing game setup…" });
+                        if matches!(phase,"verifying"|"verifying_existing"|"dependencies"|"extracting") && snapshot.total_bytes>0 {
                             fraction=Some(snapshot.bytes_completed as f64/snapshot.total_bytes as f64);
                         } else if matches!(phase,"downloading"|"materializing") && let Some(total)=snapshot.download_total_bytes.filter(|total| *total>0) {
                             fraction=Some(snapshot.bytes_downloaded as f64/total as f64);
@@ -3187,7 +3187,10 @@ fn update_install_library_free_space(path: &std::path::Path, label: &gtk::Label)
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                label.set_label("Unavailable");
+                glib::ControlFlow::Break
+            }
         }
     });
 }

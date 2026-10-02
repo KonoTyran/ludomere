@@ -236,11 +236,18 @@ pub(super) fn render_detail_page(
             if !detail.owned {
                 if let Some(uri) = detail.links.store.as_deref() {
                     let launcher = gtk::UriLauncher::new(uri);
-                    launcher.launch(Some(&widgets.window), gio::Cancellable::NONE, |result| {
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "could not open DLC store page");
-                        }
-                    });
+                    let parent = widgets.window.clone();
+                    launcher.launch(
+                        Some(&widgets.window),
+                        gio::Cancellable::NONE,
+                        move |result| {
+                            widgets::file_open::report_launch_result(
+                                &parent,
+                                "DLC store page",
+                                result,
+                            );
+                        },
+                    );
                 }
                 return;
             }
@@ -865,6 +872,7 @@ pub(super) fn render_detail_page(
         } else {
             "non-starred-symbolic"
         });
+        star.set_widget_name(&format!("detail-favorite-{}", game.product_id));
         star.set_tooltip_text(Some(if favorite {
             "Remove from favorites"
         } else {
@@ -1982,36 +1990,79 @@ fn installation_status_panel(
     cloud_enable.add_css_class("suggested-action");
     cloud_enable.set_visible(false);
     panel.append(&cloud_enable);
-    {
+    let determinate = Rc::new(std::cell::Cell::new(false));
+    for (button, preference) in [
+        (&cloud_decline, crate::domain::CloudSavePreference::Disabled),
+        (&cloud_enable, crate::domain::CloudSavePreference::Enabled),
+    ] {
         let panel = panel.clone();
+        let heading = heading.clone();
+        let detail = detail.clone();
+        let progress = progress.clone();
+        let determinate = determinate.clone();
+        let decline = cloud_decline.clone();
+        let enable = cloud_enable.clone();
+        let model = model.clone();
         let refresh = refresh_after_install.clone();
-        cloud_decline.connect_clicked(move |_| {
-            if let Ok(store) = StateStore::open() {
-                store
-                    .set_cloud_save_preference(
-                        product_id,
-                        crate::domain::CloudSavePreference::Disabled,
-                    )
-                    .ok();
-            }
-            panel.set_visible(false);
-            refresh();
-        });
-    }
-    {
-        let panel = panel.clone();
-        let refresh = refresh_after_install.clone();
-        cloud_enable.connect_clicked(move |_| {
-            if let Ok(store) = StateStore::open() {
-                store
-                    .set_cloud_save_preference(
-                        product_id,
-                        crate::domain::CloudSavePreference::Enabled,
-                    )
-                    .ok();
-            }
-            panel.set_visible(false);
-            refresh();
+        button.connect_clicked(move |_| {
+            decline.set_sensitive(false);
+            enable.set_sensitive(false);
+            heading.set_label("SAVING CLOUD-SAVE PREFERENCE");
+            detail.set_label("Saving your choice…");
+            determinate.set(false);
+            progress.set_visible(true);
+            let session = online::account_session();
+            let generation = model.borrow().detail_generation;
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = online::with_account_session(session, || {
+                    StateStore::open()?.set_cloud_save_preference(product_id, preference)
+                });
+                let _ = sender.send(result);
+            });
+            let panel = panel.clone();
+            let heading = heading.clone();
+            let detail = detail.clone();
+            let progress = progress.clone();
+            let decline = decline.clone();
+            let enable = enable.clone();
+            let model = model.clone();
+            let refresh = refresh.clone();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                if panel.root().is_none()
+                    || online::account_session() != session
+                    || model.borrow().account_epoch != account_epoch
+                    || model.borrow().logout_pending
+                    || model.borrow().detail_generation != generation
+                {
+                    return glib::ControlFlow::Break;
+                }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                        "Saving stopped unexpectedly. Choose an option to try again."
+                    )),
+                };
+                progress.set_visible(false);
+                decline.set_sensitive(true);
+                enable.set_sensitive(true);
+                match result {
+                    Ok(()) => {
+                        decline.set_visible(false);
+                        enable.set_visible(false);
+                        panel.set_visible(false);
+                        refresh();
+                    }
+                    Err(error) => {
+                        heading.set_label("COULD NOT SAVE CLOUD-SAVE PREFERENCE");
+                        detail.set_label(
+                            notifications::failure_message("", &error.to_string()).trim_start(),
+                        );
+                    }
+                }
+                glib::ControlFlow::Break
+            });
         });
     }
     let receiver = crate::installation::subscribe_installation_events();
@@ -2020,7 +2071,6 @@ fn installation_status_panel(
     let panel_for_poll = panel.clone();
     let primary_action = primary_action.clone();
     let action_group = action_group.clone();
-    let determinate = Rc::new(std::cell::Cell::new(false));
     let was_installing = Rc::new(std::cell::Cell::new(initially_installing));
     let was_uninstalling = Rc::new(std::cell::Cell::new(false));
     let pending_snapshot = Rc::new(RefCell::new(initial_snapshot));
@@ -2222,6 +2272,7 @@ fn installation_status_panel(
                 "calculating" => "CALCULATING DOWNLOAD SIZE".to_owned(),
                 "downloading" => "STARTING DOWNLOAD".to_owned(),
                 "materializing" => "DOWNLOADING".to_owned(),
+                "extracting" => "EXTRACTING GAME FILES".to_owned(),
                 "committing" => "INSTALLING".to_owned(),
                 "finalizing" => "FINALIZING".to_owned(),
                 "dependencies" => "DOWNLOADING REQUIRED COMPONENTS".to_owned(),
@@ -2248,7 +2299,10 @@ fn installation_status_panel(
                 } else {
                     detail.set_label("Applying required game setup");
                 }
-            } else if snapshot.state == "dependencies" {
+            } else if matches!(
+                snapshot.state.as_str(),
+                "dependencies" | "extracting" | "verifying" | "verifying_existing"
+            ) {
                 depot_rate.borrow_mut().reset();
                 if snapshot.total_bytes > 0 {
                     progress.set_fraction(
@@ -2262,7 +2316,11 @@ fn installation_status_panel(
                     ));
                 } else {
                     determinate.set(false);
-                    detail.set_label("Preparing required components");
+                    detail.set_label(match snapshot.state.as_str() {
+                        "extracting" => "Extracting downloaded game files",
+                        "verifying" | "verifying_existing" => "Checking game files",
+                        _ => "Preparing required components",
+                    });
                 }
             } else if matches!(snapshot.state.as_str(), "committing" | "finalizing") {
                 determinate.set(false);
@@ -2497,6 +2555,11 @@ fn installation_status_panel(
                 normal_action.label(),
             );
         }
+        if cloud_enable.is_visible() || checking_cloud.get() {
+            view_error.set_visible(false);
+            set_idle_primary_action(&primary_action, &action_group, normal_action);
+            return glib::ControlFlow::Continue;
+        }
         if let Some(snapshot) = depot_snapshot.as_ref().filter(|snapshot| {
             depot_operation_id.as_ref() == Some(&snapshot.operation_id)
                 && matches!(
@@ -2537,11 +2600,6 @@ fn installation_status_panel(
             progress.set_visible(true);
             progress.set_fraction(1.0);
             determinate.set(true);
-            return glib::ControlFlow::Continue;
-        }
-        if cloud_enable.is_visible() || checking_cloud.get() {
-            view_error.set_visible(false);
-            set_idle_primary_action(&primary_action, &action_group, normal_action);
             return glib::ControlFlow::Continue;
         }
         view_error.set_visible(installation_snapshot.as_ref().is_some_and(|snapshot| {
@@ -3146,10 +3204,9 @@ fn render_product_logs(
             let window = window.clone();
             move |_| {
                 let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
-                launcher.launch(Some(&window), gio::Cancellable::NONE, |result| {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "could not open installation log");
-                    }
+                let parent = window.clone();
+                launcher.launch(Some(&window), gio::Cancellable::NONE, move |result| {
+                    widgets::file_open::report_launch_result(&parent, "installation log", result);
                 });
             }
         });
@@ -3257,139 +3314,12 @@ pub(super) fn uri_button(label: &str, uri: &str, window: &adw::ApplicationWindow
     let launcher = gtk::UriLauncher::new(uri);
     let window = window.clone();
     button.connect_clicked(move |_| {
-        launcher.launch(Some(&window), gio::Cancellable::NONE, |result| {
-            if let Err(error) = result {
-                tracing::warn!(%error, "could not open link");
-            }
+        let parent = window.clone();
+        launcher.launch(Some(&window), gio::Cancellable::NONE, move |result| {
+            widgets::file_open::report_launch_result(&parent, "link", result);
         });
     });
     button
-}
-
-#[cfg(any())]
-pub(super) fn build_dlc_view(dlcs: &[Dlc], window: &adw::ApplicationWindow) -> gtk::Paned {
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Single);
-    list.add_css_class("boxed-list");
-    for (index, dlc) in dlcs.iter().enumerate() {
-        let row = gtk::ListBoxRow::new();
-        row.set_widget_name(&index.to_string());
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        content.set_margin_top(8);
-        content.set_margin_bottom(8);
-        content.set_margin_start(10);
-        content.set_margin_end(10);
-        content.append(&picture(dlc.icon.as_ref(), 46, 46, "game-icon"));
-        let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        labels.set_hexpand(true);
-        let title = gtk::Label::new(Some(&dlc.title));
-        title.set_xalign(0.0);
-        title.set_wrap(true);
-        title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        let kind = gtk::Label::new(Some(dlc.kind()));
-        kind.set_xalign(0.0);
-        kind.add_css_class("dim-label");
-        labels.append(&title);
-        labels.append(&kind);
-        content.append(&labels);
-        row.set_child(Some(&content));
-        list.append(&row);
-    }
-    let list_scroll = gtk::ScrolledWindow::builder()
-        .min_content_width(250)
-        .min_content_height(520)
-        .child(&list)
-        .build();
-
-    let detail = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    detail.set_margin_start(22);
-    detail.set_margin_end(6);
-    let initial = adw::StatusPage::builder()
-        .title("Select DLC")
-        .description("Choose an expansion or content pack to view its details and files.")
-        .icon_name("package-x-generic-symbolic")
-        .build();
-    detail.append(&initial);
-
-    let dlcs = dlcs.to_vec();
-    let detail_for_signal = detail.clone();
-    let window = window.clone();
-    list.connect_row_selected(move |_, row| {
-        let Some(index) = row.and_then(|row| row.widget_name().parse::<usize>().ok()) else {
-            return;
-        };
-        let Some(dlc) = dlcs.get(index) else {
-            return;
-        };
-        populate_dlc_detail(&detail_for_signal, dlc, &window);
-    });
-
-    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    paned.set_position(290);
-    paned.set_resize_start_child(false);
-    paned.set_shrink_start_child(false);
-    paned.set_start_child(Some(&list_scroll));
-    paned.set_end_child(Some(&detail));
-    paned
-}
-
-#[cfg(any())]
-pub(super) fn populate_dlc_detail(
-    container: &gtk::Box,
-    dlc: &Dlc,
-    window: &adw::ApplicationWindow,
-) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-    container.append(&picture(dlc.artwork.as_ref(), -1, 210, "dlc-hero"));
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    heading.append(&picture(dlc.icon.as_ref(), 64, 64, "detail-icon"));
-    let labels = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    labels.set_hexpand(true);
-    let title = gtk::Label::new(Some(&dlc.title));
-    title.set_xalign(0.0);
-    title.set_wrap(true);
-    title.add_css_class("section-title");
-    let subtitle = gtk::Label::new(Some(&format!(
-        "{} · {} · {}",
-        dlc.kind(),
-        empty_dash(&dlc.platform_label()),
-        human_size(dlc.disk_usage)
-    )));
-    subtitle.set_xalign(0.0);
-    subtitle.add_css_class("dim-label");
-    labels.append(&title);
-    labels.append(&subtitle);
-    heading.append(&labels);
-    container.append(&heading);
-    container.append(&folder_button("Open DLC folder", &dlc.location, window));
-    if !dlc.description.is_empty() {
-        container.append(&expandable_section(
-            "Overview",
-            text::html_to_text(&dlc.description),
-            1_000,
-        ));
-    }
-    container.append(&section(
-        "DLC information",
-        &format!(
-            "Languages: {}\nLocation: {}",
-            empty_dash(&dlc.languages.join(", ")),
-            dlc.location.display()
-        ),
-    ));
-    if !dlc.installers.is_empty() {
-        container.append(&file_section("Installers", &dlc.installers));
-    }
-    if !dlc.extras.is_empty() {
-        let extras = dlc.location.join("extras");
-        container.append(&folder_button("Open DLC extras folder", &extras, window));
-        container.append(&file_section("Extras", &dlc.extras));
-    }
-    if !dlc.changelog.is_empty() {
-        container.append(&lazy_html_section("Changelog", dlc.changelog.clone()));
-    }
 }
 
 pub(super) fn build_dlc_catalog(
@@ -3577,146 +3507,4 @@ mod installation_progress_tests {
             Some(displayed)
         );
     }
-}
-
-#[cfg(any())]
-pub(super) fn show_dlc_page_old(
-    w: &Widgets,
-    model: &Rc<RefCell<AppModel>>,
-    parent_id: i64,
-    dlc: &Dlc,
-) {
-    let Some(parent) = model
-        .borrow()
-        .games
-        .iter()
-        .find(|game| game.product_id == parent_id)
-        .cloned()
-    else {
-        return;
-    };
-    model.borrow_mut().selected = None;
-    while let Some(child) = w.details.first_child() {
-        w.details.remove(&child);
-    }
-    w.details
-        .append(&detail_hero_picture(dlc.detail_artwork.as_ref()));
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 20);
-    page.set_margin_start(36);
-    page.set_margin_end(36);
-    page.set_margin_top(22);
-    page.set_margin_bottom(48);
-    let back = gtk::Button::with_label("← Back to game");
-    back.set_halign(gtk::Align::Start);
-    back.add_css_class("flat");
-    let widgets = w.clone_refs();
-    let model_for_back = model.clone();
-    back.connect_clicked(move |_| {
-        show_game(&widgets, &model_for_back, parent_id, Some(false));
-        let root: gtk::Widget = widgets.details.clone().upcast();
-        if let Some(stack) = find_named_descendant(&root, "game-tabs").and_downcast::<gtk::Stack>()
-        {
-            stack.set_visible_child_name("dlc");
-        }
-    });
-    page.append(&back);
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-    heading.append(&picture(dlc.icon.as_ref(), 72, 72, "detail-icon"));
-    let labels = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    labels.set_hexpand(true);
-    let title = gtk::Label::new(Some(&dlc.title));
-    title.set_xalign(0.0);
-    title.set_wrap(true);
-    title.add_css_class("game-title");
-    let subtitle = gtk::Label::new(Some(&format!(
-        "{} · {} · {}",
-        dlc.kind(),
-        empty_dash(&dlc.platform_label()),
-        human_size(dlc.disk_usage)
-    )));
-    subtitle.set_xalign(0.0);
-    subtitle.add_css_class("dim-label");
-    labels.append(&title);
-    labels.append(&subtitle);
-    heading.append(&labels);
-    heading.append(&folder_button("Open DLC folder", &dlc.location, &w.window));
-    page.append(&heading);
-    let tabs = gtk::Stack::new();
-    tabs.set_widget_name("game-tabs");
-    tabs.set_transition_type(gtk::StackTransitionType::Crossfade);
-    tabs.set_vexpand(true);
-    let switcher = gtk::StackSwitcher::builder()
-        .stack(&tabs)
-        .halign(gtk::Align::Start)
-        .build();
-    switcher.add_css_class("detail-tabs");
-    let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    navigation.add_css_class("game-navigation");
-    navigation.append(&switcher);
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    navigation.append(&spacer);
-    if let Some(url) = &dlc.links.store {
-        navigation.append(&uri_button("Store Page", url, &w.window));
-    }
-    if let Some(url) = &dlc.links.forum {
-        navigation.append(&uri_button("Community Forum", url, &w.window));
-    }
-    if let Some(url) = &dlc.links.support {
-        navigation.append(&uri_button("Support", url, &w.window));
-    }
-    page.append(&navigation);
-
-    let overview = gtk::Box::new(gtk::Orientation::Vertical, 20);
-    overview.set_margin_top(12);
-    if !dlc.description.is_empty() {
-        overview.append(&expandable_section(
-            "Overview",
-            text::html_to_text(&dlc.description),
-            1_600,
-        ));
-    }
-    if !dlc.screenshots.is_empty() {
-        overview.append(&screenshot_strip(
-            dlc.product_id,
-            &dlc.screenshots,
-            &w.window,
-        ));
-    }
-    overview.append(&section(
-        "DLC information",
-        &format!(
-            "Parent game: {}\nSlug: {}\nLanguages: {}\nLocation: {}",
-            parent.title,
-            dlc.slug,
-            empty_dash(&dlc.languages.join(", ")),
-            dlc.location.display()
-        ),
-    ));
-    tabs.add_titled(&overview, Some("overview"), "Overview");
-
-    let visible_dlc_count = parent
-        .dlcs
-        .iter()
-        .filter(|dlc| dlc.is_catalog_visible())
-        .count();
-    let dlc_view = build_dlc_catalog(&parent.dlcs, w, model, parent_id);
-    tabs.add_titled(
-        &dlc_view,
-        Some("dlc"),
-        &format!("DLC ({visible_dlc_count})"),
-    );
-    tabs.add_titled(
-        &build_dlc_files_page(dlc, &w.window),
-        Some("files"),
-        "Offline Installers",
-    );
-    let logs = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    logs.set_margin_top(12);
-    refresh_product_logs(&logs, dlc.product_id, &w.window);
-    tabs.add_titled(&logs, Some("logs"), "Logs");
-    page.append(&tabs);
-    w.details.append(&page);
-    let adjustment = w.details_scroll.vadjustment();
-    glib::idle_add_local_once(move || adjustment.set_value(adjustment.lower()));
 }

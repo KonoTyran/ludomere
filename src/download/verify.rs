@@ -79,11 +79,30 @@ fn parse_gog_checksum(xml: &str, fallback_name: Option<&str>) -> Result<GogCheck
                         _ => {}
                     }
                 }
+                let filename = filename
+                    .or_else(|| fallback_name.map(str::to_owned))
+                    .context("GOG checksum metadata has no filename")?;
+                anyhow::ensure!(
+                    !filename.trim().is_empty()
+                        && !filename
+                            .chars()
+                            .any(|character| character.is_control()
+                                || matches!(character, '/' | '\\'))
+                        && matches!(
+                            Path::new(&filename).components().next(),
+                            Some(std::path::Component::Normal(_))
+                        )
+                        && Path::new(&filename).components().count() == 1,
+                    "GOG checksum metadata filename must be a single safe filename"
+                );
+                let md5 = checksum.context("GOG checksum metadata has no MD5")?;
+                anyhow::ensure!(
+                    md5.len() == 32 && md5.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "GOG checksum metadata MD5 must contain exactly 32 hexadecimal digits"
+                );
                 return Ok(GogChecksum {
-                    filename: filename
-                        .or_else(|| fallback_name.map(str::to_owned))
-                        .context("GOG checksum metadata has no filename")?,
-                    md5: checksum.context("GOG checksum metadata has no MD5")?,
+                    filename,
+                    md5,
                     size: size.context("GOG checksum metadata has no exact size")?,
                 });
             }
@@ -107,5 +126,110 @@ mod tests {
         assert_eq!(checksum.filename, "setup_game.exe");
         assert_eq!(checksum.md5, "9dd2b837300bfa19c6b5b8fde5d38df6");
         assert_eq!(checksum.size, 550_072_224);
+    }
+
+    #[test]
+    fn checksum_names_reject_paths_without_normalizing_or_using_fallback() {
+        for filename in [
+            "",
+            " ",
+            ".",
+            "..",
+            "../outside.exe",
+            "/outside.exe",
+            "sub/setup.exe",
+            "./setup.exe",
+            "setup.exe/",
+            "C:\\outside.exe",
+            "..\\outside.exe",
+            "\\\\host\\setup.exe",
+            "bad\0.exe",
+            "bad\n.exe",
+        ] {
+            let xml = format!(
+                "<file name=\"{filename}\" md5=\"9dd2b837300bfa19c6b5b8fde5d38df6\" total_size=\"1\"/>"
+            );
+            assert!(
+                parse_gog_checksum(&xml, Some("safe_fallback.exe")).is_err(),
+                "unsafe XML name {filename:?}"
+            );
+            assert!(
+                parse_gog_checksum(
+                    "<file md5=\"9dd2b837300bfa19c6b5b8fde5d38df6\" total_size=\"1\"/>",
+                    Some(filename)
+                )
+                .is_err(),
+                "unsafe fallback name {filename:?}"
+            );
+        }
+        for filename in [
+            "setup_game.exe",
+            "setup_game-1.bin",
+            "soundtrack bonus.zip",
+            "日本語の特典.zip",
+            " leading space.zip",
+            "trailing space.zip ",
+        ] {
+            let xml = format!(
+                "<file name=\"{filename}\" md5=\"9dd2b837300bfa19c6b5b8fde5d38df6\" total_size=\"1\"/>"
+            );
+            assert_eq!(
+                parse_gog_checksum(&xml, Some("other.exe"))
+                    .unwrap()
+                    .filename,
+                filename
+            );
+            assert_eq!(
+                parse_gog_checksum(
+                    "<file md5=\"9dd2b837300bfa19c6b5b8fde5d38df6\" total_size=\"1\"/>",
+                    Some(filename)
+                )
+                .unwrap()
+                .filename,
+                filename
+            );
+        }
+        assert!(
+            parse_gog_checksum(
+                "<file name=\"..&#47;outside.exe\" md5=\"9dd2b837300bfa19c6b5b8fde5d38df6\" total_size=\"1\"/>",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            parse_gog_checksum(
+                "<file name=\"bad&#10;.exe\" md5=\"9dd2b837300bfa19c6b5b8fde5d38df6\" total_size=\"1\"/>",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checksum_hashes_reject_malformed_values_and_preserve_hex_case() {
+        for hash in [
+            "",
+            "abc",
+            "9dd2b837300bfa19c6b5b8fde5d38df",
+            "9dd2b837300bfa19c6b5b8fde5d38df60",
+            "zdd2b837300bfa19c6b5b8fde5d38df6",
+            " dd2b837300bfa19c6b5b8fde5d38df6",
+            "9dd2b837300bfa19c6b5b8fde5d38df6 ",
+        ] {
+            let xml = format!("<file name=\"setup.exe\" md5=\"{hash}\" total_size=\"1\"/>");
+            assert!(
+                parse_gog_checksum(&xml, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("MD5")
+            );
+        }
+        for hash in [
+            "9dd2b837300bfa19c6b5b8fde5d38df6",
+            "9DD2B837300BFA19C6B5B8FDE5D38DF6",
+        ] {
+            let xml = format!("<file name=\"setup.exe\" md5=\"{hash}\" total_size=\"1\"/>");
+            assert_eq!(parse_gog_checksum(&xml, None).unwrap().md5, hash);
+        }
     }
 }

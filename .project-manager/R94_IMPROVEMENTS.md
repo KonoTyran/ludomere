@@ -33,6 +33,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | 1511b83 | P270 | Guard hidden-game and tag saves across sign-out/reset and report save failures. |
 | 95b2f0f | P272 | Keep verification results inline, distinguish unavailable checksums and reject stale repairs. |
 | a5752fb | P274 | Report achievement cache failures accurately and guard loading sessions. |
+| 7a305df | P275 | Read installation-status logs incrementally with bounded memory. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -79,6 +80,11 @@ hidden/tag writes are source-ready under independent review and coordinated priv
   untouched. Twenty unchanged polls read0 payload bytes versus over20MiB previously in fixture.
   `/tmp/ludomere-p275-report.md`, `/tmp/ludomere-p276-log-review.md`. Wave7 shipping compile,
   fmt/diff/all-target Clippy PASS. Committing set19.
+  Commit7a305df exact post-commit build PASS; existing status-mapper regression also PASS.
+- P276 rejects unsafe authoritative checksum filenames and malformed MD5 before they can drive
+  repair decisions; valid Unicode/spacing/multipart names and upper/lower hashes preserved exactly.
+  Owner and independent parser3 each PASS, source/security review PASS
+  `/tmp/ludomere-p278-checksum-review.md`. No network or deletion tests. Committing set20.
 
 ## Completed sets
 

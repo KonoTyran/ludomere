@@ -496,10 +496,20 @@ pub(super) fn proton_selection_group_guarded(
                         saved_index.set(index as u32);
                         selected.set_selected(index as u32);
                         browse.set_visible(index as u32 == custom_index.get());
-                        status.set_label(&save_error.borrow_mut().take().unwrap_or_default());
+                        let error = save_error.borrow_mut().take();
+                        let save_initial = !prompt_without_saved
+                            && product_id.is_none()
+                            && saved.is_none()
+                            && paths.borrow().get(index).is_some_and(Option::is_some)
+                            && error.is_none();
+                        status.set_label(&error.unwrap_or_default());
                         buttons.set_sensitive(true);
                         selected.set_sensitive(true);
                         busy.set(false);
+                        if save_initial {
+                            // Discovery selected this row while saves were suppressed as busy.
+                            selected.notify("selected");
+                        }
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {

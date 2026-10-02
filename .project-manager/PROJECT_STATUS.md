@@ -4,6 +4,10 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- Eighteen commits througha5752fb, all18 exact post-commit builds PASS. Final implementation wave:
+  P273 title lookup (post-idle GTK selection discrepancy being isolated), P275 incremental logs,
+  P276 checksum filename/hash safety and P277 migration references/preflight guard. Independent
+  backend cumulative review PASS; UI cumulative review identified P277, now fixed pending tests.
 - All16 exact post-commit builds PASS. P272 verification, P273 titles and P274 achievements source
   frozen for wave6 compile; cross-reviews underway. P275 incremental status-log reader approved
   after compilation snapshot. Final full build process plus changed-control/safety review pending.

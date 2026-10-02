@@ -5,7 +5,8 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -883,6 +884,64 @@ struct UmuLogStatusMonitor {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct UmuLogTail {
+    identity: Option<(u64, u64)>,
+    consumed: u64,
+    partial: Vec<u8>,
+    oversized: bool,
+}
+
+impl UmuLogTail {
+    const CHUNK: usize = 64 * 1024;
+    const LINE_LIMIT: usize = 16 * 1024;
+
+    fn read(&mut self, path: &Path) -> std::io::Result<(usize, bool, Vec<String>)> {
+        let mut file = File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other("UMU log is not a regular file"));
+        }
+        let identity = (metadata.dev(), metadata.ino());
+        let reset = self.identity != Some(identity) || metadata.len() < self.consumed;
+        if reset {
+            self.identity = Some(identity);
+            self.consumed = 0;
+            self.partial.clear();
+            self.oversized = false;
+        }
+        file.seek(SeekFrom::Start(self.consumed))?;
+        let mut bytes = [0; Self::CHUNK];
+        let read = file.read(&mut bytes)?;
+        self.consumed += read as u64;
+        let mut lines = Vec::new();
+        for fragment in bytes[..read].split_inclusive(|byte| *byte == b'\n') {
+            if !self.oversized {
+                if self.partial.len() + fragment.len() <= Self::LINE_LIMIT {
+                    self.partial.extend_from_slice(fragment);
+                } else {
+                    self.partial.clear();
+                    self.oversized = true;
+                }
+            }
+            if fragment.ends_with(b"\n") {
+                if !self.oversized {
+                    lines.push(
+                        String::from_utf8_lossy(&self.partial)
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                }
+                self.partial.clear();
+                self.oversized = false;
+            }
+        }
+        Ok((read, reset, lines))
+    }
+}
+
 impl UmuLogStatusMonitor {
     fn start(
         log_path: PathBuf,
@@ -892,38 +951,33 @@ impl UmuLogStatusMonitor {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = thread::spawn(move || {
-            let mut consumed = 0;
+            let mut tail = UmuLogTail::default();
             let mut last_message = None;
-            let mut partial_line = String::new();
             while !worker_stop.load(Ordering::Acquire) {
-                if let Ok(bytes) = fs::read(&log_path) {
-                    if bytes.len() < consumed {
-                        consumed = 0;
+                if let Ok((read, reset, lines)) = tail.read(&log_path) {
+                    if reset {
+                        last_message = None;
                     }
-                    if bytes.len() > consumed {
-                        partial_line.push_str(&String::from_utf8_lossy(&bytes[consumed..]));
-                        consumed = bytes.len();
-                        let complete_length = partial_line
-                            .rfind('\n')
-                            .map_or(0, |newline| newline.saturating_add(1));
-                        let complete = partial_line[..complete_length].to_owned();
-                        partial_line.drain(..complete_length);
-                        for line in complete.lines() {
-                            let component = current_component.lock().unwrap().clone();
-                            let Some(message) = umu_widget_status(line, component.as_deref())
-                            else {
-                                continue;
-                            };
-                            if last_message.as_deref() == Some(message.as_str()) {
-                                continue;
-                            }
-                            last_message = Some(message.clone());
-                            let _ = events.send(InstallationEvent::Running {
-                                log_path: log_path.clone(),
-                                percentage: None,
-                                message,
-                            });
+                    for line in lines {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
                         }
+                        let component = current_component.lock().unwrap().clone();
+                        let Some(message) = umu_widget_status(&line, component.as_deref()) else {
+                            continue;
+                        };
+                        if last_message.as_deref() == Some(message.as_str()) {
+                            continue;
+                        }
+                        last_message = Some(message.clone());
+                        let _ = events.send(InstallationEvent::Running {
+                            log_path: log_path.clone(),
+                            percentage: None,
+                            message,
+                        });
+                    }
+                    if read == UmuLogTail::CHUNK {
+                        continue;
                     }
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -1384,6 +1438,107 @@ mod tests {
         installation::marker::{InstallationMarker, InstalledCompatibility, InstalledComponent},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn umu_log_tail_reads_only_appends_and_bounds_incomplete_lines() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("synthetic.log");
+        fs::write(&path, b"first \xc3").unwrap();
+        let mut tail = UmuLogTail::default();
+        assert!(tail.read(&path).unwrap().2.is_empty());
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\xa9\npartial")
+            .unwrap();
+        assert_eq!(tail.read(&path).unwrap().2, ["first é"]);
+        fs::write(&path, b"x\n").unwrap();
+        let (read, reset, lines) = tail.read(&path).unwrap();
+        assert_eq!(read, 2);
+        assert!(reset);
+        assert_eq!(lines, ["x"]);
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"replacement larger than old file\n").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let (_, reset, lines) = tail.read(&path).unwrap();
+        assert!(reset);
+        assert_eq!(lines, ["replacement larger than old file"]);
+        fs::write(&replacement, [b'x'; 1024 * 1024]).unwrap();
+        File::options()
+            .append(true)
+            .open(&replacement)
+            .unwrap()
+            .write_all(b"\nWinetricks complete\n")
+            .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let mut total = 0;
+        let mut lines = Vec::new();
+        loop {
+            let (read, _, complete) = tail.read(&path).unwrap();
+            assert!(read <= UmuLogTail::CHUNK);
+            assert!(tail.partial.len() <= UmuLogTail::LINE_LIMIT);
+            total += read;
+            lines.extend(complete);
+            if read == 0 {
+                break;
+            }
+        }
+        assert_eq!(total as u64, fs::metadata(&path).unwrap().len());
+        assert_eq!(lines, ["Winetricks complete"]);
+        for _ in 0..20 {
+            assert_eq!(tail.read(&path).unwrap(), (0, false, vec![]));
+        }
+        eprintln!(
+            "Unchanged 1MiB log: 20 polls read0 content bytes after initial {total} bytes; previous full reads would exceed20MiB"
+        );
+    }
+
+    #[test]
+    fn umu_log_monitor_reports_complete_statuses_and_stops_promptly() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("synthetic.log");
+        fs::write(
+            &path,
+            b"Downloading steamrt\nDownloading steamrt\nWinetricks comp",
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let monitor = UmuLogStatusMonitor::start(path.clone(), sender, Arc::new(Mutex::new(None)));
+        let message = |event| match event {
+            InstallationEvent::Running { message, .. } => message,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert_eq!(
+            message(receiver.recv_timeout(Duration::from_secs(2)).unwrap()),
+            "Downloading UMU runtime"
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(150)).is_err());
+        File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"lete\n")
+            .unwrap();
+        assert_eq!(
+            message(receiver.recv_timeout(Duration::from_secs(2)).unwrap()),
+            "Finalizing compatibility environment"
+        );
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"Winetricks complete\n").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            message(receiver.recv_timeout(Duration::from_secs(2)).unwrap()),
+            "Finalizing compatibility environment"
+        );
+        let started = std::time::Instant::now();
+        drop(monitor);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn depot_uninstall_removes_payload_prefix_and_staging() {

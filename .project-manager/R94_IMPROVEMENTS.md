@@ -32,6 +32,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 | b2a7c99 | P264 | Load Compatibility preferences asynchronously with error details and Retry. |
 | 1511b83 | P270 | Guard hidden-game and tag saves across sign-out/reset and report save failures. |
 | 95b2f0f | P272 | Keep verification results inline, distinguish unavailable checksums and reject stale repairs. |
+| a5752fb | P274 | Report achievement cache failures accurately and guard loading sessions. |
 
 Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
 The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
@@ -67,6 +68,17 @@ hidden/tag writes are source-ready under independent review and coordinated priv
   reservation/account-change behavior. Worker activity and original-session guard, sanitized useful
   diagnostics and truthful offline cache status preserved. Review
   `/tmp/ludomere-p274-independent-review.md`; committing set18.
+  Commita5752fb exact post-commit build PASS.
+- Final implementation wave is P273 title lookup, P275 incremental status-log reads, P276 strict
+  authoritative checksum name/hash validation, P277 migration callback/preflight lifecycle.
+  Cumulative independent backend review found no added critical issue; UI review identified P277.
+  No real integration/delete/repair/helper tests are authorized by these changes.
+- P275 owner and independent synthetic log-reader2 each PASS; source review PASS. New reader
+  reads appended64KiB chunks, bounds unfinished status lines16KiB, handles observed truncation/
+  inode replacement and split UTF-8, preserves normal statuses and stops between chunks. Raw log
+  untouched. Twenty unchanged polls read0 payload bytes versus over20MiB previously in fixture.
+  `/tmp/ludomere-p275-report.md`, `/tmp/ludomere-p276-log-review.md`. Wave7 shipping compile,
+  fmt/diff/all-target Clippy PASS. Committing set19.
 
 ## Completed sets
 

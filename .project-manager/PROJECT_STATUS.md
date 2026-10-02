@@ -4,6 +4,10 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- Commits0dd8af8 sidebar and0e69cd7 batched cache reads independently reviewed and exact-commit
+  cargo build --locked PASS (r94-set1/set2-build.log). P252 source migration reviewed with private
+  GTK PASS, committing next. P255 operation-log feedback/P256 image FIFO/P257 login page feedback
+  approved second wave; root serializes shared Cargo artifacts and preserves separate sets.
 - First wave: P253 sidebar optimization independently reviewed;2 unit+1 private GTK pass.
   P251 cache fixture10 loads improved1.012s→0.421s locally,7 focused tests pass; review pending.
   P252 migration async/progress implementation private GTK pass; review pending. Root wave1

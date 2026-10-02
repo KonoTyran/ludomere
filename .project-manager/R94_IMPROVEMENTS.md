@@ -28,9 +28,14 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   Seven focused tests pass, including500 bases+500 DLC/2000parts/builds and existing caller
   transactions. Synthetic10 reads:1.012s baseline→0.421s patched (independent0.402s); source-derived
   SELECTs3001→10. Independent P254 state review PASS. Reports /tmp/ludomere-p251-report.md and
-  /tmp/ludomere-p254-state-review.md. Exact post-commit build pending.
-- P252: move source-change inspection/preparation off GTK, display actual migration phases and
-  stopped-worker errors, prevent duplicate submissions; keep existing source/saves policy.
+  /tmp/ludomere-p254-state-review.md. Commit0e69cd7 exact post-commit build PASS
+  (/tmp/ludomere-r94-set2-build.log).
+- P252 source-change feedback (reviewed, committing): worker preflight/target preparation replaces
+  GTK filesystem/DB work; immediate activity, truthful backup/uninstall/install/restore stages,
+  duplicate prevention, Close explanation, terminal results, stopped-worker/branch errors and
+  account-change feedback. Existing migration/saves policy retained. Private actual GTK test and
+  independent P254 review PASS; final account callback correction source-reviewed. Reports
+  /tmp/ludomere-p252-report.md and /tmp/ludomere-p254-migration-review.md; exact build pending.
 - Follow-ons queued separately: efficient image FIFO; GOG login page loading/error/retry feedback.
 
 ## Deferred findings and verification limits

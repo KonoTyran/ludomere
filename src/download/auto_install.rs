@@ -141,11 +141,19 @@ pub(super) fn intent(
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids.dedup();
+    let known_dlcs = if ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        store
+            .cached_product_game(choice.product_id)?
+            .into_iter()
+            .flat_map(|game| game.dlcs)
+            .map(|dlc| dlc.product_id)
+            .collect()
+    };
     for id in ids {
         ensure!(
-            store
-                .cached_product_game(choice.product_id)?
-                .is_some_and(|game| game.dlcs.iter().any(|dlc| dlc.product_id == id)),
+            known_dlcs.contains(&id),
             "A selected installer is not a known DLC of this game; download it separately or disable automatic installation"
         );
         let selected=groups.iter().filter(|group|group.product_id==id && group.operating_system==base.operating_system && compatible(group.language.as_deref(),base.language.as_deref()) && compatible(group.version.as_deref(),base.version.as_deref())).min_by_key(|group|&group.job_id).context("Selected DLC installers do not match the base installer's platform, language or version; adjust the selection or disable automatic installation")?;
@@ -161,21 +169,15 @@ pub(super) fn intent(
         dlcs,
         interactive_prompts: choice.config.interactive_installer_prompts,
     };
-    let job_ids = std::iter::once(plan.base.job_id.clone())
-        .chain(plan.dlcs.iter().map(|dlc| dlc.job_id.clone()))
-        .collect();
     for selected in std::iter::once(&plan.base).chain(&plan.dlcs) {
         let request = requests
             .iter()
-            .find(|request| {
-                super::job_id_in(
-                    store,
-                    &request.artifacts.iter().collect::<Vec<_>>(),
-                    &request.destination,
-                )
-                .is_ok_and(|id| id == selected.job_id)
-            })
-            .unwrap();
+            .zip(&job_ids)
+            .find(|(_, id)| **id == selected.job_id)
+            .map(|(request, _)| request)
+            .context(
+                "The selected installer request is unavailable; review the download choices",
+            )?;
         ensure!(
             request.artifacts.iter().all(|artifact| artifact
                 .operating_system
@@ -205,7 +207,9 @@ pub(super) fn intent(
             choice.product_id,
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ),
-        job_ids,
+        job_ids: std::iter::once(plan.base.job_id.clone())
+            .chain(plan.dlcs.iter().map(|dlc| dlc.job_id.clone()))
+            .collect(),
         plan_json: serde_json::to_string(&plan)?,
         state: "waiting".into(),
         error: None,
@@ -673,10 +677,12 @@ mod tests {
         store
             .upsert_normalized_library(&[Game {
                 product_id: 7,
-                dlcs: vec![Dlc {
-                    product_id: 8,
-                    ..Default::default()
-                }],
+                dlcs: (8..=10)
+                    .map(|product_id| Dlc {
+                        product_id,
+                        ..Default::default()
+                    })
+                    .collect(),
                 ..Default::default()
             }])
             .unwrap();
@@ -684,12 +690,37 @@ mod tests {
             request(&choice.config.game_libraries[0].path, 7, "windows"),
             request(&choice.config.game_libraries[0].path, 7, "linux"),
             request(&choice.config.game_libraries[0].path, 8, "linux"),
+            request(&choice.config.game_libraries[0].path, 10, "linux"),
+            request(&choice.config.game_libraries[0].path, 9, "linux"),
         ];
+        let retained = &requests[3];
+        store
+            .save_download_job(&DownloadJobUpdate {
+                job_id: "retained-legacy-dlc-job",
+                product_id: 10,
+                title: &retained.title,
+                artifacts: &retained.artifacts,
+                destination: &retained.destination,
+                state: DownloadState::Paused,
+                bytes_downloaded: 0,
+                total_bytes: Some(4),
+                completed_files: &[],
+                error: None,
+            })
+            .unwrap();
         let record = intent(&store, &requests, &choice).unwrap().unwrap();
         let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
         assert_eq!(plan.base.operating_system, "linux");
-        assert_eq!(plan.dlcs.len(), 1);
-        assert_eq!(record.job_ids.len(), 2);
+        assert_eq!(
+            plan.dlcs
+                .iter()
+                .map(|dlc| dlc.product_id)
+                .collect::<Vec<_>>(),
+            [8, 9, 10]
+        );
+        assert_eq!(record.job_ids.len(), 4);
+        assert_eq!(plan.dlcs[2].job_id, "retained-legacy-dlc-job");
+        assert_eq!(record.job_ids[3], "retained-legacy-dlc-job");
         assert!(intent(&store, &requests[2..], &choice).unwrap().is_none());
         let mut partial = request(root.path(), 7, "linux");
         partial.artifacts[0].part_count = Some(2);

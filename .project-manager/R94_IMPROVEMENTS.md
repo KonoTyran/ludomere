@@ -55,10 +55,29 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 - P255 final independent source/GTK review PASS, /tmp/ludomere-p258-logs-review.md; committing.
   Commitb2a451f exact post-commit build PASS (/tmp/ludomere-r94-set5-build.log).
 - P257 owner GTK1+account1 and independent GTK1 PASS, /tmp/ludomere-p258-login-review.md.
+  Commit689c786 exact post-commit build PASS (/tmp/ludomere-r94-set6-build.log).
 - P259 automatic-install request/DLC lookup reuse source ready; P260 filter count reuse and
   P261 asynchronous preferred-patch inspection/in-place activity feedback approved and implementing.
+- P259 focused automatic-install4 PASS: selection/legacy identity, parts+DLC/reopen dispatch once,
+  blocked prerequisites/consent and existing/untracked payload protection. For the retained5-request,
+  3-DLC fixture, source-derived expensive identity calls19→5 and base catalog reads3→1. No selection,
+  installation or consent policy changed. Wave3 shipping compile/fmt/diff/all-target Clippy PASS.
 
 ## Deferred findings and verification limits
 
 Material ambiguous behavior or risky changes will be recorded here rather than guessed while the
 user is unavailable. Private GTK fixtures can exercise controls but not real game/portal behavior.
+
+- Network-preparation timeout audit found no unbounded-default defect: locked reqwest0.12.28
+  blocking Client::new uses30s default timeout, verified in local dependency source. Existing
+  gog::client uses45s. No speculative network/deadline policy change made; aggregate multi-request
+  duration remains distinct from per-request bounds.
+- Targeted local refresh still inspects every game child before reconciling selected products.
+  Proposed later root-only inspection can retain root/archive validation and full Storage
+  diagnostics; pending separate ownership/review rather than weakening validation opportunistically.
+- Game Properties Cloud Saves still reads its initial record synchronously and falls back on read
+  failure; fixing safely requires separating its large record-dependent builder. Deferred pending
+  a bounded design. The narrower Compatibility fixes read/loading/Retry change is approved next.
+- Managed-file summary labels still read DB/file metadata on GTK after deletion. Async conversion
+  needs proper per-view request generations and coordinated call-site changes; deferred rather
+  than introduce stale-result races or a global cache.

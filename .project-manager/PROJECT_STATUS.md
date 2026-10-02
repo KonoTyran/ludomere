@@ -4,6 +4,13 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- Wave3 P259/P260/P261 source frozen; shared shipping test compile PASS, copied immutable binary
+  /tmp/ludomere-r94-wave3-test-bin. Independent source reviews PASS (patch callback reference
+  cycle corrected before compile); focused/private GTK execution and all-target Clippy underway.
+  P263 targeted root inspection/P264 async compatibility-fix loading approved after current commits.
+- Sets4–6 committedb7a45fd/b2a451f/689c786, each exact-commit build PASS. All wave2 focused and
+  independent reviews PASS (P255 logs, P256 image FIFO, P257 login). P259 install-plan reuse,
+  P260 filter-count reuse and P261 preferred-patch activity are the next bounded workstreams.
 - Sets1–3 committed as0dd8af8/0e69cd7/30fdce4; each exact-commit build PASS. Wave2 shipping
   compilation/fmt/all-target Clippy PASS. P255 log GTK1+pure3 and P257 independent login GTK1
   PASS; P258 final image/log review executions pending. No real WebView/network/account used.

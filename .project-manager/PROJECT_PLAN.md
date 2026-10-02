@@ -1,5 +1,20 @@
 # Project plan
 
+## P263–P265 R94 targeted refresh and compatibility preference loading
+
+- P263 depot next after P259 commit: storage.rs/sections.rs root-only Game Files compatibility
+  inspection for targeted local refresh; preserve full root/ancestor/infrastructure and archive
+  checks, own-target reconciliation, and full Storage child diagnostics. Document that lightweight
+  snapshots do not contain child issues (no model consumer uses them). Regression for partial
+  sibling, unsafe roots/overlap and archive type checks. No cached-validation bypass.
+- P264 ui_review next after P260 commit: game_settings.rs Compatibility fixes initial load only.
+  Worker SQLite read; disabled controls with loading/error/Retry; populate under reset suppression,
+  enable only when loaded and installed. Preserve save/default-reset behavior, session/reset and
+  weak-lifetime checks; private GTK synthetic/database tests, no real profile/helper changes.
+  Cloud Saves initial read deferred because its large record-dependent builder needs separate
+  design; managed-detail label async rewrite also deferred to avoid unbounded call-site churn.
+- P265 nonimplementer reviews and focused checks for each; root separate commit/exact build gates.
+
 ## P260–P262 R94 filter counts and patch feedback
 
 - P260 ui_review owns library.rs: direct Game predicate plus per-refresh matching IDs to remove

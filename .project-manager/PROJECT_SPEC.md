@@ -1,5 +1,22 @@
 # Project specification
 
+## R94 bounded autonomous improvement pass — 2026-10-02
+
+User specification: "Until I interrupt you, continue looking for inefficiencies and potential
+improvements to the software. Attempt to improve UX, UI,, and feedback features indicating the
+program is working properly. Each new set of fixes or features should be a separate commit, though
+all new work should go into a single new branch. Do not create a PR yet. Do keep track of any fixes
+you make. I should be back in an hour or two. Do not work for more than two hours. Use subagents
+and the $project-manager skill to asist you. I will not be here to answer questions. Do not break
+existing features. Ensure the build works after each commit."
+
+Start20:53:48 UTC; hard stop22:53:48 UTC on2026-10-02, or earlier user interruption. Scope is
+evidenced efficiency/usability/activity-feedback improvements preserving existing behavior and
+safety. Defer material ambiguous/product-policy decisions while user unavailable. Single new branch
+from merged upstream; local commits per coherent change, validated build after each. No PR/push,
+package installation/build, real profile/game/account actions, dependency/schema/version changes
+or broad architecture rewrite required. Maintain auditable fixes, checks and deferred findings.
+
 ## R93 version 0.2.4 and publication — 2026-10-02
 
 User requests bumping to0.2.4, committing and pushing the reviewed R92 changes, and posting a

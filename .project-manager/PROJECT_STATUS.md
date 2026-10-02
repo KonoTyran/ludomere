@@ -2,6 +2,20 @@
 
 Last meaningful update: 2026-10-02.
 
+## R94 active timed improvement pass
+
+- First wave: P253 sidebar optimization independently reviewed;2 unit+1 private GTK pass.
+  P251 cache fixture10 loads improved1.012s→0.421s locally,7 focused tests pass; review pending.
+  P252 migration async/progress implementation private GTK pass; review pending. Root wave1
+  all-target Clippy/fmt/diff pass; separate exact-commit builds use detached checkout to avoid
+  relying on another worker's uncommitted code. Baseline cargo build also passed.
+- Started20:53:48 UTC, hard stop22:53:48 UTC2026-10-02 or user interruption. New branch
+  improvement/ux-performance-audit-2026-10-02 from upstream d836fbe (merged PR6 plus upstream
+  build fixes). P251 backend/P252 async UI/P253 presentation audits, then bounded edits and
+  P254 independent reviews; root manages separate commits and post-commit builds. No PR/push.
+- R93 complete:530d074 version0.2.4 pushed; PRcomment5959973766 verified. PR6 merged at19:42:52Z
+  as7ffd2d9, read from GitHub. Working tree was clean before creating this branch.
+
 ## R93 active publication
 
 - P249 metadata checks pass; Cargo/lock/pacman/AppStream now0.2.4, pkgrel1 and release history

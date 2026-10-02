@@ -1,5 +1,24 @@
 # Project plan
 
+## P251–P254 R94 bounded audit, first wave
+
+- Approved first sets: P251 state.rs bulk normalized-library child data loading, preserving narrow
+  lookup/order/errors, measured on synthetic500-game fixture; P252 game_settings.rs async source
+  migration inspection/preparation, phase feedback/duplicate prevention and worker-stop errors.
+  P252 login page busy/error/retry and P251 image FIFO VecDeque are queued separate later sets.
+- P251 depot audits backend state/download/installation inefficiency, nonblocking work and bounded
+  IO. P252 storage_audit audits UI async actions/loading/error/cancellation feedback in dialogs and
+  settings. P253 ui_review audits library/details/rendering/event-refresh responsiveness. Initial
+  read-only findings with exact evidence; root approves narrow disjoint edits within R94 before
+  implementation. No new feature policy or security loosening; defer ambiguity without questions.
+- P254 nonimplementer cross-review and focused regression/private GTK checks per set. Root alone
+  owns records/Git, stages separate coherent sets, runs appropriate fmt/lint/focused checks and
+  verifies cargo build --locked after each commit. Other workers pause mutations during each gate.
+  At end run build-process checks once if time allows; no package/PR/push. Stop starting edits by
+  22:25 UTC, reserve final verification time, hard stop22:53:48 UTC or user interruption.
+- All agents read AGENTS and relevant skills, preserve new upstream d836fbe changes. Reports in
+  /tmp/ludomere-p25*-report.md; durable change ledger .project-manager/R94_IMPROVEMENTS.md.
+
 ## P249–P250 R93 publication
 
 - P249 storage_audit owns version0.2.4 in Cargo/lock/PKGBUILD/AppStream only; keep package release1

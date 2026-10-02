@@ -1,5 +1,14 @@
 # Project plan
 
+## P268 R94 explicit patch-row activity
+
+- storage_audit after P266 commit owns files.rs explicit archive-row Run Patch only: reuse row
+  status/progress for preflight/applying/terminal feedback, full sanitized errors, no background
+  completion/error modal, distinguish disconnection from cancellation. Preserve explicit consent,
+  backend patch validation and action restoration. Include session/lifetime guards as needed for
+  this path; private synthetic events/GTK tests only, no patch/helper invocation. Depot independent
+  review after P263 ready. Separate commit/exact build required.
+
 ## P267 R94 account-bound manual cloud actions (before P264)
 
 - Confirmed safety finding: Game Properties force-sync confirmation can outlive its account;

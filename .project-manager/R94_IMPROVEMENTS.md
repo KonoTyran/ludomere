@@ -77,6 +77,7 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   one direct predicate pass and matching-ID set; for1000 games source-derived ID comparisons
   1,001,000→1000 direct predicates+1000 memberships, excluding unchanged GTK row callbacks.
   Final review /tmp/ludomere-p262-filters-review.md; wave3c fmt/diff/Clippy PASS.
+  Commita6fe580 exact post-commit build PASS (/tmp/ludomere-r94-set9-build.log).
 - P266 update-check/policy-load errors now retain sanitized diagnostic chains and distinguish
   stopped workers; existing recovery/control rules unchanged. Focused3 PASS, independent source
   review+sanitizer PASS /tmp/ludomere-p265-update-diagnostics-review.md. Await separate commit.

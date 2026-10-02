@@ -1540,26 +1540,6 @@ pub(super) fn connect_windows_action(
     });
 }
 
-pub(super) fn patch_with_components(
-    window: &adw::ApplicationWindow,
-    game: crate::domain::InstalledGame,
-    patch: PathBuf,
-    target: Option<String>,
-) -> mpsc::Receiver<crate::installation::PatchEvent> {
-    let (sender, receiver) = mpsc::channel();
-    with_windows_components(window, game.product_id, true, None, move || {
-        let events = crate::installation::run_patch(game, patch, target);
-        std::thread::spawn(move || {
-            for event in events {
-                if sender.send(event).is_err() {
-                    break;
-                }
-            }
-        });
-    });
-    receiver
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

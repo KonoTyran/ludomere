@@ -90,9 +90,22 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   independent500-sibling regression PASS, full12.9ms→root0.211ms locally (not whole-app timing).
   Review /tmp/ludomere-p268-storage-review.md. Initial owner non-isolated invocation had an
   environment-dependent existing test failure; isolated full focused run passes, source unchanged.
+  Isolation incident: the first invocation inherited HOME=/home/chris; validation can call
+  StateStore::open at the normal profile database (create/open/chmod/schema read). The swallowed
+  error prevents determining how far it got; do not claim no access or mutation. No follow-up
+  real-profile inspection was performed. All subsequent owner/reviewer runs explicitly isolate
+  HOME/allXDG/TMP; this limitation is retained rather than treating the first run as valid evidence.
 - Wave4 compilation/fmt PASS. Clippy identified obsolete patch_with_components after both callers
   migrated; P268 owner removed that unused wrapper instead of suppressing the warning. P268 GTK1
   PASS; P267 GTK fixture waiting on synthetic dialog teardown requires correction before commit.
+  Corrected fixture uses actual Cancel/Force buttons, not a raw response signal that does not
+  close the widget. Final P267 owner+independent GTK1 each PASS, cloud pure2 PASS. No real cloud
+  calls. Wave4b all-target Clippy PASS after obsolete wrapper removal.
+- P268 explicit Run Patch rows now pulse during requirements/applying, retain sanitized details
+  and terminal/disconnect feedback in place, suppress stale account/view actions, and no longer
+  open background completion/error modals. Unused patch_with_components removed. GTK1 PASS and
+  independent review PASS /tmp/ludomere-p268-patch-review.md. Separate commit next.
+- P263 commit656d145 exact post-commit build PASS (/tmp/ludomere-r94-set11-build.log).
 
 ## Deferred findings and verification limits
 

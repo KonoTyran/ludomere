@@ -1332,6 +1332,70 @@ fn monitor_preferred_patch(
     });
 }
 
+fn monitor_archive_patch(
+    status: &gtk::Label,
+    details: &gtk::Label,
+    progress: &gtk::ProgressBar,
+    buttons: [gtk::Button; 3],
+    current: Rc<dyn Fn() -> bool>,
+    receiver: mpsc::Receiver<crate::installation::PatchEvent>,
+) {
+    let status = status.clone();
+    let details = details.clone();
+    let progress = progress.clone();
+    let mut started = false;
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if !current() {
+            progress.set_visible(false);
+            status.set_label("Account or view changed");
+            details.set_label("A patch already started may still be running. Reopen the game's files to inspect its state.");
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Ok(crate::installation::PatchEvent::Started { log_path }) => {
+                started = true;
+                status.set_label("Applying patch…");
+                details.set_label(&format!(
+                    "Log: {}\nPatch work continues if you leave this view.",
+                    log_path.display()
+                ));
+                progress.pulse();
+                return glib::ControlFlow::Continue;
+            }
+            Ok(crate::installation::PatchEvent::Complete { .. }) => {
+                status.set_label("Patch complete");
+                status.add_css_class("success");
+                details.set_label(
+                    "Launch the game to verify the update; use Repair Installation if necessary.",
+                );
+            }
+            Ok(crate::installation::PatchEvent::Failed(error)) => {
+                status.set_label("Patch failed");
+                status.add_css_class("error");
+                details.set_label(&super::notifications::failure_message(
+                    "Patch update failed",
+                    &error,
+                ));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                status.set_label("Patch stopped");
+                status.add_css_class("error");
+                details.set_label(if started { "Patch reporting stopped unexpectedly. Inspect the game's state and patch log before retrying." } else { "Patch preparation stopped. Review Windows requirements using Finish setup and inspect the game's state before retrying." });
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                progress.pulse();
+                return glib::ControlFlow::Continue;
+            }
+        }
+        status.remove_css_class("dim-label");
+        progress.set_visible(false);
+        for button in &buttons {
+            button.set_sensitive(true);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 pub(super) struct FilesPageOptions<'a> {
     pub access_token: Option<&'a str>,
     pub config: &'a Config,
@@ -2586,10 +2650,25 @@ fn artifact_download_action(
         let status = status.clone();
         let download_button = button.clone();
         let delete_button = delete_button.clone();
-        let run_patch_button_for_click = run_patch_button.clone();
+        let progress = progress.clone();
+        let details = gtk::Label::new(None);
+        details.set_wrap(true);
+        details.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        details.set_selectable(true);
+        details.set_xalign(0.0);
+        details.set_visible(false);
+        labels.append(&details);
+        let session = online::account_session();
+        let auth_session = auth::session();
         let target_version =
             crate::installation::patch_target_version(artifacts[0].version.as_deref());
-        run_patch_button.connect_clicked(move |_| {
+        run_patch_button.connect_clicked(move |run_patch_button| {
+            if online::account_session() != session || auth::session() != auth_session {
+                status.set_label("Account changed"); status.set_visible(true);
+                details.set_label("Close and reopen this game's files before running a patch."); details.set_visible(true);
+                run_patch_button.set_sensitive(false);
+                return;
+            }
             let Some(patch) = downloaded_files.borrow().iter().find(|path| {
                 path.extension()
                     .and_then(|value| value.to_str())
@@ -2615,80 +2694,46 @@ fn artifact_download_action(
             let status = status.clone();
             let download_button = download_button.clone();
             let delete_button = delete_button.clone();
-            let run_patch_button = run_patch_button_for_click.clone();
+            let run_patch_button = run_patch_button.clone();
+            let progress = progress.clone();
+            let details = details.clone();
             let target_version = target_version.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response != "run" {
                     return;
                 }
+                if online::account_session() != session || auth::session() != auth_session || status.root().is_none() || !window_for_response.is_visible() {
+                    status.set_label("Account or view changed"); status.set_visible(true);
+                    details.set_label("Close and reopen this game's files before running a patch."); details.set_visible(true);
+                    run_patch_button.set_sensitive(false);
+                    return;
+                }
                 status.remove_css_class("success");
+                status.remove_css_class("error");
                 status.add_css_class("dim-label");
-                status.set_label("Running patch…");
+                status.set_label("Checking Windows requirements…");
                 status.set_visible(true);
                 run_patch_button.set_sensitive(false);
                 download_button.set_sensitive(false);
                 delete_button.set_sensitive(false);
-                let receiver = patch_with_components(
-                    &window_for_response,
-                    installed.clone(),
-                    patch.clone(),
-                    target_version.clone(),
-                );
-                let status_for_event = status.clone();
-                let run_button_for_event = run_patch_button.clone();
-                let download_for_event = download_button.clone();
-                let delete_for_event = delete_button.clone();
-                let window_for_event = window_for_response.clone();
-                glib::timeout_add_local(Duration::from_millis(100), move || {
-                    match receiver.try_recv() {
-                        Ok(crate::installation::PatchEvent::Started { log_path }) => {
-                            status_for_event.set_label("Applying patch…");
-                            status_for_event.set_tooltip_text(Some(&format!(
-                                "Log: {}", log_path.display()
-                            )));
-                            glib::ControlFlow::Continue
-                        }
-                        Ok(crate::installation::PatchEvent::Complete { .. }) => {
-                            status_for_event.remove_css_class("dim-label");
-                            status_for_event.add_css_class("success");
-                            status_for_event.set_label("Patch completed");
-                            run_button_for_event.set_sensitive(true);
-                            download_for_event.set_sensitive(true);
-                            delete_for_event.set_sensitive(true);
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("Patch completed")
-                                .body("The patch finished successfully and Ludomere recorded the base game and installed DLC as current. Launch the game to verify the update; use Repair Installation if it did not apply correctly.")
-                                .build();
-                            dialog.add_response("close", "Close");
-                            dialog.present(Some(&window_for_event));
-                            glib::ControlFlow::Break
-                        }
-                        Ok(crate::installation::PatchEvent::Failed(error)) => {
-                            status_for_event.remove_css_class("dim-label");
-                            status_for_event.add_css_class("error");
-                            status_for_event.set_label("Patch failed");
-                            status_for_event.set_tooltip_text(Some(&error));
-                            run_button_for_event.set_sensitive(true);
-                            download_for_event.set_sensitive(true);
-                            delete_for_event.set_sensitive(true);
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("Could not apply patch")
-                                .body(error)
-                                .build();
-                            dialog.add_response("close", "Close");
-                            dialog.present(Some(&window_for_event));
-                            glib::ControlFlow::Break
-                        }
-                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            status_for_event.set_label("Patch cancelled");
-                            run_button_for_event.set_sensitive(true);
-                            download_for_event.set_sensitive(true);
-                            delete_for_event.set_sensitive(true);
-                            glib::ControlFlow::Break
-                        }
+                progress.set_visible(true); progress.set_show_text(false); progress.pulse();
+                details.set_label("Preparing the patch. Once started, patch work continues if you leave this view."); details.set_visible(true);
+                let current: Rc<dyn Fn() -> bool> = Rc::new({
+                    let status = status.downgrade(); let window = window_for_response.downgrade();
+                    move || online::account_session() == session && auth::session() == auth_session
+                        && status.upgrade().is_some_and(|status| status.root().is_some())
+                        && window.upgrade().is_some_and(|window| window.is_visible())
+                });
+                let (sender, receiver) = mpsc::channel();
+                super::proton::with_windows_components(&window_for_response, installed.product_id, true, None, {
+                    let current = current.clone();
+                    move || {
+                        if !current() { return; }
+                        let events = crate::installation::run_patch(installed, patch, target_version);
+                        std::thread::spawn(move || { for event in events { if sender.send(event).is_err() { break; } } });
                     }
                 });
+                monitor_archive_patch(&status, &details, &progress, [run_patch_button, download_button, delete_button], current, receiver);
             });
         });
     }
@@ -3961,6 +4006,94 @@ fn inferred_local_artifact(file: &LibraryFile) -> Option<RemoteArtifact> {
 #[cfg(test)]
 mod unified_row_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG and private GTK display; uses synthetic patch events only"]
+    fn archive_patch_feedback_handles_terminal_events_and_stale_views() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p268-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        for case in 0..5 {
+            let status = gtk::Label::new(Some("Checking Windows requirements…"));
+            let details = gtk::Label::new(None);
+            let progress = gtk::ProgressBar::new();
+            let buttons = std::array::from_fn(|_| {
+                let button = gtk::Button::new();
+                button.set_sensitive(false);
+                button
+            });
+            let current = Rc::new(std::cell::Cell::new(true));
+            let (sender, receiver) = mpsc::channel();
+            monitor_archive_patch(
+                &status,
+                &details,
+                &progress,
+                buttons.clone(),
+                Rc::new({
+                    let current = current.clone();
+                    move || current.get()
+                }),
+                receiver,
+            );
+            if case == 0 || case == 2 {
+                sender
+                    .send(crate::installation::PatchEvent::Started {
+                        log_path: "/tmp/synthetic-patch.log".into(),
+                    })
+                    .unwrap();
+                wait_until(|| status.label() == "Applying patch…");
+                assert!(details.label().contains("synthetic-patch.log"));
+                assert!(progress.is_visible());
+                assert!(buttons.iter().all(|button| !button.is_sensitive()));
+            }
+            match case {
+                0 => sender
+                    .send(crate::installation::PatchEvent::Complete { exit_code: Some(0) })
+                    .unwrap(),
+                1 => sender
+                    .send(crate::installation::PatchEvent::Failed(
+                        "synthetic failure https://example.invalid/?token=secret".into(),
+                    ))
+                    .unwrap(),
+                4 => current.set(false),
+                _ => {}
+            }
+            drop(sender);
+            wait_until(|| !progress.is_visible());
+            assert_eq!(
+                status.label(),
+                match case {
+                    0 => "Patch complete",
+                    1 => "Patch failed",
+                    4 => "Account or view changed",
+                    _ => "Patch stopped",
+                }
+            );
+            assert!(
+                buttons
+                    .iter()
+                    .all(|button| button.is_sensitive() == (case != 4))
+            );
+            assert!(!details.label().contains("secret"));
+            if case == 2 {
+                assert!(details.label().contains("reporting stopped unexpectedly"));
+            }
+            if case == 3 {
+                assert!(details.label().contains("Finish setup"));
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus; never executes a patch"]

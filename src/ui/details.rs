@@ -1072,9 +1072,10 @@ pub(super) fn render_detail_page(
         let logs = operation_logs;
         let window = w.window.clone();
         let product_id = game.product_id;
+        let session = online::account_session();
         move |tabs| {
             if tabs.visible_child_name().as_deref() == Some("logs") {
-                refresh_product_logs(&logs, product_id, &window);
+                refresh_product_logs(&logs, product_id, &window, session);
             }
         }
     });
@@ -3040,16 +3041,51 @@ pub(super) fn append_official_metadata(
     }
 }
 
-fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::ApplicationWindow) {
+#[derive(Default)]
+struct ProductLogs {
+    files: Vec<(&'static str, std::path::PathBuf)>,
+    installation_error: Option<String>,
+    download_failures: Vec<DownloadJobRecord>,
+    read_error: Option<String>,
+}
+
+fn refresh_product_logs(
+    container: &gtk::Box,
+    product_id: i64,
+    window: &adw::ApplicationWindow,
+    session: u64,
+) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
-    let loading = gtk::Spinner::new();
-    loading.set_size_request(16, 16);
-    loading.start();
+    if online::account_session() != session {
+        container.append(&gtk::Label::new(Some(
+            "Account changed. Reopen the game to view its operation logs.",
+        )));
+        return;
+    }
+    let loading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spinner = gtk::Spinner::new();
+    spinner.set_size_request(16, 16);
+    spinner.start();
+    loading.append(&spinner);
+    loading.append(&gtk::Label::new(Some("Loading operation logs…")));
     container.append(&loading);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
+        if online::account_session() != session {
+            return;
+        }
+        let _activity = match crate::profile_reset::begin_activity("loading operation logs") {
+            Ok(activity) => activity,
+            Err(error) => {
+                let _ = sender.send(ProductLogs {
+                    read_error: Some(format!("Could not load operation logs: {error:#}")),
+                    ..ProductLogs::default()
+                });
+                return;
+            }
+        };
         let logs = [
             (
                 "Installer log",
@@ -3073,28 +3109,79 @@ fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::App
                 .then_some(snapshot.message)
                 .flatten()
             });
-        let download_failures = StateStore::open()
-            .and_then(|store| store.download_jobs())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|job| job.product_id == product_id && job.state == DownloadState::Failed)
-            .collect::<Vec<_>>();
-        let _ = sender.send((logs, installation_error, download_failures));
+        let (download_failures, read_error) =
+            match StateStore::open().and_then(|store| store.download_jobs()) {
+                Ok(jobs) => (
+                    jobs.into_iter()
+                        .filter(|job| {
+                            job.product_id == product_id && job.state == DownloadState::Failed
+                        })
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!(
+                        "Could not load download failure records: {error:#}"
+                    )),
+                ),
+            };
+        let _ = sender.send(ProductLogs {
+            files: logs,
+            installation_error,
+            download_failures,
+            read_error,
+        });
     });
+    monitor_product_logs(container, product_id, window, session, loading, receiver);
+}
+
+fn monitor_product_logs(
+    container: &gtk::Box,
+    product_id: i64,
+    window: &adw::ApplicationWindow,
+    session: u64,
+    loading: gtk::Box,
+    receiver: mpsc::Receiver<ProductLogs>,
+) {
     let weak = container.downgrade();
     let window = window.clone();
     glib::timeout_add_local(Duration::from_millis(32), move || {
         let Some(container) = weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
+        // Each refresh owns its loading row; an older result must not replace newer content.
+        if container.first_child().as_ref() != Some(loading.upcast_ref()) {
+            return glib::ControlFlow::Break;
+        }
+        if online::account_session() != session {
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
+            }
+            container.append(&gtk::Label::new(Some(
+                "Account changed. Reopen the game to view its operation logs.",
+            )));
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
-            Ok((logs, error, failures)) => {
-                render_product_logs(&container, &window, logs, error, failures);
+            Ok(logs) => {
+                render_product_logs(&container, &window, product_id, session, logs);
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(_) => {
-                loading.stop();
+                render_product_logs(
+                    &container,
+                    &window,
+                    product_id,
+                    session,
+                    ProductLogs {
+                        read_error: Some(
+                            "Operation log loading stopped unexpectedly. Please retry.".into(),
+                        ),
+                        ..ProductLogs::default()
+                    },
+                );
                 glib::ControlFlow::Break
             }
         }
@@ -3104,14 +3191,43 @@ fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::App
 fn render_product_logs(
     container: &gtk::Box,
     window: &adw::ApplicationWindow,
-    logs: Vec<(&str, std::path::PathBuf)>,
-    installation_error: Option<String>,
-    download_failures: Vec<DownloadJobRecord>,
+    product_id: i64,
+    session: u64,
+    logs: ProductLogs,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
-    if logs.is_empty() && download_failures.is_empty() {
+    if let Some(error) = &logs.read_error {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let message = gtk::Label::new(Some(
+            super::notifications::failure_message("", error).trim_start(),
+        ));
+        message.set_wrap(true);
+        message.set_selectable(true);
+        message.set_xalign(0.0);
+        message.set_hexpand(true);
+        message.add_css_class("error");
+        row.append(&message);
+        let retry = gtk::Button::with_label("Retry");
+        retry.set_valign(gtk::Align::Center);
+        retry.connect_clicked({
+            let weak = container.downgrade();
+            let window = window.clone();
+            move |_| {
+                if let Some(container) = weak.upgrade() {
+                    refresh_product_logs(&container, product_id, &window, session);
+                }
+            }
+        });
+        row.append(&retry);
+        container.append(&row);
+    }
+    if logs.files.is_empty()
+        && logs.download_failures.is_empty()
+        && logs.installation_error.is_none()
+        && logs.read_error.is_none()
+    {
         let empty = adw::StatusPage::builder()
             .title("No operation logs for this game")
             .description("Installation and download logs will appear here when available.")
@@ -3120,10 +3236,10 @@ fn render_product_logs(
         container.append(&empty);
         return;
     }
-    if !download_failures.is_empty() {
+    if !logs.download_failures.is_empty() {
         let download_group = adw::PreferencesGroup::new();
         download_group.set_title("Downloads");
-        for job in download_failures {
+        for job in logs.download_failures {
             let row = adw::ExpanderRow::new();
             row.set_title(&job.title);
             let timestamp = chrono::DateTime::from_timestamp(job.updated_at, 0)
@@ -3160,7 +3276,7 @@ fn render_product_logs(
                         Some(&window),
                         gio::Cancellable::NONE,
                         move |response| {
-                            if response == "discard" {
+                            if response == "discard" && online::account_session() == session {
                                 download::remove(&job_id);
                             }
                         },
@@ -3190,10 +3306,13 @@ fn render_product_logs(
     }
     let group = adw::PreferencesGroup::new();
     group.set_title("Installation");
-    if let Some(error) = installation_error {
-        group.set_description(Some(&error));
+    let has_installation_logs = !logs.files.is_empty() || logs.installation_error.is_some();
+    if let Some(error) = logs.installation_error {
+        group.set_description(Some(
+            super::notifications::failure_message("", &error).trim_start(),
+        ));
     }
-    for (title, path) in logs {
+    for (title, path) in logs.files {
         let row = adw::ActionRow::new();
         row.set_title(title);
         row.set_subtitle(&path.display().to_string());
@@ -3213,7 +3332,7 @@ fn render_product_logs(
         row.add_suffix(&open);
         group.add(&row);
     }
-    if group.first_child().is_some() {
+    if has_installation_logs {
         container.append(&group);
     }
 }
@@ -3419,6 +3538,159 @@ pub(super) fn show_dlc_page(w: &Widgets, model: &Rc<RefCell<AppModel>>, parent_i
 #[cfg(test)]
 mod installation_progress_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn operation_logs_show_partial_failures_retry_and_reject_stale_results() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p255-")
+        );
+        adw::init().unwrap();
+        fn text(widget: &gtk::Widget) -> String {
+            let mut result = widget
+                .clone()
+                .downcast::<gtk::Label>()
+                .map(|label| label.label().to_string())
+                .unwrap_or_default();
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                result.push_str(&text(&current));
+                child = current.next_sibling();
+            }
+            result
+        }
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.OperationLogsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        window.set_content(Some(&container));
+        window.present();
+        let session = online::account_session();
+        let product_id = 9255001;
+        render_product_logs(
+            &container,
+            &window,
+            product_id,
+            session,
+            ProductLogs {
+                installation_error: Some(
+                    "Synthetic installation failure https://example.invalid/?token=secret".into(),
+                ),
+                ..ProductLogs::default()
+            },
+        );
+        assert!(text(container.upcast_ref()).contains("Synthetic installation failure"));
+        assert!(!text(container.upcast_ref()).contains("secret"));
+        assert!(!text(container.upcast_ref()).contains("No operation logs"));
+        render_product_logs(
+            &container,
+            &window,
+            product_id,
+            session,
+            ProductLogs::default(),
+        );
+        assert!(text(container.upcast_ref()).contains("No operation logs"));
+
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var_os("XDG_DATA_HOME").unwrap()));
+        std::fs::create_dir_all(&database).unwrap();
+        let log = crate::installation::installation_log_path(product_id).unwrap();
+        std::fs::write(&log, "synthetic installation output").unwrap();
+        refresh_product_logs(&container, product_id, &window, session);
+        assert!(text(container.upcast_ref()).contains("Loading operation logs"));
+        wait_until(|| {
+            text(container.upcast_ref()).contains("Could not load download failure records")
+        });
+        assert!(text(container.upcast_ref()).contains("Installer log"));
+        assert!(!text(container.upcast_ref()).contains("No operation logs"));
+        let retry = container
+            .first_child()
+            .unwrap()
+            .last_child()
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        std::fs::remove_dir(&database).unwrap();
+        retry.emit_clicked();
+        assert!(text(container.upcast_ref()).contains("Loading operation logs"));
+        wait_until(|| text(container.upcast_ref()).contains("Installer log"));
+        assert!(!text(container.upcast_ref()).contains("Could not load"));
+        assert!(!text(container.upcast_ref()).contains("Retry"));
+
+        for stale_session in [false, true] {
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
+            }
+            let loading = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            container.append(&loading);
+            let (sender, receiver) = mpsc::channel();
+            monitor_product_logs(
+                &container,
+                product_id,
+                &window,
+                if stale_session {
+                    session.wrapping_add(1)
+                } else {
+                    session
+                },
+                loading,
+                receiver,
+            );
+            drop(sender);
+            wait_until(|| {
+                text(container.upcast_ref()).contains(if stale_session {
+                    "Account changed"
+                } else {
+                    "stopped unexpectedly"
+                })
+            });
+            assert_eq!(
+                text(container.upcast_ref()).contains("Retry"),
+                !stale_session
+            );
+        }
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+        let loading = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        container.append(&loading);
+        let (sender, receiver) = mpsc::channel();
+        monitor_product_logs(
+            &container,
+            product_id,
+            &window,
+            session,
+            loading.clone(),
+            receiver,
+        );
+        container.remove(&loading);
+        container.append(&gtk::Label::new(Some("Newer refresh result")));
+        sender
+            .send(ProductLogs {
+                installation_error: Some("Stale result".into()),
+                ..ProductLogs::default()
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(text(container.upcast_ref()), "Newer refresh result");
+        window.close();
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/all XDG, private D-Bus and Xvfb"]

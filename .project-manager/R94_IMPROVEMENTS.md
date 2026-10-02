@@ -45,11 +45,15 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   PASS; independent source review PASS, independent execution pending. Report p255-report.md.
 - P256 image scheduling: FIFO VecDeque removes repeated shifting of all pending jobs under the
   queue mutex; explicit priority ordering, four workers and cancellation behavior unchanged.
+  Three focused tests PASS, independent P258 review and2 reruns PASS. Commitb7a45fd exact
+  post-commit build PASS (/tmp/ludomere-r94-set4-build.log).
 - P257 sign-in: loading indicator, generic safe failure with Retry, stopped-browser feedback,
   canceled-navigation/redirect teardown handling. Retry starts the public login URL; no raw OAuth
   URLs/errors displayed. Independent synthetic GTK1 PASS; no WebView/account/network execution.
 - Wave2 shipping compilation, fmt/diff and all-target Clippy PASS. Each set gets its own commit
   and exact post-commit build. P259 request/DLC lookup reuse approved next, awaiting P256 commit.
+- P255 final independent source/GTK review PASS, /tmp/ludomere-p258-logs-review.md; committing.
+- P257 owner GTK1+account1 and independent GTK1 PASS, /tmp/ludomere-p258-login-review.md.
 
 ## Deferred findings and verification limits
 

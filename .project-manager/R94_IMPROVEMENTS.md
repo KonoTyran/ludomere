@@ -53,7 +53,10 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 - Wave2 shipping compilation, fmt/diff and all-target Clippy PASS. Each set gets its own commit
   and exact post-commit build. P259 request/DLC lookup reuse approved next, awaiting P256 commit.
 - P255 final independent source/GTK review PASS, /tmp/ludomere-p258-logs-review.md; committing.
+  Commitb2a451f exact post-commit build PASS (/tmp/ludomere-r94-set5-build.log).
 - P257 owner GTK1+account1 and independent GTK1 PASS, /tmp/ludomere-p258-login-review.md.
+- P259 automatic-install request/DLC lookup reuse source ready; P260 filter count reuse and
+  P261 asynchronous preferred-patch inspection/in-place activity feedback approved and implementing.
 
 ## Deferred findings and verification limits
 

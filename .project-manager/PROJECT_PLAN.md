@@ -1,5 +1,19 @@
 # Project plan
 
+## P260–P262 R94 filter counts and patch feedback
+
+- P260 ui_review owns library.rs: direct Game predicate plus per-refresh matching IDs to remove
+  repeated ID scans for counts/section headings. Preserve all filters, playable/hidden behavior,
+  missing metadata, collapse/selection and existing GTK callbacks; no persistent index/cache.
+  Focused equivalence and private GTK regressions; measured/sourced work reduction.
+- P261 storage_audit owns files.rs preferred-patch flow: move DB/file inspection to worker;
+  visible inspection, explicit errors/normal no-patch result, existing patch consent, in-place
+  patch progress and terminal/disconnect feedback. No completion modal/focus change; closing
+  progress does not cancel. Account/reset/lifetime guards required; synthetic GTK only, no patch
+  execution or game/profile mutation. Preserve patch choice/version rules and update fallback.
+- P262 independent cross-review after P259–P261 source ready; root coordinates compilation,
+  relevant tests, separate commits and post-commit builds. No new dependency/schema/policy.
+
 ## P259 R94 automatic-install planning efficiency
 
 - Depot approved next separate set after P256 commit: reuse request job IDs already resolved by

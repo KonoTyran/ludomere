@@ -1,5 +1,23 @@
 # Project plan
 
+## P267 R94 account-bound manual cloud actions (before P264)
+
+- Confirmed safety finding: Game Properties force-sync confirmation can outlive its account;
+  run_cloud_action captures auth session only inside sync when worker starts. ui_review owns
+  game_settings.rs bounded fix before P264: bind manual normal/force actions to originating
+  Properties auth/account session, recheck confirmation and worker dispatch, call existing
+  sync_for_session, suppress stale result/control updates with actionable account-change text.
+  Preserve destructive consent and all backend safeguards. No network/keyring/save tests;
+  private GTK stale-confirmation controls and synthetic dispatch verification. storage_audit
+  independently reviews session boundaries/security and behavior. No cloud-builder redesign.
+
+## P266 R94 update error diagnostics
+
+- storage_audit owns update_policies.rs only: preserve actionable sanitized actual errors for
+  global update checks and per-game policy loading, distinguish worker disconnection. Keep current
+  retry/close-reopen controls and save policy; no new framework/backend/network actions. Focused
+  existing policy/sanitizer checks, independent source review and separate commit/build gate.
+
 ## P263–P265 R94 targeted refresh and compatibility preference loading
 
 - P263 depot next after P259 commit: storage.rs/sections.rs root-only Game Files compatibility

@@ -193,12 +193,22 @@ pub(super) fn rebuild_sidebar_presentation(w: &Widgets, model: &mut AppModel) {
     glib::idle_add_local_once(move || game_list.invalidate_filter());
 }
 
-fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) {
+fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) -> usize {
+    let matching_ids = model
+        .games
+        .iter()
+        .filter(|game| {
+            game_matches_filters(model, game)
+                && (!model.sidebar_playable_only
+                    || model.playable_products.contains(&game.product_id))
+        })
+        .map(|game| game.product_id)
+        .collect::<HashSet<_>>();
     for section in &model.activity_sections {
         let matching = section
             .members
             .iter()
-            .filter(|id| game_matches_sidebar(model, **id))
+            .filter(|id| matching_ids.contains(id))
             .count();
         if let Some(row) = find_list_row(w, &section_name(section.key)) {
             row.set_visible(model.sidebar_sort_mode == SidebarSortMode::LastPlayed && matching > 0);
@@ -220,6 +230,7 @@ fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) {
         }
     }
     w.game_list.invalidate_filter();
+    matching_ids.len()
 }
 
 fn find_list_row(w: &Widgets, name: &str) -> Option<gtk::ListBoxRow> {
@@ -1148,15 +1159,284 @@ fn sidebar_refresh_reuses_rows_and_only_changes_updated_styles() {
     w.window.close();
 }
 
+#[test]
+fn direct_game_filter_preserves_library_preferences_and_unknown_metadata() {
+    use crate::domain::{Dlc, MetadataSource, MetadataTerm, Platforms};
+    let term = MetadataTerm {
+        provider_id: None,
+        name: "Adventure".into(),
+        slug: "adventure".into(),
+        source: MetadataSource::GamesDb,
+    };
+    let mut featured = Game {
+        product_id: 1,
+        title: "Featured Game".into(),
+        slug: "featured".into(),
+        platforms: Platforms {
+            windows: true,
+            ..Platforms::default()
+        },
+        features: vec!["Cloud saves".into(), "Achievements".into()],
+        languages: vec!["en".into()],
+        dlcs: vec![Dlc {
+            product_id: 101,
+            ..Dlc::default()
+        }],
+        ..Game::default()
+    };
+    featured.metadata.genres.push(term.clone());
+    featured.metadata.game_modes.push(term.clone());
+    featured.metadata.properties.push(term);
+    let games = vec![
+        featured,
+        Game {
+            product_id: 2,
+            title: "Other Game".into(),
+            platforms: Platforms {
+                linux: true,
+                ..Platforms::default()
+            },
+            ..Game::default()
+        },
+    ];
+    type FilterCase = (&'static str, fn(&mut AppModel), &'static [i64]);
+    let cases: &[FilterCase] = &[
+        ("all", |_| {}, &[1, 2]),
+        ("favorite", |m| m.favorites_only = true, &[1]),
+        ("DLC download", |m| m.downloaded_only = true, &[1]),
+        ("installed", |m| m.installed_only = true, &[1]),
+        ("played", |m| m.played_only = true, &[2]),
+        ("unplayed", |m| m.unplayed_only = true, &[1]),
+        (
+            "both play filters",
+            |m| {
+                m.played_only = true;
+                m.unplayed_only = true;
+            },
+            &[1, 2],
+        ),
+        ("Windows", |m| m.windows_only = true, &[1]),
+        ("Linux", |m| m.linux_only = true, &[2]),
+        ("language", |m| m.language_filter = Some("EN".into()), &[1]),
+        ("cloud", |m| m.cloud_saves_only = true, &[1]),
+        ("achievements", |m| m.achievements_only = true, &[1]),
+        (
+            "genre",
+            |m| {
+                m.genre_theme_filters.insert("adventure".into());
+            },
+            &[1],
+        ),
+        (
+            "mode",
+            |m| {
+                m.game_mode_filters.insert("Adventure".into());
+            },
+            &[1],
+        ),
+        (
+            "property",
+            |m| {
+                m.property_filters.insert("Adventure".into());
+            },
+            &[1],
+        ),
+        ("metadata search", |m| m.query = "ADVENTURE".into(), &[1]),
+        ("personal tag search", |m| m.query = "Personal".into(), &[1]),
+        (
+            "tag",
+            |m| {
+                m.tag_filters.insert("Personal".into());
+            },
+            &[1],
+        ),
+        (
+            "hidden",
+            |m| {
+                m.hidden_products.insert(1);
+            },
+            &[2],
+        ),
+        (
+            "show hidden",
+            |m| {
+                m.hidden_products.insert(1);
+                m.show_hidden = true;
+            },
+            &[1, 2],
+        ),
+        (
+            "unknown metadata",
+            |m| {
+                m.cloud_saves_only = true;
+                m.section_states
+                    .remove(&(2, online::DetailSection::Metadata));
+            },
+            &[1, 2],
+        ),
+    ];
+    for (name, configure, expected) in cases {
+        let mut model = AppModel {
+            games: games.clone(),
+            ..AppModel::default()
+        };
+        model.favorites.insert(1);
+        model.downloaded_products.insert(101);
+        model.installed_products.insert(1);
+        model.tags.insert(1, vec!["Personal".into()]);
+        model.product_activity.insert(
+            2,
+            ProductActivity {
+                last_played_at: Some(1),
+                ..ProductActivity::default()
+            },
+        );
+        for id in [1, 2] {
+            model
+                .section_states
+                .insert((id, online::DetailSection::Metadata), SectionState::Ready);
+        }
+        configure(&mut model);
+        assert_eq!(
+            model
+                .games
+                .iter()
+                .filter(|game| game_matches_filters(&model, game))
+                .map(|game| game.product_id)
+                .collect::<Vec<_>>(),
+            *expected,
+            "{name}"
+        );
+        for game in &model.games {
+            assert_eq!(
+                game_matches_filters(&model, game),
+                game_matches_library_filters(&model, game.product_id),
+                "{name}"
+            );
+        }
+        assert!(!game_matches_library_filters(&model, 999));
+    }
+}
+
+#[test]
+#[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+fn filter_counts_reuse_matches_without_changing_rows_selection_or_collapsed_sections() {
+    assert!(
+        std::env::var("HOME")
+            .unwrap()
+            .starts_with("/tmp/ludomere-p260-")
+    );
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.ludomere.FilterCountTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let w = window::create_widgets(&app, &Config::default());
+    let model = Rc::new(RefCell::new(AppModel {
+        games: (1..=1000)
+            .map(|id| Game {
+                product_id: id,
+                title: format!("Synthetic {id}"),
+                ..Game::default()
+            })
+            .collect(),
+        sidebar_sort_mode: SidebarSortMode::LastPlayed,
+        sidebar_playable_only: true,
+        playable_products: (1..=1000).filter(|id| id % 2 != 0).collect(),
+        hidden_products: (1..=1000).filter(|id| id % 4 == 0).collect(),
+        activity_sections: vec![
+            SidebarSection {
+                key: ActivitySectionKey::Recent,
+                label: "RECENT".into(),
+                members: (1..=500).collect(),
+            },
+            SidebarSection {
+                key: ActivitySectionKey::NeverPlayed,
+                label: "NEVER PLAYED".into(),
+                members: (501..=1000).collect(),
+            },
+        ],
+        collapsed_activity_sections: HashSet::from([ActivitySectionKey::NeverPlayed]),
+        ..AppModel::default()
+    }));
+    for section in &model.borrow().activity_sections {
+        w.game_list.append(&activity_section_row(section));
+    }
+    for game in &model.borrow().games {
+        let row = game_row(game, false, false);
+        row.set_widget_name(&game.product_id.to_string());
+        w.game_list.append(&row);
+    }
+    w.game_list.set_filter_func({
+        let model = model.clone();
+        move |row| sidebar_row_visible(&model.borrow(), row)
+    });
+    w.window.present();
+    while glib::MainContext::default().iteration(false) {}
+    let selected = find_list_row(&w, "1").unwrap();
+    selected.set_focusable(true);
+    w.game_list.select_row(Some(&selected));
+    gtk::prelude::GtkWindowExt::set_focus(&w.window, Some(&selected));
+    let focused = gtk::prelude::GtkWindowExt::focus(&w.window);
+    assert_eq!(focused.as_ref(), Some(selected.upcast_ref()));
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "500 games");
+    for section in &model.borrow().activity_sections {
+        let header = find_list_row(&w, &section_name(section.key)).unwrap();
+        assert!(header.is_visible());
+        assert_eq!(
+            find_named_descendant(header.upcast_ref(), "activity-count")
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+                .label(),
+            "(250)"
+        );
+    }
+    assert!(!sidebar_row_visible(
+        &model.borrow(),
+        &find_list_row(&w, "501").unwrap()
+    ));
+    assert_eq!(w.game_list.selected_row(), Some(selected.clone()));
+    assert_eq!(find_list_row(&w, "1"), Some(selected));
+    assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focused);
+    model.borrow_mut().sidebar_playable_only = false;
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "750 games");
+    model.borrow_mut().show_hidden = true;
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "1000 games");
+    model.borrow_mut().query = "absent".into();
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "0 games · metadata search incomplete");
+    assert!(
+        !find_list_row(&w, &section_name(ActivitySectionKey::Recent))
+            .unwrap()
+            .is_visible()
+    );
+    w.window.close();
+}
+
 pub(super) fn game_matches_library_filters(model: &AppModel, id: i64) -> bool {
     if (!model.show_hidden && model.hidden_products.contains(&id))
         || !organization::matches_tags(model.tags.get(&id), &model.tag_filters, model.tag_match_all)
     {
         return false;
     }
-    let Some(game) = model.games.iter().find(|game| game.product_id == id) else {
+    model
+        .games
+        .iter()
+        .find(|game| game.product_id == id)
+        .is_some_and(|game| game_matches_filters(model, game))
+}
+
+fn game_matches_filters(model: &AppModel, game: &Game) -> bool {
+    let id = game.product_id;
+    if (!model.show_hidden && model.hidden_products.contains(&id))
+        || !organization::matches_tags(model.tags.get(&id), &model.tag_filters, model.tag_match_all)
+    {
         return false;
-    };
+    }
     if model.favorites_only && !model.favorites.contains(&id) {
         return false;
     }
@@ -1328,13 +1608,8 @@ pub(super) fn sidebar_row_visible(model: &AppModel, row: &gtk::ListBoxRow) -> bo
 }
 
 pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
-    refresh_sidebar_visibility(w, model);
+    let count = refresh_sidebar_visibility(w, model);
     w.home_grid.invalidate_filter();
-    let count = model
-        .games
-        .iter()
-        .filter(|game| game_matches_sidebar(model, game.product_id))
-        .count();
     let incomplete = model
         .games
         .iter()

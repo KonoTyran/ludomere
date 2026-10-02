@@ -69,6 +69,20 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   completion focus-stealing modal. Close-before-start prevents launch; started work continues.
   Profile/session guards and weak callbacks retained. Private GTK1 PASS, independent P262 PASS
   /tmp/ludomere-p262-patch-review.md. No real patch/helper executed. Committing next.
+  Commit277888a exact post-commit build PASS (/tmp/ludomere-r94-set8-build.log).
+- P260 filter fixture corrections: numeric row names and expected incomplete-metadata search
+  notice were missing from the test. Production code unchanged; final GTK rerun required before
+  commit. Intermediate run passed count/header/collapse/selection/focus checks before final text.
+  Final owner+independent GTK1 each PASS; pure21-case matrix PASS. Count/header work now shares
+  one direct predicate pass and matching-ID set; for1000 games source-derived ID comparisons
+  1,001,000→1000 direct predicates+1000 memberships, excluding unchanged GTK row callbacks.
+  Final review /tmp/ludomere-p262-filters-review.md; wave3c fmt/diff/Clippy PASS.
+- P266 update-check/policy-load errors now retain sanitized diagnostic chains and distinguish
+  stopped workers; existing recovery/control rules unchanged. Focused3 PASS, independent source
+  review+sanitizer PASS /tmp/ludomere-p265-update-diagnostics-review.md. Await separate commit.
+- P267 confirmed account-safety finding: manual cloud sync/force confirmation may capture a new
+  session after the originating Properties view becomes stale. Approved bounded session-binding
+  fix before compatibility loader work; no real remote-save actions will be exercised.
 
 ## Deferred findings and verification limits
 

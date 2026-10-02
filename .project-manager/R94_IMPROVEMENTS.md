@@ -1,220 +1,135 @@
-# Timed UX and performance improvement pass
+# R94 UX and performance audit
 
-User-authorized window: 2026-10-02 20:53:48–22:53:48 UTC; stop on interruption.
+Authorized window: **2026-10-02 20:53:48–22:53:48 UTC**, stopping earlier on interruption.
 Branch: `improvement/ux-performance-audit-2026-10-02`.
-Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requested.
+Baseline: upstream `d836fbe`, after PR6 merged.
+No PR, push, package build/install, version bump, dependency or schema change.
 
-## Work log
+## Delivered changes
 
-- Initial read-only audits: backend efficiency, async dialog feedback, library/detail rendering.
-- Each implemented set gets a separate commit, independent review, relevant tests and a verified
-  post-commit build. Tests use synthetic fixtures and private profiles; the P263 isolation mistake
-  and its uncertain impact are documented below. No real account/helper operations were requested.
+Each row is a separate local commit. Every commit passed an exact post-commit
+`cargo build --locked`; sets 1–21 used a detached verification checkout, and set 22 used the
+frozen main checkout. Work concluded within the authorized two-hour window.
 
-## Current completion index
+| Set | Commit | Task | Features and fixes |
+| --- | --- | --- | --- |
+| 1 | `0dd8af8` | P253 | Reuse installed-game map lookups; skip unchanged sidebar CSS, title, tooltip and opacity writes. Preserve colors, row identity, focus and selection. |
+| 2 | `0e69cd7` | P251 | Batch cached catalog reads in groups of 400; index DLC parents; use a coherent read snapshot while preserving order, narrow lookup and error behavior. |
+| 3 | `30fdce4` | P252 | Move installation-source inspection/preparation off GTK. Show backup, uninstall, install and restore stages, errors and stopped-worker feedback; preserve explicit consent and explain closing active progress. |
+| 4 | `b7a45fd` | P256 | Replace shifting FIFO image-job vectors with a deque; preserve priorities, cancellation and four-worker scheduling. |
+| 5 | `b2a451f` | P255 | Show operation-log loading and Retry; retain successful sources alongside partial failures; display installation errors without log files; reject stale results and guard profile reads. |
+| 6 | `689c786` | P257 | Show embedded GOG sign-in loading, safe failures and Retry. Handle canceled navigation and closed/successful redirects without exposing OAuth URLs or raw browser errors. |
+| 7 | `6b03690` | P259 | Reuse resolved download identities and read DLC membership once during automatic-install planning; replace an impossible-selection panic with an error. Preserve choices, legacy identities and consent. |
+| 8 | `277888a` | P261 | Inspect preferred patches asynchronously. Show no-patch/error/full-update choices and patch stages/results in place; keep explicit Apply consent and stale/closed-view guards. |
+| 9 | `a6fe580` | P260 | Share one filter predicate pass and matching-ID set for library counts and activity headers; preserve existing filtering, collapsed sections and incomplete-metadata notices. |
+| 10 | `b383ad9` | P266 | Preserve sanitized diagnostic chains for update checks and update-policy loading; distinguish disconnected workers. |
+| 11 | `656d145` | P263 | Skip unrelated Game Files child traversal during targeted local refresh. Retain root safety, archive checks, per-target validation and full Storage diagnostics. |
+| 12 | `7fd0c7f` | P268 | Show explicit archive-patch requirements, progress and full terminal errors inline instead of opening background completion dialogs. Remove the now-unused patch wrapper. |
+| 13 | `e326e21` | P267 | Bind manual cloud sync, Force confirmations and inventory to the originating auth/online/UI session. Reject stale actions/results, guard inventory activity and remove an unused fresh-session wrapper. |
+| 14 | `4ed3ee3` | P269 | Batch catalog evidence used to classify library files; preserve represented-product scope, retired revisions, category fallback and malformed-row errors. |
+| 15 | `b2a7c99` | P264 | Load Compatibility fixes asynchronously. Keep controls disabled while loading/failed, show error details and Retry, and populate saved overrides without autosaving defaults. |
+| 16 | `1511b83` | P270 | Guard hidden-game and personal-tag writes across sign-out/reset. Show immediate visibility-save activity, preserve state on failure and restore controls with sanitized diagnostics. |
+| 17 | `95b2f0f` | P272 | Keep complete, selectable verification results inline and across revisiting Files. Distinguish unavailable checksums from no downloads, correct stopped/determinate progress, and reject stale repair work. |
+| 18 | `a5752fb` | P274 | Report achievement cache errors and offline empty/cached states accurately; preserve cache-first rendering, guard worker activity and clear obsolete account results. |
+| 19 | `7a305df` | P275 | Read only appended installation-log data in bounded chunks. Handle observed truncation/replacement and split UTF-8, bound unfinished status lines, and check shutdown between chunks. Full saved logs remain untouched. |
+| 20 | `e431fae` | P276 | Reject unsafe authoritative checksum filenames without normalization or fallback substitution; require 32 hexadecimal MD5 digits before metadata can drive repair decisions. |
+| 21 | `8d02889` | P277 | Remove migration-dialog Close/Continue reference cycles and guard initial inspection with the originating account and profile activity. |
+| 22 | `a456d48` | P279 | Remove an ignored GTK CSS overflow declaration that printed a warning at startup; preserve supported styling and layout. |
 
-| Commit | Task | Change |
-| --- | --- | --- |
-| 0dd8af8 | P253 | Reuse installed-game lookups and avoid unchanged sidebar widget writes. |
-| 0e69cd7 | P251 | Batch cached catalog reads and index DLC parents in a coherent snapshot. |
-| 30fdce4 | P252 | Move source migration preparation off GTK and show meaningful stages/results. |
-| b7a45fd | P256 | Use a FIFO image queue without repeated vector shifting. |
-| b2a451f | P255 | Show operation-log loading, partial failures, Retry and fileless errors. |
-| 689c786 | P257 | Show embedded sign-in page loading, safe failures and Retry. |
-| 6b03690 | P259 | Reuse resolved download identities and DLC membership during auto-install planning. |
-| 277888a | P261 | Inspect preferred patches asynchronously with consent and in-place progress/results. |
-| a6fe580 | P260 | Reuse one filter predicate pass for counts and sidebar headers. |
-| b383ad9 | P266 | Preserve sanitized update-check and policy-loading error details. |
-| 656d145 | P263 | Skip unrelated game-folder traversal during targeted local refresh. |
-| 7fd0c7f | P268 | Show explicit archive patch progress and terminal details in the existing row. |
-| e326e21 | P267 | Bind manual cloud actions and confirmations to the originating account. |
-| 4ed3ee3 | P269 | Batch catalog evidence used to classify stored files without changing validation. |
-| b2a7c99 | P264 | Load Compatibility preferences asynchronously with error details and Retry. |
-| 1511b83 | P270 | Guard hidden-game and tag saves across sign-out/reset and report save failures. |
-| 95b2f0f | P272 | Keep verification results inline, distinguish unavailable checksums and reject stale repairs. |
-| a5752fb | P274 | Report achievement cache failures accurately and guard loading sessions. |
-| 7a305df | P275 | Read installation-status logs incrementally with bounded memory. |
-| e431fae | P276 | Reject unsafe authoritative checksum filenames and malformed MD5 values. |
+## Verification
 
-Every indexed commit passed its exact post-commit `cargo build --locked` in an isolated checkout.
-The numbered `/tmp/ludomere-r94-setN-build.log` files correspond to table order. Notes below are
-chronological evidence, including intermediate states; this index is the current disposition.
+- All 22 exact post-commit product builds passed. Logs: `/tmp/ludomere-r94-set1-build.log`
+  through `/tmp/ludomere-r94-set22-build.log`.
+- Final `tools/check.sh` passed on the complete product source at `8d02889`:
+  formatting, all-target Clippy with warnings denied, **539 library tests, six integration tests,
+  and five Python helper tests**. Log: `/tmp/ludomere-r94-final-check.log`.
+- The default suite reported 35 ignored entries. Changed GTK controls were exercised separately
+  with private Broadway displays and D-Bus sessions; some ignored child-process helpers are
+  invoked by their integration tests. This is not a claim that every ignored test ran.
+- Final build-process execution used a private HOME, all XDG roots and TMPDIR, offline Cargo,
+  and removed inherited desktop/helper overrides. No package was built or installed.
+- After the CSS-only set 22, formatting and all-target Clippy passed again. The existing ignored
+  empty-profile startup test was explicitly run against the rebuilt source: **one passed**, and
+  the unsupported CSS warning was absent. Its private D-Bus disabled service activation; private
+  Broadway, HOME/all XDG/TMP and a dead-loopback proxy isolated desktop, credentials and outbound
+  probes. No product/test source was changed for the harness. Logs/review:
+  `/tmp/ludomere-empty-startup.log`, `/tmp/ludomere-p279-css-review.md` and
+  `/tmp/ludomere-r94-css-clippy.log`. Nonfatal isolated GSettings-schema warnings remained.
+- Focused tests and independent reviews were required before each implemented set was accepted.
+  Shared test binaries were copied before parallel tests; exact-commit builds used a separate
+  checkout until the final source freeze so another worker's uncommitted source could not
+  accidentally satisfy a build. Final records-only closeout also receives a post-commit build.
+- Final independent backend, UI and security/lifecycle reviews found no introduced blocker
+  within the reviewed scope. Reports:
+  `/tmp/ludomere-p278-backend-assurance.md`,
+  `/tmp/ludomere-p278-final-ui-assurance.md`,
+  `/tmp/ludomere-p278-security-review.md`.
 
-P269 batched storage classification, P264 Compatibility preference loading and P270 account-bound
-hidden/tag writes are source-ready under independent review and coordinated private testing.
+### Focused evidence
 
-- P269 independent source and private 500-product regression PASS, with original category/root/
-  retired/error semantics retained. Catalog SELECTs 1000→4; independent synthetic timing 28.503ms
-  →4.960ms, not end-to-end refresh timing. Wave5 shipping compilation/fmt/diff/all-target Clippy
-  PASS. Report `/tmp/ludomere-p270-storage-review.md`; committing as set14.
-  Commit4ed3ee3 exact post-commit build PASS; owner storage11 and independent regression1 PASS.
-- P264 owner and independent private GTK1 each PASS, including error/Retry/stored overrides,
-  no initial autosaves, uninstalled/stale controls and group release. Review
-  `/tmp/ludomere-p264-independent-review.md`; committing as set15.
-  Commitb2a7c99 exact post-commit build PASS.
-- P270 hidden/tag writes now register profile activity and the original account commit guard,
-  show immediate visibility-save feedback, preserve pending behavior and retain sanitized errors.
-  Owner and independent private GTK1+pure1 each PASS; independent security review PASS
-  `/tmp/ludomere-p271-organization-review.md`. Committing as set16.
-  Commit1511b83 exact post-commit build PASS.
-- P272 verification feedback/account guards, P273 rebuild title lookup reuse and P274 achievement
-  loading/account guards approved next. Product edits remain bounded; no new edits after22:25 UTC.
-- P272 verified owner+independent private GTK1 each PASS, source/session/lock review PASS. Full
-  sanitized verification outcomes stay inline; unavailable checksums and disconnected workers are
-  explicit, progress remains determinate where known, stale account/reset work is rejected.
-  Existing repair choices retained. `/tmp/ludomere-p272-report.md` and
-  `/tmp/ludomere-p275-verification-review.md`. Wave6c shipping compile/all-target Clippy PASS after
-  a style-only collapsible-if correction. Committing set17; no real verification/repair executed.
-  Commit95b2f0f exact post-commit build PASS.
-- P274 owner and independent offline private GTK1 each PASS: cache error/Retry/empty/cached/reset
-  reservation/account-change behavior. Worker activity and original-session guard, sanitized useful
-  diagnostics and truthful offline cache status preserved. Review
-  `/tmp/ludomere-p274-independent-review.md`; committing set18.
-  Commita5752fb exact post-commit build PASS.
-- Final implementation wave is P273 title lookup, P275 incremental status-log reads, P276 strict
-  authoritative checksum name/hash validation, P277 migration callback/preflight lifecycle.
-  Cumulative independent backend review found no added critical issue; UI review identified P277.
-  No real integration/delete/repair/helper tests are authorized by these changes.
-- P275 owner and independent synthetic log-reader2 each PASS; source review PASS. New reader
-  reads appended64KiB chunks, bounds unfinished status lines16KiB, handles observed truncation/
-  inode replacement and split UTF-8, preserves normal statuses and stops between chunks. Raw log
-  untouched. Twenty unchanged polls read0 payload bytes versus over20MiB previously in fixture.
-  `/tmp/ludomere-p275-report.md`, `/tmp/ludomere-p276-log-review.md`. Wave7 shipping compile,
-  fmt/diff/all-target Clippy PASS. Committing set19.
-  Commit7a305df exact post-commit build PASS; existing status-mapper regression also PASS.
-- P276 rejects unsafe authoritative checksum filenames and malformed MD5 before they can drive
-  repair decisions; valid Unicode/spacing/multipart names and upper/lower hashes preserved exactly.
-  Owner and independent parser3 each PASS, source/security review PASS
-  `/tmp/ludomere-p278-checksum-review.md`. No network or deletion tests. Committing set20.
-  Commite431fae exact post-commit build PASS.
-- P277 removes migration-dialog Close/Continue reference cycles and guards initial inspection
-  with original account/profile activity. Owner and independent extended private GTK1 each PASS,
-  including weak destruction and stale/reset rejection before database creation. Review
-  `/tmp/ludomere-p276-migration-review.md`; committing set21.
-- P273 title-map optimization deferred: repeated synthetic GTK fixture selection assertions failed,
-  including when exercising the unchanged sidebar finalizer and registering the production filter.
-  This is insufficient evidence of a production defect or safe full-control regression pass.
-  Owner removes only the uncommitted P273 delta; previously verified P253/P260 remain. Do not claim
-  the proposed title optimization or a sidebar-selection fix as delivered.
+| Area | Evidence |
+| --- | --- |
+| Sidebar/filter work | Private 1000-row GTK tests, unchanged-notification checks, state colors/identity/focus/selection, and a 21-scenario filter matrix. |
+| Catalog/storage/planning | Seven focused cache tests; storage scope/category/corruption fixtures; four automatic-install planning tests; owner and independent 500-product evidence equivalence. |
+| Login and logs | Synthetic loading/error/Retry/closed-state GTK tests; partial log sources, corrected private DB failures, error-only logs and stale results. Login tests did not instantiate a WebView or authenticate. |
+| Migration and patches | Synthetic actual-control tests for inspection, stages, close/session behavior, errors/disconnection and weak dialog destruction; consent/preflight boundaries source-reviewed. No real patch/migration/helper execution. |
+| Cloud, Compatibility, tags | Actual-control tests for stale confirmations, guarded worker entry, cache load failures/Retry, initialization without autosave, busy/error restoration and synthetic persistence. No real cloud/account/reset cleanup. |
+| Verification/achievements | Owner and independent GTK tests for terminal outcomes, redaction, retained text, no background modal, offline cache states and stale/reset rejection. No real checksum request or repair deletion. |
+| Log reader/checksum parser | Three focused log/status tests; three parser tests covering unsafe XML/fallback names, entity decoding, Unicode/spacing and valid/invalid hash formats. Independent reruns passed. |
 
-## Completed sets
+### Measured or source-derived improvements
 
-- P253 sidebar refresh (reviewed, committing): use the existing installed-game map instead of
-  cloning and linearly searching; skip unchanged CSS/title/tooltip/opacity writes. State/color
-  policies and row/focus/selection identity preserved. Two focused unit tests and one private
-  1000-row GTK regression pass; unchanged20 refreshes emit zero CSS notifications. Synthetic
-  installed lookup compares500,500 entries before versus1000 map lookups afterward (1.60ms versus
-  0.125ms locally; not whole-app timing). Independent P254 sidebar review PASS. Exact post-commit
-  build PASS at0dd8af8 (/tmp/ludomere-r94-set1-build.log). Evidence /tmp/ludomere-p253-gtk.log and
-  /tmp/ludomere-p254-sidebar-review.md.
+These are local synthetic fixtures or source/control-flow counts, not real-account or whole-app
+performance promises.
 
-## Further completed sets
+- A 500-base-game/500-DLC cache fixture reduced product/catalog SELECTs from 3,001 to 10.
+  Ten cached reads measured approximately 1.012 s before and 0.421 s after.
+- A 1000-game sidebar fixture replaces 500,500 installed-ID comparisons with 1000 map lookups;
+  20 unchanged refreshes emitted zero CSS notifications.
+- Filter count/header work replaces roughly 1,001,000 ID comparisons with 1000 direct predicates
+  and 1000 set memberships, excluding unchanged GTK row-filter callbacks.
+- Five-request/three-DLC installation planning reduces repeated identity resolutions from 19 to
+  five and base catalog reads from three to one.
+- A 500-product storage classification fixture reduces catalog SELECTs from 1000 to four;
+  independent local timing was approximately 28.5 ms versus 5.0 ms.
+- A 500-sibling targeted refresh fixture measured approximately 12.9 ms for full inspection
+  versus 0.21 ms for root-only inspection; full Storage diagnostics still perform full inspection.
+- Twenty unchanged status-log polls read zero payload bytes after the initial read, instead of
+  rereading more than 20 MiB in the synthetic fixture. Pending status text is bounded to 16 KiB;
+  the complete saved log is unchanged.
 
-- P251 cache loading (reviewed, committing): batch selected product catalogs in400-ID groups and
-  index DLC parents; one deferred read snapshot, narrow lookup/order/error semantics retained.
-  Seven focused tests pass, including500 bases+500 DLC/2000parts/builds and existing caller
-  transactions. Synthetic10 reads:1.012s baseline→0.421s patched (independent0.402s); source-derived
-  SELECTs3001→10. Independent P254 state review PASS. Reports /tmp/ludomere-p251-report.md and
-  /tmp/ludomere-p254-state-review.md. Commit0e69cd7 exact post-commit build PASS
-  (/tmp/ludomere-r94-set2-build.log).
-- P252 source-change feedback (reviewed, committing): worker preflight/target preparation replaces
-  GTK filesystem/DB work; immediate activity, truthful backup/uninstall/install/restore stages,
-  duplicate prevention, Close explanation, terminal results, stopped-worker/branch errors and
-  account-change feedback. Existing migration/saves policy retained. Private actual GTK test and
-  independent P254 review PASS; final account callback correction source-reviewed. Reports
-  /tmp/ludomere-p252-report.md and /tmp/ludomere-p254-migration-review.md. Commit30fdce4 exact
-  build PASS (/tmp/ludomere-r94-set3-build.log).
-## Approved sets in progress
+## Deferred findings and limits
 
-- P255 operation logs: named loading state, explicit partial-read failures and Retry, retained
-  successful log sources, installation failures without a log file, disconnected-worker errors,
-  stale request/account guards and profile-reset activity guard. Shipping private GTK1+pure3
-  PASS; independent source review PASS, independent execution pending. Report p255-report.md.
-- P256 image scheduling: FIFO VecDeque removes repeated shifting of all pending jobs under the
-  queue mutex; explicit priority ordering, four workers and cancellation behavior unchanged.
-  Three focused tests PASS, independent P258 review and2 reruns PASS. Commitb7a45fd exact
-  post-commit build PASS (/tmp/ludomere-r94-set4-build.log).
-- P257 sign-in: loading indicator, generic safe failure with Retry, stopped-browser feedback,
-  canceled-navigation/redirect teardown handling. Retry starts the public login URL; no raw OAuth
-  URLs/errors displayed. Independent synthetic GTK1 PASS; no WebView/account/network execution.
-- Wave2 shipping compilation, fmt/diff and all-target Clippy PASS. Each set gets its own commit
-  and exact post-commit build. P259 request/DLC lookup reuse approved next, awaiting P256 commit.
-- P255 final independent source/GTK review PASS, /tmp/ludomere-p258-logs-review.md; committing.
-  Commitb2a451f exact post-commit build PASS (/tmp/ludomere-r94-set5-build.log).
-- P257 owner GTK1+account1 and independent GTK1 PASS, /tmp/ludomere-p258-login-review.md.
-  Commit689c786 exact post-commit build PASS (/tmp/ludomere-r94-set6-build.log).
-- P259 automatic-install request/DLC lookup reuse source ready; P260 filter count reuse and
-  P261 asynchronous preferred-patch inspection/in-place activity feedback approved and implementing.
-- P259 focused automatic-install4 PASS: selection/legacy identity, parts+DLC/reopen dispatch once,
-  blocked prerequisites/consent and existing/untracked payload protection. For the retained5-request,
-  3-DLC fixture, source-derived expensive identity calls19→5 and base catalog reads3→1. No selection,
-  installation or consent policy changed. Wave3 shipping compile/fmt/diff/all-target Clippy PASS.
-  Independent P262 source+4 rerun PASS; commit6b03690 exact post-commit build PASS
-  (/tmp/ludomere-r94-set7-build.log).
-- P261 preferred-patch dialog: worker inspection with explicit no-patch/error/full-update choices,
-  Apply consent retained, pulsing active stages, in-place terminal/disconnect feedback and no
-  completion focus-stealing modal. Close-before-start prevents launch; started work continues.
-  Profile/session guards and weak callbacks retained. Private GTK1 PASS, independent P262 PASS
-  /tmp/ludomere-p262-patch-review.md. No real patch/helper executed. Committing next.
-  Commit277888a exact post-commit build PASS (/tmp/ludomere-r94-set8-build.log).
-- P260 filter fixture corrections: numeric row names and expected incomplete-metadata search
-  notice were missing from the test. Production code unchanged; final GTK rerun required before
-  commit. Intermediate run passed count/header/collapse/selection/focus checks before final text.
-  Final owner+independent GTK1 each PASS; pure21-case matrix PASS. Count/header work now shares
-  one direct predicate pass and matching-ID set; for1000 games source-derived ID comparisons
-  1,001,000→1000 direct predicates+1000 memberships, excluding unchanged GTK row callbacks.
-  Final review /tmp/ludomere-p262-filters-review.md; wave3c fmt/diff/Clippy PASS.
-  Commita6fe580 exact post-commit build PASS (/tmp/ludomere-r94-set9-build.log).
-- P266 update-check/policy-load errors now retain sanitized diagnostic chains and distinguish
-  stopped workers; existing recovery/control rules unchanged. Focused3 PASS, independent source
-  review+sanitizer PASS /tmp/ludomere-p265-update-diagnostics-review.md. Await separate commit.
-  Commitb383ad9 exact post-commit build PASS (/tmp/ludomere-r94-set10-build.log).
-- P267 confirmed account-safety finding: manual cloud sync/force confirmation may capture a new
-  session after the originating Properties view becomes stale. Approved bounded session-binding
-  fix before compatibility loader work; no real remote-save actions will be exercised.
-- P263 targeted local refresh: root-only Game Files inspection skips sibling traversal while
-  preserving root/archive validation and full Storage diagnostics. Owner isolated storage10 PASS;
-  independent500-sibling regression PASS, full12.9ms→root0.211ms locally (not whole-app timing).
-  Review /tmp/ludomere-p268-storage-review.md. Initial owner non-isolated invocation had an
-  environment-dependent existing test failure; isolated full focused run passes, source unchanged.
-  Isolation incident: the first invocation inherited HOME=/home/chris; validation can call
-  StateStore::open at the normal profile database (create/open/chmod/schema read). The swallowed
-  error prevents determining how far it got; do not claim no access or mutation. No follow-up
-  real-profile inspection was performed. All subsequent owner/reviewer runs explicitly isolate
-  HOME/allXDG/TMP; this limitation is retained rather than treating the first run as valid evidence.
-- Wave4 compilation/fmt PASS. Clippy identified obsolete patch_with_components after both callers
-  migrated; P268 owner removed that unused wrapper instead of suppressing the warning. P268 GTK1
-  PASS; P267 GTK fixture waiting on synthetic dialog teardown requires correction before commit.
-  Corrected fixture uses actual Cancel/Force buttons, not a raw response signal that does not
-  close the widget. Final P267 owner+independent GTK1 each PASS, cloud pure2 PASS. No real cloud
-  calls. Wave4b all-target Clippy PASS after obsolete wrapper removal.
-- P268 explicit Run Patch rows now pulse during requirements/applying, retain sanitized details
-  and terminal/disconnect feedback in place, suppress stale account/view actions, and no longer
-  open background completion/error modals. Unused patch_with_components removed. GTK1 PASS and
-  independent review PASS /tmp/ludomere-p268-patch-review.md. Separate commit next.
-  Commit7fd0c7f exact post-commit build PASS (/tmp/ludomere-r94-set12-build.log).
-- P263 commit656d145 exact post-commit build PASS (/tmp/ludomere-r94-set11-build.log).
-- P267 manual cloud Normal/Force/Check now actions carry original auth+online+UI account identity
-  through confirmation, worker and result; stale actions/results disable with reopen guidance.
-  Inventory joins profile activity; diagnostics sanitized and unused fresh-session sync wrapper
-  removed. Owner GTK1+pure2 and independent GTK1/security review PASS
-  (/tmp/ludomere-p268-cloud-review.md). No real cloud/keyring/save operations. Committing next.
-  Commite326e21 exact post-commit build PASS (/tmp/ludomere-r94-set13-build.log).
+- **P273 title lookup optimization was not delivered.** Source review was favorable, but repeated
+  synthetic GTK selection assertions remained inconclusive after adding the production filter
+  and an unchanged-finalizer baseline. Its entire uncommitted delta was removed. This does not
+  establish a production selection bug; earlier P253/P260 changes remain verified and committed.
+- Grid scrolling still checks every card's bounds on adjustment signals. Coalescing needs
+  separate timing/lifetime validation; it and the P273 title optimization are deferred.
+- Initial Cloud Saves settings still read their record synchronously; moving the large
+  record-dependent builder safely needs a separate design.
+- Managed-file summary refresh still performs DB/file metadata work on GTK after deletion;
+  asynchronous conversion needs per-view request generations and coordinated call sites.
+- Existing runtime-log viewer reads are not registered as profile activity. UI epoch/logout guards
+  reject obsolete display; its path/list/read helpers do **not** recreate profile directories.
+  This is a pre-existing read/reset overlap, not a demonstrated profile-recreation bug.
+- The HTTP audit did not establish an unbounded default timeout: the locked blocking reqwest
+  client has a 30-second default, and the GOG client uses 45 seconds. No speculative timeout
+  policy change was made; aggregate multi-request duration remains a separate concern.
+- The incremental status reader detects observed shortening and inode replacement, not
+  same-inode truncation/regrowth wholly between polls. Arbitrary filesystem I/O can still block.
+- No live GOG login, real games/controllers, Windows helpers, cloud saves, destructive repair/
+  migration, file-manager portals or installed-package integration was exercised. Synthetic GTK
+  evidence is finite; no exhaustive application QA or global “Prototype ready” claim is made.
 
-## Deferred findings and verification limits
+## Test-isolation incident
 
-Material ambiguous behavior or risky changes will be recorded here rather than guessed while the
-user is unavailable. Private GTK fixtures can exercise controls but not real game/portal behavior.
-
-- Network-preparation timeout audit found no unbounded-default defect: locked reqwest0.12.28
-  blocking Client::new uses30s default timeout, verified in local dependency source. Existing
-  gog::client uses45s. No speculative network/deadline policy change made; aggregate multi-request
-  duration remains distinct from per-request bounds.
-- Grid scrolling still checks all card bounds on each adjustment signal. Coalescing that work may
-  help, but introduces timing/lifecycle behavior; deferred while the smaller title lookup fix proceeds.
-- Game Properties Cloud Saves still reads its initial record synchronously and falls back on read
-  failure; fixing safely requires separating its large record-dependent builder. Deferred pending
-  a bounded design. The narrower Compatibility fixes read/loading/Retry change is approved next.
-- Managed-file summary labels still read DB/file metadata on GTK after deletion. Async conversion
-  needs proper per-view request generations and coordinated call-site changes; deferred rather
-  than introduce stale-result races or a global cache.
+The first P263 owner storage-test invocation mistakenly inherited the normal HOME instead of
+explicitly setting a private profile. An existing validation test failed. Its code can call
+`StateStore::open` on the normal profile database, including directory/open/permission/schema
+operations; the swallowed error means it is **not known how far that attempt proceeded**.
+No claim of zero access or mutation is made, and no follow-up inspection of private user data was
+performed. The corrected private HOME/all-XDG/TMP run passed all ten then-relevant storage tests;
+an independent private regression also passed. All subsequent launches explicitly isolated those
+roots. This incident was disclosed during the work and is retained here rather than hidden by the
+successful rerun.

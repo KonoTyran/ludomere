@@ -1,5 +1,43 @@
 # Project plan
 
+## R94 closeout
+
+- Complete within the 20:53:48–22:53:48 UTC authorized window: 22 separate product commits on
+  improvement/ux-performance-audit-2026-10-02, every exact post-commit build passed. Full build
+  process passed at8d02889; final CSS-only a456d48 passed fmt, all-target Clippy, independent review,
+  rebuilt isolated startup and its post-commit build. Root commits final records and builds once
+  more, then stops. No PR/push/package. Ledger records deferred P273, finite QA limits and the
+  disclosed P263 test-isolation incident; no exhaustive readiness claim.
+
+## P279 R94 final startup warning cleanup
+
+- The optional startup smoke test passed but emitted an unsupported GTK CSS overflow-property
+  warning. Approve a one-declaration exception to the feature freeze: ui_review removes only
+  ignored overflow:hidden from .active-transfer-header in ui/mod.rs. No widget clipping/layout
+  behavior added. Independent source review, fmt/Clippy/build and rebuilt existing startup smoke
+  test verify the warning disappears. No full-suite repeat for this CSS-only correction; prior full
+  suite remains recorded at8d02889. Separate commit/build, no other cleanup, hard stop22:53:48.
+
+## P278 R94 final build and bounded assurance
+
+- Root runs tools/check.sh once as final build process, with private HOME/all XDG/TMP, offline
+  Cargo, no desktop/helper overrides and a20-minute process deadline. Source21 commits frozen.
+  Depot reviews cumulative backend performance/correctness claims; storage_audit reviews changed
+  session/reset/path boundaries; ui_review reconciles changed controls and user-facing inventory.
+  Read-only reports only unless a concrete release-blocking regression requires a scoped repair.
+  No new feature work after22:25 UTC; hard stop22:53:48. No real account/game/keyring/cloud/helper
+  actions and no PR/push/package. Root records limits, deferred P273, isolation incident and results.
+- Final full process PASS:539 library tests,6 integration tests,5 Python helper tests;35 tests
+  ignored by normal suite, with changed GTK cases already exercised separately. Read-only final
+  reviewers report no introduced blocker. Optional existing empty-profile startup smoke test may
+  run only after a read-only safety check confirms private HOME/display/bus cannot reach real
+  credentials, games/helpers or mutate user state; otherwise record as unexercised. No new code.
+- Safety review found the existing test replaces XDG_RUNTIME_DIR and startup probes Secret
+  Service/public versions. Approved storage_audit's temporary harness: private bus with no service
+  activation, private HOME/XDG/TMP, dead-loopback proxy, Broadway started after runtime replacement
+  via a private utility wrapper, unchanged integration binary/fixture,90-second deadline and
+  owned-process cleanup. No signed-out marker shortcut or product/test edits; report actual outcome.
+
 ## P277 R94 source migration lifecycle follow-up
 
 - Independent cumulative review found strong Close/Continue callback cycles in P252 MigrationView

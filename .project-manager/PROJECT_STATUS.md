@@ -2,60 +2,37 @@
 
 Last meaningful update: 2026-10-02.
 
-## R94 active timed improvement pass
+## R94 completed — timed improvement pass
 
-- Twenty commits throughe431fae and20 exact builds PASS. P277 independently tested and committing;
-  P273 deferred/owner reverting its uncommitted delta because GTK fixture selection could not be
-  verified reliably. Other earlier library improvements stay. Final full build process starts after
-  source cleanup; no further feature work planned, only evidence review and any required fixes.
-- Eighteen commits througha5752fb, all18 exact post-commit builds PASS. Final implementation wave:
-  P273 title lookup (post-idle GTK selection discrepancy being isolated), P275 incremental logs,
-  P276 checksum filename/hash safety and P277 migration references/preflight guard. Independent
-  backend cumulative review PASS; UI cumulative review identified P277, now fixed pending tests.
-- All16 exact post-commit builds PASS. P272 verification, P273 titles and P274 achievements source
-  frozen for wave6 compile; cross-reviews underway. P275 incremental status-log reader approved
-  after compilation snapshot. Final full build process plus changed-control/safety review pending.
-- Sixteen commits complete through1511b83, first15 exact builds PASS and set16 checking. Wave5
-  owner/independent tests all PASS. P272 verification feedback with minimum account/reset guards
-  and P273 title lookup reuse approved next; achievements remains read-only audit. No PR/push.
-- Wave5 shipping compilation/fmt/diff/all-target Clippy PASS. P269 source review and private
-  500-product equivalence regression PASS; set14 committing. P270 private GTK1+tag filter1 PASS;
-  P264/P270 independent GTK checks pending. Continue bounded audits until22:25, then final checks.
-- Thirteen commits complete throughe326e21; all13 exact post-commit builds PASS. P263 targeted
-  inspection, P268 patch rows and P267 account-bound cloud controls reviewed with focused tests.
-  P269 classification batching source ready; P264 compatibility initial loading and P270 guarded
-  organization writes implementing. Full build-process run remains reserved for final consolidation.
-  One P263 owner test launch omitted private profile environment and failed; potential normal
-  StateStore open attempt is documented in R94 ledger, not claimed harmless. Corrected runs pass.
-- Ten local commits now complete throughb383ad9; exact post-commit builds PASS for all10.
-  P260 filter final owner+independent GTK pass after test-only fixture corrections. P266 diagnostic
-  checks/review pass. P263 targeted refresh source ready/review PASS; P267 account-bound cloud
-  action safety and P268 explicit patch-row progress are implementing. P264 fixes loader queued.
-- Wave3 P259/P260/P261 source frozen; shared shipping test compile PASS, copied immutable binary
-  /tmp/ludomere-r94-wave3-test-bin. Independent source reviews PASS (patch callback reference
-  cycle corrected before compile); focused/private GTK execution and all-target Clippy underway.
-  P263 targeted root inspection/P264 async compatibility-fix loading approved after current commits.
-- Sets4–6 committedb7a45fd/b2a451f/689c786, each exact-commit build PASS. All wave2 focused and
-  independent reviews PASS (P255 logs, P256 image FIFO, P257 login). P259 install-plan reuse,
-  P260 filter-count reuse and P261 preferred-patch activity are the next bounded workstreams.
-- Sets1–3 committed as0dd8af8/0e69cd7/30fdce4; each exact-commit build PASS. Wave2 shipping
-  compilation/fmt/all-target Clippy PASS. P255 log GTK1+pure3 and P257 independent login GTK1
-  PASS; P258 final image/log review executions pending. No real WebView/network/account used.
-- Commits0dd8af8 sidebar and0e69cd7 batched cache reads independently reviewed and exact-commit
-  cargo build --locked PASS (r94-set1/set2-build.log). P252 source migration reviewed with private
-  GTK PASS, committing next. P255 operation-log feedback/P256 image FIFO/P257 login page feedback
-  approved second wave; root serializes shared Cargo artifacts and preserves separate sets.
-- First wave: P253 sidebar optimization independently reviewed;2 unit+1 private GTK pass.
-  P251 cache fixture10 loads improved1.012s→0.421s locally,7 focused tests pass; review pending.
-  P252 migration async/progress implementation private GTK pass; review pending. Root wave1
-  all-target Clippy/fmt/diff pass; separate exact-commit builds use detached checkout to avoid
-  relying on another worker's uncommitted code. Baseline cargo build also passed.
-- Started20:53:48 UTC, hard stop22:53:48 UTC2026-10-02 or user interruption. New branch
-  improvement/ux-performance-audit-2026-10-02 from upstream d836fbe (merged PR6 plus upstream
-  build fixes). P251 backend/P252 async UI/P253 presentation audits, then bounded edits and
-  P254 independent reviews; root manages separate commits and post-commit builds. No PR/push.
-- R93 complete:530d074 version0.2.4 pushed; PRcomment5959973766 verified. PR6 merged at19:42:52Z
-  as7ffd2d9, read from GitHub. Working tree was clean before creating this branch.
+- Authorized window: 2026-10-02 20:53:48–22:53:48 UTC, stop on interruption. Product work and
+  independent assurance concluded before the deadline; final records-only commit/build closes out.
+- Branch `improvement/ux-performance-audit-2026-10-02` from upstream `d836fbe`, after PR6 merged.
+  Twenty-two feature/fix commits through `a456d48`; all 22 exact post-commit builds passed.
+  No PR, push, package build/install, version, dependency or schema change.
+- Prior R93 publication completed: `530d074` was pushed, comment5959973766 verified, and PR6
+  merged as `7ffd2d9` at19:42:52Z. The working tree was clean before this new branch was created.
+- Final `tools/check.sh` at `8d02889` passed: formatting, all-target Clippy, 539 library tests, six integration
+  tests and five Python helper tests. Private HOME/all XDG/TMP, offline Cargo, no inherited
+  desktop/helper overrides. Default suite has 35 ignored entries; changed GTK cases ran separately,
+  and some ignored helpers are executed indirectly by integration tests.
+- Independent cumulative backend, UI and security/lifecycle reviews found no introduced blocker.
+  Reports `/tmp/ludomere-p278-{backend-assurance,final-ui-assurance,security-review}.md`.
+  Finite source/synthetic-control assurance only; no global Prototype ready declaration.
+- Delivered inventory, per-commit build evidence, measurements, deferred work and limitations are
+  maintained in `R94_IMPROVEMENTS.md`. The 22 delivered sets passed their scoped implementation
+  and independent review gates; P278 final assurance and P279 startup cleanup are complete.
+- P273 title-map optimization is deferred and its uncommitted delta was removed after unresolved
+  GTK fixture selection assertions. This does not establish a production regression. Earlier
+  independently verified sidebar/filter work remains committed.
+- Existing empty-profile startup test passed both before and after P279 CSS cleanup. Its private harness
+  disables D-Bus service activation and outbound probes, supplies Broadway after the test replaces
+  its runtime directory, and uses the unchanged fixture with a rebuilt binary. No real keyring/game/helper
+  action. Unsupported CSS warning is absent after P279; final fmt and all-target Clippy also pass.
+- One P263 owner test invocation omitted private-profile environment and failed. It may have
+  attempted the normal database open/permission/schema path; extent is unknown. This was disclosed
+  and is documented in the ledger. Correctly isolated reruns passed; no private-data follow-up.
+- No further feature work. Any remaining synchronous UI reads, broad GTK indexing or lifecycle
+  findings are documented for follow-up, with no manual user-filesystem work imposed by this pass.
 
 ## R93 active publication
 

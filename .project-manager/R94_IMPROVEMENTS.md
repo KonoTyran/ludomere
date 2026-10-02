@@ -62,6 +62,13 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
   blocked prerequisites/consent and existing/untracked payload protection. For the retained5-request,
   3-DLC fixture, source-derived expensive identity calls19→5 and base catalog reads3→1. No selection,
   installation or consent policy changed. Wave3 shipping compile/fmt/diff/all-target Clippy PASS.
+  Independent P262 source+4 rerun PASS; commit6b03690 exact post-commit build PASS
+  (/tmp/ludomere-r94-set7-build.log).
+- P261 preferred-patch dialog: worker inspection with explicit no-patch/error/full-update choices,
+  Apply consent retained, pulsing active stages, in-place terminal/disconnect feedback and no
+  completion focus-stealing modal. Close-before-start prevents launch; started work continues.
+  Profile/session guards and weak callbacks retained. Private GTK1 PASS, independent P262 PASS
+  /tmp/ludomere-p262-patch-review.md. No real patch/helper executed. Committing next.
 
 ## Deferred findings and verification limits
 

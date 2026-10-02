@@ -139,9 +139,9 @@ pub fn apply_game_dll_overrides(
     };
     let mut clauses = Vec::new();
     for (name, order) in defaults {
-        if !names.iter().any(|existing| basename(existing) == *name)
-            && !overrides.contains_key(*name)
-            && !(*name == "xinput1_3" && native_xinput)
+        if !(names.iter().any(|existing| basename(existing) == *name)
+            || overrides.contains_key(*name)
+            || *name == "xinput1_3" && native_xinput)
         {
             // Wine consults env then registry at EACH key: qualified, wildcard, bare.
             clauses.push(format!("{name},*{name}={}", order.value()));

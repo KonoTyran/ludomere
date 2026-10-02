@@ -1129,8 +1129,8 @@ fn build_storage_section(
                                 .is_some_and(|snapshot| snapshot.queued || matches!(snapshot.state,
                                     crate::domain::InstallationState::Pending | crate::domain::InstallationState::Installing | crate::domain::InstallationState::Uninstalling)),
                                 "Finish or cancel installation work for {} before moving it.", item.title);
-                            anyhow::ensure!(!installation::depot_operation_snapshot_for_product(item.game.product_id)
-                                .is_some_and(|snapshot| !matches!(snapshot.state.as_str(), "complete" | "abandoned")),
+                            anyhow::ensure!(installation::depot_operation_snapshot_for_product(item.game.product_id)
+                                .is_none_or(|snapshot| matches!(snapshot.state.as_str(), "complete" | "abandoned")),
                                 "Finish or discard the saved Depot operation for {} before moving it.", item.title);
                         }
                         crate::storage::validate_library(&config, crate::config::LibraryKind::GameFiles, &target_library.id)?;

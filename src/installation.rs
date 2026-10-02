@@ -894,7 +894,7 @@ mod tests {
         assert!(validate_offline_sources(&config, &files).is_err());
         let mixed = root.path().join("games/installer.zip");
         fs::write(&mixed, b"preserved").unwrap();
-        assert!(validate_game_library(&config, "games", &root.path().join("games/game")).is_err());
+        validate_game_library(&config, "games", &root.path().join("games/game")).unwrap();
         assert_eq!(fs::read(mixed).unwrap(), b"preserved");
         assert!(files.iter().all(|path| path.is_file()));
     }

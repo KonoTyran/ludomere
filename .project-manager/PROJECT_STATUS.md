@@ -4,6 +4,10 @@ Last meaningful update: 2026-10-02.
 
 ## R94 active timed improvement pass
 
+- Ten local commits now complete throughb383ad9; exact post-commit builds PASS for all10.
+  P260 filter final owner+independent GTK pass after test-only fixture corrections. P266 diagnostic
+  checks/review pass. P263 targeted refresh source ready/review PASS; P267 account-bound cloud
+  action safety and P268 explicit patch-row progress are implementing. P264 fixes loader queued.
 - Wave3 P259/P260/P261 source frozen; shared shipping test compile PASS, copied immutable binary
   /tmp/ludomere-r94-wave3-test-bin. Independent source reviews PASS (patch callback reference
   cycle corrected before compile); focused/private GTK execution and all-target Clippy underway.

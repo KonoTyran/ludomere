@@ -81,9 +81,18 @@ Baseline: upstream `d836fbe`, after PR6 merge. No new PR or push authorized/requ
 - P266 update-check/policy-load errors now retain sanitized diagnostic chains and distinguish
   stopped workers; existing recovery/control rules unchanged. Focused3 PASS, independent source
   review+sanitizer PASS /tmp/ludomere-p265-update-diagnostics-review.md. Await separate commit.
+  Commitb383ad9 exact post-commit build PASS (/tmp/ludomere-r94-set10-build.log).
 - P267 confirmed account-safety finding: manual cloud sync/force confirmation may capture a new
   session after the originating Properties view becomes stale. Approved bounded session-binding
   fix before compatibility loader work; no real remote-save actions will be exercised.
+- P263 targeted local refresh: root-only Game Files inspection skips sibling traversal while
+  preserving root/archive validation and full Storage diagnostics. Owner isolated storage10 PASS;
+  independent500-sibling regression PASS, full12.9ms→root0.211ms locally (not whole-app timing).
+  Review /tmp/ludomere-p268-storage-review.md. Initial owner non-isolated invocation had an
+  environment-dependent existing test failure; isolated full focused run passes, source unchanged.
+- Wave4 compilation/fmt PASS. Clippy identified obsolete patch_with_components after both callers
+  migrated; P268 owner removed that unused wrapper instead of suppressing the warning. P268 GTK1
+  PASS; P267 GTK fixture waiting on synthetic dialog teardown requires correction before commit.
 
 ## Deferred findings and verification limits
 

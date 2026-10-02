@@ -403,7 +403,11 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
             let store = StateStore::open()?;
-            let statuses = crate::storage::inspect_libraries(&config)?;
+            let statuses = if targeted {
+                crate::storage::inspect_libraries_for_refresh(&config, &store)?
+            } else {
+                crate::storage::inspect_libraries(&config)?
+            };
             let libraries = config
                 .game_libraries
                 .iter()

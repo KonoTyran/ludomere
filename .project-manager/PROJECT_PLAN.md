@@ -1,5 +1,24 @@
 # Project plan
 
+## P270 R94 organization write lifecycle
+
+- Confirmed root review: organization.rs hide/tag worker writes use UI epoch only for results;
+  queued work can open/create the profile after sign-out/reset, unlike the guarded Favorite path.
+  storage_audit next after P268 commit owns organization.rs: capture account session at action,
+  acquire profile activity then use with_account_session for SQLite mutation/readback, preserve
+  UI pending/epoch behavior and add immediate visibility-save activity plus sanitized failures.
+  Existing tag/visibility semantics unchanged. Private synthetic stale-session/reset exclusion and
+  existing behavior tests, independent review required. No real profile reset or account activity.
+
+## P269 R94 batched library classification evidence
+
+- Depot after P263 commit owns state.rs/storage.rs: reuse existing P251 selected-product revision
+  loader in400-ID batches for library_evidence, including retired revisions. Preserve represented
+  product scope, parsing failures, category/fallback and cross-product semantics; no narrow JOIN
+  that silently weakens old validation. Expose existing internal helper only as needed. Synthetic
+  equivalence, malformed/unrelated and retained-part tests; quantify source query reduction.
+  No schema/dependency/network/profile changes; independent review and separate commit/build.
+
 ## P268 R94 explicit patch-row activity
 
 - storage_audit after P266 commit owns files.rs explicit archive-row Run Patch only: reuse row
@@ -19,6 +38,9 @@
   Preserve destructive consent and all backend safeguards. No network/keyring/save tests;
   private GTK stale-confirmation controls and synthetic dispatch verification. storage_audit
   independently reviews session boundaries/security and behavior. No cloud-builder redesign.
+- Also bind the existing Check now inventory path to its originating session and discard stale
+  result updates. ui_review additionally owns cloud_saves/mod.rs inventory signature (one caller)
+  to pass original auth session explicitly; no new compatibility wrapper or changed cloud policy.
 
 ## P266 R94 update error diagnostics
 

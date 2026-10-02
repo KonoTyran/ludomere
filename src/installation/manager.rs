@@ -3500,29 +3500,27 @@ fn start_queued_installation(persisted_plan: PersistedInstallationPlan, session:
                     | InstallationEvent::Cancelled
                     | InstallationEvent::Failed(_)
             );
-            let shutting_down = {
-                let manager = MANAGER.lock().unwrap();
-                manager.shutting_down || manager.paused_for_sign_out
-            };
-            if shutting_down && !matches!(event, InstallationEvent::Complete { .. }) {
-                if terminal {
-                    if MANAGER.lock().unwrap().paused_for_sign_out {
-                        if let Err(error) = pause_game_operation(&paused_game) {
-                            MANAGER.lock().unwrap().pause_errors.push(error.to_string());
+            let (interrupted, publish_pause) =
+                if matches!(event, InstallationEvent::Complete { .. }) {
+                    (false, false)
+                } else {
+                    let mut manager = MANAGER.lock().unwrap();
+                    if manager.shutting_down {
+                        (true, false)
+                    } else if manager.paused_for_sign_out {
+                        if terminal && let Err(error) = pause_game_operation(&paused_game) {
+                            manager.pause_errors.push(error.to_string());
                         }
+                        (true, terminal)
                     } else {
-                        persist_existing_operation(
-                            product_id,
-                            "queued",
-                            Some("Interrupted; start this operation again to resume"),
-                            None,
-                            None,
-                        );
+                        (false, false)
                     }
+                };
+            if interrupted {
+                if publish_pause {
                     publish_sign_out_pause(product_id);
                 }
-            } else {
-                update_installation_snapshot(product_id, &event);
+            } else if update_installation_snapshot(product_id, &event) {
                 if matches!(event, InstallationEvent::Complete { .. })
                     && let Some(intent_id) = &download_intent
                     && let Ok(store) = StateStore::open()
@@ -3611,29 +3609,26 @@ fn start_queued_uninstallation(plan: PersistedUninstallationPlan, session: u64) 
                     | UninstallationEvent::Cancelled
                     | UninstallationEvent::Failed(_)
             );
-            let shutting_down = {
-                let manager = MANAGER.lock().unwrap();
-                manager.shutting_down || manager.paused_for_sign_out
-            };
-            if shutting_down && !matches!(event, UninstallationEvent::Complete) {
-                if terminal {
-                    if MANAGER.lock().unwrap().paused_for_sign_out {
-                        if let Err(error) = pause_game_operation(&paused_game) {
-                            MANAGER.lock().unwrap().pause_errors.push(error.to_string());
-                        }
-                    } else {
-                        persist_existing_operation(
-                            product_id,
-                            "queued",
-                            Some("Interrupted; start this operation again to resume"),
-                            None,
-                            None,
-                        );
+            let (interrupted, publish_pause) = if matches!(event, UninstallationEvent::Complete) {
+                (false, false)
+            } else {
+                let mut manager = MANAGER.lock().unwrap();
+                if manager.shutting_down {
+                    (true, false)
+                } else if manager.paused_for_sign_out {
+                    if terminal && let Err(error) = pause_game_operation(&paused_game) {
+                        manager.pause_errors.push(error.to_string());
                     }
+                    (true, terminal)
+                } else {
+                    (false, false)
+                }
+            };
+            if interrupted {
+                if publish_pause {
                     publish_sign_out_pause(product_id);
                 }
-            } else {
-                update_uninstallation_snapshot(product_id, &event);
+            } else if update_uninstallation_snapshot(product_id, &event) {
                 publish(InstallationManagerEvent::Uninstallation { product_id, event });
             }
             if terminal {
@@ -4152,29 +4147,26 @@ pub fn wait_for_paused() -> anyhow::Result<()> {
 }
 
 pub fn shutdown() {
-    let (active_products, paused) = {
-        let mut manager = MANAGER.lock().unwrap();
-        manager.shutting_down = true;
-        for control in manager.active.values() {
-            match control {
-                OperationControl::Installation(control) => control.cancel(),
-                OperationControl::Uninstallation(control) => control.cancel(),
-            }
-        }
+    let mut manager = MANAGER.lock().unwrap();
+    manager.shutting_down = true;
+    let (state, message) = if manager.paused_for_sign_out {
         (
-            manager.active.keys().copied().collect::<Vec<_>>(),
-            manager.paused_for_sign_out,
+            "paused",
+            "Interrupted by sign-out; start this operation again to resume",
         )
+    } else {
+        ("queued", "Queued after application shutdown")
     };
-    for product_id in active_products {
-        persist_existing_operation(
-            product_id,
-            if paused { "paused" } else { "queued" },
-            Some("Queued after application shutdown"),
-            None,
-            None,
-        );
+    for product_id in manager.active.keys().copied().collect::<Vec<_>>() {
+        persist_existing_operation(product_id, state, Some(message), None, None);
     }
+    for control in manager.active.values() {
+        match control {
+            OperationControl::Installation(control) => control.cancel(),
+            OperationControl::Uninstallation(control) => control.cancel(),
+        }
+    }
+    drop(manager);
     let mut depot_manager = DEPOT_MANAGER.lock().unwrap();
     depot_manager.shutting_down = true;
     for cancelled in depot_manager.active.values() {
@@ -4190,7 +4182,7 @@ fn publish(event: InstallationManagerEvent) {
         .retain(|subscriber| subscriber.send(event.clone()).is_ok());
 }
 
-fn update_installation_snapshot(product_id: i64, event: &InstallationEvent) {
+fn update_installation_snapshot(product_id: i64, event: &InstallationEvent) -> bool {
     let base_remains_installed = matches!(
         event,
         InstallationEvent::Cancelled | InstallationEvent::Failed(_)
@@ -4253,7 +4245,13 @@ fn update_installation_snapshot(product_id: i64, event: &InstallationEvent) {
             None,
         ),
     };
-    MANAGER.lock().unwrap().snapshots.insert(
+    let mut manager = MANAGER.lock().unwrap();
+    if !matches!(event, InstallationEvent::Complete { .. })
+        && (manager.shutting_down || manager.paused_for_sign_out)
+    {
+        return false;
+    }
+    manager.snapshots.insert(
         product_id,
         InstallationOperationSnapshot {
             product_id,
@@ -4283,9 +4281,10 @@ fn update_installation_snapshot(product_id: i64, event: &InstallationEvent) {
         (state == crate::domain::InstallationState::Installed && !operation_failed)
             .then(|| chrono::Utc::now().timestamp()),
     );
+    true
 }
 
-fn update_uninstallation_snapshot(product_id: i64, event: &UninstallationEvent) {
+fn update_uninstallation_snapshot(product_id: i64, event: &UninstallationEvent) -> bool {
     let (state, message) = match event {
         UninstallationEvent::Started => (
             crate::domain::InstallationState::Uninstalling,
@@ -4304,7 +4303,13 @@ fn update_uninstallation_snapshot(product_id: i64, event: &UninstallationEvent) 
             Some(error.clone()),
         ),
     };
-    MANAGER.lock().unwrap().snapshots.insert(
+    let mut manager = MANAGER.lock().unwrap();
+    if !matches!(event, UninstallationEvent::Complete)
+        && (manager.shutting_down || manager.paused_for_sign_out)
+    {
+        return false;
+    }
+    manager.snapshots.insert(
         product_id,
         InstallationOperationSnapshot {
             product_id,
@@ -4326,6 +4331,7 @@ fn update_uninstallation_snapshot(product_id: i64, event: &UninstallationEvent) 
         (state == crate::domain::InstallationState::Pending)
             .then(|| chrono::Utc::now().timestamp()),
     );
+    true
 }
 
 fn persist_operation<T: serde::Serialize>(

@@ -1,5 +1,37 @@
 # Project specification
 
+## R100 version 0.3.0 and new upstream PR — 2026-10-02
+
+User requests version0.3.0, ensuring upstream changes merge without conflicts, successful build,
+and a new PR against upstream/main summarizing all new additions/changes/fixes/updates. Commit
+and push existing branch as necessary; preserve all reviewed R94–R99 changes. Full build checks
+authorized; no Arch package install/build or real account/game operations requested.
+
+## R99 GOG language_setup prerequisite failure — 2026-10-02
+
+User reports LEGO Harry Potter Years 1–4, Years 5–7 and LEGO Indiana Jones Depot preparation
+fails with language_setup: Invalid dependency manifest before game transfer. Investigate official
+metadata/parser mismatch, correct evidenced support deficiencies without skipping prerequisites
+or weakening integrity/path checks, and run focused regressions. Preserve R97/R98 uncommitted work;
+no real account/game/helper actions or publication requested.
+
+## R98 single removal confirmation — 2026-10-02
+
+User accepts simplifying Review File Reset: automatically prepare the appropriate removal method
+in the initial uninstall dialog, without an extra review-button press. Preserve explicit final
+confirmation with affected paths/all-contents warnings, direct Browse, optional downloaded-file
+cleanup defaulting off, normal uninstall and existing reset safety. Preserve meaningful choices
+when multiple copies cannot be resolved automatically. No real user-file deletion or publication.
+
+## R97 remove redundant interaction steps — 2026-10-02
+
+User reports Browse Local Files Before Removing opens another modal requiring a second click
+to open the directory, and requests finding/eliminating similar unnecessary modal/button/procedure
+steps. Direct read-only actions with one known destination should execute from the initial click.
+Keep meaningful destination choices and confirmations for destructive actions, downloads or
+execution. Preserve path validation, asynchronous work, visible feedback and account/view guards.
+No real user-file deletion, desktop activation tests, package or publication requested.
+
 ## R96 version 0.2.5 and upstream integration — 2026-10-02
 
 User requests bumping to0.2.5, committing and pushing current changes, and checking Kono's new

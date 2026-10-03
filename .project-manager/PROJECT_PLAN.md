@@ -1,5 +1,75 @@
 # Project plan
 
+## R100 publication and version0.3.0
+
+- P292 (complete, ui_review): bump Cargo manifest/app lock entry, PKGBUILD and AppStream to0.3.0,
+  preserve historical release/dependencies/schema. Scoped metadata checks; root builds.
+- P293 (complete, depot): read-only upstream delta and complete PR summary inventory R94–R99,
+  draft concise markdown to/tmp against actual upstream diff, no public messages or product edits.
+- P294 (complete for scoped release assurance, storage_audit): independent final review of release metadata/diff and safe
+  full-build harness. Root fetches/merges/commits/pushes and opens requested PR after checks.
+  No real profile/account/game/helper/file-manager action; private test roots and loopback only.
+- P295 (complete, depot; independent review storage_audit): correct evidenced upstream restart
+  test-server race exposed by full build. Own tests/restart_recovery.rs only; tolerate expected
+  interrupted-client disconnect at final first-response write, retain strict resumed range/content
+  assertions and production behavior. Private focused repetitions, then full release checks.
+- Full final tools/check.sh and cargo build --locked PASS;541 library/six integration/five Python
+  tests passed. Restart fixture10/10 isolated repetitions. Root publication pending; no package build.
+
+## R99 language_setup prerequisite compatibility
+
+- P290 (complete, depot): trace dependency resolution and official public language_setup
+  metadata; propose minimal parser/resolver correction before edits. Own gog/dependencies.rs and
+  needed depot_manifest.rs tests after scoped proposal; no bypass or upstream executable execution.
+- P291 (complete for scoped verification, storage_audit): independent format/security/validation review and focused
+  regression assessment. Root coordinates build/test/records, preserves UI working tree; public
+  metadata only, no credentials/account/game payload or helper execution, full suite or publication.
+- Verified official language_setup GameFiles manifest39757bac2293fab156a465e52c23b552 contains
+  /language_setup.exe, rejected by generic absolute-path protection. Approved dependencies-only
+  single-leading-slash adaptation after frozen hash/inflate; retain strict parser/validators and
+  original frozen bytes. Metadata-only fixture plus unsafe/collision/hash/error-detail regressions.
+- Delivered deps.rs-only adapter and metadata fixture; nested safe preparation cause retained.
+  Dependencies10 + genericmanifest12 focused tests PASS in private profile, including normalized
+  inert cache publication; independent review PASS. fmt/Clippy/build/diff PASS. No actual LEGO
+  installation or helper execution; final test-only clone-to-from_ref correction Clippy-verified.
+
+## R98 single removal confirmation
+
+- P288 (complete, ui_review): inspect and minimally simplify uninstall.rs fallback preparation,
+  preserving normal removal, exact-copy safety and confirmation. Own relevant retained GTK tests
+  and README wording. Propose fallback/multiple-copy behavior before edits; no backend policy change.
+- P289 (complete for scoped verification, storage_audit): independent source/consent/path review and private focused GTK
+  test on root-built immutable binary. Root owns Cargo/records; synthetic profile only, no actual
+  desktop/helpers/account/game operations, full suite, commit/push or package.
+- Approved: when normal preparation fails and one safe candidate exists, prepare exact-folder
+  reset read-only in the same worker and show final consent immediately. Keep multiple-copy choice
+  and healthy normal method; corrupt journal recovery remains explicit. Neutral all-contents warning;
+  worker profile activity/session guard protects new fallback reads during reset.
+- Final private recovery GTK test PASS, including automatic singleton preview, explicit multiple
+  fallback selection, cancel/no deletion, direct Browse and actual synthetic removal. Independent
+  source/consent review PASS. fmt, all-target Clippy -D warnings and cargo build --locked PASS.
+
+## R97 direct actions without redundant dialogs
+
+- P285 (complete, ui_review): shared recovery Browse flow in files.rs and minimal callers.
+  One resolved path opens directly; preserve multi-copy choice, safe parent browsing, validation,
+  async/account/window cancellation and failure feedback. Audit uninstall exact-library selection.
+  Return bounded proposal then implementation/private controls tests; no actual file-manager launch.
+- P286 (complete, depot): approved Settings archive-library opener: zero paths gives inline
+  guidance, one opens directly after validation, multiple retain chooser. Proton reset keeps initial
+  consent but replaces completion popup with persistent selectable backup-path/next-step feedback.
+  Own settings.rs/proton.rs and minimal DLL editor caller; coordinate P285 shared launch helper.
+- P285 approved immediate validated-directory launch helper in widgets/file_open.rs with request
+  lifetime predicate and test-only capture; recovery retains dedicated damaged-path validation.
+- P287 (complete for scoped synthetic QA, storage_audit): independent interaction and security review, scoped synthetic
+  regressions and source audit of preserved safeguards. Root coordinates Cargo/private HOME/all
+  XDG/TMP bus/display, maintains records; no full suite, commit/push/PR or real account/file actions.
+- Final three targeted GTK tests PASS: exact-copy/single/multiple/safe-parent Browse and cancellation;
+  Settings empty/invalid/single/multiple/stale/unmapped; reset consent/backups/persistent inline notice.
+  fmt, all-target Clippy with denied warnings, cargo build --locked and diff checks PASS. Reports
+  /tmp/ludomere-p285-report.md, /tmp/ludomere-p286-report.md, /tmp/ludomere-p287-review.md.
+  Launch requests captured, actual compositor/file-manager activation remains unexercised.
+
 ## R96 publication and clean upstream merge
 
 - P283 (complete, ui_review): bump only application0.2.5 Cargo manifest/lock, PKGBUILD and

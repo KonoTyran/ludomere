@@ -2,6 +2,95 @@
 
 Last meaningful update: 2026-10-02.
 
+## R100 active — version0.3.0 and new upstream PR
+
+- User authorizes version bump, upstream integration, successful build and new upstream/main PR.
+  P292 metadata/P293 change inventory/P294 assurance delegated; root handles publication. Preserve
+  reviewed R97–R99 uncommitted work, full build checks in private profile; no package requested.
+- Fresh upstream/main remains2b7a083, already ancestor of this branch; git merge --ff-only reports
+  Already up to date. No conflict or additional merge commit required. P292 metadata0.3.0 verified;
+  P293 complete PR inventory and P294 source/metadata/summary review pass.
+- Committed reviewed UI/removal work3b39dcc and dependency fix245c686. Initial isolated full run
+  passed formatting/Clippy but11 image tests failed because private XDG_DATA_DIRS hid installed
+  Glycin loader metadata (empty image_loader configuration).530 passed/34 ignored. Correcting only
+  verification harness to expose trusted system loader configs, retaining private profile/bus.
+- Attempt2 also required trusted system MIME metadata for image decoding; no product changes.
+  Attempt3 passed541 library tests/34 ignored, but exposed an unchanged upstream integration fixture
+  race: intentional client shutdown precedes server tail write, causing BrokenPipe before resumed
+  accept. Independent P294 confirms; P295 assigned minimal test-only correction with strict resumed
+  transfer assertions retained. Prior attempt logs preserved; final full checks/publication pending.
+- P295 test-only correction independently reviewed;10/10 private restart recovery repetitions pass.
+  Final tools/check.sh PASS:fmt, all-target Clippy -D warnings,541 library/six integration/five Python
+  tests. cargo build --locked PASS. Default-ignored GTK tests remain separately scoped, not claimed
+  as exhaustive. Log /tmp/ludomere-r100-full-build.log; metadata/schema/dependencies preserved.
+  Fresh upstream fetch still2b7a083 and ancestor. Release commit/push/new PR next; actual KWallet
+  first login, desktop file-manager activation and full LEGO installation remain user checks.
+
+## R99 implemented and verified — LEGO Depot prerequisite failure
+
+- Reported shared language_setup manifest error affects three LEGO titles. P290 traces public
+  dependency metadata and parser; P291 independent review. R97/R98 UI edits remain uncommitted
+  and protected. No live account/game operations or publication requested.
+- Public catalog build59705672826648994 and checksum-matched language_setup manifest confirm
+  GameFiles path /language_setup.exe; generic parser rejects the leading slash. Independent P291
+  confirms. Approved bounded dependency-wire adaptation with unchanged original hashes/path safety;
+  metadata-only274-byte fixture. No executable payload acquired or run.
+- dependencies.rs now normalizes one depot-root slash only for GameFiles dependencies after
+  original hash/bounded inflation; normal parser and dependency validators remain authoritative.
+  Frozen bytes/hash, transfer integrity and generic product/snapshot parsing unchanged. Error
+  aggregation includes nested cause instead of losing it under Invalid dependency manifest.
+- Focused tests PASS:10 dependency +12 generic manifest, private HOME/allXDG/TMP and synthetic
+  loopback only. Official metadata/plan roundtrip, unsafe paths/collisions, tampering, method
+  restriction, cache/publication and informative errors covered. Final fixture-only Clippy fix
+  replaces cloned one-element slice with from_ref; production unchanged after tested binary.
+- fmt, all-target Clippy -D warnings, cargo build --locked and diff checks PASS. Reports
+  /tmp/ludomere-p290-report.md and /tmp/ludomere-p291-review.md; logs
+  /tmp/ludomere-r99-{compile,fmt,clippy,build}.log and /tmp/ludomere-p291-{dependencies,manifest}-tests.log.
+  No full suite or publication. Actual LEGO installs remain a user retry; no success beyond
+  the reproduced prerequisite preparation failure and synthetic publication is claimed.
+
+## R98 implemented and verified — remove intermediate file-reset review
+
+- User agrees initial uninstall dialog should automatically prepare the appropriate method and
+  need only the final removal confirmation. P288 implementation/P289 independent review assigned;
+  retain R97 uncommitted changes and all existing file/consent safety. No publication requested.
+- Initial normal preparation failure with one safe folder now automatically prepares its exact
+  file-only removal in the same dialog. Final explicit confirmation remains; multiple fallback
+  candidates retain selection. Normal success, prefix behavior, archive opt-in and damaged-journal
+  recovery safeguards unchanged. Background preparation guarded against reset/session changes.
+- Existing private GTK recovery regression PASS (one test, 0.84s), independent P289 source/consent
+  review PASS. Format, Clippy all targets -D warnings, cargo build --locked and diff checks PASS.
+  Reports /tmp/ludomere-p288-report.md and /tmp/ludomere-p289-review.md; logs
+  /tmp/ludomere-r98-{compile,fmt,clippy,build}.log and /tmp/ludomere-p289-p246-gtk.log.
+  README updated; no full suite, real files/accounts/helpers/desktop activation or publication.
+  Actual installed-game uninstall/corrupt-journal integrations not re-exercised by synthetic UI test.
+
+## R97 implemented and verified — direct Browse and redundant-step audit
+
+- User requests eliminating extra clicks such as Browse Local Files opening another Open button.
+  Clean baseline62237fe on existing improvement branch. P285 shared recovery Browse, P286 broader
+  read-only UI audit and P287 independent review delegated. Preserve actual choices/consent,
+  async validation and feedback; no real desktop/file actions or publication requested.
+- Approved bounded changes: recovery Browse directly opens a single folder and honors the selected
+  installation; retain multi-copy chooser. Settings archive opener skips empty/singleton dialogs.
+  Proton preference reset completion becomes persistent inline backup/next-step feedback, retaining
+  reset consent. Shared final launch boundary checks request lifetime and supports synthetic capture.
+  Worker edits in progress; P287 independent review and isolated controls verification pending.
+- Initial private GTK recovery/uninstall and Proton/DLL reset tests PASS; Settings fixture failed
+  at asynchronous multi-choice completion and exposed raw ampersand markup in empty feedback.
+  P286 correcting feedback and checking fixture timing. Compilation caught/fixed generic recursive
+  monomorphization; Clippy follow-ups are bounded type alias/test assertion changes. No real desktop
+  activations or user-profile operations; immutable test binary and private display/bus used.
+- Final source fixes verified: Settings plain-text feedback, actual async-completion fixture wait,
+  originating-row cancellation and selected-library root consistency. Independent source reviews
+  found no introduced blocker. All three targeted GTK cases PASS; final recovery and Settings
+  rerun against rebuilt immutable binary, unchanged Proton/DLL reset case already passed.
+- Formatting, all-target Clippy -D warnings, cargo build --locked and git diff --check PASS.
+  Logs /tmp/ludomere-r97-{compile,fmt,clippy,build}.log and /tmp/ludomere-p287-{p246,p286,p247}-gtk.log.
+  README updated. No full-suite run, commit/push/PR/package or real profile/account/file-manager
+  operation. Actual desktop activation remains a manual check; captured launch requests validate
+  direct dispatch only. Existing nonfatal private GSettings-schema warnings remain in GTK logs.
+
 ## R96 published — version 0.2.5 and clean upstream merge
 
 - User authorizes0.2.5 commit/push and clean upstream integration, with conflict reporting otherwise.

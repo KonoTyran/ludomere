@@ -151,6 +151,7 @@ fn installation_recovery_helper_process() {
             ));
             wait_for_operation(product_id, InstallationState::Installing);
             installation::shutdown();
+            installation::wait_for_paused().unwrap();
 
             let record: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
@@ -182,6 +183,7 @@ fn installation_recovery_helper_process() {
             assert!(installation::enqueue_uninstallation(game));
             wait_for_operation(product_id, InstallationState::Uninstalling);
             installation::shutdown();
+            installation::wait_for_paused().unwrap();
 
             let record: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();

@@ -7,7 +7,8 @@
   isolation and completeness of accumulated change summary. No source edits or publication.
 - Root runs isolated full build checks, reviews/stages existing changes, commits and pushes the
   current PR branch, then posts the explicitly requested concise PR comment. No package work.
-- Full isolated tools/check.sh and cargo build --locked PASS; publication pending root actions.
+- Full isolated tools/check.sh and cargo build --locked PASS. Root published release commit
+  1c30bdb and posted PR7 comment5966389307; only this records closeout follows.
 
 ## R107 archive state from unified downloads
 

@@ -2,7 +2,7 @@
 
 Last meaningful update: 2026-10-03.
 
-## R108 active — 0.3.1 build, commit, push and PR comment
+## R108 complete — 0.3.1 build, commit, push and PR comment
 
 - User explicitly authorized version bump and publication of accumulated R101–R107 changes.
   P314 release metadata and P315 independent review; root handles isolated full build checks and
@@ -16,6 +16,11 @@ Last meaningful update: 2026-10-03.
 - PR7 verified OPEN on upstream/main. SSH fetch lacks an available key; HTTPS fetch using
   existing GitHub CLI authentication succeeds without changing configured remotes. Root preparing
   commit and non-force push plus user-authorized PR comment.
+- Full gate:544 library tests, six integration tests and five Python tests pass; opt-in tests
+  remain excluded from default suite, with affected GTK evidence retained from implementation.
+  Release commit1c30bdb pushed non-force to the existing origin branch; PR7 summary posted:
+  https://github.com/KonoTyran/ludomere/pull/7#issuecomment-5966389307.
+  This records-only closeout preserves the exact verified product source.
 
 ## R107 implemented and verified — archive visibility and Manage deletion removal
 

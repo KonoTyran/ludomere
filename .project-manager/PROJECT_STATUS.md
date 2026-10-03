@@ -2,7 +2,7 @@
 
 Last meaningful update: 2026-10-02.
 
-## R100 active — version0.3.0 and new upstream PR
+## R100 published — version0.3.0 and new upstream PR
 
 - User authorizes version bump, upstream integration, successful build and new upstream/main PR.
   P292 metadata/P293 change inventory/P294 assurance delegated; root handles publication. Preserve
@@ -25,6 +25,12 @@ Last meaningful update: 2026-10-02.
   as exhaustive. Log /tmp/ludomere-r100-full-build.log; metadata/schema/dependencies preserved.
   Fresh upstream fetch still2b7a083 and ancestor. Release commit/push/new PR next; actual KWallet
   first login, desktop file-manager activation and full LEGO installation remain user checks.
+- Release5663a05 and test-fixture3523004 committed with successful post-commit builds and pushed.
+  New upstream/main PR: https://github.com/KonoTyran/ludomere/pull/7, complete concise feature/fix
+  inventory and Codex(GPT-6) attribution. GitHub reports MERGEABLE; Arch CI in progress at initial
+  verification, not claimed passed. Upstream2b7a083 remains included without conflicts. Final
+  independent P294 scoped assurance PASS; no new introduced blocker identified. Records closeout
+  receives its own post-commit build/push; live integration limitations above remain explicit.
 
 ## R99 implemented and verified — LEGO Depot prerequisite failure
 

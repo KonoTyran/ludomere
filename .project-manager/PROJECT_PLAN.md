@@ -14,7 +14,8 @@
   interrupted-client disconnect at final first-response write, retain strict resumed range/content
   assertions and production behavior. Private focused repetitions, then full release checks.
 - Full final tools/check.sh and cargo build --locked PASS;541 library/six integration/five Python
-  tests passed. Restart fixture10/10 isolated repetitions. Root publication pending; no package build.
+  tests passed. Restart fixture10/10 isolated repetitions. Version0.3.0 published in upstream PR7;
+  mergeable without conflicts, GitHub Arch CI initially in progress. No local package build.
 
 ## R99 language_setup prerequisite compatibility
 

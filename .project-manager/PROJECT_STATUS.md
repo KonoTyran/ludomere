@@ -2,7 +2,7 @@
 
 Last meaningful update: 2026-10-02.
 
-## R96 active — version and publication
+## R96 published — version 0.2.5 and clean upstream merge
 
 - User authorizes0.2.5 commit/push and clean upstream integration, with conflict reporting otherwise.
   Upstream fetched over HTTPS:2b7a083 adds shutdown journal race fix beyond our d836fbe baseline.
@@ -12,8 +12,16 @@ Last meaningful update: 2026-10-02.
   dependency versions and historical releases unchanged. P284 upstream review and merge-tree
   preview PASS without conflicts; upstream modifies only unchanged manager code and recovery tests.
 - R95 fixes committed separately:037e57c onboarding and e5f1e74 wallet preparation. Each exact
-  post-commit cargo build --locked PASS in a private verification checkout. Version commit,
-  actual clean merge, focused recovery verification and HTTPS push remain.
+  post-commit cargo build --locked PASS in a private verification checkout. Version commit
+  ae55b45 and clean merge5d9d9a5 also passed their post-commit builds. Kono's2b7a083 is included;
+  earlier upstreamd836fbe was already our baseline. No conflicts or manual resolutions.
+- Merged verification: manager32 and installation-recovery4 tests PASS (its ignored subprocess
+  helper runs through the four integration tests), fmt/diff and all-target Clippy PASS. Private
+  HOME/all XDG/TMP, offline Cargo, synthetic installer/uninstaller sleep scripts only. Logs
+  /tmp/ludomere-r96-{manager-tests,recovery-tests,clippy,merge-build}.log. No full-suite repeat.
+- Published improvement/ux-performance-audit-2026-10-02 to origin via command-local HTTPS push
+  URL and existing gh credential helper. SSH remote configuration remains unchanged. Final
+  records-only closeout receives its own build/push; no PR, package or real account/game action.
 
 ## R95 implemented and verified — manual-test regressions
 

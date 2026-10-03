@@ -2,15 +2,19 @@
 
 ## R96 publication and clean upstream merge
 
-- P283 (in_progress, ui_review): bump only application0.2.5 Cargo manifest/lock, PKGBUILD and
+- P283 (complete, ui_review): bump only application0.2.5 Cargo manifest/lock, PKGBUILD and
   AppStream metadata; retain historical releases and pkgrel1. No dependency/schema changes.
   Verify locked metadata, XML/version consistency and focused format checks; root builds.
-- P284 (in_progress, depot): read-only review newly fetched upstream2b7a083 shutdown journal
+- P284 (complete, depot): read-only review newly fetched upstream2b7a083 shutdown journal
   race fix and overlap with our changes. Recommend relevant merge verification; no edits.
 - Root commits reviewed R95 fixes separately, preserves each post-commit build, and previews
   merge conflicts without altering working tree. If clean, merge and run focused merged checks,
   commit version and publish existing branch to origin. No conflict resolution without user input.
   SSH fetch failed; public HTTPS fetch succeeded and existing gh credentials verified usable.
+- Completed commits037e57c/e5f1e74/ae55b45 and clean merge5d9d9a5; each exact post-commit build
+  passed. Merged manager32 and recovery4 tests, fmt and all-target Clippy PASS. Branch published
+  to origin over HTTPS without permanent remote changes; no PR. Final records-only closeout is
+  built and pushed separately; no package, full-suite repeat or user-profile operation.
 
 ## R95 focused manual-test fixes
 

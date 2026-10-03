@@ -231,7 +231,7 @@ pub(super) fn diagnostic(file: &mut File, text: &str) {
     let _ = writeln!(file, "[Ludomere] {}", sanitize(text));
 }
 
-fn sanitize(text: &str) -> String {
+pub(crate) fn sanitize(text: &str) -> String {
     let mut safe = String::new();
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();

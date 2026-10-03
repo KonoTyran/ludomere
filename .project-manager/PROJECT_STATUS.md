@@ -1,6 +1,234 @@
 # Project status
 
-Last meaningful update: 2026-10-02.
+Last meaningful update: 2026-10-03.
+
+## R108 active — 0.3.1 build, commit, push and PR comment
+
+- User explicitly authorized version bump and publication of accumulated R101–R107 changes.
+  P314 release metadata and P315 independent review; root handles isolated full build checks and
+  git/GitHub publication. Current branch improvement/ux-performance-audit-2026-10-02.
+- Version metadata 0.3.1 matches Cargo/lockfile/PKGBUILD/AppStream; pkgrel1, release2026-10-03,
+  dependencies unchanged. P315 independent inventory and isolation review PASS.
+- Full tools/check.sh and cargo build --locked PASS in private HOME/all XDG/TMP with offline
+  Cargo, no real desktop bus and synthetic local HTTP/process fixtures. Log
+  /tmp/ludomere-r108-full-build.log; report /tmp/ludomere-p315-review.md. Earlier affected GTK
+  tests remain valid; no real accounts/games/installers or package build/install exercised.
+- PR7 verified OPEN on upstream/main. SSH fetch lacks an available key; HTTPS fetch using
+  existing GitHub CLI authentication succeeds without changing configured remotes. Root preparing
+  commit and non-force push plus user-authorized PR comment.
+
+## R107 implemented and verified — archive visibility and Manage deletion removal
+
+- Investigate offline installer downloaded from primary detail action missing from archive tab's
+  downloaded state. User explicitly requests deletion through that tab, removing Manage's bulk
+  Delete Downloaded Files item. P311 UI, P312 backend diagnosis, P313 independent review assigned.
+- Preserve all prior dirty edits; use private synthetic fixtures and focused tests, no user data,
+  actual download/installer, commit or publication. No clarification needed for requested behavior.
+- Independent diagnosis: Acquisition section renders on metadata state changes only; managed-file
+  updates change local model but leave prebuilt archive row captures stale. P312 confirms ordinary
+  unified-download registration/group identity matches archive lookup. No backend change needed.
+  Existing multi-copy LIMIT1 lookup concern is adjacent and deferred, not claimed as this cause.
+- P311 moved to fresh-context archive_refresh after diagnosis. Approved optional existing model
+  reference for archive rows, product-relevant revision gating and off-thread existing matching/
+  plausibility checks; reconcile existing controls in place, shared counted state, busy/session/
+  view guards. Preserve filters and installed payloads. Bulk Manage removal and README scoped in.
+- Implemented source review passes pending focused execution. Review corrected missing-file
+  fallback after deletion, repeated failed-refresh loops, signed-out idle gating, stale view guards
+  and confirmation file-list races. Shared counted state prevents own/external double updates.
+  Initial compilation passed; final GTK visible-property busy guard and focused tests pending.
+- Final three focused GTK tests PASS: external archive registration updates same filtered row,
+  checkmark/count/delete controls; cancel/failure/deletion preserve game payload and restore one
+  Download after delayed refresh; proxy layout and unified source/queue regressions pass.
+  Monitor uses progress.get_visible to preserve busy work even while its tab is hidden.
+- Independent source/security review has no introduced blocker. Final cargo fmt --check,
+  cargo clippy --locked --all-targets -- -D warnings, git diff --check and cargo build --locked
+  PASS. Evidence /tmp/ludomere-r107-{compile,clippy,build}.log and
+  /tmp/ludomere-p313-{external-archive,proxy-layout,unified-queue}-tests.log; reports P311–P313
+  under /tmp/ludomere-p31*-{report,review}.md. README deletion instructions updated.
+- Fixtures use private inert files/SQLite/GTK and captured queues. They persist external completion
+  and apply its equivalent local-model snapshot; actual transfer/full manager→UI event chain is
+  not executed here (existing event delivery covered in R106). No real account/game/installer,
+  full suite, package, commit or publication. Previous working-tree changes preserved.
+
+## R106 implemented and verified — offline installer handoff and stale detail actions
+
+- User requests auto-install after detail-initiated offline downloads, explicit local installer
+  arrow action and immediate primary-state updates after file/install/uninstall changes.
+  P308 UI/P309 handoff-refresh/P310 independent review assigned; primary label clarification sent.
+  All prior uncommitted changes preserved; no real install/launch or external operations.
+- Primary click already reads current state; arrow entries capture initial render state. P308
+  approved stable dynamically visible actions and local-only chooser using worker-derived usable
+  base installer availability, distinct from broad backup/DLC coverage. After reasonable response
+  opportunity, stated assumption follows requested Download plus local-install arrow wording.
+- P309 confirms existing complete-part handoff but found redundant handed_off write after dispatch
+  can overwrite a fast terminal result. Approved removing that redundant ownership and testing
+  synchronous completion; preserve manager's durable handoff and archive-only behavior.
+- P308 found direct archive deletion bypasses the manager's ManagedFilesChanged event; count-only
+  refresh leaves local actions stale. P309 owns a minimal session-filtered existing-event notifier
+  and helper call, including partial deletion failures, with focused event regression. No polling
+  or new deletion semantics. P310 retracted an initial Play-menu concern after confirming all
+  installed games already use Play regardless of update availability.
+- User confirmed keeping Download with the offline-install menu action. Nine focused backend,
+  state and archive-deletion checks pass. Final UI checks pending two narrow source guards:
+  skip candidate catalog reads without local installers and retain the existing DLC Install route.
+- Final unified local-only chooser regression passes (ten focused checks now pass); actual action
+  panel transition fails to reveal the offline entry on archive arrival. P308 diagnosing this
+  reproducible failure before acceptance. Final compile/fmt/Clippy/build pass, but UI gate remains
+  open until the failed transition is corrected and independently rerun.
+- Action-panel failure traced to fixture use of GTK is_visible (includes closed popover ancestor),
+  not a stopped refresh. Replaced those assertions with get_visible (the row property), removed
+  temporary diagnostics; production unchanged. Final exact rerun and test-target lint pending.
+- Final live detail action regression PASS; eleven focused checks total pass. Stable controls
+  transition through Download, archive arrival/offline entry, installed Play, uninstall with archive
+  retained and archive deletion without reopening the page. Local-only chooser, exact multipart
+  handoff/terminal race, current/stale session events and prior archive deletion flow pass.
+- Final fmt, all-target Clippy -D warnings, diff check and cargo build --locked PASS. Evidence:
+  /tmp/ludomere-r106-*.log, /tmp/ludomere-p309-tests.log, /tmp/ludomere-p310-*-tests.log;
+  reports /tmp/ludomere-p308-report.md, /tmp/ludomere-p309-report.md and
+  /tmp/ludomere-p310-review.md. README updated. Private synthetic profiles/files/GTK only,
+  captured download queues and stubbed installation dispatch; no real account, installer or game
+  exercised. All earlier dirty work preserved; no full suite, package, commit or publication.
+
+## R105 implemented and verified — executable selection loop and duplicate archive actions
+
+- User requests sole-executable auto-selection, persistent multi-executable choice and functional
+  Play, plus single Download after archive deletion and Notifications feedback. P305 launch,
+  P306 archive row, P307 independent review. Preserve all R101–R104 uncommitted changes.
+- Independent cause review confirms saved executable is not copied into AppModel before retry;
+  chooser also always presents candidates. Approved async inline discovery for sole candidate,
+  persisted/model-updated continuation, retained ambiguous chooser and guarded failure feedback.
+  Both detail and files.rs context-launch callers must use the corrected shared flow.
+- Archive deletion leaves Download to another library visible; proxy icon/tooltip updates also
+  override aggregate direct/menu visibility. Approved coherent visibility reset, distinct copy label
+  and icon, busy feedback/Notifications and bounded session/profile guards for deletion.
+- Review caught chooser callback retaining its dialog and delayed close resetting the next launch's
+  busy flag; P305 corrected both before freeze. Shared per-game chooser reentry guard authorized
+  across detail/context launch callers, with minimal model state only if required. Synthetic actual
+  control fixtures are being prepared; no real installer or game execution authorized/needed.
+- Initial production check, test compilation and Clippy pass. Archive deletion actual-control
+  regression passes cancellation, unavailable destination, successful deletion preserving game
+  payload, Notifications and re-download queue. Chooser cancellation now synchronously guards
+  pending persistence, including Escape/window dismissal via close-attempt; final checks pending.
+- Eight focused checks pass: executable-choice GTK flow, archive deletion GTK, proxy layout GTK,
+  existing archive-download GTK and four executable discovery tests. Final chooser run exposed
+  an Adwaita diagnostic when closing a never-presented singleton dialog; P305 applying a narrow
+  visibility guard, then rerun only that affected test. Build/fmt/Clippy pass before this guard.
+- GTK is_visible is true for an unpresented dialog, so the first guard was insufficient. P307
+  also identified singleton save-error recovery could remain hidden. P305 replaces those checks
+  with actual widget-root presence and adds a targeted automatic-save failure regression.
+- Final chooser rerun passes with no unpresented-dialog diagnostic: one candidate saves and
+  updates model before one continuation without modal; multiple candidates require selection;
+  save failures expose recovery and Notifications; Cancel/Escape/stale views suppress continuation.
+  Archive deletion restores a single functional Download, preserves game payload, shows busy
+  feedback and reports success/failure. Distinct copy-download label/icon and proxy layout fixed.
+- Eight focused checks PASS total (four GTK tests, four executable discovery tests); final fmt,
+  all-target Clippy -D warnings, diff check and cargo build --locked PASS. Logs
+  /tmp/ludomere-p307-{chooser,archive-delete,layout,archive-download,discovery}-tests.log and
+  /tmp/ludomere-r105-*.log. Reports /tmp/ludomere-p305-report.md, /tmp/ludomere-p306-report.md,
+  /tmp/ludomere-p307-review.md. Synthetic private files/profiles/GTK only; launch continuation and
+  queue captured, no real installer/game/cloud/account accessed. Changes uncommitted/unpublished.
+
+## R104 implemented and verified — cloud-save buttons after offline installation
+
+- User requests the same consent timing as Depot: no cloud buttons immediately after install;
+  retain launch-time cloud choice. Source has a dedicated post-offline-install discovery/consent
+  branch in details.rs. P303 implementing, P304 independently reviewing; preserve prior edits.
+- P303/P304 confirm shared launcher already discovers support and requests consent for supported,
+  undecided Windows games independent of installation source. Approved deleting only premature
+  post-install worker/buttons/save callbacks, restoring idle controls and retaining install refresh.
+  Verify existing idle-controls GTK test and two launcher cloud-policy tests in private profiles.
+- P303 source frozen: details.rs removes158/adds5 lines, deleting premature controls/worker;
+  completion restores normal primary/alternate actions and refreshes state. Formatting, all-target
+  Clippy -D warnings and cargo build --locked pass. P304 focused isolated execution pending.
+- Final P304 review passes with three focused tests: private GTK idle-control restoration and two
+  pure launcher consent/discovery checks. Logs /tmp/ludomere-p304-{idle,policy,discovery}-tests.log;
+  reports /tmp/ludomere-p303-report.md and /tmp/ludomere-p304-review.md. No live installation,
+  cloud request or game execution; source review verifies removal and retained launch flow.
+  Prior changes preserved. No full suite, package, commit or publication performed.
+
+## R103 implemented and verified — numeric catalog mismatch blocked registration
+
+- User error confirms exact mismatch381681664 catalog vs382662456 observed; prior legacy-only
+  exception is insufficient. Existing installation candidate logic already treats catalog sizes
+  as estimates and validates observed managed size. Investigate transfer/receipt boundary without
+  removing protection against incomplete payloads. P301 implementation/P302 independent review.
+  Duplicate summary also confirmed. Preserve all current uncommitted R101/R102 work.
+- P301 implementation frozen: catalog lengths no longer override observed receipt identity;
+  new transfers validate HTTP lengths and resumed Content-Range before publication/reuse.
+  Existing receipt format, file identity, path and account bindings remain unchanged. Numeric
+  catalog mismatch tests include the user's exact sizes using sparse files and a live synthetic
+  manager transfer. Nested bookkeeping summaries are deduplicated with sanitized causes retained.
+  P302 independent source review passes; focused compilation/testing underway.
+- Final verification PASS31 focused tests: download20, completion5, transfer3, classifier1,
+  manager integration1 and restart integration1. Corrected test-only unchecked-read lint; rebuilt
+  and reran affected20 tests successfully. Formatting, all-target Clippy -D warnings, diff check,
+  and cargo build --locked pass. Reports /tmp/ludomere-p301-report.md and
+  /tmp/ludomere-p302-review.md; test logs /tmp/ludomere-p302-*-tests.log and root build/static logs
+  /tmp/ludomere-r103-*.log. Private synthetic profiles/loopback only; actual GOG file not inspected.
+  User can restart the rebuilt application and retry preserved downloads without deleting them.
+  R103 supersedes R102's legacy-only exception; changes remain uncommitted/unpublished.
+
+## R102 implemented and verified — shared offline completion failure
+
+- Both entry points now transfer but fail completion bookkeeping; repeat attempt fails receipt/
+  registration refresh. Preserve R101 uncommitted changes. P299 diagnosis/implementation and P300
+  independent review assigned. Source identifies shared transfer completion/receipt errors with
+  underlying causes currently hidden; no real user files/account inspected.
+- P299/P300 independently identify concrete matching failure: account fallback metadata parses
+  rounded size labels into size_bytes without provider identity. Receipt record writes durable
+  receipt then exact-size validation rejects it; retry rejects the same receipt before DB work.
+  Actual user metadata not inspected, so this is a reproduced-path hypothesis pending fixtures.
+- Approved narrow exception only for labeled legacy artifacts with all provider identity fields
+  absent; authoritative/unlabeled sizes remain exact. Actual receipt size/inode/device/timestamps,
+  artifact digest and path validation remain strict. Reuse existing backend log sanitizer to show
+  nested registration cause; verify preserved-receipt recovery and authoritative mismatch rejection.
+- Before-fix regression independently reproduced exact record/retry mechanism: observed104-byte
+  file vs100-byte display estimate creates receipt then fails validation. Final fix bypasses only
+  legacy display estimates, preserves all actual receipt/file identities, and exposes sanitized
+  nested bookkeeping causes. No state/schema changes and no real user file/receipt mutation.
+- Focused final tests PASS9:completion5, transfer3, classifier1. Covers unchanged receipt/payload
+  recovery, authoritative/unlabeled size rejection, tampering/missingfiles/unsafe paths, atomic DB
+  failure/retry without network, and safe error diagnostics. Logs /tmp/ludomere-p300-{baseline,
+  completion,transfer,worker}-tests.log; reports /tmp/ludomere-p299-report.md and
+  /tmp/ludomere-p300-review.md. Final fmt/Clippy -D warnings/diff/cargo build --locked PASS. Actual user's
+  artifact metadata remains uninspected: mechanism matches symptoms, not claimed live diagnosis.
+
+## R101 implemented and verified — offline download and install UX failures
+
+- Clean baseline80510ac. User requests direct Download from archive library picker and one
+  unified Depot/offline install selector, automatic installation after complete required transfer.
+  P296 UI/P297 acquisition/P298 independent review assigned; scope excludes unrelated cleanup,
+  publication and full-suite runs. Keep strict typed-library and account/lifecycle boundaries.
+- P298 establishes archive blocker: visible menu proxies forward clicks to an unmounted source
+  button; its root guards always discard selection and preparation callbacks. P296 fixes mounted
+  lifetime guard and Download action; selector defaults already initialize but require regression.
+- Approved unified source model adds remote complete installer groups beside Depot/local choices,
+  inline typed archive destination, async metadata/errors and existing enqueue_with_install handoff.
+  Existing local/Depot DLC controls remain; remote base does not silently include unrelated DLC or
+  extras. Existing backend readiness/consent reused. P297 tightens numbered multipart coverage and
+  verifies waiting/error states and dispatch only after complete payloads; no schema/API expansion.
+- Initial production cargo check --locked PASS. Independent backend range/readiness source review
+  PASS. UI reviewers confirm exact selected group and typed targets; requested activity/auth guards
+  on newly reachable archive preparation and initial acquisition, plus pending-action feedback.
+  Retained actual-visible-proxy/unified-dialog fixtures and scoped compilation/tests still pending.
+- Final archive chooser Download dispatches initialized/current typed selection; proxy guard uses
+  original account/auth and window lifetime, allowing a consented request through a row rebuild.
+  Unified fresh base source list includes Depot, complete local and remote offline variants,
+  with inline archive destination, no secondary archive chooser, and exact complete-group auto
+  install request. Missing storage and metadata failures give inline guidance/Retry; pending
+  queue work has spinner/disabled controls. Existing local/Depot DLC and native behavior preserved.
+- Verification PASS:2 retained private GTK actual-control tests (archive default/change/detachedrow/
+  cancel/missinglibrary; unified language/source/destination/allparts/intent/no extra chooser),
+  4 automatic-install tests including multipart coverage, unfinished/error/missingfile gating and
+  exactly-once dispatch. Final fmt, all-target Clippy -D warnings, cargo build --locked and diff
+  checks PASS. Initial fixture downcast and test-only large-Err Clippy issues corrected; latter
+  boxes test-only fallback data without production behavior changes. No full suite run.
+- Independent P298 scoped QA/security review and P297 integration review PASS. Evidence:
+  /tmp/ludomere-p296-report.md, /tmp/ludomere-p297-report.md, /tmp/ludomere-p298-review.md;
+  /tmp/ludomere-p298-{archive,install}-gtk.log, /tmp/ludomere-p297-tests.log and
+  /tmp/ludomere-r101-{compile,clippy,build}.log. README updated. Same-ID relocation/stale-session/
+  retry/disconnect branches source-reviewed; real authenticated transfer and actual installer
+  execution remain manual checks. No publication, package operation or version bump requested.
 
 ## R100 published — version0.3.0 and new upstream PR
 

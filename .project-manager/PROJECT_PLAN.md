@@ -1,5 +1,102 @@
 # Project plan
 
+## R108 release verification and publication
+
+- P314 (complete, archive_refresh): bump project release metadata to 0.3.1; no dependency churn.
+- P315 (complete, storage_audit): independently verify release metadata, existing build/test
+  isolation and completeness of accumulated change summary. No source edits or publication.
+- Root runs isolated full build checks, reviews/stages existing changes, commits and pushes the
+  current PR branch, then posts the explicitly requested concise PR comment. No package work.
+- Full isolated tools/check.sh and cargo build --locked PASS; publication pending root actions.
+
+## R107 archive state from unified downloads
+
+- P311 (complete, archive_refresh; initial diagnosis ui_review): fix archive row refresh from detail downloads;
+  remove Manage deletion item. Own UI files and necessary focused GTK fixtures; preserve prior work.
+- P312 (complete, depot): independent backend identity/registration diagnosis; ordinary flow is
+  correctly registered. No backend correction needed; /tmp/ludomere-p312-report.md.
+- P313 (complete for scoped verification, storage_audit): independent correctness/security review and focused isolated QA.
+- Root coordinates compilation and records. No real accounts/files/games/helpers, full suite,
+  schema/package/publication, or unrelated cleanup. Report causes and minimal proposed changes.
+- Three focused GTK tests pass: external completion/deletion, action proxy layout, unified exact
+  queue/source selection. Final fmt/Clippy -D warnings/diff/build pass; real transfer not exercised.
+
+## R106 detail action state and offline automatic installation
+
+- P308 (complete, ui_review): details/sections/mod/chooser reactive primary/menu/click behavior
+  and local offline-install entry; user confirmed retaining Download with the offline-install menu.
+- P309 (complete, depot): trace exact offline auto-install handoff and file/operation refresh;
+  minimal necessary backend/event fixes and focused tests, coordinate UI ownership.
+- P310 (complete for scoped verification, storage_audit): independent source/lifecycle review and proportionate synthetic
+  UI/backend QA; no implementation edits. No real accounts/games/helpers/profile data.
+- Root coordinates compilation/records; no full suite, schema/package/publication/unrelated work.
+- Eleven focused checks pass: automatic-install4, event delivery1, state policy3, archive deletion1,
+  live detail actions1 and unified local-only chooser1. Formatting, all-target Clippy with warnings
+  denied, diff check and cargo build pass. Real authenticated installer/game flow not exercised.
+
+## R105 launch executable and archive action transitions
+
+- P305 (complete, ui_review): executable chooser/persistence/retry fix; own chooser/details and
+  necessary executable backend code. Auto-select one valid candidate, retain ambiguous choices.
+- P306 (complete, depot): files.rs archive deletion/direct Download/menu transitions and safe
+  Notifications/busy/error feedback; preserve existing R101 row changes and installed payloads.
+- P307 (complete for scoped verification, storage_audit): independent diagnosis, review and focused synthetic QA for
+  both paths. No implementation edits. Private profiles/files, no real games/helpers/cloud/account.
+- Root manages records/builds; no full suite, publication, package or unrelated refactoring.
+- Final eight focused checks pass, including actual chooser/row interactions and four executable
+  discovery tests. Review, formatting, Clippy -D warnings, diff check and final build pass.
+
+## R104 cloud consent timing
+
+- P303 (complete, ui_review): diagnose and correct premature offline-install cloud controls in
+  details.rs, reusing launch-time behavior. Preserve completion refresh and R101–R103 changes.
+- P304 (complete for scoped verification, storage_audit): independent source/lifecycle review and focused synthetic
+  verification. No product edits, real profiles, account/cloud requests, games or helpers.
+- Root coordinates compilation and records. No full suite, package, commit or publication.
+- Three focused checks pass: existing GTK idle restoration and two launcher cloud policy tests.
+  Independent review, formatting, Clippy with warnings denied and final build pass.
+
+## R103 transfer length and completion evidence
+
+- P301 (complete, depot): inspect/propose minimal download transfer/completion correction and
+  duplicate-error fix, own download/{completion,transfer,worker,protocol}.rs as necessary. Preserve
+  original payloads/receipts, account bindings and integrity; test genuine transport truncation/range
+  failures separately from nonauthoritative catalog sizes. No speculative tolerance percentage.
+- P302 (complete for scoped verification, storage_audit): independent security/recovery diagnosis and regression review;
+  no product edits. Private profiles and inert synthetic HTTP fixtures only; root coordinates Cargo.
+  No user profile/files/credentials/helpers, real downloads, schema/package/publication/full suite.
+- Implementation removes catalog-size equality from observed completion receipts, validates HTTP
+  transfer boundaries, and deduplicates error context. Focused tests passed31 cases, including
+  persistent manager and restart integrations. Final test-fixture lint correction is compiled;
+  affected20-test download-filter rerun, final product build, formatting and Clippy pass.
+
+## R102 downloaded file registration
+
+- P299 (complete, depot): trace/reproduce shared transfer receipt and database registration
+  failure; propose minimal fix then own download/completion/transfer code and necessary state
+  integration/tests. Preserve files, strict receipts and R101 edits; no unsupported schema variants.
+- P300 (complete for scoped verification, storage_audit): independent cause/security/recovery review and focused
+  regression verification; no product edits. Private HOME/all XDG/TMP only, synthetic inert data.
+- Root coordinates compilation/records; no full suite, user profile access, real downloads/helpers,
+  package or publication. Ask for safe diagnostics only if source/fixtures cannot establish cause.
+- Legacy rounded-size regression failed before fix and passed after;9 focused completion/transfer/
+  classifier tests PASS. Independent source/security review PASS; fmt/Clippy/final build PASS.
+
+## R101 offline acquisition and unified installation
+
+- P296 (complete, ui_review): own download_chooser.rs and necessary UI wiring; fix direct
+  library/download flow and unified source choices with in-place feedback. Coordinate backend
+  contract with P297; minimal affected controls regressions. README delegated to P297.
+- P297 (complete, depot): trace acquisition/auto-install grouping and readiness; propose then
+  correct necessary backend deficiencies, owning src/download/ and installation planning only.
+  Preserve multipart completion, typed storage, install consent and account/session safety.
+- P298 (complete for scoped verification, storage_audit): independent flow/security review, affected-control inventory
+  and private synthetic QA; no product edits. Root coordinates Cargo and records. No real profile,
+  credentials, downloads, helpers, games, desktop actions, publication or full suite. Report gaps.
+- Verified2 actual GTK controls tests and4 automatic-install tests in private profiles; final
+  fmt, all-target Clippy with warnings denied, cargo build --locked and diff checks PASS. No real
+  authenticated transfer/installer execution performed; source-only lifecycle branches documented.
+
 ## R100 publication and version0.3.0
 
 - P292 (complete, ui_review): bump Cargo manifest/app lock entry, PKGBUILD and AppStream to0.3.0,

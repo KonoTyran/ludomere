@@ -14,6 +14,7 @@ pub(super) struct LocalActionState {
     pub depot: bool,
     pub backup_update: bool,
     pub downloaded: bool,
+    pub offline_installer: bool,
     pub dlc: DlcActionState,
     pub coverage: InstallerCoverage,
     pub required_dlcs: HashSet<i64>,
@@ -68,7 +69,12 @@ pub(super) fn current_primary_action(
             .get(&(parent.unwrap_or(id), online::DetailSection::Acquisition)),
         Some(SectionState::Ready)
     );
-    ready_local_action(local, acquisition_ready)
+    let action = ready_local_action(local, acquisition_ready);
+    if parent.is_none() && action == GamePrimaryAction::Install {
+        GamePrimaryAction::Download
+    } else {
+        action
+    }
 }
 
 fn ready_local_action(local: &LocalActionState, acquisition_ready: bool) -> GamePrimaryAction {
@@ -402,6 +408,11 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
     let (status_sender, status_receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
+            let _activity = crate::profile_reset::begin_activity("refreshing local game files")?;
+            anyhow::ensure!(
+                online::account_session() == session,
+                "Account changed; refresh local files again."
+            );
             let store = StateStore::open()?;
             let statuses = if targeted {
                 crate::storage::inspect_libraries_for_refresh(&config, &store)?
@@ -554,6 +565,19 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                 {
                     product_downloaded.insert(root);
                 }
+                let offline_files = files
+                    .iter()
+                    .filter(|file| {
+                        file.present
+                            && statuses.iter().any(|status| {
+                                status.kind == crate::config::LibraryKind::OfflineInstallers
+                                    && status.compatibility
+                                        == crate::storage::LibraryCompatibility::Compatible
+                                    && file.path.starts_with(&status.path)
+                            })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let mut actions = HashMap::new();
                 for detail in local_action_details(game) {
                     let local = installed.get(&detail.product_id).cloned();
@@ -585,6 +609,21 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                         }
                     }
                     let coverage = installer_backup_coverage_from(&detail, &config, &managed_paths);
+                    let offline_installer = offline_files.iter().any(|file| {
+                        file.product_id == detail.product_id && file.kind == ArtifactKind::Installer
+                    }) && crate::installation::detect_installer_candidates(
+                        detail.product_id,
+                        &store.load_all_download_revisions(detail.product_id)?,
+                        &offline_files,
+                        &config,
+                    )
+                    .usable
+                    .iter()
+                    .any(|candidate| {
+                        candidate.complete
+                            && candidate.method
+                                != crate::installation::InstallationMethod::Unsupported
+                    });
                     actions.insert(
                         detail.product_id,
                         LocalActionState {
@@ -598,6 +637,7 @@ fn start_local_refresh(w: &Widgets, model: &Rc<RefCell<AppModel>>, ids: Option<H
                                 .unwrap_or(false),
                             backup_update: backup_updates.contains(&detail.product_id),
                             downloaded: coverage == InstallerCoverage::Complete,
+                            offline_installer,
                             dlc: owned_dlc_action_state_from(
                                 &detail,
                                 &config,

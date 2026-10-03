@@ -159,6 +159,7 @@ struct AppModel {
     detail_generation: u64,
     detail_target: Option<(i64, Option<i64>)>,
     installed_games: HashMap<i64, crate::domain::InstalledGame>,
+    executable_selections: HashSet<(u64, i64)>,
     local_actions: HashMap<i64, LocalActionState>,
     local_refresh_running: bool,
     local_refresh_pending: bool,

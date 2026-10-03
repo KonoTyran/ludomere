@@ -90,6 +90,8 @@ fn manager_downloads_one_game_at_a_time_and_parallelizes_its_parts() {
     download::set_network_available(true);
     download::set_authenticated(true);
     let mut first_part = artifact(0, format!("http://{address}/0"));
+    // Official numeric catalog sizes can be rounded; HTTP defines the actual bytes.
+    first_part.size_bytes = Some(9);
     first_part.part_count = Some(2);
     let mut second_part = artifact(1, format!("http://{address}/1"));
     second_part.provider_file_id = Some("part-2".into());
@@ -431,8 +433,8 @@ fn exercise_active_pause_and_resume(root: &std::path::Path) {
         let remaining = &server_body[offset..];
         write!(
             resumed,
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"setup_5.bin\"\r\nConnection: close\r\n\r\n",
-            remaining.len()
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {offset}-{}/{}\r\nContent-Disposition: attachment; filename=\"setup_5.bin\"\r\nConnection: close\r\n\r\n",
+            remaining.len(), server_body.len() - 1, server_body.len()
         )
         .unwrap();
         resumed.write_all(remaining).unwrap();

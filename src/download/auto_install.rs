@@ -196,7 +196,11 @@ pub(super) fn intent(
             .filter_map(|artifact| artifact.part_number)
             .collect::<std::collections::HashSet<_>>();
         ensure!(
-            parts.is_empty() || parts.len() == request.artifacts.len(),
+            parts.is_empty()
+                || (parts.len() == request.artifacts.len()
+                    && parts
+                        .iter()
+                        .all(|part| *part > 0 && *part as usize <= request.artifacts.len())),
             "Selected installer parts are duplicated or incomplete"
         );
     }
@@ -453,23 +457,25 @@ fn process_with(
         .into_iter()
         .filter(|intent| intent.state == "waiting")
     {
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<()> {
             let plan: InstallPlan = serde_json::from_str(&intent.plan_json)?;
             let Some((game, additional)) = prepare(store, &plan)? else {
-                return Ok(false);
+                return Ok(());
             };
             let _activity =
                 crate::profile_reset::begin_activity("automatic installation preparation")?;
             preflight(&game)?;
+            if let Some(base) = intent.job_ids.first() {
+                store.set_download_job_status(base, None)?;
+            }
             dispatch(&intent, game, additional)?;
-            Ok(true)
+            Ok(())
         })();
         let message = match result {
-            Ok(false) => continue,
-            Ok(true) => {
-                store.set_download_install_state(&intent.intent_id, "handed_off", None)?;
-                "Queued for automatic installation".to_owned()
-            }
+            // The dispatcher persists handed_off before starting its worker. It
+            // may already have completed by now; never overwrite its terminal
+            // state or replace completion feedback with another queued message.
+            Ok(()) => continue,
             Err(error) => {
                 let message = format!(
                     "Automatic installation needs attention: {error}. Retry installation after resolving this, or install manually."
@@ -721,10 +727,45 @@ mod tests {
         assert_eq!(record.job_ids.len(), 4);
         assert_eq!(plan.dlcs[2].job_id, "retained-legacy-dlc-job");
         assert_eq!(record.job_ids[3], "retained-legacy-dlc-job");
+        let mut selected = request(&choice.config.game_libraries[0].path, 7, "windows");
+        selected.artifacts[0].language = Some("Polish".into());
+        selected.artifacts[0].version = Some("selected-version".into());
+        let selected = intent(&store, &[selected], &choice).unwrap().unwrap();
+        let selected: InstallPlan = serde_json::from_str(&selected.plan_json).unwrap();
+        assert_eq!(selected.base.operating_system, "windows");
+        assert_eq!(selected.base.language.as_deref(), Some("Polish"));
+        assert_eq!(selected.base.version.as_deref(), Some("selected-version"));
+        assert_eq!(selected.library.id, choice.library_id);
         assert!(intent(&store, &requests[2..], &choice).unwrap().is_none());
         let mut partial = request(root.path(), 7, "linux");
         partial.artifacts[0].part_count = Some(2);
         assert!(intent(&store, &[partial], &choice).is_err());
+        for (numbers, valid) in [
+            ([Some(1), Some(2)], true),
+            ([Some(2), Some(1)], true),
+            ([None, None], true),
+            ([Some(2), Some(3)], false),
+            ([Some(0), Some(1)], false),
+            ([Some(1), Some(1)], false),
+            ([Some(1), None], false),
+        ] {
+            let mut multipart = request(root.path(), 7, "linux");
+            multipart.artifacts = numbers
+                .into_iter()
+                .enumerate()
+                .map(|(index, part_number)| RemoteArtifact {
+                    part_number,
+                    part_count: Some(2),
+                    download_path: format!("/installer/7/linux/{index}"),
+                    ..multipart.artifacts[0].clone()
+                })
+                .collect();
+            assert_eq!(
+                intent(&store, &[multipart], &choice).is_ok(),
+                valid,
+                "installer part numbers: {numbers:?}"
+            );
+        }
         let mut extra = request(root.path(), 7, "linux");
         extra.artifacts[0].kind = ArtifactKind::Extra;
         assert!(intent(&store, &[extra], &choice).unwrap().is_none());
@@ -765,12 +806,74 @@ mod tests {
                 ..Default::default()
             }])
             .unwrap();
-        let requests = vec![
+        let mut requests = vec![
             request(&choice.config.game_libraries[0].path, 7, "linux"),
             request(&choice.config.game_libraries[0].path, 8, "linux"),
         ];
+        requests[0].artifacts[0].part_count = Some(2);
+        let second_part = RemoteArtifact {
+            part_number: Some(2),
+            download_path: "/installer/7/linux/2".into(),
+            ..requests[0].artifacts[0].clone()
+        };
+        requests[0].artifacts.push(second_part);
+        let mut extras = request(&choice.config.game_libraries[0].path, 7, "linux");
+        extras.artifacts[0].kind = ArtifactKind::Extra;
+        extras.artifacts[0].download_path = "/extras/unavailable".into();
+        requests.push(extras);
         let record = intent(&store, &requests, &choice).unwrap().unwrap();
+        assert_eq!(
+            record.job_ids.len(),
+            2,
+            "extras must not gate game installation"
+        );
+        let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
         store.save_download_install_intent(&record).unwrap();
+        save_job(&store, &requests[0], true);
+        save_job(&store, &requests[1], true);
+        let base = store.download_job(&plan.base.job_id).unwrap().unwrap();
+        assert_eq!(base.completed_files.len(), 2);
+        for state in [
+            DownloadState::Downloading,
+            DownloadState::Queued,
+            DownloadState::Paused,
+            DownloadState::Failed,
+            DownloadState::Complete,
+        ] {
+            store
+                .save_download_job(&DownloadJobUpdate {
+                    job_id: &base.job_id,
+                    product_id: base.product_id,
+                    title: &base.title,
+                    artifacts: &base.artifacts,
+                    destination: &base.destination,
+                    state,
+                    bytes_downloaded: 4,
+                    total_bytes: Some(8),
+                    completed_files: &base.completed_files[..1],
+                    error: None,
+                })
+                .unwrap();
+            if state == DownloadState::Complete {
+                assert!(completed_job(&store, &plan.base).is_err());
+            } else {
+                process_with(
+                    &store,
+                    |_| panic!("unfinished multipart installer reached preflight"),
+                    |_, _, _| panic!("unfinished multipart installer dispatched"),
+                )
+                .unwrap();
+                assert_eq!(
+                    store.download_install_intents().unwrap()[0].state,
+                    "waiting"
+                );
+            }
+        }
+        save_job(&store, &requests[0], true);
+        std::fs::write(&base.completed_files[1], b"").unwrap();
+        assert!(completed_job(&store, &plan.base).is_err());
+        std::fs::remove_file(&base.completed_files[1]).unwrap();
+        assert!(completed_job(&store, &plan.base).is_err());
         save_job(&store, &requests[0], true);
         save_job(&store, &requests[1], false);
         let count = Cell::new(0);
@@ -788,9 +891,20 @@ mod tests {
         process_with(
             &store,
             |_| Ok(()),
-            |_, game, dlc| {
+            |intent, game, dlc| {
                 assert_eq!(game.product_id, 7);
+                assert_eq!(game.installer_files.len(), 2);
                 assert_eq!(dlc.len(), 1);
+                assert_eq!(game.library_id, choice.library_id);
+                assert_eq!(
+                    game.installation_directory,
+                    choice.config.game_libraries[0].path.join("game")
+                );
+                // Match the production dispatcher's durable handoff, then model
+                // a fast worker completing before the enqueue call returns.
+                store.set_download_install_state(&intent.intent_id, "handed_off", None)?;
+                store.complete_download_install_intent(game.product_id, &intent.intent_id)?;
+                store.set_download_job_status(&plan.base.job_id, Some("Installation completed"))?;
                 count.set(count.get() + 1);
                 Ok(())
             },
@@ -799,7 +913,16 @@ mod tests {
         assert_eq!(count.get(), 1);
         assert_eq!(
             store.download_install_intents().unwrap()[0].state,
-            "handed_off"
+            "complete"
+        );
+        assert_eq!(
+            store
+                .download_job(&plan.base.job_id)
+                .unwrap()
+                .unwrap()
+                .status_message
+                .as_deref(),
+            Some("Installation completed")
         );
         drop(store);
         let store = StateStore::open_at(&database).unwrap();
@@ -842,6 +965,13 @@ mod tests {
             store.download_install_intents().unwrap()[0].state,
             "blocked"
         );
+        assert!(
+            store.download_jobs().unwrap()[0]
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("Set up the runtime")
+        );
         process_with(
             &store,
             |_| Ok(()),
@@ -851,7 +981,17 @@ mod tests {
         store
             .set_download_install_state(&record.intent_id, "waiting", None)
             .unwrap();
-        process_with(&store, |_| Ok(()), |_, _, _| Ok(())).unwrap();
+        process_with(
+            &store,
+            |_| Ok(()),
+            |intent, _, _| store.set_download_install_state(&intent.intent_id, "handed_off", None),
+        )
+        .unwrap();
+        assert_eq!(
+            store.download_install_intents().unwrap()[0].state,
+            "handed_off"
+        );
+        assert!(store.download_jobs().unwrap()[0].status_message.is_none());
         clear_for_requests(&store, &requests).unwrap();
         assert!(store.download_install_intents().unwrap().is_empty());
         store.save_download_install_intent(&record).unwrap();

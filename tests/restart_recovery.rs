@@ -66,8 +66,8 @@ fn recovers_a_partial_download_in_a_fresh_process() {
         let remaining = &server_body[offset..];
         write!(
             resumed,
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"setup_restart.bin\"\r\nConnection: close\r\n\r\n",
-            remaining.len()
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {offset}-{}/{}\r\nContent-Disposition: attachment; filename=\"setup_restart.bin\"\r\nConnection: close\r\n\r\n",
+            remaining.len(), server_body.len() - 1, server_body.len()
         )
         .unwrap();
         resumed.write_all(remaining).unwrap();

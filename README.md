@@ -49,16 +49,22 @@ remain on disk without automatic pruning. Recognized URLs and credential fields 
 viewer and copied text; raw private log files may still contain sensitive game-generated output, so
 review them before sharing. Existing installer/uninstaller log links remain available below.
 
-For eligible Windows games, Download opens the source chooser with generation-two Depot builds
-first and confirms **Download and install**. Source metadata loads independently; a failed check
-offers Retry rather than silently choosing another source. **Offline installers and extras…**
-opens the archive chooser. Customized source ordering is preserved; the former default order is
-migrated once to Depot first. Installed Depot games compare their installed build with Depot
-metadata, independently of any offline installer backups.
+For a new installation, Download opens one source chooser for available generation-two Windows
+Depot builds, downloaded installers, and Linux or Windows offline installer versions. Selecting a
+remote offline installer shows its Offline Installers destination in the same dialog. **Download
+and install** saves every required part there, then automatically installs into the selected Game
+Files library once all parts are complete. Failed source checks offer Retry; customized source
+ordering is preserved, with Depot first by default. For an uninstalled game, the arrow beside
+**Download** offers **Install from Offline Installer** to use complete, already-downloaded local
+installer files. The primary action updates in place as downloads, installation, uninstallation,
+and archive deletion change the game's state. The separate archive views remain available
+for installers, patches, goodies and extras; their library chooser's **Download** action queues the
+selected files directly. Installed Depot games compare their installed build with Depot metadata,
+independently of offline installer backups.
 
 Before transferring a Windows Depot game, Ludomere resolves its complete required dependency list
 against GOG's official catalog. Missing or unsupported requirements stop preparation with details;
-**Offline installers and extras…** remains an explicit alternative. Supported catalog components
+an offline installer remains an explicit alternative in the source chooser. Supported catalog components
 include executable and MSI installers, game-local files, and the GOG setup interpreter. Downloaded
 components are checksum-verified and cached for reuse, then verified again before setup. Required
 components are part of the confirmed game installation; Proton and Steam Linux Runtime downloads
@@ -221,9 +227,9 @@ Finish setup, then use Retry installation. Existing installations are preserved.
 Extras starts unchecked for new profiles. Existing “Include extras by default” preferences remain
 in effect and can still be changed in Settings.
 
-Manage → Delete Downloaded Files removes confirmed, recorded installer/patch/extra files and related
-DLC downloads while preserving installed payloads, saves and preferences. It appears when managed
-downloads are present. Uninstall remains available for partial, failed and active operations. Healthy
+Use each downloaded item's Delete action in Offline Installers to remove its archive files while
+preserving installed payloads, saves and preferences.
+Uninstall remains available for partial, failed and active operations. Healthy
 idle installations keep their normal uninstall flow, with downloaded-file cleanup unchecked and
 performed only after successful uninstall. Recovery removal first stops affected work, then removes
 the exact game directories shown in its confirmation and resets operation state. Windows uninstall,
@@ -523,7 +529,8 @@ result. Treat unavailable controls or unsupported game features as untested, not
 - Unified download and installation queue with pause, resume, cancellation, speed history, and
   separate network and disk progress
 - Configurable installation-source priority; the default is Windows Depot, Linux offline, then
-  Windows offline, with an explicit offline installer/extras route
+  Windows offline, in one chooser that downloads all required installer parts before automatic
+  installation; separate archive views download installers, patches, goodies and extras
 - Multiple game libraries with library-owned installation markers and operation recovery journals
 - Persistent favorites, local hiding and personal tags with global rename/delete and any/all filters
 - Account-scoped, read-only achievements with cached offline access

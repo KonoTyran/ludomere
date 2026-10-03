@@ -1,5 +1,72 @@
 # Project specification
 
+## R108 version 0.3.1 and publication
+
+User requests bump to 0.3.1, successful build verification, then commit/push accumulated changes
+and post a PR comment summarizing new fixes/additions. Full build checks authorized; preserve all
+R101–R107 work. No package build/install or unrelated new features requested.
+
+## R107 unified-download archive visibility and menu cleanup
+
+User reports an offline installer acquired through the primary detail Download flow is not marked
+downloaded in Offline Installers, though Manage → Delete Downloaded Files finds it. Ensure those
+files appear as downloaded and are deletable through the Offline Installers tab, including refresh
+after completion. Remove Delete Downloaded Files from the game's Manage menu. Preserve installed
+game payloads, archive-only downloads, typed storage and prior changes. Focused tests only.
+
+## R106 offline installer handoff and reactive detail actions
+
+User requires offline installer downloads initiated by the large detail Download action to install
+automatically after all required installer parts finish. A locally available offline installer must
+be offered through an arrow action labeled Install from Offline Installer. Main button and actions
+must update in place after installer download/deletion, game installation/uninstallation and related
+state changes. User confirmed: keep Download for an uninstalled base game and put
+Install from Offline Installer in its arrow menu when a usable local installer is available.
+Preserve explicit installation intent, archive-only downloads and prior fixes.
+
+## R105 executable selection and archive deletion UX
+
+User reports Play after offline installation unnecessarily prompts for a sole executable and
+reopens the chooser after selection instead of saving/launching. Automatically use the sole valid
+candidate; retain selection when ambiguous, persist choices and launch correctly. Deleting an
+offline installer from its tab must remove those files and restore the single Download action,
+not a menu with duplicate Download entries/gear icon. Keep game installation intact, ensure
+consistent affected interactions and Notifications success/error feedback. Ask if ambiguities
+arise; otherwise make focused fixes and tests, preserving existing work.
+
+## R104 defer offline-install cloud consent until launch
+
+User reports offline installation initiated through the detail Download action adds two cloud-save
+buttons to the game's status bar. Match Depot behavior: completing installation must not show
+cloud consent controls; keep the existing user-initiated launch consent flow. Preserve completion
+refresh and existing cloud preferences. Scope is this UI inconsistency, with focused verification.
+
+## R103 numeric catalog size mismatch on completed offline download
+
+User now reports exact nested failure: expected381681664 bytes, found382662456 bytes, with the
+bookkeeping summary duplicated. R102's fallback-only exception did not resolve this case.
+Correct catalog-size versus actual transfer validation and preserved-receipt recovery without
+accepting truncated/changed files; remove duplicated error summary. Preserve R101/R102 work and
+all typed-storage/account/path invariants. Focused synthetic verification, no full suite or publish.
+
+## R102 offline transfer completion registration failures
+
+User reports both archive-tab and unified-install downloads transfer files but fail recording
+completion; retry then fails downloaded-file registration/refresh. Diagnose and correct shared
+completion and recovery handling, preserve existing downloaded files and R101 work, retain
+integrity/path/account safety, and verify with focused synthetic regressions. No real credentials,
+game execution, package operation, publication or full-suite run requested.
+
+## R101 functional offline downloads and unified installation selection
+
+User reports Offline Installers download opens a library selector with no download action.
+Replace Use Selected Libraries with Download, initialize and update the selected library on
+opening/change, and start downloads to that destination. Main game Install dialog must offer
+Depot and each offline installer in one source dropdown, remove Offline installers and extras
+navigation, and download all required installer files before automatically installing. Preserve
+typed Game Files/Offline Installers/Extras storage and existing native/Windows safety. No new
+publication or version bump requested; focused tests plus compilation, not a full test suite.
+
 ## R100 version 0.3.0 and new upstream PR — 2026-10-02
 
 User requests version0.3.0, ensuring upstream changes merge without conflicts, successful build,

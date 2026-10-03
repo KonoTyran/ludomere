@@ -213,6 +213,7 @@ pub fn build_window(app: &adw::Application) {
         detail_generation: 0,
         detail_target: None,
         installed_games: HashMap::new(),
+        executable_selections: HashSet::new(),
         library_statuses: Vec::new(),
         local_actions: HashMap::new(),
         local_refresh_running: false,

@@ -1,5 +1,48 @@
 # Project plan
 
+## R96 publication and clean upstream merge
+
+- P283 (in_progress, ui_review): bump only application0.2.5 Cargo manifest/lock, PKGBUILD and
+  AppStream metadata; retain historical releases and pkgrel1. No dependency/schema changes.
+  Verify locked metadata, XML/version consistency and focused format checks; root builds.
+- P284 (in_progress, depot): read-only review newly fetched upstream2b7a083 shutdown journal
+  race fix and overlap with our changes. Recommend relevant merge verification; no edits.
+- Root commits reviewed R95 fixes separately, preserves each post-commit build, and previews
+  merge conflicts without altering working tree. If clean, merge and run focused merged checks,
+  commit version and publish existing branch to origin. No conflict resolution without user input.
+  SSH fetch failed; public HTTPS fetch succeeded and existing gh credentials verified usable.
+
+## R95 focused manual-test fixes
+
+- P280 (complete, ui_review): trace initial onboarding Proton selection and implement the
+  minimum correction in setup/proton UI. Visible initial valid selection must be persisted and
+  Next must work without toggling; preserve custom/unavailable selection and async/session guards.
+  Private synthetic GTK regression; no real runtime/helper/game operations.
+- P281 (complete, depot): investigate credential-service preparation and first post-reset
+  save failure in auth.rs and pinned keyring implementation. Return evidence/proposal before
+  edits if cause requires changing credential behavior. Synthetic provider/error tests only;
+  never inspect/call real wallet or read tokens. No retries that bypass consent or storage fallback.
+- P282 (complete for scoped synthetic QA, storage_audit): independent QA/security review of both changes and relevant
+  regression results. Root coordinates Cargo and private HOME/all XDG/TMP tests, reviews diff,
+  maintains records. No commits/push/PR/package unless separately authorized for this follow-up.
+- P280 cause confirmed: discovery selects first row while busy, suppressing autosave; Next
+  correctly rejects unsaved selection. Reuse guarded save notification once after discovery only
+  for global onboarding without saved choice or save error. Preserve Settings/per-game semantics.
+- P281 approved proposal: explicit login resolves standard service/default wallet readiness and
+  unlocks before the single keyring save. Pinned keyring3.6.3 swallows get_collection unlock errors
+  via fallback that can attempt create_item on a locked collection; user-specific failure remains
+  unproven. No vendor edit/new dependency, alias/collection mutation or secret read. Pin service
+  owner; private worker MainContext and sender/path-scoped prompt; bounded readiness and120s prompt
+  wait; original-session checks; distinguish missing/default, dismissal, timeout and access errors.
+  Best-effort dismiss own prompt on cancellation; no credential-save retries. Independent review
+  requires synthetic sequence/early-completion/owner-change/cancellation and redaction coverage.
+- Final evidence: focused auth12 PASS (including twelve private-provider scenarios), private GTK3
+  PASS; new actual wizard regression rerun on final binary PASS. Root fmt/diff, all-target Clippy
+  with warnings denied, and cargo build --locked PASS. No full suite or real wallet/profile action.
+  Reports /tmp/ludomere-p280-report.md, /tmp/ludomere-p281-report.md and
+  /tmp/ludomere-p282-review.md. User's actual KDE first post-reset sign-in remains unverified;
+  pinned preflight does not make the subsequent existing keyring connection atomic.
+
 ## R94 closeout
 
 - Complete within the 20:53:48–22:53:48 UTC authorized window: 22 separate product commits on

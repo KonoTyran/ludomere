@@ -2,6 +2,40 @@
 
 Last meaningful update: 2026-10-02.
 
+## R96 active — version and publication
+
+- User authorizes0.2.5 commit/push and clean upstream integration, with conflict reporting otherwise.
+  Upstream fetched over HTTPS:2b7a083 adds shutdown journal race fix beyond our d836fbe baseline.
+  Configured SSH lacked an available key; existing gh authentication works over HTTPS. P283
+  version metadata/P284 merge review delegated; root handles commits, verification and push.
+- P283 metadata checks PASS: application manifest/lock, PKGBUILD and AppStream0.2.5, pkgrel1;
+  dependency versions and historical releases unchanged. P284 upstream review and merge-tree
+  preview PASS without conflicts; upstream modifies only unchanged manager code and recovery tests.
+- R95 fixes committed separately:037e57c onboarding and e5f1e74 wallet preparation. Each exact
+  post-commit cargo build --locked PASS in a private verification checkout. Version commit,
+  actual clean merge, focused recovery verification and HTTPS push remain.
+
+## R95 implemented and verified — manual-test regressions
+
+- User reports initially displayed Proton not applied and first post-reset sign-in credential
+  storage failure; second sign-in prompts KDE wallet and succeeds. P280/P281 implemented and
+  independently reviewed by P282. Clean baseline10b282c, same improvement branch; follow-up
+  changes committed as037e57c/e5f1e74 during R96. No real user credentials/profile actions.
+- P280 narrow initial-save fix independently reviewed; three private GTK tests pass, including
+  untouched actual Next, saved-choice preservation, no detected runtimes, existing Settings and
+  failed-choice restoration. Initial fixture clicked before async selector settled; corrected to
+  wait for both real controls. Logs /tmp/ludomere-p282-{p280,p172,p166}-gtk.log.
+- P281 pinned keyring unlock-error swallowing independently confirmed; explicit standard-wallet
+  preparation implemented, not blind credential-save retries. Missing default wallet, canceled
+  prompt, timeout and provider change now have fixed diagnostics. Twelve private-provider cases
+  verify unlock/readiness, single-save success, failure preserving sign-out marker, early completion,
+  rejection and cleanup. Exact user's provider failure unknown; real KDE validation remains a
+  user follow-up. No vendor code, dependency, schema or wallet configuration changes.
+- Final focused auth12 and private GTK3 PASS; new actual wizard test rerun on final binary PASS.
+  fmt/diff, all-target Clippy -D warnings and cargo build --locked PASS. Logs
+  /tmp/ludomere-r95-{auth-tests,clippy,build}.log; owner reports p280/p281 and independent review
+  /tmp/ludomere-p282-review.md. No full-suite repeat; finite QA, no global readiness claim.
+
 ## R94 completed — timed improvement pass
 
 - Authorized window: 2026-10-02 20:53:48–22:53:48 UTC, stop on interruption. Product work and

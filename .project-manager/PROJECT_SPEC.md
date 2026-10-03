@@ -1,5 +1,23 @@
 # Project specification
 
+## R96 version 0.2.5 and upstream integration — 2026-10-02
+
+User requests bumping to0.2.5, committing and pushing current changes, and checking Kono's new
+upstream commits for a clean merge. Merge if clean; if conflicts arise, explain the differences
+and stop for user decisions rather than resolving them silently. Keep the existing new improvement
+branch and no-PR instruction. No package build/install requested.
+
+## R95 manual-test onboarding and credential failures — 2026-10-02
+
+User reports: initial Proton choice shown during onboarding is not applied; Next incorrectly
+requires choosing another version or reselecting the visible choice. After factory reset, GOG
+authentication succeeds but credential storage fails with the generic save-login message. A
+second login prompts for the KDE wallet password and then loads the library successfully.
+Correct the initial selection and evidenced credential-service readiness/save deficiencies.
+Preserve secure credential storage, existing choices, session/reset guards and explicit wallet
+consent. No real wallet/token access, real factory reset, plaintext fallback or desktop changes.
+Use focused tests and compilation; no full-suite/package/publication work requested.
+
 ## R94 bounded autonomous improvement pass — 2026-10-02
 
 User specification: "Until I interrupt you, continue looking for inefficiencies and potential

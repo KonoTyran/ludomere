@@ -172,6 +172,7 @@ pub(super) fn show_settings_page(
     let maintenance = adw::PreferencesGroup::new();
     maintenance.set_title("Storage and synchronization");
     let open_downloads = adw::ActionRow::new();
+    open_downloads.set_use_markup(false);
     open_downloads.set_title("Open a downloaded-file library");
     let open_downloads_button = gtk::Button::with_label("Open");
     open_downloads_button.set_valign(gtk::Align::Center);
@@ -503,40 +504,7 @@ pub(super) fn show_settings_page(
         let model = model.clone();
         let row = open_downloads.clone();
         open_downloads_button.connect_clicked(move |button| {
-            let config = model.borrow().config.clone();
-            let dialog = adw::AlertDialog::builder().heading("Open a library").body("Choose a configured Offline Installers or Goodies & Extras directory. Incompatible libraries cannot be opened here.").build();
-            dialog.add_response("cancel", "Cancel");
-            let libraries = [crate::config::LibraryKind::OfflineInstallers, crate::config::LibraryKind::Extras].into_iter()
-                .flat_map(|kind| config.libraries(kind).iter().cloned().map(move |library| (kind, library))).collect::<Vec<_>>();
-            if libraries.is_empty() {
-                dialog.set_body("No Offline Installers or Goodies & Extras directory is configured. Add a directory in Settings → Storage first.");
-            }
-            for (index, (kind, library)) in libraries.iter().enumerate() {
-                dialog.add_response(&index.to_string(), &format!("{} — {}", kind.label(), library.path.display()));
-            }
-            let window = window.clone(); let epoch = model.borrow().account_epoch; let model = model.clone();
-            let row = row.clone(); let button = button.clone();
-            dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
-                if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
-                let Some((kind, library)) = response.parse::<usize>().ok().and_then(|index| libraries.get(index)).cloned() else { return; };
-                row.set_subtitle("Checking library access…");
-                button.set_sensitive(false);
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || { let _ = sender.send(crate::storage::read_config().and_then(|current| {
-                    let found = crate::storage::validate_library(&current, kind, &library.id)?;
-                    anyhow::ensure!(found.path == library.path, "Library changed; choose it again."); Ok(found)
-                })); });
-                let window = window.clone();
-                glib::timeout_add_local(Duration::from_millis(50), move || {
-                    if !window.is_visible() || model.borrow().account_epoch != epoch || model.borrow().logout_pending { button.set_sensitive(true); return glib::ControlFlow::Break; }
-                    match receiver.try_recv() {
-                        Ok(Ok(library)) => { row.set_subtitle("Opening library in your file manager…"); super::widgets::file_open::open_directory(&library.path, &window, "library directory"); },
-                        Ok(Err(error)) => { row.set_subtitle(&format!("Could not open library: {error:#}")); },
-                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                        Err(_) => row.set_subtitle("Library inspection stopped unexpectedly. Try again."),
-                    } button.set_sensitive(true); glib::ControlFlow::Break
-                });
-            });
+            open_download_library(&window, &model, &row, button);
         });
     }
     {
@@ -834,6 +802,144 @@ fn save_preferences(config: &Config, status: &gtk::Label) {
             status.set_visible(true);
         }
     }
+}
+
+fn open_download_library(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    row: &adw::ActionRow,
+    button: &gtk::Button,
+) {
+    if !window.is_visible() || !row.is_mapped() || model.borrow().logout_pending {
+        return;
+    }
+    let config = model.borrow().config.clone();
+    let mut libraries = [
+        crate::config::LibraryKind::OfflineInstallers,
+        crate::config::LibraryKind::Extras,
+    ]
+    .into_iter()
+    .flat_map(|kind| {
+        config
+            .libraries(kind)
+            .iter()
+            .cloned()
+            .map(move |library| (kind, library))
+    })
+    .collect::<Vec<_>>();
+    if libraries.is_empty() {
+        row.set_subtitle("No Offline Installers or Goodies & Extras directory is configured. Add a directory in Settings → Storage first.");
+        return;
+    }
+    let epoch = model.borrow().account_epoch;
+    let session = online::account_session();
+    let open = {
+        let window = window.clone();
+        let model = model.clone();
+        let row = row.clone();
+        let button = button.clone();
+        move |kind, library: crate::config::GameLibrary| {
+            if !window.is_visible()
+                || !row.is_mapped()
+                || model.borrow().account_epoch != epoch
+                || model.borrow().logout_pending
+                || online::account_session() != session
+            {
+                return;
+            }
+            row.set_subtitle("Checking library access…");
+            button.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<_> {
+                    let _activity = crate::profile_reset::begin_activity("library inspection")?;
+                    anyhow::ensure!(
+                        online::account_session() == session,
+                        "Account changed; open the library again."
+                    );
+                    let current = crate::storage::read_config()?;
+                    let found = crate::storage::validate_library(&current, kind, &library.id)?;
+                    anyhow::ensure!(
+                        found.path == library.path,
+                        "Library changed; choose it again."
+                    );
+                    Ok(found)
+                })();
+                let _ = sender.send(result);
+            });
+            let window = window.clone();
+            let model = model.clone();
+            let row = row.clone();
+            let button = button.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                if !window.is_visible()
+                    || !row.is_mapped()
+                    || model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                    || online::account_session() != session
+                {
+                    row.set_subtitle(
+                        "Opening canceled because the window or account changed. Try again.",
+                    );
+                    button.set_sensitive(true);
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(Ok(library)) => {
+                        row.set_subtitle("Opening library in your file manager…");
+                        let model = Rc::downgrade(&model);
+                        let row = row.downgrade();
+                        super::widgets::file_open::launch_validated_directory(
+                            &library.path,
+                            &window,
+                            "library directory",
+                            move || {
+                                online::account_session() == session
+                                    && row.upgrade().is_some_and(|row| row.is_mapped())
+                                    && model.upgrade().is_some_and(|model| {
+                                        let model = model.borrow();
+                                        model.account_epoch == epoch && !model.logout_pending
+                                    })
+                            },
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        row.set_subtitle(&format!("Could not open library: {error:#}"))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => {
+                        row.set_subtitle("Library inspection stopped unexpectedly. Try again.")
+                    }
+                }
+                button.set_sensitive(true);
+                glib::ControlFlow::Break
+            });
+        }
+    };
+    if libraries.len() == 1 {
+        let (kind, library) = libraries.remove(0);
+        open(kind, library);
+        return;
+    }
+    let dialog = adw::AlertDialog::builder().heading("Open a library").body("Choose a configured Offline Installers or Goodies & Extras directory. Incompatible libraries cannot be opened here.").build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.set_close_response("cancel");
+    for (index, (kind, library)) in libraries.iter().enumerate() {
+        dialog.add_response(
+            &index.to_string(),
+            &format!("{} — {}", kind.label(), library.path.display()),
+        );
+    }
+    dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
+        if let Some((kind, library)) = response
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| libraries.get(index))
+            .cloned()
+        {
+            open(kind, library);
+        }
+    });
 }
 
 fn find_settings_stack(widget: &gtk::Widget) -> Option<gtk::Stack> {
@@ -1142,6 +1248,156 @@ fn clear_replaceable_images_at(cache_root: &std::path::Path) -> std::io::Result<
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, D-Bus and display; never activates a file manager"]
+    fn downloaded_library_open_skips_redundant_choices_and_stops_stale_requests() {
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        assert!(home.starts_with("/tmp") && home.to_string_lossy().contains("ludomere-p286-"));
+        super::super::widgets::file_open::DIRECTORY_LAUNCHES
+            .with(|paths| *paths.borrow_mut() = Some(Vec::new()));
+        adw::init().unwrap();
+        let application = adw::Application::builder()
+            .application_id("io.github.legendarylinux.ludomere.LibraryOpenTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&application);
+        let group = adw::PreferencesGroup::new();
+        let row = adw::ActionRow::builder()
+            .title("Open library")
+            .use_markup(false)
+            .build();
+        let button = gtk::Button::with_label("Open");
+        row.add_suffix(&button);
+        group.add(&row);
+        window.set_content(Some(&group));
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        model.borrow_mut().config.offline_libraries.clear();
+        model.borrow_mut().config.extras_libraries.clear();
+        button.connect_clicked({
+            let window = window.clone();
+            let model = model.clone();
+            let row = row.clone();
+            move |button| open_download_library(&window, &model, &row, button)
+        });
+        let wait_until = |condition: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "settings response timed out"
+                );
+                while glib::MainContext::default().pending() {
+                    glib::MainContext::default().iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_until(&|| row.is_mapped());
+        button.emit_clicked();
+        assert!(row.subtitle().unwrap().contains("Settings → Storage"));
+        assert!(window.visible_dialog().is_none());
+
+        // An ordinary file cannot be used as a library. Exercising the real worker
+        // therefore proves direct dispatch without ever launching a desktop app.
+        let invalid = home.join("not-a-directory");
+        std::fs::write(&invalid, b"synthetic").unwrap();
+        let library = crate::config::GameLibrary {
+            id: "single".into(),
+            name: "Single".into(),
+            path: invalid.clone(),
+            default: true,
+        };
+        model.borrow_mut().config.offline_libraries = vec![library.clone()];
+        model.borrow().config.save().unwrap();
+        button.emit_clicked();
+        assert!(window.visible_dialog().is_none());
+        assert!(!button.is_sensitive());
+        assert_eq!(row.subtitle().as_deref(), Some("Checking library access…"));
+        wait_until(&|| button.is_sensitive());
+        assert!(row.subtitle().unwrap().contains("Could not open library"));
+        assert!(window.visible_dialog().is_none());
+
+        std::fs::remove_file(&invalid).unwrap();
+        std::fs::create_dir(&invalid).unwrap();
+        button.emit_clicked();
+        wait_until(&|| button.is_sensitive());
+        assert!(window.visible_dialog().is_none());
+        super::super::widgets::file_open::DIRECTORY_LAUNCHES
+            .with(|paths| assert_eq!(paths.borrow().as_ref().unwrap(), &[invalid]));
+
+        model.borrow_mut().config.extras_libraries = vec![crate::config::GameLibrary {
+            id: "second".into(),
+            path: home.join("other"),
+            ..library
+        }];
+        let extra = home.join("other");
+        std::fs::create_dir(&extra).unwrap();
+        model.borrow().config.save().unwrap();
+        button.emit_clicked();
+        let dialog = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert_eq!(dialog.heading().as_deref(), Some("Open a library"));
+        assert!(button.is_sensitive());
+        dialog.close();
+        wait_until(&|| window.visible_dialog().is_none());
+
+        fn click(widget: &gtk::Widget, label: &str) -> bool {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>()
+                && button.label().as_deref() == Some(label)
+            {
+                button.emit_clicked();
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if click(&widget, label) {
+                    return true;
+                }
+                child = widget.next_sibling();
+            }
+            false
+        }
+        button.emit_clicked();
+        let dialog = window.visible_dialog().unwrap();
+        assert!(click(
+            dialog.upcast_ref(),
+            &format!(
+                "{} — {}",
+                crate::config::LibraryKind::Extras.label(),
+                extra.display()
+            )
+        ));
+        wait_until(&|| {
+            let status = row.subtitle().unwrap_or_default();
+            assert!(
+                !status.contains("Could not open") && !status.contains("canceled"),
+                "{status}"
+            );
+            super::super::widgets::file_open::DIRECTORY_LAUNCHES
+                .with(|paths| paths.borrow().as_ref().unwrap().len() == 2)
+        });
+        super::super::widgets::file_open::DIRECTORY_LAUNCHES
+            .with(|paths| assert_eq!(paths.borrow().as_ref().unwrap().last(), Some(&extra)));
+
+        model.borrow_mut().config.extras_libraries.clear();
+        button.emit_clicked();
+        model.borrow_mut().account_epoch += 1;
+        wait_until(&|| button.is_sensitive());
+        assert!(row.subtitle().unwrap().contains("canceled"));
+        assert!(window.visible_dialog().is_none());
+        button.emit_clicked();
+        group.set_visible(false);
+        wait_until(&|| button.is_sensitive());
+        assert!(row.subtitle().unwrap().contains("canceled"));
+        super::super::widgets::file_open::DIRECTORY_LAUNCHES
+            .with(|paths| assert_eq!(paths.borrow_mut().take().unwrap().len(), 2));
+        window.close();
+    }
 
     #[test]
     fn image_cache_clear_preserves_unrelated_cached_state() {

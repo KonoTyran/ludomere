@@ -2,6 +2,44 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DIRECTORY_LAUNCHES: std::cell::RefCell<Option<Vec<std::path::PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Activate a directory already validated by the caller's worker, without another async hop.
+pub(crate) fn launch_validated_directory(
+    path: &Path,
+    parent: &impl IsA<gtk::Window>,
+    description: &'static str,
+    is_current: impl Fn() -> bool + 'static,
+) {
+    if !parent.as_ref().is_visible() || !is_current() {
+        return;
+    }
+    #[cfg(test)]
+    if DIRECTORY_LAUNCHES.with_borrow_mut(|capture| {
+        if let Some(paths) = capture {
+            paths.push(path.to_path_buf());
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+    let weak = parent.as_ref().downgrade();
+    launcher.launch(Some(parent), gio::Cancellable::NONE, move |result| {
+        if let Some(parent) = weak.upgrade()
+            && parent.is_visible()
+            && is_current()
+        {
+            report_launch_result(&parent, description, result);
+        }
+    });
+}
+
 pub(crate) fn report_launch_result(
     parent: &impl IsA<gtk::Window>,
     description: &str,

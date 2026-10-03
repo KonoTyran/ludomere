@@ -317,7 +317,7 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
         let recover = recover.clone();
         move |reload| load(product_id, &editor, &controls, reload, &recover)
     });
-    proton::connect_preferences_recovery(
+    group.add(&proton::connect_preferences_recovery(
         &recover,
         &editor.status,
         Rc::new({
@@ -327,7 +327,7 @@ pub(super) fn group(product_id: i64) -> adw::PreferencesGroup {
             let recover = recover.clone();
             move || load(product_id, &editor, &controls, &reload, &recover)
         }),
-    );
+    ));
     load(product_id, &editor, &controls, &reload, &recover);
     group
 }
@@ -445,12 +445,18 @@ mod tests {
                 .unwrap()
         };
         let respond = |response: &str| {
-            window
+            let dialog = window
                 .visible_dialog()
                 .unwrap()
                 .downcast::<adw::AlertDialog>()
+                .unwrap();
+            let label = dialog.response_label(response);
+            widgets(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(label.as_str()))
                 .unwrap()
-                .emit_by_name::<()>("response", &[&response])
+                .emit_clicked();
         };
         button("Reset DLL Overrides…").emit_clicked();
         respond("cancel");
@@ -537,13 +543,19 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(std::fs::read(&backup).unwrap(), malformed);
-        let done = window
-            .visible_dialog()
-            .unwrap()
-            .downcast::<adw::AlertDialog>()
+        assert!(window.visible_dialog().is_none());
+        let notice = widgets(group.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+            .find(|label| label.label().contains(backup.to_str().unwrap()))
             .unwrap();
-        assert!(done.body().contains(backup.to_str().unwrap()));
-        respond("close");
+        assert!(notice.is_selectable() && notice.is_visible());
+        assert!(notice.label().contains("Choose your default Proton again"));
+        let saved_notice = notice.label();
+        button("Retry Loading").emit_clicked();
+        pump();
+        assert_eq!(notice.label(), saved_notice);
+        assert!(window.visible_dialog().is_none());
         other_window.close();
         window.close();
     }

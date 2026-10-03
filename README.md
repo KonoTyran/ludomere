@@ -96,7 +96,8 @@ A resolved dependency is not a guarantee that its installer or the game will wor
 Failures keep the operation retryable and do not mark the game successfully installed.
 If interrupted setup cannot be proven stopped, Resume and recovery refuse to change its files.
 An interrupted launch with no saved process identity requires a reboot, not just restarting Ludomere.
-For an unreadable operation journal, Uninstall → Review File Reset → Prepare Recovery can record a
+For an unreadable operation journal, Uninstall → Prepare Recovery (choose the folder first if more
+than one copy exists) can record a
 safe recovery checkpoint. Restart the computer, then explicitly prepare recovery again: unchanged
 damaged operation data is retained as a recovery copy before a separate file-reset confirmation.
 It is never discarded automatically to bypass the process-safety check.
@@ -233,9 +234,11 @@ and Ludomere preferences are kept. Full profile reset continues to preserve inst
 prefixes. Downloaded installers and extras remain unless the unchecked cleanup option
 is selected. Recovery can be cancelled, and unsafe paths or partial failures remain visible with a
 fresh review/retry action. Browse Local Files remains available even when a game is incomplete or its
-marker is damaged, and the uninstall dialog lets you inspect files before removal. If normal removal
-cannot identify a healthy installation, Review File Reset offers the exact known-game folder with
-an explicit all-contents warning. This fallback preserves Windows prefixes; only the listed game
+marker is damaged, and opens a single folder directly. Multiple copies offer a folder choice;
+browsing from an exact-folder uninstall review opens that selected copy. If normal removal
+cannot identify a healthy installation and only one safe game folder is available, the same dialog
+prepares file-only removal with an explicit all-contents warning and one final confirmation.
+Multiple copies retain a folder choice. This fallback preserves Windows prefixes; only the listed game
 folder is reset. After successful recovery, Install Again opens the normal installation choices;
 it never silently starts a new download.
 

@@ -1281,9 +1281,14 @@ fn start_existing_depot_operation_dialog(
             let window = window.clone();
             let model = model.clone();
             let detail = detail.clone();
-            move |_| {
+            let directory = directory.clone();
+            move |button| {
                 if model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
-                    browse_game_files(&window, &model, &detail);
+                    if let Some(directory) = &directory {
+                        browse_recovery_directory(&window, &model, directory.clone(), button);
+                    } else {
+                        browse_game_files(&window, &model, &detail, None, button);
+                    }
                 }
             }
         });

@@ -1,5 +1,451 @@
 # Project plan
 
+## R108 release verification and publication
+
+- P314 (complete, archive_refresh): bump project release metadata to 0.3.1; no dependency churn.
+- P315 (complete, storage_audit): independently verify release metadata, existing build/test
+  isolation and completeness of accumulated change summary. No source edits or publication.
+- Root runs isolated full build checks, reviews/stages existing changes, commits and pushes the
+  current PR branch, then posts the explicitly requested concise PR comment. No package work.
+- Full isolated tools/check.sh and cargo build --locked PASS. Root published release commit
+  1c30bdb and posted PR7 comment5966389307; only this records closeout follows.
+
+## R107 archive state from unified downloads
+
+- P311 (complete, archive_refresh; initial diagnosis ui_review): fix archive row refresh from detail downloads;
+  remove Manage deletion item. Own UI files and necessary focused GTK fixtures; preserve prior work.
+- P312 (complete, depot): independent backend identity/registration diagnosis; ordinary flow is
+  correctly registered. No backend correction needed; /tmp/ludomere-p312-report.md.
+- P313 (complete for scoped verification, storage_audit): independent correctness/security review and focused isolated QA.
+- Root coordinates compilation and records. No real accounts/files/games/helpers, full suite,
+  schema/package/publication, or unrelated cleanup. Report causes and minimal proposed changes.
+- Three focused GTK tests pass: external completion/deletion, action proxy layout, unified exact
+  queue/source selection. Final fmt/Clippy -D warnings/diff/build pass; real transfer not exercised.
+
+## R106 detail action state and offline automatic installation
+
+- P308 (complete, ui_review): details/sections/mod/chooser reactive primary/menu/click behavior
+  and local offline-install entry; user confirmed retaining Download with the offline-install menu.
+- P309 (complete, depot): trace exact offline auto-install handoff and file/operation refresh;
+  minimal necessary backend/event fixes and focused tests, coordinate UI ownership.
+- P310 (complete for scoped verification, storage_audit): independent source/lifecycle review and proportionate synthetic
+  UI/backend QA; no implementation edits. No real accounts/games/helpers/profile data.
+- Root coordinates compilation/records; no full suite, schema/package/publication/unrelated work.
+- Eleven focused checks pass: automatic-install4, event delivery1, state policy3, archive deletion1,
+  live detail actions1 and unified local-only chooser1. Formatting, all-target Clippy with warnings
+  denied, diff check and cargo build pass. Real authenticated installer/game flow not exercised.
+
+## R105 launch executable and archive action transitions
+
+- P305 (complete, ui_review): executable chooser/persistence/retry fix; own chooser/details and
+  necessary executable backend code. Auto-select one valid candidate, retain ambiguous choices.
+- P306 (complete, depot): files.rs archive deletion/direct Download/menu transitions and safe
+  Notifications/busy/error feedback; preserve existing R101 row changes and installed payloads.
+- P307 (complete for scoped verification, storage_audit): independent diagnosis, review and focused synthetic QA for
+  both paths. No implementation edits. Private profiles/files, no real games/helpers/cloud/account.
+- Root manages records/builds; no full suite, publication, package or unrelated refactoring.
+- Final eight focused checks pass, including actual chooser/row interactions and four executable
+  discovery tests. Review, formatting, Clippy -D warnings, diff check and final build pass.
+
+## R104 cloud consent timing
+
+- P303 (complete, ui_review): diagnose and correct premature offline-install cloud controls in
+  details.rs, reusing launch-time behavior. Preserve completion refresh and R101–R103 changes.
+- P304 (complete for scoped verification, storage_audit): independent source/lifecycle review and focused synthetic
+  verification. No product edits, real profiles, account/cloud requests, games or helpers.
+- Root coordinates compilation and records. No full suite, package, commit or publication.
+- Three focused checks pass: existing GTK idle restoration and two launcher cloud policy tests.
+  Independent review, formatting, Clippy with warnings denied and final build pass.
+
+## R103 transfer length and completion evidence
+
+- P301 (complete, depot): inspect/propose minimal download transfer/completion correction and
+  duplicate-error fix, own download/{completion,transfer,worker,protocol}.rs as necessary. Preserve
+  original payloads/receipts, account bindings and integrity; test genuine transport truncation/range
+  failures separately from nonauthoritative catalog sizes. No speculative tolerance percentage.
+- P302 (complete for scoped verification, storage_audit): independent security/recovery diagnosis and regression review;
+  no product edits. Private profiles and inert synthetic HTTP fixtures only; root coordinates Cargo.
+  No user profile/files/credentials/helpers, real downloads, schema/package/publication/full suite.
+- Implementation removes catalog-size equality from observed completion receipts, validates HTTP
+  transfer boundaries, and deduplicates error context. Focused tests passed31 cases, including
+  persistent manager and restart integrations. Final test-fixture lint correction is compiled;
+  affected20-test download-filter rerun, final product build, formatting and Clippy pass.
+
+## R102 downloaded file registration
+
+- P299 (complete, depot): trace/reproduce shared transfer receipt and database registration
+  failure; propose minimal fix then own download/completion/transfer code and necessary state
+  integration/tests. Preserve files, strict receipts and R101 edits; no unsupported schema variants.
+- P300 (complete for scoped verification, storage_audit): independent cause/security/recovery review and focused
+  regression verification; no product edits. Private HOME/all XDG/TMP only, synthetic inert data.
+- Root coordinates compilation/records; no full suite, user profile access, real downloads/helpers,
+  package or publication. Ask for safe diagnostics only if source/fixtures cannot establish cause.
+- Legacy rounded-size regression failed before fix and passed after;9 focused completion/transfer/
+  classifier tests PASS. Independent source/security review PASS; fmt/Clippy/final build PASS.
+
+## R101 offline acquisition and unified installation
+
+- P296 (complete, ui_review): own download_chooser.rs and necessary UI wiring; fix direct
+  library/download flow and unified source choices with in-place feedback. Coordinate backend
+  contract with P297; minimal affected controls regressions. README delegated to P297.
+- P297 (complete, depot): trace acquisition/auto-install grouping and readiness; propose then
+  correct necessary backend deficiencies, owning src/download/ and installation planning only.
+  Preserve multipart completion, typed storage, install consent and account/session safety.
+- P298 (complete for scoped verification, storage_audit): independent flow/security review, affected-control inventory
+  and private synthetic QA; no product edits. Root coordinates Cargo and records. No real profile,
+  credentials, downloads, helpers, games, desktop actions, publication or full suite. Report gaps.
+- Verified2 actual GTK controls tests and4 automatic-install tests in private profiles; final
+  fmt, all-target Clippy with warnings denied, cargo build --locked and diff checks PASS. No real
+  authenticated transfer/installer execution performed; source-only lifecycle branches documented.
+
+## R100 publication and version0.3.0
+
+- P292 (complete, ui_review): bump Cargo manifest/app lock entry, PKGBUILD and AppStream to0.3.0,
+  preserve historical release/dependencies/schema. Scoped metadata checks; root builds.
+- P293 (complete, depot): read-only upstream delta and complete PR summary inventory R94–R99,
+  draft concise markdown to/tmp against actual upstream diff, no public messages or product edits.
+- P294 (complete for scoped release assurance, storage_audit): independent final review of release metadata/diff and safe
+  full-build harness. Root fetches/merges/commits/pushes and opens requested PR after checks.
+  No real profile/account/game/helper/file-manager action; private test roots and loopback only.
+- P295 (complete, depot; independent review storage_audit): correct evidenced upstream restart
+  test-server race exposed by full build. Own tests/restart_recovery.rs only; tolerate expected
+  interrupted-client disconnect at final first-response write, retain strict resumed range/content
+  assertions and production behavior. Private focused repetitions, then full release checks.
+- Full final tools/check.sh and cargo build --locked PASS;541 library/six integration/five Python
+  tests passed. Restart fixture10/10 isolated repetitions. Version0.3.0 published in upstream PR7;
+  mergeable without conflicts, GitHub Arch CI initially in progress. No local package build.
+
+## R99 language_setup prerequisite compatibility
+
+- P290 (complete, depot): trace dependency resolution and official public language_setup
+  metadata; propose minimal parser/resolver correction before edits. Own gog/dependencies.rs and
+  needed depot_manifest.rs tests after scoped proposal; no bypass or upstream executable execution.
+- P291 (complete for scoped verification, storage_audit): independent format/security/validation review and focused
+  regression assessment. Root coordinates build/test/records, preserves UI working tree; public
+  metadata only, no credentials/account/game payload or helper execution, full suite or publication.
+- Verified official language_setup GameFiles manifest39757bac2293fab156a465e52c23b552 contains
+  /language_setup.exe, rejected by generic absolute-path protection. Approved dependencies-only
+  single-leading-slash adaptation after frozen hash/inflate; retain strict parser/validators and
+  original frozen bytes. Metadata-only fixture plus unsafe/collision/hash/error-detail regressions.
+- Delivered deps.rs-only adapter and metadata fixture; nested safe preparation cause retained.
+  Dependencies10 + genericmanifest12 focused tests PASS in private profile, including normalized
+  inert cache publication; independent review PASS. fmt/Clippy/build/diff PASS. No actual LEGO
+  installation or helper execution; final test-only clone-to-from_ref correction Clippy-verified.
+
+## R98 single removal confirmation
+
+- P288 (complete, ui_review): inspect and minimally simplify uninstall.rs fallback preparation,
+  preserving normal removal, exact-copy safety and confirmation. Own relevant retained GTK tests
+  and README wording. Propose fallback/multiple-copy behavior before edits; no backend policy change.
+- P289 (complete for scoped verification, storage_audit): independent source/consent/path review and private focused GTK
+  test on root-built immutable binary. Root owns Cargo/records; synthetic profile only, no actual
+  desktop/helpers/account/game operations, full suite, commit/push or package.
+- Approved: when normal preparation fails and one safe candidate exists, prepare exact-folder
+  reset read-only in the same worker and show final consent immediately. Keep multiple-copy choice
+  and healthy normal method; corrupt journal recovery remains explicit. Neutral all-contents warning;
+  worker profile activity/session guard protects new fallback reads during reset.
+- Final private recovery GTK test PASS, including automatic singleton preview, explicit multiple
+  fallback selection, cancel/no deletion, direct Browse and actual synthetic removal. Independent
+  source/consent review PASS. fmt, all-target Clippy -D warnings and cargo build --locked PASS.
+
+## R97 direct actions without redundant dialogs
+
+- P285 (complete, ui_review): shared recovery Browse flow in files.rs and minimal callers.
+  One resolved path opens directly; preserve multi-copy choice, safe parent browsing, validation,
+  async/account/window cancellation and failure feedback. Audit uninstall exact-library selection.
+  Return bounded proposal then implementation/private controls tests; no actual file-manager launch.
+- P286 (complete, depot): approved Settings archive-library opener: zero paths gives inline
+  guidance, one opens directly after validation, multiple retain chooser. Proton reset keeps initial
+  consent but replaces completion popup with persistent selectable backup-path/next-step feedback.
+  Own settings.rs/proton.rs and minimal DLL editor caller; coordinate P285 shared launch helper.
+- P285 approved immediate validated-directory launch helper in widgets/file_open.rs with request
+  lifetime predicate and test-only capture; recovery retains dedicated damaged-path validation.
+- P287 (complete for scoped synthetic QA, storage_audit): independent interaction and security review, scoped synthetic
+  regressions and source audit of preserved safeguards. Root coordinates Cargo/private HOME/all
+  XDG/TMP bus/display, maintains records; no full suite, commit/push/PR or real account/file actions.
+- Final three targeted GTK tests PASS: exact-copy/single/multiple/safe-parent Browse and cancellation;
+  Settings empty/invalid/single/multiple/stale/unmapped; reset consent/backups/persistent inline notice.
+  fmt, all-target Clippy with denied warnings, cargo build --locked and diff checks PASS. Reports
+  /tmp/ludomere-p285-report.md, /tmp/ludomere-p286-report.md, /tmp/ludomere-p287-review.md.
+  Launch requests captured, actual compositor/file-manager activation remains unexercised.
+
+## R96 publication and clean upstream merge
+
+- P283 (complete, ui_review): bump only application0.2.5 Cargo manifest/lock, PKGBUILD and
+  AppStream metadata; retain historical releases and pkgrel1. No dependency/schema changes.
+  Verify locked metadata, XML/version consistency and focused format checks; root builds.
+- P284 (complete, depot): read-only review newly fetched upstream2b7a083 shutdown journal
+  race fix and overlap with our changes. Recommend relevant merge verification; no edits.
+- Root commits reviewed R95 fixes separately, preserves each post-commit build, and previews
+  merge conflicts without altering working tree. If clean, merge and run focused merged checks,
+  commit version and publish existing branch to origin. No conflict resolution without user input.
+  SSH fetch failed; public HTTPS fetch succeeded and existing gh credentials verified usable.
+- Completed commits037e57c/e5f1e74/ae55b45 and clean merge5d9d9a5; each exact post-commit build
+  passed. Merged manager32 and recovery4 tests, fmt and all-target Clippy PASS. Branch published
+  to origin over HTTPS without permanent remote changes; no PR. Final records-only closeout is
+  built and pushed separately; no package, full-suite repeat or user-profile operation.
+
+## R95 focused manual-test fixes
+
+- P280 (complete, ui_review): trace initial onboarding Proton selection and implement the
+  minimum correction in setup/proton UI. Visible initial valid selection must be persisted and
+  Next must work without toggling; preserve custom/unavailable selection and async/session guards.
+  Private synthetic GTK regression; no real runtime/helper/game operations.
+- P281 (complete, depot): investigate credential-service preparation and first post-reset
+  save failure in auth.rs and pinned keyring implementation. Return evidence/proposal before
+  edits if cause requires changing credential behavior. Synthetic provider/error tests only;
+  never inspect/call real wallet or read tokens. No retries that bypass consent or storage fallback.
+- P282 (complete for scoped synthetic QA, storage_audit): independent QA/security review of both changes and relevant
+  regression results. Root coordinates Cargo and private HOME/all XDG/TMP tests, reviews diff,
+  maintains records. No commits/push/PR/package unless separately authorized for this follow-up.
+- P280 cause confirmed: discovery selects first row while busy, suppressing autosave; Next
+  correctly rejects unsaved selection. Reuse guarded save notification once after discovery only
+  for global onboarding without saved choice or save error. Preserve Settings/per-game semantics.
+- P281 approved proposal: explicit login resolves standard service/default wallet readiness and
+  unlocks before the single keyring save. Pinned keyring3.6.3 swallows get_collection unlock errors
+  via fallback that can attempt create_item on a locked collection; user-specific failure remains
+  unproven. No vendor edit/new dependency, alias/collection mutation or secret read. Pin service
+  owner; private worker MainContext and sender/path-scoped prompt; bounded readiness and120s prompt
+  wait; original-session checks; distinguish missing/default, dismissal, timeout and access errors.
+  Best-effort dismiss own prompt on cancellation; no credential-save retries. Independent review
+  requires synthetic sequence/early-completion/owner-change/cancellation and redaction coverage.
+- Final evidence: focused auth12 PASS (including twelve private-provider scenarios), private GTK3
+  PASS; new actual wizard regression rerun on final binary PASS. Root fmt/diff, all-target Clippy
+  with warnings denied, and cargo build --locked PASS. No full suite or real wallet/profile action.
+  Reports /tmp/ludomere-p280-report.md, /tmp/ludomere-p281-report.md and
+  /tmp/ludomere-p282-review.md. User's actual KDE first post-reset sign-in remains unverified;
+  pinned preflight does not make the subsequent existing keyring connection atomic.
+
+## R94 closeout
+
+- Complete within the 20:53:48–22:53:48 UTC authorized window: 22 separate product commits on
+  improvement/ux-performance-audit-2026-10-02, every exact post-commit build passed. Full build
+  process passed at8d02889; final CSS-only a456d48 passed fmt, all-target Clippy, independent review,
+  rebuilt isolated startup and its post-commit build. Root commits final records and builds once
+  more, then stops. No PR/push/package. Ledger records deferred P273, finite QA limits and the
+  disclosed P263 test-isolation incident; no exhaustive readiness claim.
+
+## P279 R94 final startup warning cleanup
+
+- The optional startup smoke test passed but emitted an unsupported GTK CSS overflow-property
+  warning. Approve a one-declaration exception to the feature freeze: ui_review removes only
+  ignored overflow:hidden from .active-transfer-header in ui/mod.rs. No widget clipping/layout
+  behavior added. Independent source review, fmt/Clippy/build and rebuilt existing startup smoke
+  test verify the warning disappears. No full-suite repeat for this CSS-only correction; prior full
+  suite remains recorded at8d02889. Separate commit/build, no other cleanup, hard stop22:53:48.
+
+## P278 R94 final build and bounded assurance
+
+- Root runs tools/check.sh once as final build process, with private HOME/all XDG/TMP, offline
+  Cargo, no desktop/helper overrides and a20-minute process deadline. Source21 commits frozen.
+  Depot reviews cumulative backend performance/correctness claims; storage_audit reviews changed
+  session/reset/path boundaries; ui_review reconciles changed controls and user-facing inventory.
+  Read-only reports only unless a concrete release-blocking regression requires a scoped repair.
+  No new feature work after22:25 UTC; hard stop22:53:48. No real account/game/keyring/cloud/helper
+  actions and no PR/push/package. Root records limits, deferred P273, isolation incident and results.
+- Final full process PASS:539 library tests,6 integration tests,5 Python helper tests;35 tests
+  ignored by normal suite, with changed GTK cases already exercised separately. Read-only final
+  reviewers report no introduced blocker. Optional existing empty-profile startup smoke test may
+  run only after a read-only safety check confirms private HOME/display/bus cannot reach real
+  credentials, games/helpers or mutate user state; otherwise record as unexercised. No new code.
+- Safety review found the existing test replaces XDG_RUNTIME_DIR and startup probes Secret
+  Service/public versions. Approved storage_audit's temporary harness: private bus with no service
+  activation, private HOME/XDG/TMP, dead-loopback proxy, Broadway started after runtime replacement
+  via a private utility wrapper, unchanged integration binary/fixture,90-second deadline and
+  owned-process cleanup. No signed-out marker shortcut or product/test edits; report actual outcome.
+
+## P277 R94 source migration lifecycle follow-up
+
+- Independent cumulative review found strong Close/Continue callback cycles in P252 MigrationView
+  and missing initial-preflight profile activity. ui_review owns game_settings.rs narrow fix:
+  weak captures, original-session/activity checks before inspection, preserve explicit migration
+  consent and existing progress/close behavior. Retained private GTK weak-release and stale/reset
+  tests; no real migration/helper. Independent review and separate commit/build required.
+
+## P276 R94 authoritative checksum filename safety
+
+- storage_audit found pre-existing parse_gog_checksum accepts raw XML filenames which verification
+  may join to a destination before deleting a corrupt/missing download. Approve narrow verify.rs
+  validation proposal, then reject unsafe XML and fallback filenames before exposing GogChecksum;
+  never normalize an authoritative traversal into another filename. Synthetic parser/path tests,
+  no file deletion/network. Preserve valid names, checksum/size semantics. Independent review and
+  separate commit/build. Source frozen P272 first; no destructive diagnostic test needed.
+- Approved strict basename validation after XML/fallback selection: reject empty/whitespace-only,
+  dot/dotdot, separators, controls and non-single-normal components; retain accepted original name.
+  Invalid explicit XML must not fall back to a safe name. Pure valid Unicode/space/multipart and
+  traversal/absolute/control rejection tables; existing protocol fallback normalization unchanged.
+- Root review also confirms malformed MD5 currently counts as a corrupt payload and can trigger
+  repair deletion. Same bounded parser set must reject non-32-hex MD5 before exposing authoritative
+  checksum metadata; accept upper/lowercase valid hashes, preserve original value. No hashing or
+  deletion test required; parser fixtures use valid hashes when testing names.
+
+## P275 R94 installation status-log efficiency audit
+
+- Root found UmuLogStatusMonitor rereads its entire growing log every100ms in executor.rs, then
+  processes only new bytes. Depot read-only audit next: propose bounded incremental reading while
+  preserving complete-line/status behavior, truncation/replacement and prompt worker shutdown.
+  Synthetic files only, no helper/process/game launch. No edits until proposal reviewed; avoid
+  generic log framework or unrelated logging changes. Independent tests/review if approved.
+- Approved executor.rs-only incremental reader: inode/device+offset,64 KiB reads, stop checks
+  between chunks,100ms idle wait,16 KiB pending-line bound with oversized status lines skipped
+  until newline (raw saved logs untouched). Reset pending/dedup on truncation/replacement; decode
+  completed lines to preserve split UTF-8. Private append/unchanged/truncate/replace/oversize and
+  synthetic monitor shutdown tests. No real helper launch; no generic log infrastructure.
+
+## P274 R94 achievement loading lifecycle and truthful failures
+
+- ui_review confirmed the only achievement worker opens cache without profile activity/session
+  precheck, discards cache failures and claims cached achievements exist even when absent/offline.
+  Own ui/achievements.rs: original-session check and activity around worker, session-aware UI
+  results, sanitized diagnostics retaining useful cache failure when refresh fails, truthful empty
+  offline feedback. Preserve cache-first rendering, refresh and Comet policy; no network/backend
+  protocol change. Private synthetic offline cache/error/reset tests and independent review; never
+  real account, keyring, achievements or profile operations. Separate commit/post-commit build.
+
+## P272 R94 downloaded-file verification feedback
+
+- storage_audit identified start_product_verification presenting a completion modal from a
+  background callback, losing full details from the persistent status and mislabeling unavailable
+  checksums as no downloads. Own files.rs verification path only: retain sanitized completion/error
+  detail inline, remove unsolicited terminal modal, distinguish empty input from unavailable checks.
+  Preserve consent, repair/deletion decisions, cancellation and session checks. Synthetic events/
+  private GTK or pure outcomes only; no real files/helper/network. Independent review and focused
+  tests, separate commit/build; stop for scope expansion or unresolved deletion-policy ambiguity.
+- Approved minimum lifecycle correction: capture original online/auth sessions in request and
+  ephemeral verification state (ui/mod.rs field extension allowed); profile activity covers worker,
+  session checks between stages, account commit guard only for short mutations/delete+enqueue,
+  never network/hash/traversal. Reject stale confirmation and UI results. Preserve existing selected
+  corrupt-file decisions and explicit Verify-and-repair consent. No real verification execution.
+
+## P273 R94 further library responsiveness audit
+
+- Depot read-only audit library.rs rebuild/title and grid-scroll cover-priority work. Establish
+  actual redundant work and propose bounded improvements with source evidence and synthetic
+  verification; no edits before manager accepts proposal. Preserve live-state checks, row identity,
+  priority ordering and account/closing behavior; no persistent broad model-index redesign.
+- Confirmed title refresh makes two per-widget linear searches and unconditional title writes.
+  Depot owns library.rs bounded fix: ephemeral ID→title map preserving first-duplicate behavior,
+  release model borrow before GTK mutations, skip identical labels. Keep idle new-row live-model
+  relookup unchanged. Private retained GTK unchanged/changed/removed IDs, focus/selection and
+  row/card identity plus independent review required. Scroll throttling deferred due timing surface.
+
+## P270 R94 organization write lifecycle
+
+- Confirmed root review: organization.rs hide/tag worker writes use UI epoch only for results;
+  queued work can open/create the profile after sign-out/reset, unlike the guarded Favorite path.
+  storage_audit next after P268 commit owns organization.rs: capture account session at action,
+  acquire profile activity then use with_account_session for SQLite mutation/readback, preserve
+  UI pending/epoch behavior and add immediate visibility-save activity plus sanitized failures.
+  Existing tag/visibility semantics unchanged. Private synthetic stale-session/reset exclusion and
+  existing behavior tests, independent review required. No real profile reset or account activity.
+
+## P269 R94 batched library classification evidence
+
+- Depot after P263 commit owns state.rs/storage.rs: reuse existing P251 selected-product revision
+  loader in400-ID batches for library_evidence, including retired revisions. Preserve represented
+  product scope, parsing failures, category/fallback and cross-product semantics; no narrow JOIN
+  that silently weakens old validation. Expose existing internal helper only as needed. Synthetic
+  equivalence, malformed/unrelated and retained-part tests; quantify source query reduction.
+  No schema/dependency/network/profile changes; independent review and separate commit/build.
+
+## P268 R94 explicit patch-row activity
+
+- storage_audit after P266 commit owns files.rs explicit archive-row Run Patch only: reuse row
+  status/progress for preflight/applying/terminal feedback, full sanitized errors, no background
+  completion/error modal, distinguish disconnection from cancellation. Preserve explicit consent,
+  backend patch validation and action restoration. Include session/lifetime guards as needed for
+  this path; private synthetic events/GTK tests only, no patch/helper invocation. Depot independent
+  review after P263 ready. Separate commit/exact build required.
+
+## P267 R94 account-bound manual cloud actions (before P264)
+
+- Confirmed safety finding: Game Properties force-sync confirmation can outlive its account;
+  run_cloud_action captures auth session only inside sync when worker starts. ui_review owns
+  game_settings.rs bounded fix before P264: bind manual normal/force actions to originating
+  Properties auth/account session, recheck confirmation and worker dispatch, call existing
+  sync_for_session, suppress stale result/control updates with actionable account-change text.
+  Preserve destructive consent and all backend safeguards. No network/keyring/save tests;
+  private GTK stale-confirmation controls and synthetic dispatch verification. storage_audit
+  independently reviews session boundaries/security and behavior. No cloud-builder redesign.
+- Also bind the existing Check now inventory path to its originating session and discard stale
+  result updates. ui_review additionally owns cloud_saves/mod.rs inventory signature (one caller)
+  to pass original auth session explicitly; no new compatibility wrapper or changed cloud policy.
+
+## P266 R94 update error diagnostics
+
+- storage_audit owns update_policies.rs only: preserve actionable sanitized actual errors for
+  global update checks and per-game policy loading, distinguish worker disconnection. Keep current
+  retry/close-reopen controls and save policy; no new framework/backend/network actions. Focused
+  existing policy/sanitizer checks, independent source review and separate commit/build gate.
+
+## P263–P265 R94 targeted refresh and compatibility preference loading
+
+- P263 depot next after P259 commit: storage.rs/sections.rs root-only Game Files compatibility
+  inspection for targeted local refresh; preserve full root/ancestor/infrastructure and archive
+  checks, own-target reconciliation, and full Storage child diagnostics. Document that lightweight
+  snapshots do not contain child issues (no model consumer uses them). Regression for partial
+  sibling, unsafe roots/overlap and archive type checks. No cached-validation bypass.
+- P264 ui_review next after P260 commit: game_settings.rs Compatibility fixes initial load only.
+  Worker SQLite read; disabled controls with loading/error/Retry; populate under reset suppression,
+  enable only when loaded and installed. Preserve save/default-reset behavior, session/reset and
+  weak-lifetime checks; private GTK synthetic/database tests, no real profile/helper changes.
+  Cloud Saves initial read deferred because its large record-dependent builder needs separate
+  design; managed-detail label async rewrite also deferred to avoid unbounded call-site churn.
+- P265 nonimplementer reviews and focused checks for each; root separate commit/exact build gates.
+
+## P260–P262 R94 filter counts and patch feedback
+
+- P260 ui_review owns library.rs: direct Game predicate plus per-refresh matching IDs to remove
+  repeated ID scans for counts/section headings. Preserve all filters, playable/hidden behavior,
+  missing metadata, collapse/selection and existing GTK callbacks; no persistent index/cache.
+  Focused equivalence and private GTK regressions; measured/sourced work reduction.
+- P261 storage_audit owns files.rs preferred-patch flow: move DB/file inspection to worker;
+  visible inspection, explicit errors/normal no-patch result, existing patch consent, in-place
+  patch progress and terminal/disconnect feedback. No completion modal/focus change; closing
+  progress does not cancel. Account/reset/lifetime guards required; synthetic GTK only, no patch
+  execution or game/profile mutation. Preserve patch choice/version rules and update fallback.
+- P262 independent cross-review after P259–P261 source ready; root coordinates compilation,
+  relevant tests, separate commits and post-commit builds. No new dependency/schema/policy.
+
+## P259 R94 automatic-install planning efficiency
+
+- Depot approved next separate set after P256 commit: reuse request job IDs already resolved by
+  intent and read base DLC membership once; preserve selection ordering, validation and consent.
+  Own src/download/auto_install.rs and relevant existing tests only. Synthetic queue/DLC/legacy
+  identity fixtures, focused intent/completion/reopen tests and independent review required.
+  No schema, filesystem policy, helper or real profile actions. Await wave2 commit before edits.
+
+## P255–P258 R94 second wave
+
+- P255 ui_review owns details.rs operation-log loading/error/Retry: preserve available sources,
+  display installation errors without files, stale-refresh/session guards; private GTK synthetic
+  success/error/empty/disconnect/retry. No actual discard/log-folder action.
+- P256 depot owns online.rs image FIFO VecDeque scheduling, preserve selected priority/cancel/
+  workers semantics; focused scheduler tests. P257 storage_audit owns account.rs embedded-login
+  loading/error/retry using sanitized generic messages and ephemeral WebKit; preserve OAuth,
+  redirect/session/cancel behavior, no real network/account tests. Each separate reviewed commit.
+- P258 independent cross-review follows each; root serializes Cargo and uses immutable copied
+  test binaries plus exact-commit build checkout. No new work beyond these approved scopes yet.
+
+## P251–P254 R94 bounded audit, first wave
+
+- Approved first sets: P251 state.rs bulk normalized-library child data loading, preserving narrow
+  lookup/order/errors, measured on synthetic500-game fixture; P252 game_settings.rs async source
+  migration inspection/preparation, phase feedback/duplicate prevention and worker-stop errors.
+  P252 login page busy/error/retry and P251 image FIFO VecDeque are queued separate later sets.
+- P251 depot audits backend state/download/installation inefficiency, nonblocking work and bounded
+  IO. P252 storage_audit audits UI async actions/loading/error/cancellation feedback in dialogs and
+  settings. P253 ui_review audits library/details/rendering/event-refresh responsiveness. Initial
+  read-only findings with exact evidence; root approves narrow disjoint edits within R94 before
+  implementation. No new feature policy or security loosening; defer ambiguity without questions.
+- P254 nonimplementer cross-review and focused regression/private GTK checks per set. Root alone
+  owns records/Git, stages separate coherent sets, runs appropriate fmt/lint/focused checks and
+  verifies cargo build --locked after each commit. Other workers pause mutations during each gate.
+  At end run build-process checks once if time allows; no package/PR/push. Stop starting edits by
+  22:25 UTC, reserve final verification time, hard stop22:53:48 UTC or user interruption.
+- All agents read AGENTS and relevant skills, preserve new upstream d836fbe changes. Reports in
+  /tmp/ludomere-p25*-report.md; durable change ledger .project-manager/R94_IMPROVEMENTS.md.
+
 ## P249–P250 R93 publication
 
 - P249 storage_audit owns version0.2.4 in Cargo/lock/PKGBUILD/AppStream only; keep package release1

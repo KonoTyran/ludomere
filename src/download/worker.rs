@@ -122,12 +122,28 @@ pub(super) fn worker_is_active(job_id: &str) -> bool {
 
 pub(super) fn classify_download_error(error: &anyhow::Error) -> DownloadFailure {
     if let Some(bookkeeping) = error.downcast_ref::<super::transfer::BookkeepingError>() {
+        let summary = if bookkeeping.files.is_empty() {
+            "Downloaded-file registration failed. Existing files were preserved; check the download destination and retry.".into()
+        } else {
+            bookkeeping.to_string()
+        };
+        let details = error
+            .chain()
+            .map(ToString::to_string)
+            // anyhow's context wrapper displays the bookkeeping message but
+            // cannot itself be downcast to BookkeepingError.
+            .filter(|cause| cause != &bookkeeping.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         return DownloadFailure {
             kind: DownloadFailureKind::Bookkeeping,
-            message: if bookkeeping.files.is_empty() {
-                "Downloaded-file registration failed. Existing files were preserved; check the download destination and retry.".into()
+            message: if details.is_empty() {
+                summary
             } else {
-                bookkeeping.to_string()
+                format!(
+                    "{summary}\nDetails: {}",
+                    crate::installation::runtime_logs::sanitize(&details).trim()
+                )
             },
         };
     }
@@ -163,5 +179,45 @@ pub(super) fn classify_download_error(error: &anyhow::Error) -> DownloadFailure 
     DownloadFailure {
         kind,
         message: format!("{error:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bookkeeping_errors_retain_safe_causes_on_first_attempt_and_retry() {
+        for files in [vec![], vec![PathBuf::from("/inert/installer")]] {
+            let error = anyhow::anyhow!(
+                "Catalog size mismatch: expected 100 bytes, found 104 bytes\nhttps://example.invalid/file?signature=inert-signature\naccess_token=inert-secret"
+            )
+            .context(super::super::transfer::BookkeepingError { files: files.clone() })
+            .context("Registering completed download")
+            .context(super::super::transfer::BookkeepingError { files });
+            let failure = classify_download_error(&error);
+            assert_eq!(failure.kind, DownloadFailureKind::Bookkeeping);
+            assert!(
+                failure
+                    .message
+                    .contains("expected 100 bytes, found 104 bytes")
+            );
+            assert!(failure.message.contains("[URL redacted]"));
+            assert!(!failure.message.contains("inert-signature"));
+            assert!(!failure.message.contains("inert-secret"));
+            assert!(failure.message.contains("preserved"));
+            assert_eq!(
+                failure
+                    .message
+                    .matches("recording completion failed")
+                    .count(),
+                if failure.message.starts_with("Downloaded-file") {
+                    0
+                } else {
+                    1
+                }
+            );
+            assert!(failure.message.contains("Registering completed download"));
+        }
     }
 }

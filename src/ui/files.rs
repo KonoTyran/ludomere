@@ -5,146 +5,232 @@ pub(super) fn browse_game_files(
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
     game: &DetailPageModel,
+    exact_library: Option<String>,
+    button: &gtk::Button,
 ) {
-    let config = model.borrow().config.clone();
+    let expected_root = exact_library.as_ref().and_then(|id| {
+        model
+            .borrow()
+            .config
+            .game_libraries
+            .iter()
+            .find(|library| &library.id == id)
+            .map(|library| library.path.clone())
+    });
     let slug = game.slug.clone();
     let title = format!("{} — Local Files", game.title);
-    show_recovery_folders(window, model, &title, move || {
-        crate::storage::game_directories_for_browsing(&config, &slug)
-    });
+    show_recovery_folders(
+        window,
+        model,
+        &title,
+        button,
+        Box::new(move |config| {
+            if let Some(id) = exact_library {
+                crate::compatibility::validate_slug(&slug)?;
+                let library = config
+                    .game_libraries
+                    .iter()
+                    .find(|library| library.id == id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("This Game Files library is no longer configured.")
+                    })?;
+                anyhow::ensure!(
+                    Some(&library.path) == expected_root.as_ref(),
+                    "The selected library changed. Review its folder before browsing again."
+                );
+                return recovery_directory_for_browsing(config, library.path.join(slug));
+            }
+            crate::storage::game_directories_for_browsing(config, &slug)
+        }),
+    );
 }
 
 pub(super) fn browse_recovery_directory(
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
     directory: std::path::PathBuf,
+    button: &gtk::Button,
 ) {
-    let config = model.borrow().config.clone();
-    show_recovery_folders(window, model, "Inspect local files", move || {
-        let library = config
-            .game_libraries
-            .iter()
-            .find(|library| directory.parent() == Some(library.path.as_path()))
-            .ok_or_else(|| {
-                anyhow::anyhow!("This item is no longer in a configured Game Files library.")
-            })?;
-        crate::storage::validate_library(
-            &config,
-            crate::config::LibraryKind::GameFiles,
-            &library.id,
-        )?;
-        let metadata = std::fs::symlink_metadata(&directory)?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            crate::storage::validate_game_directory_location(&config, &directory)?;
-            Ok(vec![directory])
-        } else {
-            // Inspect loose files and links from the safe parent, without following the entry.
-            Ok(vec![library.path.clone()])
-        }
-    });
+    show_recovery_folders(
+        window,
+        model,
+        "Inspect local files",
+        button,
+        Box::new(move |config| recovery_directory_for_browsing(config, directory)),
+    );
 }
+
+fn recovery_directory_for_browsing(
+    config: &Config,
+    directory: std::path::PathBuf,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let library = config
+        .game_libraries
+        .iter()
+        .find(|library| directory.parent() == Some(library.path.as_path()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("This item is no longer in a configured Game Files library.")
+        })?;
+    crate::storage::validate_library(config, crate::config::LibraryKind::GameFiles, &library.id)?;
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        crate::storage::validate_game_directory_location(config, &directory)?;
+        Ok(vec![directory])
+    } else {
+        // Inspect loose files and links from the safe parent, without following the entry.
+        Ok(vec![library.path.clone()])
+    }
+}
+
+type FolderInspection = Box<dyn FnOnce(&Config) -> anyhow::Result<Vec<std::path::PathBuf>> + Send>;
 
 fn show_recovery_folders(
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
     title: &str,
-    inspect: impl FnOnce() -> anyhow::Result<Vec<std::path::PathBuf>> + Send + 'static,
+    button: &gtk::Button,
+    inspect: FolderInspection,
 ) {
-    let dialog = adw::AlertDialog::builder().heading(title).build();
-    dialog.add_response("close", "Close");
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let status = gtk::Label::new(Some("Checking game folder locations…"));
-    status.set_wrap(true);
-    status.set_selectable(true);
-    let spinner = gtk::Spinner::new();
-    spinner.start();
-    content.append(&spinner);
-    content.append(&status);
-    dialog.set_extra_child(Some(&content));
-    let closed = Rc::new(std::cell::Cell::new(false));
-    dialog.connect_closed({
-        let closed = closed.clone();
-        move |_| closed.set(true)
-    });
-    dialog.present(Some(window));
     let epoch = model.borrow().account_epoch;
-    let model = model.clone();
-    let window = window.clone();
+    let generation = model.borrow().detail_generation;
+    let session = (online::account_session(), auth::session());
+    let original_dialog = window.visible_dialog();
+    let closed = Rc::new(std::cell::Cell::new(false));
+    if let Some(dialog) = &original_dialog {
+        dialog.connect_closed({
+            let closed = closed.clone();
+            move |_| closed.set(true)
+        });
+    }
+    let current: Rc<dyn Fn() -> bool> = Rc::new({
+        let model = Rc::downgrade(model);
+        let window = window.downgrade();
+        let original_dialog = original_dialog.as_ref().map(ObjectExt::downgrade);
+        move || {
+            !closed.get()
+                && window.upgrade().is_some_and(|window| window.is_visible())
+                && session == (online::account_session(), auth::session())
+                && original_dialog
+                    .as_ref()
+                    .is_none_or(|dialog| dialog.upgrade().is_some())
+                && model.upgrade().is_some_and(|model| {
+                    model.try_borrow().is_ok_and(|model| {
+                        model.account_epoch == epoch
+                            && !model.logout_pending
+                            && (original_dialog.is_some() || model.detail_generation == generation)
+                    })
+                })
+        }
+    });
+    if !current() {
+        return;
+    }
+    let old_label = button.label();
+    button.set_label("Opening…");
+    button.set_sensitive(false);
+    let button = button.downgrade();
+    let model = Rc::downgrade(model);
+    let window = window.downgrade();
+    let title = title.to_owned();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(inspect());
+        let result = (|| {
+            let _activity = crate::profile_reset::begin_activity("browsing game folders")?;
+            anyhow::ensure!(
+                session == (online::account_session(), auth::session()),
+                "The account changed. Try browsing again."
+            );
+            inspect(&crate::storage::read_config()?)
+        })();
+        let _ = sender.send(result);
     });
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if closed.get() {
-            return glib::ControlFlow::Break;
-        }
-        if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-            dialog.close();
+        if !current() {
+            if let Some(button) = button.upgrade() {
+                button.set_label(old_label.as_deref().unwrap_or("Browse Files"));
+                button.set_sensitive(true);
+            }
             return glib::ControlFlow::Break;
         }
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             Err(_) => Err(anyhow::anyhow!(
-                "Folder inspection stopped. Close this dialog and try again."
+                "Folder inspection stopped. Try browsing again."
             )),
         };
-        spinner.stop();
-        spinner.set_visible(false);
+        if let Some(button) = button.upgrade() {
+            button.set_label(old_label.as_deref().unwrap_or("Browse Files"));
+            button.set_sensitive(true);
+        }
+        let (Some(window), Some(model)) = (window.upgrade(), model.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if let Ok(paths) = &result
+            && let [path] = paths.as_slice()
+        {
+            let current = current.clone();
+            super::widgets::file_open::launch_validated_directory(
+                path,
+                &window,
+                "game folder",
+                move || current(),
+            );
+            return glib::ControlFlow::Break;
+        }
+        let dialog = adw::AlertDialog::builder().heading(&title).build();
+        dialog.add_response("close", "Close");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let status = gtk::Label::new(None);
+        status.set_wrap(true);
+        status.set_selectable(true);
+        content.append(&status);
+        dialog.set_extra_child(Some(&content));
         match result {
             Ok(paths) => {
-                status.set_label(if paths.is_empty() { "No game files were found in the configured Game Files libraries. Download or install the game to create them." } else { "Open a folder to inspect or back up its contents. Browsing does not change files or make this installation ready to play." });
+                status.set_label(if paths.is_empty() { "No game files were found in the configured Game Files libraries. Download or install the game to create them." } else { "This game has files in more than one library. Choose the folder to open." });
                 for path in paths {
-                    let open = gtk::Button::new();
-                    let label = gtk::Label::new(Some(&path.display().to_string()));
-                    label.set_wrap(true);
-                    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-                    open.set_child(Some(&label));
-                    let window = window.clone();
+                    let open = gtk::Button::with_label(&path.display().to_string());
+                    if let Some(label) = open.child().and_downcast::<gtk::Label>() {
+                        label.set_wrap(true);
+                        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                    }
+                    let window = window.downgrade();
                     let model = model.clone();
-                    let status = status.clone();
+                    let current = current.clone();
+                    let title = title.clone();
                     open.connect_clicked(move |button| {
-                        if model.borrow().account_epoch != epoch || model.borrow().logout_pending { return; }
-                        button.set_sensitive(false);
-                        status.set_label("Checking and opening the folder…");
+                        if !current() {
+                            return;
+                        }
+                        let Some(window) = window.upgrade() else {
+                            return;
+                        };
                         let path = path.clone();
-                        let (sender, receiver) = mpsc::channel();
-                        std::thread::spawn(move || {
-                            let result = crate::storage::read_config().and_then(|config| {
-                                if let Some(library) = config.game_libraries.iter().find(|library| library.path == path) {
-                                    crate::storage::validate_library(&config, crate::config::LibraryKind::GameFiles, &library.id)?;
+                        show_recovery_folders(
+                            &window,
+                            &model,
+                            &title,
+                            button,
+                            Box::new(move |config| {
+                                if let Some(library) = config
+                                    .game_libraries
+                                    .iter()
+                                    .find(|library| library.path == path)
+                                {
+                                    crate::storage::validate_library(
+                                        config,
+                                        crate::config::LibraryKind::GameFiles,
+                                        &library.id,
+                                    )?;
                                 } else {
-                                    crate::storage::validate_game_directory_location(&config, &path)?;
+                                    crate::storage::validate_game_directory_location(
+                                        config, &path,
+                                    )?;
                                 }
-                                Ok(path)
-                            });
-                            let _ = sender.send(result);
-                        });
-                        let window = window.clone();
-                        let model = model.clone();
-                        let status = status.clone();
-                        let button = button.downgrade();
-                        glib::timeout_add_local(Duration::from_millis(50), move || {
-                            if model.borrow().account_epoch != epoch || model.borrow().logout_pending || !status.is_mapped() { return glib::ControlFlow::Break; }
-                            let result = match receiver.try_recv() {
-                                Ok(result) => result,
-                                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                                Err(_) => Err(anyhow::anyhow!("Folder inspection stopped. Try again.")),
-                            };
-                            if let Some(button) = button.upgrade() { button.set_sensitive(true); }
-                            match result {
-                                Ok(path) => {
-                                    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
-                                    let window = window.clone();
-                                    status.set_label("Requested the file manager. You can inspect or back up these files before resetting the game.");
-                                    launcher.launch(Some(&window.clone()), gio::Cancellable::NONE, move |result| {
-                                        super::widgets::file_open::report_launch_result(&window, "game folder", result);
-                                    });
-                                }
-                                Err(error) => status.set_label(&format!("Could not open this folder: {error:#}")),
-                            }
-                            glib::ControlFlow::Break
-                        });
+                                Ok(vec![path])
+                            }),
+                        );
                     });
                     content.append(&open);
                 }
@@ -153,6 +239,7 @@ fn show_recovery_folders(
                 "Could not inspect game files: {error:#}. No files were changed."
             )),
         }
+        dialog.present(Some(&window));
         glib::ControlFlow::Break
     });
 }
@@ -176,8 +263,6 @@ pub(super) fn detail_file_management(
     status.set_wrap(true);
     status.add_css_class("dim-label");
     status.set_visible(false);
-    let cleanup_notice = find_named_descendant(window.upcast_ref(), "application-status-message")
-        .and_downcast::<gtk::Label>();
 
     let actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
     actions.set_margin_start(6);
@@ -323,151 +408,6 @@ pub(super) fn detail_file_management(
     manage_submenu_actions.push(check_updates.clone());
     manage_submenu_actions.push(verify.clone());
 
-    let downloaded = Rc::new(RefCell::new(
-        None::<Result<download::ManagedDownloads, String>>,
-    ));
-    let delete_downloads = management_menu_button("Delete Downloaded Files…");
-    delete_downloads.add_css_class("destructive-action");
-    delete_downloads.set_visible(false);
-    manage_actions.append(&delete_downloads);
-    manage_submenu_actions.push(delete_downloads.clone());
-    let preview_busy = Rc::new(std::cell::Cell::new(false));
-    let preview_pending = Rc::new(std::cell::Cell::new(false));
-    let refresh_preview: Rc<dyn Fn()> = {
-        let product_id = game.product_id;
-        let downloaded = downloaded.clone();
-        let delete = delete_downloads.clone();
-        let model = model.clone();
-        let busy = preview_busy.clone();
-        let status = status.clone();
-        let pending = preview_pending.clone();
-        let notice = cleanup_notice.clone();
-        Rc::new(move || {
-            *downloaded.borrow_mut() = None;
-            if busy.replace(true) {
-                pending.set(true);
-                return;
-            }
-            let epoch = model.borrow().account_epoch;
-            delete.set_sensitive(false);
-            let mut receiver = inspect_downloaded_files(product_id);
-            let downloaded = downloaded.clone();
-            let delete = delete.clone();
-            let model = model.clone();
-            let busy = busy.clone();
-            let status = status.clone();
-            let pending = pending.clone();
-            let notice = notice.clone();
-            glib::timeout_add_local(Duration::from_millis(100), move || {
-                if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-                    busy.set(false);
-                    return glib::ControlFlow::Break;
-                }
-                match receiver.try_recv() {
-                    Ok(result) => {
-                        if pending.replace(false) {
-                            receiver = inspect_downloaded_files(product_id);
-                            return glib::ControlFlow::Continue;
-                        }
-                        busy.set(false);
-                        if let Err(error) = &result {
-                            status.set_label(&format!("Could not inspect downloaded files: {error}. Reopen Manage or retry in Uninstall."));
-                            status.set_visible(true);
-                            hold_status_notice(notice.as_ref(), &status.label());
-                        }
-                        delete.set_visible(result.as_ref().is_ok_and(|files| files.count() > 0));
-                        delete.set_sensitive(true);
-                        *downloaded.borrow_mut() = Some(result);
-                        glib::ControlFlow::Break
-                    }
-                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                    Err(_) => {
-                        busy.set(false);
-                        *downloaded.borrow_mut() =
-                            Some(Err("Could not inspect downloaded files".into()));
-                        glib::ControlFlow::Break
-                    }
-                }
-            });
-        })
-    };
-    {
-        let downloaded = downloaded.clone();
-        let window = window.clone();
-        let status = status.clone();
-        let model = model.clone();
-        let refresh = refresh_after_change.clone();
-        let cleanup_notice = cleanup_notice.clone();
-        delete_downloads.connect_clicked(move |button| {
-            let Some(Ok(files)) = downloaded.borrow().clone() else {
-                return;
-            };
-            let epoch = model.borrow().account_epoch;
-            let confirmation = adw::AlertDialog::builder()
-                .heading("Delete downloaded files?")
-                .body(format!("Permanently delete {} managed downloaded files ({}) for this game and its recorded DLC? Installed games, saves and preferences are preserved.", files.count(), human_size(files.bytes())))
-                .build();
-            confirmation.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
-            confirmation.set_default_response(Some("cancel"));
-            confirmation.set_close_response("cancel");
-            confirmation.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-            let button = button.clone();
-            let model = model.clone();
-            let status = status.clone();
-            let refresh = refresh.clone();
-            let cleanup_notice = cleanup_notice.clone();
-            confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "delete"
-                    || model.borrow().account_epoch != epoch
-                    || model.borrow().logout_pending
-                {
-                    return;
-                }
-                button.set_sensitive(false);
-                status.set_label("Deleting downloaded files…");
-                status.set_visible(true);
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let _ = sender.send(download::delete_managed_downloads(files));
-                });
-                glib::timeout_add_local(Duration::from_millis(100), move || {
-                    if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-                        return glib::ControlFlow::Break;
-                    }
-                    match receiver.try_recv() {
-                        Ok(result) => {
-                            match result {
-                                Ok(result) if result.failures.is_empty() => {
-                                    status.set_label(&format!("Deleted {} downloaded files", result.deleted));
-                                    button.set_visible(false);
-                                }
-                                Ok(result) => {
-                                    status.set_label(&format!("Deleted {} files; some files could not be deleted: {}", result.deleted, result.failures.join("; ")));
-                                    button.set_sensitive(true);
-                                }
-                                Err(error) => {
-                                    status.set_label(&format!("Downloaded files were not deleted: {error}"));
-                                    button.set_sensitive(true);
-                                }
-                            }
-                            status.set_visible(true);
-                            hold_status_notice(cleanup_notice.as_ref(), &status.label());
-                            refresh();
-                            glib::ControlFlow::Break
-                        }
-                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(_) => {
-                            status.set_label("Downloaded-file cleanup stopped. Check the files and try again.");
-                            hold_status_notice(cleanup_notice.as_ref(), &status.label());
-                            button.set_sensitive(true);
-                            glib::ControlFlow::Break
-                        }
-                    }
-                });
-            });
-        });
-    }
-
     if game.parent_id.is_none() {
         manage_actions.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         let browse = management_menu_button("Browse Local Files");
@@ -475,8 +415,8 @@ pub(super) fn detail_file_management(
             let game = game.clone();
             let model = model.clone();
             let window = window.clone();
-            browse.connect_clicked(move |_| {
-                browse_game_files(&window, &model, &game);
+            browse.connect_clicked(move |button| {
+                browse_game_files(&window, &model, &game, None, button);
             });
         }
         manage_actions.append(&browse);
@@ -534,10 +474,6 @@ pub(super) fn detail_file_management(
     let manage_popover = gtk::Popover::new();
     manage_popover.add_css_class("game-management-popover");
     manage_popover.set_child(Some(&manage_actions));
-    {
-        let refresh = refresh_preview.clone();
-        manage_popover.connect_show(move |_| refresh());
-    }
     manage.set_popover(Some(&manage_popover));
     let hover = gtk::EventControllerMotion::new();
     {
@@ -645,6 +581,7 @@ pub(super) fn detail_file_management(
             .map(|token| token.access_token.clone());
         let status = status.clone();
         let progress = progress.clone();
+        let session = (online::account_session(), auth::session());
         verify.connect_clicked(move |button| {
             let confirmation = adw::AlertDialog::builder()
                 .heading("Verify and repair downloads?")
@@ -659,21 +596,15 @@ pub(super) fn detail_file_management(
                 title: title.clone(),
                 artifacts: artifacts.clone(),
                 access_token: access_token.clone(),
+                session,
             };
             let button = button.clone();
             let window = window.clone();
-            let response_window = window.clone();
             let status = status.clone();
             let progress = progress.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response == "verify" {
-                    start_product_verification(
-                        request,
-                        &button,
-                        &response_window,
-                        &status,
-                        &progress,
-                    );
+                    start_product_verification(request, &button, &status, &progress);
                 }
             });
         });
@@ -710,17 +641,6 @@ fn management_menu_button(label: &str) -> gtk::Button {
     button.set_halign(gtk::Align::Fill);
     button.set_hexpand(true);
     button
-}
-
-fn inspect_downloaded_files(
-    product_id: i64,
-) -> mpsc::Receiver<Result<download::ManagedDownloads, String>> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ =
-            sender.send(download::managed_downloads(product_id).map_err(|error| error.to_string()));
-    });
-    receiver
 }
 
 pub(super) fn archive_deletion_group(
@@ -995,10 +915,9 @@ pub(super) fn activate_context_primary_action(
         GamePrimaryAction::Install => show_install_dialog(&widgets.window, model, &game),
         GamePrimaryAction::InstallUpdate => {
             if model.borrow().config.prefer_patch_updates
-                && installed.as_ref().is_some_and(|installed| {
-                    try_run_preferred_patch(&widgets.window, &game, installed)
-                })
+                && let Some(installed) = installed.as_ref()
             {
+                show_preferred_patch(&widgets.window, model, &game, installed);
                 return;
             }
             show_update_dialog(&widgets.window, model, &game)
@@ -1011,8 +930,20 @@ pub(super) fn activate_context_primary_action(
                 let retry_game = game.clone();
                 if prompt_for_windows_executable(
                     &widgets.window,
+                    model,
                     &game.title,
                     &installed,
+                    &widgets.status,
+                    Rc::new({
+                        let status = widgets.live_status.clone();
+                        move |busy| {
+                            status.set_label(if busy {
+                                "Checking game launch files…"
+                            } else {
+                                ""
+                            })
+                        }
+                    }),
                     Rc::new(move || {
                         activate_context_primary_action(
                             &retry_widgets,
@@ -1096,19 +1027,20 @@ pub(super) fn activate_context_primary_action(
     }
 }
 
-fn try_run_preferred_patch(
-    window: &adw::ApplicationWindow,
-    game: &DetailPageModel,
-    installed: &crate::domain::InstalledGame,
-) -> bool {
-    let Ok(store) = StateStore::open() else {
-        return false;
-    };
-    let Ok(mut patches) = store.managed_files() else {
-        return false;
-    };
+fn inspect_preferred_patch(
+    product_id: i64,
+    installed_version: Option<&str>,
+    session: u64,
+) -> anyhow::Result<Option<crate::state::ManagedFileRecord>> {
+    let _activity = crate::profile_reset::begin_activity("inspecting downloaded patches")?;
+    anyhow::ensure!(
+        online::account_session() == session,
+        "Account changed; reopen the game before checking patches."
+    );
+    let store = StateStore::open()?;
+    let mut patches = store.managed_files_for_products(&[product_id])?;
     patches.retain(|file| {
-        file.product_id == game.product_id
+        file.product_id == product_id
             && file.kind == ArtifactKind::Patch
             && file.present
             && file.path.is_file()
@@ -1121,68 +1053,283 @@ fn try_run_preferred_patch(
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-            && installed
-                .installed_version
-                .as_deref()
-                .is_none_or(|version| {
-                    file.filename.contains(version)
-                        || file
-                            .version
-                            .as_deref()
-                            .is_some_and(|label| label.contains(version))
-                })
+            && installed_version.is_none_or(|version| {
+                file.filename.contains(version)
+                    || file
+                        .version
+                        .as_deref()
+                        .is_some_and(|label| label.contains(version))
+            })
     });
     patches.sort_by_key(|file| file.revision_id.unwrap_or_default());
-    let Some(patch) = patches.pop() else {
-        return false;
-    };
-    let target_version = crate::installation::patch_target_version(patch.version.as_deref());
-    let confirmation = adw::AlertDialog::builder()
-        .heading("Apply preferred patch update?")
-        .body("Ludomere will apply the downloaded patch and record the base game and installed DLC as current if it exits successfully. Launch the game afterward to verify it; use Repair Installation if necessary.")
+    Ok(patches.pop())
+}
+
+fn show_preferred_patch(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    game: &DetailPageModel,
+    installed: &crate::domain::InstalledGame,
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Preferred patch update")
+        .content_width(600)
         .build();
-    confirmation.add_responses(&[("cancel", "Cancel"), ("run", "Apply Patch")]);
-    confirmation.set_default_response(Some("run"));
-    confirmation.set_close_response("cancel");
-    let window_for_response = window.clone();
-    let installed = installed.clone();
-    confirmation.choose(Some(window), gio::Cancellable::NONE, move |response| {
-        if response != "run" { return; }
-        let receiver = patch_with_components(
-            &window_for_response,
-            installed.clone(),
-            patch.path.clone(),
-            target_version.clone(),
-        );
-        let window = window_for_response.clone();
-        glib::timeout_add_local(Duration::from_millis(100), move || match receiver.try_recv() {
-            Ok(crate::installation::PatchEvent::Started { .. }) => glib::ControlFlow::Continue,
-            Ok(crate::installation::PatchEvent::Complete { .. }) => {
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Patch update completed")
-                    .body("Launch the game to verify the update. If it did not apply correctly, choose Repair Installation from the cog menu.")
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&window));
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.append(&adw::HeaderBar::new());
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_start(20);
+    body.set_margin_end(20);
+    body.set_margin_bottom(20);
+    let status = gtk::Label::new(Some("Inspecting downloaded patches…"));
+    status.set_wrap(true);
+    status.set_selectable(true);
+    status.set_xalign(0.0);
+    let progress = gtk::ProgressBar::new();
+    body.append(&status);
+    body.append(&progress);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let close = gtk::Button::with_label("Close");
+    let retry = gtk::Button::with_label("Retry inspection");
+    let full_update = gtk::Button::with_label("Continue with full update…");
+    let apply = gtk::Button::with_label("Apply Patch");
+    apply.add_css_class("suggested-action");
+    for button in [&retry, &full_update, &apply] {
+        button.set_visible(false);
+        actions.append(button);
+    }
+    actions.append(&close);
+    body.append(&actions);
+    root.append(&body);
+    dialog.set_child(Some(&root));
+    close.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    let closed = Rc::new(std::cell::Cell::new(false));
+    dialog.connect_closed({
+        let closed = closed.clone();
+        move |_| closed.set(true)
+    });
+    let epoch = model.borrow().account_epoch;
+    let session = online::account_session();
+    let current: Rc<dyn Fn() -> bool> = Rc::new({
+        let model = model.clone();
+        move || {
+            let state = model.borrow();
+            state.account_epoch == epoch
+                && !state.logout_pending
+                && online::account_session() == session
+        }
+    });
+    let patch = Rc::new(RefCell::new(None::<crate::state::ManagedFileRecord>));
+    let busy = Rc::new(std::cell::Cell::new(false));
+    retry.connect_clicked({
+        let status = status.clone(); let progress = progress.clone(); let apply = apply.clone(); let full_update = full_update.clone();
+        let current = current.clone(); let closed = closed.clone(); let patch = patch.clone(); let busy = busy.clone();
+        let product_id = game.product_id; let version = installed.installed_version.clone();
+        move |button| {
+            if closed.get() || busy.get() { return; }
+            if !current() { status.set_label("Account changed. Close and reopen the game to check updates."); button.set_sensitive(false); return; }
+            busy.set(true); button.set_sensitive(false); apply.set_visible(false); full_update.set_visible(false);
+            progress.set_visible(true); status.set_label("Inspecting downloaded patches…");
+            let (sender, receiver) = mpsc::channel(); let version = version.clone();
+            std::thread::spawn(move || { let _ = sender.send(inspect_preferred_patch(product_id, version.as_deref(), session)); });
+            let button = button.clone(); let status = status.clone(); let progress = progress.clone(); let apply = apply.clone(); let full_update = full_update.clone();
+            let current = current.clone(); let closed = closed.clone(); let patch = patch.clone(); let busy = busy.clone();
+            glib::timeout_add_local(Duration::from_millis(80), move || {
+                if closed.get() { return glib::ControlFlow::Break; }
+                if !current() { busy.set(false); button.set_sensitive(false); apply.set_sensitive(false); full_update.set_sensitive(false); progress.set_visible(false); status.set_label("Account changed. Close and reopen the game to check updates."); return glib::ControlFlow::Break; }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => { progress.pulse(); return glib::ControlFlow::Continue; }
+                    Err(_) => Err(anyhow::anyhow!("Patch inspection stopped unexpectedly.")),
+                };
+                busy.set(false); progress.set_visible(false); button.set_sensitive(true);
+                match result {
+                    Ok(Some(found)) => {
+                        status.set_label("Ludomere will apply the downloaded patch and record the base game and installed DLC as current if it exits successfully. Launch the game afterward to verify it; use Repair Installation if necessary.");
+                        *patch.borrow_mut() = Some(found); apply.set_visible(true);
+                    }
+                    Ok(None) => { status.set_label("No compatible downloaded patch was found. Continue with the full update to review other update options."); full_update.set_visible(true); }
+                    Err(error) => { status.set_label(&super::notifications::failure_message("Could not inspect downloaded patches. Retry inspection or continue with the full update.", &format!("{error:#}"))); button.set_visible(true); full_update.set_visible(true); }
+                }
                 glib::ControlFlow::Break
+            });
+        }
+    });
+    full_update.connect_clicked({
+        let dialog = dialog.downgrade();
+        let model = model.clone();
+        let window = window.clone();
+        let game = game.clone();
+        let current = current.clone();
+        let closed = closed.clone();
+        let status = status.clone();
+        move |_| {
+            if closed.get() {
+                return;
+            }
+            if !current() {
+                status.set_label("Account changed. Close and reopen the game to check updates.");
+                return;
+            }
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+            show_update_dialog(&window, &model, &game);
+        }
+    });
+    apply.connect_clicked({
+        let window = window.clone(); let installed = installed.clone(); let status = status.clone(); let progress = progress.clone();
+        let current = current.clone(); let closed = closed.clone(); let close = close.clone(); let retry = retry.downgrade();
+        move |button| {
+            if closed.get() || busy.get() { return; }
+            if !current() { status.set_label("Account changed. Close and reopen the game to check updates."); button.set_sensitive(false); return; }
+            let Some(patch) = patch.borrow_mut().take() else { return; };
+            busy.set(true); button.set_sensitive(false); if let Some(retry) = retry.upgrade() { retry.set_visible(false); } full_update.set_visible(false);
+            close.set_tooltip_text(Some("Closing during the Windows requirements check prevents the patch from starting. After that check, patch work continues."));
+            status.set_label("Checking Windows requirements before applying the patch…"); progress.set_visible(true);
+            let (sender, receiver) = mpsc::channel();
+            let ready_current = current.clone(); let ready_closed = closed.clone(); let installed = installed.clone();
+            let ready_status = status.clone();
+            super::proton::with_windows_components(&window, installed.product_id, true, None, move || {
+                if ready_closed.get() || !ready_current() { return; }
+                ready_status.set_label("Preparing and applying the patch…\nPatch work continues if this view is closed.");
+                let target = crate::installation::patch_target_version(patch.version.as_deref());
+                let events = crate::installation::run_patch(installed, patch.path, target);
+                std::thread::spawn(move || { for event in events { if sender.send(event).is_err() { break; } } });
+            });
+            monitor_preferred_patch(&status, &progress, current.clone(), closed.clone(), receiver);
+        }
+    });
+    dialog.present(Some(window));
+    retry.emit_clicked();
+}
+
+fn monitor_preferred_patch(
+    status: &gtk::Label,
+    progress: &gtk::ProgressBar,
+    current: Rc<dyn Fn() -> bool>,
+    closed: Rc<std::cell::Cell<bool>>,
+    receiver: mpsc::Receiver<crate::installation::PatchEvent>,
+) {
+    let status = status.clone();
+    let progress = progress.clone();
+    let mut started = false;
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        if !current() {
+            progress.set_visible(false);
+            status.set_label("Account changed. A patch already started may still be running; reopen the game to inspect its state.");
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Ok(crate::installation::PatchEvent::Started { log_path }) => {
+                started = true;
+                status.set_label(&format!(
+                    "Applying patch…\nLog: {}\nThe patch continues if this view is closed.",
+                    log_path.display()
+                ));
+            }
+            Ok(crate::installation::PatchEvent::Complete { .. }) => {
+                progress.set_visible(false);
+                status.set_label("Patch update completed. Launch the game to verify it; use Repair Installation if necessary.");
+                return glib::ControlFlow::Break;
             }
             Ok(crate::installation::PatchEvent::Failed(error)) => {
-                let dialog = adw::AlertDialog::builder()
-                    .heading("Patch update failed")
-                    .body(error)
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&window));
-                glib::ControlFlow::Break
+                progress.set_visible(false);
+                status.set_label(&super::notifications::failure_message(
+                    "Patch update failed",
+                    &error,
+                ));
+                return glib::ControlFlow::Break;
             }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        });
+            Err(mpsc::TryRecvError::Disconnected) => {
+                progress.set_visible(false);
+                status.set_label(if started { "Patch reporting stopped unexpectedly. Inspect the game's state and patch log before retrying." } else { "Patch preparation stopped. Review Windows requirements using Finish setup and inspect the game's state before retrying." });
+                return glib::ControlFlow::Break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        progress.pulse();
+        glib::ControlFlow::Continue
     });
-    true
+}
+
+fn monitor_archive_patch(
+    status: &gtk::Label,
+    details: &gtk::Label,
+    progress: &gtk::ProgressBar,
+    buttons: [gtk::Button; 3],
+    current: Rc<dyn Fn() -> bool>,
+    receiver: mpsc::Receiver<crate::installation::PatchEvent>,
+) {
+    let status = status.clone();
+    let details = details.clone();
+    let progress = progress.clone();
+    let mut started = false;
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if !current() {
+            progress.set_visible(false);
+            status.set_label("Account or view changed");
+            details.set_label("A patch already started may still be running. Reopen the game's files to inspect its state.");
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
+            Ok(crate::installation::PatchEvent::Started { log_path }) => {
+                started = true;
+                status.set_label("Applying patch…");
+                details.set_label(&format!(
+                    "Log: {}\nPatch work continues if you leave this view.",
+                    log_path.display()
+                ));
+                progress.pulse();
+                return glib::ControlFlow::Continue;
+            }
+            Ok(crate::installation::PatchEvent::Complete { .. }) => {
+                status.set_label("Patch complete");
+                status.add_css_class("success");
+                details.set_label(
+                    "Launch the game to verify the update; use Repair Installation if necessary.",
+                );
+            }
+            Ok(crate::installation::PatchEvent::Failed(error)) => {
+                status.set_label("Patch failed");
+                status.add_css_class("error");
+                details.set_label(&super::notifications::failure_message(
+                    "Patch update failed",
+                    &error,
+                ));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                status.set_label("Patch stopped");
+                status.add_css_class("error");
+                details.set_label(if started { "Patch reporting stopped unexpectedly. Inspect the game's state and patch log before retrying." } else { "Patch preparation stopped. Review Windows requirements using Finish setup and inspect the game's state before retrying." });
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                progress.pulse();
+                return glib::ControlFlow::Continue;
+            }
+        }
+        status.remove_css_class("dim-label");
+        progress.set_visible(false);
+        for button in &buttons {
+            button.set_sensitive(true);
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 pub(super) struct FilesPageOptions<'a> {
+    pub model: &'a Rc<RefCell<AppModel>>,
     pub access_token: Option<&'a str>,
     pub config: &'a Config,
     pub library_statuses: &'a [crate::storage::LibraryStatus],
@@ -1198,6 +1345,7 @@ pub(super) fn build_files_page(
     options: FilesPageOptions<'_>,
 ) -> gtk::Box {
     let FilesPageOptions {
+        model,
         access_token,
         config,
         library_statuses,
@@ -1323,6 +1471,7 @@ pub(super) fn build_files_page(
         .cloned()
         .collect::<Vec<_>>();
     let installer_context = RemoteFileContext {
+        model: Some(model),
         product_id: game.product_id,
         product_slug: &game.slug,
         parent_slug: None,
@@ -1347,6 +1496,7 @@ pub(super) fn build_files_page(
     if !remote_patches.is_empty() {
         let patch_folder = game.location.join("patches");
         let patch_context = RemoteFileContext {
+            model: Some(model),
             product_id: game.product_id,
             product_slug: &game.slug,
             parent_slug: None,
@@ -1372,6 +1522,7 @@ pub(super) fn build_files_page(
     if !remote_extras.is_empty() {
         let extras_folder = game.location.join("extras");
         let extras_context = RemoteFileContext {
+            model: Some(model),
             product_id: game.product_id,
             product_slug: &game.slug,
             parent_slug: None,
@@ -1421,6 +1572,7 @@ pub(super) fn build_files_page(
         page.append(&dlc_heading);
         for dlc in owned_dlcs {
             page.append(&dlc_file_section(
+                model,
                 dlc,
                 &game.slug,
                 window,
@@ -1438,6 +1590,7 @@ pub(super) fn build_files_page(
 
 #[allow(clippy::too_many_arguments)]
 fn dlc_file_section(
+    model: &Rc<RefCell<AppModel>>,
     dlc: &Dlc,
     parent_slug: &str,
     window: &adw::ApplicationWindow,
@@ -1492,6 +1645,7 @@ fn dlc_file_section(
             }
             let folder = dlc_root.join(kind.as_str());
             let context = RemoteFileContext {
+                model: Some(model),
                 product_id: dlc.product_id,
                 product_slug: &dlc.slug,
                 parent_slug: Some(parent_slug),
@@ -1551,6 +1705,7 @@ pub(super) struct InstallerFilterDefaults {
 type InstallerFilterRows = Rc<RefCell<Vec<(gtk::Box, Option<String>, Option<String>)>>>;
 
 struct RemoteFileContext<'a> {
+    model: Option<&'a Rc<RefCell<AppModel>>>,
     product_id: i64,
     product_slug: &'a str,
     parent_slug: Option<&'a str>,
@@ -1739,6 +1894,7 @@ fn sync_action_proxy(source: &gtk::Button, proxy: &gtk::Button, include_text: bo
         .map(|value| value.to_string())
         .unwrap_or_else(|| match source_label.as_deref() {
             Some("Run Patch") => "view-refresh-symbolic".into(),
+            Some("Download to another library") => "folder-download-symbolic".into(),
             _ => "emblem-system-symbolic".into(),
         });
     let label = source_label
@@ -1757,7 +1913,6 @@ fn sync_action_proxy(source: &gtk::Button, proxy: &gtk::Button, include_text: bo
     }
     proxy.set_child(Some(&content));
     proxy.set_tooltip_text(Some(&label));
-    proxy.set_visible(source.is_visible());
     if source.has_css_class("destructive-action") {
         proxy.add_css_class("destructive-action");
     }
@@ -1773,6 +1928,8 @@ fn compact_file_action_label(label: &str) -> &str {
         "Discard"
     } else if lower.contains("cancel download") {
         "Cancel"
+    } else if lower.contains("download to another library") {
+        "Download to Another Library"
     } else if lower.contains("download") || lower.contains("resume") || lower.contains("retry") {
         "Download"
     } else {
@@ -2164,7 +2321,7 @@ fn remote_file_collection(
                     return;
                 }
                 button.set_sensitive(false);
-                delete_downloaded_files(paths, move |result| match result {
+                delete_downloaded_files(product_id, paths, move |result| match result {
                     Ok(()) => {
                         row.set_visible(false);
                         refresh_managed_detail_labels(&response_window, product_id);
@@ -2436,10 +2593,25 @@ fn artifact_download_action(
         let status = status.clone();
         let download_button = button.clone();
         let delete_button = delete_button.clone();
-        let run_patch_button_for_click = run_patch_button.clone();
+        let progress = progress.clone();
+        let details = gtk::Label::new(None);
+        details.set_wrap(true);
+        details.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        details.set_selectable(true);
+        details.set_xalign(0.0);
+        details.set_visible(false);
+        labels.append(&details);
+        let session = online::account_session();
+        let auth_session = auth::session();
         let target_version =
             crate::installation::patch_target_version(artifacts[0].version.as_deref());
-        run_patch_button.connect_clicked(move |_| {
+        run_patch_button.connect_clicked(move |run_patch_button| {
+            if online::account_session() != session || auth::session() != auth_session {
+                status.set_label("Account changed"); status.set_visible(true);
+                details.set_label("Close and reopen this game's files before running a patch."); details.set_visible(true);
+                run_patch_button.set_sensitive(false);
+                return;
+            }
             let Some(patch) = downloaded_files.borrow().iter().find(|path| {
                 path.extension()
                     .and_then(|value| value.to_str())
@@ -2465,80 +2637,46 @@ fn artifact_download_action(
             let status = status.clone();
             let download_button = download_button.clone();
             let delete_button = delete_button.clone();
-            let run_patch_button = run_patch_button_for_click.clone();
+            let run_patch_button = run_patch_button.clone();
+            let progress = progress.clone();
+            let details = details.clone();
             let target_version = target_version.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response != "run" {
                     return;
                 }
+                if online::account_session() != session || auth::session() != auth_session || status.root().is_none() || !window_for_response.is_visible() {
+                    status.set_label("Account or view changed"); status.set_visible(true);
+                    details.set_label("Close and reopen this game's files before running a patch."); details.set_visible(true);
+                    run_patch_button.set_sensitive(false);
+                    return;
+                }
                 status.remove_css_class("success");
+                status.remove_css_class("error");
                 status.add_css_class("dim-label");
-                status.set_label("Running patch…");
+                status.set_label("Checking Windows requirements…");
                 status.set_visible(true);
                 run_patch_button.set_sensitive(false);
                 download_button.set_sensitive(false);
                 delete_button.set_sensitive(false);
-                let receiver = patch_with_components(
-                    &window_for_response,
-                    installed.clone(),
-                    patch.clone(),
-                    target_version.clone(),
-                );
-                let status_for_event = status.clone();
-                let run_button_for_event = run_patch_button.clone();
-                let download_for_event = download_button.clone();
-                let delete_for_event = delete_button.clone();
-                let window_for_event = window_for_response.clone();
-                glib::timeout_add_local(Duration::from_millis(100), move || {
-                    match receiver.try_recv() {
-                        Ok(crate::installation::PatchEvent::Started { log_path }) => {
-                            status_for_event.set_label("Applying patch…");
-                            status_for_event.set_tooltip_text(Some(&format!(
-                                "Log: {}", log_path.display()
-                            )));
-                            glib::ControlFlow::Continue
-                        }
-                        Ok(crate::installation::PatchEvent::Complete { .. }) => {
-                            status_for_event.remove_css_class("dim-label");
-                            status_for_event.add_css_class("success");
-                            status_for_event.set_label("Patch completed");
-                            run_button_for_event.set_sensitive(true);
-                            download_for_event.set_sensitive(true);
-                            delete_for_event.set_sensitive(true);
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("Patch completed")
-                                .body("The patch finished successfully and Ludomere recorded the base game and installed DLC as current. Launch the game to verify the update; use Repair Installation if it did not apply correctly.")
-                                .build();
-                            dialog.add_response("close", "Close");
-                            dialog.present(Some(&window_for_event));
-                            glib::ControlFlow::Break
-                        }
-                        Ok(crate::installation::PatchEvent::Failed(error)) => {
-                            status_for_event.remove_css_class("dim-label");
-                            status_for_event.add_css_class("error");
-                            status_for_event.set_label("Patch failed");
-                            status_for_event.set_tooltip_text(Some(&error));
-                            run_button_for_event.set_sensitive(true);
-                            download_for_event.set_sensitive(true);
-                            delete_for_event.set_sensitive(true);
-                            let dialog = adw::AlertDialog::builder()
-                                .heading("Could not apply patch")
-                                .body(error)
-                                .build();
-                            dialog.add_response("close", "Close");
-                            dialog.present(Some(&window_for_event));
-                            glib::ControlFlow::Break
-                        }
-                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            status_for_event.set_label("Patch cancelled");
-                            run_button_for_event.set_sensitive(true);
-                            download_for_event.set_sensitive(true);
-                            delete_for_event.set_sensitive(true);
-                            glib::ControlFlow::Break
-                        }
+                progress.set_visible(true); progress.set_show_text(false); progress.pulse();
+                details.set_label("Preparing the patch. Once started, patch work continues if you leave this view."); details.set_visible(true);
+                let current: Rc<dyn Fn() -> bool> = Rc::new({
+                    let status = status.downgrade(); let window = window_for_response.downgrade();
+                    move || online::account_session() == session && auth::session() == auth_session
+                        && status.upgrade().is_some_and(|status| status.root().is_some())
+                        && window.upgrade().is_some_and(|window| window.is_visible())
+                });
+                let (sender, receiver) = mpsc::channel();
+                super::proton::with_windows_components(&window_for_response, installed.product_id, true, None, {
+                    let current = current.clone();
+                    move || {
+                        if !current() { return; }
+                        let events = crate::installation::run_patch(installed, patch, target_version);
+                        std::thread::spawn(move || { for event in events { if sender.send(event).is_err() { break; } } });
                     }
                 });
+                monitor_archive_patch(&status, &details, &progress, [run_patch_button, download_button, delete_button], current, receiver);
             });
         });
     }
@@ -2583,6 +2721,7 @@ fn artifact_download_action(
         });
     }
     let folder = Rc::new(RefCell::new(completed_folder));
+    let counted = Rc::new(std::cell::Cell::new(folder.borrow().is_some()));
     let running_for_download = running.clone();
     let folder_for_download = folder.clone();
     let downloaded_files_for_download = downloaded_files.clone();
@@ -2592,6 +2731,7 @@ fn artifact_download_action(
     let progress_for_download = progress.clone();
     let window_for_download = context.window.clone();
     let count_for_download = collection_count.clone();
+    let copy_for_download = download_copy.clone();
     let product_slug = context
         .parent_slug
         .unwrap_or(context.product_slug)
@@ -2601,6 +2741,221 @@ fn artifact_download_action(
         .map(|_| context.product_slug.to_string());
     let session = online::account_session();
     let copy_requested = Rc::new(std::cell::Cell::new(false));
+    let auth_session = auth::session();
+    if let Some(model) = context.model {
+        let model = Rc::downgrade(model);
+        let action = action.downgrade();
+        let folder = folder.clone();
+        let downloaded_files = downloaded_files.clone();
+        let running = running.clone();
+        let status = status.clone();
+        let progress = progress.clone();
+        let button = button.clone();
+        let delete = delete_button.clone();
+        let copy = download_copy.clone();
+        let patch = run_patch_button.clone();
+        let discard = discard_button.clone();
+        let count = collection_count.clone();
+        let counted = counted.clone();
+        let artifacts = artifacts.clone();
+        let can_download = context.access_token.is_some();
+        // A global revision can cover another game; only inspect this product when
+        // its files or local refresh version changed.
+        let product_files = move |state: &AppModel| {
+            state.games.iter().find_map(|game| {
+                let files = if game.product_id == product_id {
+                    Some((
+                        game.installers.as_slice(),
+                        game.patches.as_slice(),
+                        game.extras.as_slice(),
+                    ))
+                } else {
+                    game.dlcs
+                        .iter()
+                        .find(|dlc| dlc.product_id == product_id)
+                        .map(|dlc| (dlc.installers.as_slice(), &[][..], dlc.extras.as_slice()))
+                }?;
+                Some((
+                    state
+                        .local_versions
+                        .get(&game.product_id)
+                        .copied()
+                        .unwrap_or(0),
+                    files
+                        .0
+                        .iter()
+                        .chain(files.1)
+                        .chain(files.2)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ))
+            })
+        };
+        let state = context.model.expect("checked above").borrow();
+        let epoch = state.account_epoch;
+        let generation = state.detail_generation;
+        let mut revision = state.local_revision;
+        let mut previous = product_files(&state);
+        drop(state);
+        let mut pending = None;
+        glib::timeout_add_local(Duration::from_millis(200), move || {
+            let (Some(model), Some(action)) = (model.upgrade(), action.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            let state = model.borrow();
+            if state.account_epoch != epoch
+                || state.logout_pending
+                || state.detail_generation != generation
+                || (online::account_session(), auth::session()) != (session, auth_session)
+            {
+                return glib::ControlFlow::Break;
+            }
+            if running.borrow().is_some() || progress.get_visible() || !action.is_sensitive() {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some((requested_revision, original_files, receiver)) = pending.as_ref() {
+                let receiver: &mpsc::Receiver<anyhow::Result<(Vec<std::path::PathBuf>, bool)>> =
+                    receiver;
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        let current = *requested_revision == state.local_revision
+                            && *original_files == *downloaded_files.borrow();
+                        pending = None;
+                        if current {
+                            previous = product_files(&state);
+                            revision = state.local_revision;
+                            let (files, complete) = match result {
+                                Ok(snapshot) => snapshot,
+                                Err(_) => {
+                                    status.set_label("Could not refresh downloaded files");
+                                    status.set_tooltip_text(Some(
+                                        "Use Manage → Refresh local state to retry.",
+                                    ));
+                                    status.set_visible(true);
+                                    return glib::ControlFlow::Continue;
+                                }
+                            };
+                            *folder.borrow_mut() = complete
+                                .then(|| {
+                                    files
+                                        .first()
+                                        .and_then(|path| path.parent())
+                                        .map(std::path::Path::to_path_buf)
+                                })
+                                .flatten();
+                            *downloaded_files.borrow_mut() = files.clone();
+                            if counted.replace(complete) != complete {
+                                adjust_downloaded_collection_count(
+                                    &count,
+                                    if complete { 1 } else { -1 },
+                                );
+                            }
+                            status.remove_css_class("dim-label");
+                            status.remove_css_class("success");
+                            status.remove_css_class("error");
+                            status.set_label(if complete {
+                                "✓"
+                            } else if files.is_empty() {
+                                ""
+                            } else {
+                                "✕"
+                            });
+                            status.set_visible(!files.is_empty());
+                            status.add_css_class(if complete { "success" } else { "error" });
+                            status.set_tooltip_text(Some(if complete {
+                                "Downloaded"
+                            } else {
+                                "Download files are missing or their file sizes do not match."
+                            }));
+                            button.set_icon_name(if complete {
+                                "folder-open-symbolic"
+                            } else {
+                                "folder-download-symbolic"
+                            });
+                            button.set_tooltip_text(Some(if complete {
+                                "Show downloaded files"
+                            } else if can_download {
+                                "Download all required parts"
+                            } else {
+                                "Sign in to GOG to download"
+                            }));
+                            button.set_sensitive(complete || can_download);
+                            delete.set_visible(!files.is_empty());
+                            copy.set_visible(complete);
+                            patch.set_visible(can_run_patch && complete);
+                            discard.set_visible(false);
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        pending = None;
+                        previous = product_files(&state);
+                        revision = state.local_revision;
+                        status.set_label("Could not refresh downloaded files");
+                        status.set_tooltip_text(Some("Use Manage → Refresh local state to retry."));
+                        status.set_visible(true);
+                    }
+                }
+            }
+            if state.local_revision == revision {
+                return glib::ControlFlow::Continue;
+            }
+            if product_files(&state) == previous {
+                revision = state.local_revision;
+                return glib::ControlFlow::Continue;
+            }
+            let (sender, receiver) = mpsc::channel();
+            pending = Some((
+                state.local_revision,
+                downloaded_files.borrow().clone(),
+                receiver,
+            ));
+            let artifacts = artifacts.clone();
+            let statuses = state.library_statuses.clone();
+            let current_folder = folder.borrow().clone();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<_> {
+                    let _activity =
+                        crate::profile_reset::begin_activity("refreshing archive files")?;
+                    anyhow::ensure!(
+                        (online::account_session(), auth::session()) == (session, auth_session),
+                        "Account changed"
+                    );
+                    let refs = artifacts.iter().collect::<Vec<_>>();
+                    let mut paths = StateStore::open()?.current_managed_paths(&refs)?;
+                    if paths.is_empty()
+                        && let Some(job) = matching_download_job(&refs)
+                            .filter(|job| job.state == DownloadState::Complete)
+                    {
+                        paths = job
+                            .completed_files
+                            .into_iter()
+                            .filter(|path| path.is_file())
+                            .collect();
+                    }
+                    if let Some(folder) = current_folder
+                        && paths
+                            .iter()
+                            .any(|path| path.parent() == Some(folder.as_path()))
+                    {
+                        paths.retain(|path| path.parent() == Some(folder.as_path()));
+                    }
+                    let complete = !paths.is_empty()
+                        && paths.iter().all(|path| {
+                            matches!(
+                                crate::storage::path_status(&statuses, path),
+                                Some(crate::storage::LibraryCompatibility::Compatible)
+                            )
+                        })
+                        && artifact_download_is_plausible(&refs, &paths);
+                    Ok((paths, complete))
+                })();
+                let _ = sender.send(result);
+            });
+            glib::ControlFlow::Continue
+        });
+    }
+    let counted_for_download = counted.clone();
     {
         let copy_requested = copy_requested.clone();
         let button = button.clone();
@@ -2648,8 +3003,15 @@ fn artifact_download_action(
         let product_slug = product_slug.clone();
         let child_slug = child_slug.clone();
         let active_job_id = active_job_id.clone();
+        let download_copy = copy_for_download.clone();
+        let counted = counted_for_download.clone();
         choose_download_libraries(&window_for_download, vec![library_kind], move |libraries| {
-            if online::account_session() != session || button.root().is_none() {
+            // File-action proxies invoke an unmounted source button. Its root is not
+            // the lifetime of this explicit download request.
+            if online::account_session() != session
+                || auth::session() != auth_session
+                || !window_for_response.is_visible()
+            {
                 return;
             }
             let library = &libraries[0].1;
@@ -2670,10 +3032,18 @@ fn artifact_download_action(
             let prepared_artifacts = artifacts.clone();
             let library_id = library.id.clone();
             std::thread::spawn(move || {
-                let prepared = download::resolve_job_id(
-                    &prepared_artifacts.iter().collect::<Vec<_>>(),
-                    &destination,
-                )
+                let prepared = (|| -> anyhow::Result<_> {
+                    let _activity =
+                        crate::profile_reset::begin_activity("preparing archive download")?;
+                    anyhow::ensure!(
+                        online::account_session() == session && auth::session() == auth_session,
+                        "The account changed. Reopen the download chooser."
+                    );
+                    download::resolve_job_id(
+                        &prepared_artifacts.iter().collect::<Vec<_>>(),
+                        &destination,
+                    )
+                })()
                 .map(|id| {
                     (
                         id,
@@ -2708,13 +3078,31 @@ fn artifact_download_action(
             let artifacts_for_validation = artifacts.clone();
             let mut prepared = false;
             glib::timeout_add_local(Duration::from_millis(100), move || {
-                if online::account_session() != session || button.root().is_none() {
+                if online::account_session() != session
+                    || auth::session() != auth_session
+                    || !window_for_response.is_visible()
+                {
                     return glib::ControlFlow::Break;
                 }
                 if !prepared {
                     match prepared_receiver.try_recv() {
                         Ok(Ok((id, request))) => {
                             *active_job_id.borrow_mut() = id;
+                            #[cfg(test)]
+                            let request = match super::download_chooser::capture_queued_downloads(
+                                vec![request],
+                                None,
+                            ) {
+                                Ok(_) => {
+                                    prepared = true;
+                                    button.set_sensitive(true);
+                                    return glib::ControlFlow::Continue;
+                                }
+                                Err(request) => {
+                                    let (mut requests, _) = *request;
+                                    requests.pop().unwrap()
+                                }
+                            };
                             *running.borrow_mut() = Some(download::enqueue(request));
                             prepared = true;
                             button.set_sensitive(true);
@@ -2799,8 +3187,11 @@ fn artifact_download_action(
                             button.set_tooltip_text(Some("Show downloaded files"));
                             button.set_sensitive(true);
                             delete_button.set_visible(true);
+                            download_copy.set_visible(true);
                             run_patch_button.set_visible(can_run_patch);
-                            adjust_downloaded_collection_count(&count_for_response, 1);
+                            if !counted.replace(true) {
+                                adjust_downloaded_collection_count(&count_for_response, 1);
+                            }
                             refresh_managed_detail_labels(&window_for_response, product_id);
                             glib::ControlFlow::Break
                         }
@@ -2848,7 +3239,20 @@ fn artifact_download_action(
         let delete_button_for_response = delete_button.clone();
         let run_patch_button_for_response = run_patch_button.clone();
         let collection_count = collection_count.clone();
+        let download_copy = download_copy.clone();
+        let discard = discard_button.clone();
+        let action = action.downgrade();
+        let title = context.product_title.to_owned();
+        let can_download = context.access_token.is_some();
+        let deleting = gtk::Spinner::new();
+        deleting.set_visible(false);
+        if let Some(action) = action.upgrade() {
+            action.append(&deleting);
+        }
         delete_button.connect_clicked(move |_| {
+            if (online::account_session(), auth::session()) != (session, auth_session) {
+                return;
+            }
             let files = downloaded_files.borrow().clone();
             let confirmation = adw::AlertDialog::builder()
                 .heading("Delete downloaded files?")
@@ -2871,31 +3275,88 @@ fn artifact_download_action(
             let run_patch_button = run_patch_button_for_response.clone();
             let window_for_response = window.clone();
             let count_for_response = collection_count.clone();
+            let download_copy = download_copy.clone();
+            let discard = discard.clone();
+            let action = action.clone();
+            let deleting = deleting.clone();
+            let title = title.clone();
+            let counted = counted.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "delete" {
+                if response != "delete"
+                    || (online::account_session(), auth::session()) != (session, auth_session)
+                    || !window_for_response.is_visible()
+                    || !action.upgrade().is_some_and(|row| row.is_mapped())
+                {
                     return;
                 }
-                let files = downloaded_files.borrow().clone();
-                delete_downloaded_files(files, move |result| match result {
-                    Ok(()) => {
-                        downloaded_files.borrow_mut().clear();
-                        *folder.borrow_mut() = None;
-                        status.set_visible(false);
-                        progress.set_visible(false);
-                        download_button.set_icon_name("folder-download-symbolic");
-                        download_button.set_tooltip_text(Some("Download all required parts"));
-                        download_button.set_sensitive(true);
-                        delete_button.set_visible(false);
-                        run_patch_button.set_visible(false);
-                        adjust_downloaded_collection_count(&count_for_response, -1);
-                        refresh_managed_detail_labels(&window_for_response, product_id);
+                if *downloaded_files.borrow() != files {
+                    status.set_label(
+                        "Downloaded files changed. Review the files and try Delete again.",
+                    );
+                    status.set_visible(true);
+                    return;
+                }
+                if let Some(action) = action.upgrade() {
+                    action.set_sensitive(false);
+                }
+                deleting.set_visible(true);
+                deleting.start();
+                status.remove_css_class("success");
+                status.remove_css_class("error");
+                status.set_label("Deleting downloaded files…");
+                status.set_visible(true);
+                delete_downloaded_files(product_id, files, move |result| {
+                    deleting.stop();
+                    deleting.set_visible(false);
+                    if (online::account_session(), auth::session()) != (session, auth_session) {
+                        return;
                     }
-                    Err(error) => {
-                        status.remove_css_class("success");
-                        status.add_css_class("error");
-                        status.set_label("Could not delete files");
-                        status.set_tooltip_text(Some(&format!("{error:#}")));
-                        status.set_visible(true);
+                    if let Some(action) = action.upgrade() {
+                        action.set_sensitive(true);
+                    }
+                    let message = match result {
+                        Ok(()) => {
+                            downloaded_files.borrow_mut().clear();
+                            *folder.borrow_mut() = None;
+                            status.set_visible(false);
+                            progress.set_visible(false);
+                            download_button.set_icon_name("folder-download-symbolic");
+                            download_button.set_tooltip_text(Some("Download all required parts"));
+                            download_button.set_sensitive(can_download);
+                            download_copy.set_visible(false);
+                            delete_button.set_visible(false);
+                            run_patch_button.set_visible(false);
+                            discard.set_visible(false);
+                            if counted.replace(false) {
+                                adjust_downloaded_collection_count(&count_for_response, -1);
+                            }
+                            refresh_managed_detail_labels(&window_for_response, product_id);
+                            notifications::failure_message(
+                                "",
+                                &format!("{title}: Downloaded files deleted."),
+                            )
+                        }
+                        Err(error) => {
+                            let message = notifications::failure_message(
+                                &format!("{title}: Could not delete downloaded files"),
+                                &format!("{error:#}"),
+                            );
+                            status.remove_css_class("success");
+                            status.add_css_class("error");
+                            status.set_label("Could not delete files");
+                            status.set_tooltip_text(Some(&message));
+                            status.set_visible(true);
+                            message
+                        }
+                    };
+                    if window_for_response.is_visible()
+                        && let Some(notice) = find_named_descendant(
+                            window_for_response.upcast_ref(),
+                            "application-status-message",
+                        )
+                        .and_downcast::<gtk::Label>()
+                    {
+                        notice.set_label(&message);
                     }
                 });
             });
@@ -2909,12 +3370,20 @@ fn artifact_download_action(
 }
 
 fn delete_downloaded_files(
+    product_id: i64,
     paths: Vec<std::path::PathBuf>,
     done: impl FnOnce(anyhow::Result<()>) + 'static,
 ) {
+    let session = (online::account_session(), auth::session());
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut attempted_deletion = false;
         let result = (|| -> anyhow::Result<()> {
+            let _activity = crate::profile_reset::begin_activity("deleting downloaded files")?;
+            anyhow::ensure!(
+                session == (online::account_session(), auth::session()),
+                "Account changed; reopen this game's files."
+            );
             let config = crate::storage::read_config()?;
             let mut roots = HashSet::new();
             for path in &paths {
@@ -2937,27 +3406,46 @@ fn delete_downloaded_files(
                 roots.insert(crate::storage::validate_path(&config, kind, path)?.path);
             }
             for path in &paths {
+                anyhow::ensure!(
+                    session == (online::account_session(), auth::session()),
+                    "Account changed; reopen this game's files."
+                );
                 let parent = path
                     .parent()
                     .ok_or_else(|| anyhow::anyhow!("Invalid downloaded file path"))?;
+                attempted_deletion = true;
                 download::delete_completed_files(parent, std::slice::from_ref(path))?;
             }
-            let store = StateStore::open()?;
-            for job in store.download_jobs()? {
-                if !job.completed_files.is_empty()
-                    && job.completed_files.iter().all(|path| paths.contains(path))
-                {
-                    store.delete_download_job(&job.job_id)?;
+            online::with_account_session(session.0, || -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    session.1 == auth::session(),
+                    "Account changed; reopen this game's files."
+                );
+                let store = StateStore::open()?;
+                for job in store.download_jobs()? {
+                    if !job.completed_files.is_empty()
+                        && job.completed_files.iter().all(|path| paths.contains(path))
+                    {
+                        store.delete_download_job(&job.job_id)?;
+                    }
                 }
-            }
-            for path in &paths {
-                store.mark_managed_file_absent(path)?;
-            }
+                for path in &paths {
+                    store.mark_managed_file_absent(path)?;
+                }
+                Ok(())
+            })?;
             for root in roots {
+                anyhow::ensure!(
+                    session == (online::account_session(), auth::session()),
+                    "Account changed; reopen this game's files."
+                );
                 download::prune_empty_directories(&root)?;
             }
             Ok(())
         })();
+        if attempted_deletion {
+            download::notify_managed_files_changed(product_id, session);
+        }
         let _ = sender.send(result);
     });
     let mut done = Some(done);
@@ -3301,13 +3789,18 @@ pub(super) fn verification_state(product_id: i64) -> Option<VerificationDisplayS
         .lock()
         .ok()?
         .get(&product_id)
+        .filter(|state| check_verification_session(state.session).is_ok())
         .cloned()
 }
 
 pub(super) fn set_verification_state(product_id: i64, state: VerificationDisplayState) {
+    if check_verification_session(state.session).is_err() {
+        return;
+    }
     if let Ok(mut states) = VERIFICATION_STATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
+        && check_verification_session(state.session).is_ok()
     {
         states.insert(product_id, state);
     }
@@ -3321,8 +3814,11 @@ pub(super) fn apply_verification_display(
 ) {
     button.set_sensitive(!state.running);
     status.set_label(&state.message);
+    status.set_wrap(true);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    status.set_selectable(true);
     status.set_visible(true);
-    progress.set_visible(true);
+    progress.set_visible(state.running);
     if let Some(fraction) = state.fraction {
         progress.set_fraction(fraction);
         progress.set_show_text(state.running);
@@ -3353,11 +3849,20 @@ pub(super) fn restore_verification_display(
     if !state.running {
         return;
     }
-    let button = button.clone();
-    let status = status.clone();
-    let progress = progress.clone();
+    let button = button.downgrade();
+    let status = status.downgrade();
+    let progress = progress.downgrade();
     glib::timeout_add_local(Duration::from_millis(200), move || {
+        let (Some(button), Some(status), Some(progress)) =
+            (button.upgrade(), status.upgrade(), progress.upgrade())
+        else {
+            return glib::ControlFlow::Break;
+        };
         let Some(state) = verification_state(product_id) else {
+            status
+                .set_label("Account changed. Reopen the game's files before verifying downloads.");
+            progress.set_visible(false);
+            button.set_sensitive(false);
             return glib::ControlFlow::Break;
         };
         apply_verification_display(&state, &button, &status, &progress);
@@ -3372,14 +3877,20 @@ pub(super) fn restore_verification_display(
 fn start_product_verification(
     request: VerificationRequest,
     button: &gtk::Button,
-    window: &adw::ApplicationWindow,
     status: &gtk::Label,
     progress: &gtk::ProgressBar,
 ) {
+    if let Err(error) = check_verification_session(request.session) {
+        status.set_label(&error.to_string());
+        status.set_visible(true);
+        button.set_sensitive(false);
+        return;
+    }
     if verification_state(request.product_id).is_some_and(|state| state.running) {
         return;
     }
     let product_id = request.product_id;
+    let session = request.session;
     let (sender, receiver) = mpsc::channel();
     button.set_sensitive(false);
     button.set_tooltip_text(Some("Verifying files…"));
@@ -3390,6 +3901,7 @@ fn start_product_verification(
     set_verification_state(
         product_id,
         VerificationDisplayState {
+            session,
             message: "Preparing verification…".into(),
             fraction: None,
             running: true,
@@ -3401,94 +3913,104 @@ fn start_product_verification(
             &request.title,
             &request.artifacts,
             request.access_token.as_deref(),
+            session,
             &sender,
         );
         let _ = sender.send(VerificationEvent::Finished(result));
     });
+    monitor_product_verification(product_id, session, button, status, progress, receiver);
+}
+
+fn monitor_product_verification(
+    product_id: i64,
+    session: (u64, u64),
+    button: &gtk::Button,
+    status: &gtk::Label,
+    progress: &gtk::ProgressBar,
+    receiver: mpsc::Receiver<VerificationEvent>,
+) {
     let button = button.clone();
-    let window = window.clone();
     let status = status.clone();
     let progress = progress.clone();
+    let mut determinate = false;
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        match receiver.try_recv() {
+        if let Err(error) = check_verification_session(session) {
+            status.set_label(&error.to_string());
+            progress.set_visible(false);
+            button.set_sensitive(false);
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
             Ok(VerificationEvent::Progress { message, fraction }) => {
-                set_verification_state(
-                    product_id,
-                    VerificationDisplayState {
-                        message: message.clone(),
-                        fraction,
-                        running: true,
-                    },
-                );
-                status.set_label(&message);
-                if let Some(fraction) = fraction {
-                    progress.set_fraction(fraction);
-                    progress.set_show_text(true);
-                    progress.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
-                } else {
-                    progress.set_show_text(false);
+                determinate = fraction.is_some();
+                let state = VerificationDisplayState {
+                    session,
+                    message,
+                    fraction,
+                    running: true,
+                };
+                apply_verification_display(&state, &button, &status, &progress);
+                set_verification_state(product_id, state);
+                return glib::ControlFlow::Continue;
+            }
+            Ok(VerificationEvent::Finished(result)) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                if !determinate {
                     progress.pulse();
                 }
-                glib::ControlFlow::Continue
+                return glib::ControlFlow::Continue;
             }
-            Ok(VerificationEvent::Finished(result)) => {
-                button.set_sensitive(true);
-                button.set_tooltip_text(Some(
-                    "Check downloaded files using the native download database",
-                ));
-                progress.set_fraction(1.0);
-                progress.set_show_text(false);
-                status.set_label(match &result {
-                    Ok(report) if report.repair_groups > 0 => {
-                        "Verification complete; repairs queued"
-                    }
-                    Ok(_) => "Verification complete",
-                    Err(_) => "Verification failed",
-                });
-                set_verification_state(
-                    product_id,
-                    VerificationDisplayState {
-                        message: status.label().to_string(),
-                        fraction: Some(1.0),
-                        running: false,
-                    },
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "Verification worker stopped unexpectedly. Inspect downloaded files and retry verification."
+            )),
+        };
+        let message = match result {
+            Ok(report)
+                if report.checked == 0 && report.repair_groups == 0 && report.unavailable == 0 =>
+            {
+                "No completed downloads were found for this product.".into()
+            }
+            Ok(report) => {
+                let mut message = format!(
+                    "{} files verified against GOG checksums. {} download groups queued for repair. {} downloaded groups could not be verified against GOG's current checksums.",
+                    report.checked, report.repair_groups, report.unavailable
                 );
-                let dialog = match result {
-                Ok(report) if report.checked > 0 || report.repair_groups > 0 => adw::AlertDialog::builder()
-                    .heading(if report.repair_groups > 0 { "Repair downloads queued" } else { "Verification complete" })
-                    .body(format!(
-                        "{} files verified against GOG checksums. {} download groups queued for repair. {} downloaded groups could not be matched to a version currently published by GOG.",
-                        report.checked, report.repair_groups, report.unavailable
-                    ))
-                    .build(),
-                Ok(_) => adw::AlertDialog::builder()
-                    .heading("Nothing to verify")
-                    .body("No completed downloads were found for this product.")
-                    .build(),
-                Err(error) => adw::AlertDialog::builder()
-                    .heading("Verification failed")
-                    .body(error.to_string())
-                    .build(),
-            };
-                dialog.add_response("ok", "OK");
-                dialog.present(Some(&window));
-                glib::ControlFlow::Break
+                if report.unavailable > 0 {
+                    message.push_str(" Unverified groups were not repaired. Retry verification when their checksums are available.");
+                }
+                for error in report.checksum_errors {
+                    message.push('\n');
+                    message.push_str(&error);
+                }
+                super::notifications::failure_message("", &message)
+                    .trim_start()
+                    .to_owned()
             }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                button.set_sensitive(true);
-                set_verification_state(
-                    product_id,
-                    VerificationDisplayState {
-                        message: "Verification stopped unexpectedly".into(),
-                        fraction: None,
-                        running: false,
-                    },
-                );
-                glib::ControlFlow::Break
+            Err(error) => {
+                super::notifications::failure_message("Verification failed", &format!("{error:#}"))
             }
-        }
+        };
+        let state = VerificationDisplayState {
+            session,
+            message,
+            fraction: None,
+            running: false,
+        };
+        button.set_tooltip_text(Some(
+            "Check downloaded files using the native download database",
+        ));
+        apply_verification_display(&state, &button, &status, &progress);
+        set_verification_state(product_id, state);
+        glib::ControlFlow::Break
     });
+}
+
+fn check_verification_session(session: (u64, u64)) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        online::account_session() == session.0 && auth::session_is_current(session.1),
+        "Account changed. Reopen the game's files before verifying downloads."
+    );
+    Ok(())
 }
 
 struct VerificationRequest {
@@ -3496,6 +4018,7 @@ struct VerificationRequest {
     title: String,
     artifacts: Vec<RemoteArtifact>,
     access_token: Option<String>,
+    session: (u64, u64),
 }
 
 enum VerificationEvent {
@@ -3511,6 +4034,7 @@ struct VerificationReport {
     checked: usize,
     repair_groups: usize,
     unavailable: usize,
+    checksum_errors: Vec<String>,
 }
 
 fn verify_product_files(
@@ -3518,9 +4042,15 @@ fn verify_product_files(
     title: &str,
     remote_artifacts: &[RemoteArtifact],
     access_token: Option<&str>,
+    session: (u64, u64),
     progress: &mpsc::Sender<VerificationEvent>,
 ) -> anyhow::Result<VerificationReport> {
-    let jobs = StateStore::open()?.download_jobs()?;
+    check_verification_session(session)?;
+    let _activity = crate::profile_reset::begin_activity("verifying downloaded files")?;
+    let jobs = online::with_account_session(session.0, || {
+        check_verification_session(session)?;
+        StateStore::open()?.download_jobs()
+    })?;
     let completed = jobs
         .iter()
         .filter(|job| job.product_id == product_id && job.state == "complete")
@@ -3559,6 +4089,7 @@ fn verify_product_files(
     let mut processed = 0_usize;
     let mut used_jobs = HashSet::new();
     for group in groups.values_mut() {
+        check_verification_session(session)?;
         group.sort_by_key(|artifact| artifact.part_number.unwrap_or(1));
         let requested_id = download::job_id(group);
         let job = completed
@@ -3603,20 +4134,29 @@ fn verify_product_files(
         let mut corrupt = Vec::new();
         let mut matched = true;
         for artifact in group.iter() {
+            check_verification_session(session)?;
             let _ = progress.send(VerificationEvent::Progress {
                 message: format!("Fetching GOG checksum for {}…", artifact.name),
                 fraction: None,
             });
             let checksum = match download::gog_checksum(artifact, access_token) {
                 Ok(checksum) => checksum,
-                Err(_) => {
+                Err(error) => {
+                    report
+                        .checksum_errors
+                        .push(super::notifications::failure_message(
+                            "Could not obtain GOG checksums",
+                            &format!("{}: {error:#}", artifact.name),
+                        ));
                     matched = false;
                     break;
                 }
             };
-            if let Ok(store) = StateStore::open()
-                && let Err(error) = store.observe_part_checksum(artifact, &checksum.md5)
-            {
+            check_verification_session(session)?;
+            if let Err(error) = online::with_account_session(session.0, || {
+                check_verification_session(session)?;
+                StateStore::open()?.observe_part_checksum(artifact, &checksum.md5)
+            }) {
                 tracing::warn!(product_id = artifact.product_id, %error, "could not persist GOG checksum identity");
             }
             let local = job.completed_files.iter().find(|path| {
@@ -3654,12 +4194,13 @@ fn verify_product_files(
                 })
                 .is_ok_and(|actual| actual.eq_ignore_ascii_case(&checksum.md5));
             processed += 1;
+            check_verification_session(session)?;
             if hash_matches {
                 report.checked += 1;
-                if let Ok(store) = StateStore::open()
-                    && let Err(error) =
-                        store.mark_managed_file_verified(local, artifact, &checksum.md5)
-                {
+                if let Err(error) = online::with_account_session(session.0, || {
+                    check_verification_session(session)?;
+                    StateStore::open()?.mark_managed_file_verified(local, artifact, &checksum.md5)
+                }) {
                     tracing::warn!(path = %local.display(), %error, "could not record verified managed file");
                 }
             } else {
@@ -3672,22 +4213,29 @@ fn verify_product_files(
         used_jobs.insert(job.job_id.clone());
         if !corrupt.is_empty() {
             for path in corrupt {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+                online::with_account_session(session.0, || {
+                    check_verification_session(session)?;
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(error.into()),
+                    }
+                })?;
             }
             let artifacts = group.iter().map(|artifact| (*artifact).clone()).collect();
             let (sender, _receiver) = mpsc::channel();
-            download::enqueue(download::DownloadRequest {
-                artifacts,
-                title: title.to_owned(),
-                access_token: access_token.to_owned(),
-                destination: job.destination.clone(),
-                library_id: library.id,
-                events: sender,
-            });
+            online::with_account_session(session.0, || {
+                check_verification_session(session)?;
+                download::enqueue(download::DownloadRequest {
+                    artifacts,
+                    title: title.to_owned(),
+                    access_token: access_token.to_owned(),
+                    destination: job.destination.clone(),
+                    library_id: library.id,
+                    events: sender,
+                });
+                Ok(())
+            })?;
             report.repair_groups += 1;
         }
     }
@@ -3811,6 +4359,879 @@ fn inferred_local_artifact(file: &LibraryFile) -> Option<RemoteArtifact> {
 #[cfg(test)]
 mod unified_row_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "private HOME/all XDG, D-Bus and GTK; deletes only inert fixture archives"]
+    fn external_archive_completion_and_deletion_update_existing_rows() {
+        let _capture = super::super::download_chooser::DownloadQueueCapture::start();
+        adw::init().unwrap();
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                result.extend(descendants(&widget));
+                child = widget.next_sibling();
+            }
+            result
+        }
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn respond(window: &adw::ApplicationWindow, label: &str) {
+            let dialog = window.visible_dialog().unwrap();
+            descendants(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(label))
+                .unwrap()
+                .emit_clicked();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let archive_root = root.path().join("archives");
+        let game_root = root.path().join("games");
+        let file = archive_root.join("fixture/installer/windows/english/setup.exe");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(game_root.join("fixture")).unwrap();
+        let payload = game_root.join("fixture/game.exe");
+        std::fs::write(&payload, b"keep installed game").unwrap();
+        let config = Config {
+            game_libraries: vec![crate::config::GameLibrary {
+                id: "games".into(),
+                name: "Games".into(),
+                path: game_root,
+                default: true,
+            }],
+            offline_libraries: vec![crate::config::GameLibrary {
+                id: "archives".into(),
+                name: "Archives".into(),
+                path: archive_root.clone(),
+                default: true,
+            }],
+            extras_libraries: vec![],
+            ..Config::default()
+        };
+        config.save().unwrap();
+        let artifact: RemoteArtifact = serde_json::from_value(serde_json::json!({"product_id":9306001,"kind":"installer","name":"Fixture","operating_system":"windows","language":"English","version":"1","download_path":"/synthetic","part_number":1,"part_count":1})).unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ArchiveDeleteTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let notice = gtk::Label::new(None);
+        notice.set_widget_name("application-status-message");
+        let notifications = notifications::Notifications::new(&window, &notice);
+        content.append(&notifications.root);
+        let statuses = crate::storage::inspect_libraries(&config).unwrap();
+        let model = Rc::new(RefCell::new(AppModel {
+            config: config.clone(),
+            library_statuses: statuses.clone(),
+            games: vec![Game {
+                product_id: 9306001,
+                ..Game::default()
+            }],
+            ..AppModel::default()
+        }));
+        let defaults = InstallerFilterDefaults {
+            language: Some("English".into()),
+            windows: true,
+            linux: false,
+            macos: false,
+        };
+        let context = RemoteFileContext {
+            model: Some(&model),
+            product_id: 9306001,
+            product_slug: "fixture",
+            parent_slug: None,
+            product_title: "Fixture",
+            folder: root.path(),
+            window: &window,
+            access_token: Some("synthetic"),
+            download_directory: &archive_root,
+            config: &config,
+            library_statuses: &statuses,
+            installer_filters: Some(&defaults),
+            show_retired_artifacts: false,
+            installed: None,
+        };
+        let collection = remote_file_collection(
+            "Offline Installers",
+            "folder-download-symbolic",
+            std::slice::from_ref(&artifact),
+            &[],
+            &context,
+        );
+        let row = collection.last_child().unwrap();
+        let count = descendants(collection.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+            .find(|label| label.text() == "0/1 Downloaded")
+            .unwrap();
+        let language = descendants(collection.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::DropDown>().ok())
+            .unwrap();
+        let selected = language.selected();
+        let tabs = gtk::Stack::new();
+        tabs.add_named(&collection, Some("files"));
+        tabs.add_named(&gtk::Label::new(Some("Overview")), Some("overview"));
+        tabs.set_visible_child_name("files");
+        content.append(&tabs);
+        window.set_content(Some(&content));
+        window.present();
+        wait(|| row.is_mapped());
+        let menu = descendants(row.upcast_ref())
+            .into_iter()
+            .find_map(|widget| widget.downcast::<gtk::MenuButton>().ok())
+            .unwrap();
+        let controls = menu.parent().unwrap();
+        let direct_buttons = || {
+            descendants(&controls)
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .filter(|button| button.parent().as_ref() == Some(&controls) && button.is_visible())
+                .count()
+        };
+        assert!(!menu.is_visible());
+        assert_eq!(direct_buttons(), 1);
+        // Simulate the blue detail Download completing after the tab was built.
+        // No row-local download receiver participates in this registration.
+        std::fs::write(&file, b"inert installer").unwrap();
+        let store = StateStore::open().unwrap();
+        store
+            .save_download_job(&crate::state::DownloadJobUpdate {
+                job_id: &download::job_id(&[&artifact]),
+                product_id: 9306001,
+                title: "Fixture",
+                artifacts: std::slice::from_ref(&artifact),
+                destination: file.parent().unwrap(),
+                state: DownloadState::Complete,
+                bytes_downloaded: 15,
+                total_bytes: Some(15),
+                completed_files: std::slice::from_ref(&file),
+                error: None,
+            })
+            .unwrap();
+        store
+            .record_completed_artifacts(
+                &download::job_id(&[&artifact]),
+                "fixture",
+                std::slice::from_ref(&artifact),
+                std::slice::from_ref(&file),
+            )
+            .unwrap();
+        model.borrow_mut().games[0].installers.push(LibraryFile {
+            name: "setup.exe".into(),
+            path: file.clone(),
+            size: 15,
+        });
+        model.borrow_mut().local_revision += 1;
+        wait(|| count.text() == "1/1 Downloaded");
+        assert!(descendants(row.upcast_ref()).iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text() == "✓" && label.is_visible())
+        }));
+        assert_eq!(collection.last_child().as_ref(), Some(&row));
+        assert_eq!(language.selected(), selected);
+        assert_eq!(tabs.visible_child_name().as_deref(), Some("files"));
+        assert!(menu.is_visible());
+        assert_eq!(direct_buttons(), 0);
+        let popover = menu.popover().unwrap();
+        let copy = descendants(popover.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Download to another library"))
+            .unwrap();
+        assert!(descendants(copy.upcast_ref()).iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text() == "Download to Another Library")
+        }));
+        let delete = descendants(popover.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Delete downloaded files"))
+            .unwrap();
+        assert!(delete.get_visible() && delete.is_sensitive());
+        delete.emit_clicked();
+        wait(|| window.visible_dialog().is_some());
+        respond(&window, "Cancel");
+        wait(|| window.visible_dialog().is_none());
+        assert!(file.exists());
+        assert!(menu.is_visible());
+        // A changed library configuration must fail safely and restore usable controls.
+        let mut invalid = config.clone();
+        invalid.offline_libraries.clear();
+        invalid.save().unwrap();
+        delete.emit_clicked();
+        wait(|| window.visible_dialog().is_some());
+        respond(&window, "Delete");
+        wait(|| notice.text().contains("Could not delete downloaded files"));
+        assert!(file.exists());
+        assert!(row.is_sensitive());
+        assert!(menu.is_visible());
+        config.save().unwrap();
+        wait(|| window.visible_dialog().is_none());
+        delete.emit_clicked();
+        wait(|| window.visible_dialog().is_some());
+        respond(&window, "Delete");
+        wait(|| notice.text().contains("Downloaded files deleted."));
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(&payload).unwrap(), b"keep installed game");
+        assert!(!menu.is_visible());
+        assert_eq!(direct_buttons(), 1);
+        assert!(!copy.is_visible());
+        model.borrow_mut().games[0].installers.clear();
+        model.borrow_mut().local_revision += 1;
+        // Allow the external refresh to run after the row's deletion callback.
+        let deadline = std::time::Instant::now() + Duration::from_millis(700);
+        while std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(count.text(), "0/1 Downloaded");
+        assert!(!menu.is_visible());
+        assert_eq!(direct_buttons(), 1);
+        assert!(!delete.is_visible());
+        assert_eq!(collection.last_child().as_ref(), Some(&row));
+        assert_eq!(language.selected(), selected);
+        assert_eq!(tabs.visible_child_name().as_deref(), Some("files"));
+        let download = descendants(&controls)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.parent().as_ref() == Some(&controls) && button.is_visible())
+            .unwrap();
+        assert_eq!(
+            download.tooltip_text().as_deref(),
+            Some("Download all required parts")
+        );
+        download.emit_clicked();
+        wait(|| window.visible_dialog().is_some());
+        wait(|| {
+            descendants(window.visible_dialog().unwrap().upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                .any(|button| {
+                    button.label().as_deref() == Some("Download") && button.is_sensitive()
+                })
+        });
+        respond(&window, "Download");
+        wait(|| {
+            super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .len()
+                == 1
+        });
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires private GTK"]
+    fn action_content_changes_preserve_single_or_menu_layout() {
+        adw::init().unwrap();
+        let sources = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let first = gtk::Button::from_icon_name("folder-open-symbolic");
+        let second = gtk::Button::with_label("Download to another library");
+        sources.append(&first);
+        sources.append(&second);
+        let row = build_file_action_menu(&sources);
+        let direct = row.first_child().unwrap();
+        let menu = row.last_child().unwrap();
+        assert!(!direct.is_visible());
+        assert!(menu.is_visible());
+        first.set_icon_name("folder-download-symbolic");
+        first.set_tooltip_text(Some("Download all required parts"));
+        assert!(!direct.is_visible());
+        assert!(menu.is_visible());
+        second.set_visible(false);
+        assert!(direct.is_visible());
+        assert!(!menu.is_visible());
+    }
+
+    #[test]
+    #[ignore = "private HOME/all XDG, D-Bus and GTK; actual archive proxies with captured queues"]
+    fn archive_proxy_download_uses_initial_and_changed_library_without_reselect() {
+        let _capture = super::super::download_chooser::DownloadQueueCapture::start();
+        adw::init().unwrap();
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                result.extend(descendants(&widget));
+                child = widget.next_sibling();
+            }
+            result
+        }
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let libraries = (0..2)
+            .map(|index| {
+                let path = root.path().join(format!("archive-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                crate::config::GameLibrary {
+                    id: index.to_string(),
+                    name: index.to_string(),
+                    path,
+                    default: index == 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut config = Config {
+            game_libraries: vec![],
+            offline_libraries: libraries.clone(),
+            extras_libraries: vec![],
+            ..Config::default()
+        };
+        config.save().unwrap();
+        let artifacts = (1..=2).map(|part| serde_json::from_value::<RemoteArtifact>(serde_json::json!({"product_id":9296002,"kind":"installer","name":"Fixture","language":"English","operating_system":"windows","version":"1","part_number":part,"part_count":2,"provider_group_id":"fixture","provider_file_id":part.to_string(),"download_path":format!("/synthetic/{part}")})).unwrap()).collect::<Vec<_>>();
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ArchiveProxyTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.set_content(Some(&content));
+        window.present();
+        for case in 0..3 {
+            let statuses = crate::storage::inspect_libraries(&config).unwrap();
+            let context = RemoteFileContext {
+                model: None,
+                product_id: 9296002,
+                product_slug: "fixture",
+                parent_slug: None,
+                product_title: "Fixture",
+                folder: root.path(),
+                window: &window,
+                access_token: Some("synthetic"),
+                download_directory: &libraries[1].path,
+                config: &config,
+                library_statuses: &statuses,
+                installer_filters: None,
+                show_retired_artifacts: false,
+                installed: None,
+            };
+            let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let action = artifact_download_action(
+                &artifacts.iter().collect::<Vec<_>>(),
+                &[],
+                &labels,
+                &gtk::Label::new(None),
+                &context,
+            );
+            content.append(&labels);
+            content.append(&action);
+            wait(|| action.is_mapped());
+            let proxy = descendants(action.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| {
+                    button.is_mapped()
+                        && button.tooltip_text().as_deref() == Some("Download all required parts")
+                })
+                .unwrap();
+            proxy.emit_clicked();
+            wait(|| window.visible_dialog().is_some());
+            let chooser = window.visible_dialog().unwrap();
+            wait(|| {
+                descendants(chooser.upcast_ref())
+                    .iter()
+                    .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                    .any(|button| {
+                        button.label().as_deref() == Some("Download") && button.is_sensitive()
+                    })
+            });
+            let selector = descendants(chooser.upcast_ref())
+                .into_iter()
+                .find_map(|widget| widget.downcast::<gtk::DropDown>().ok())
+                .unwrap();
+            assert_eq!(selector.selected(), 1);
+            if case == 2 {
+                chooser.close();
+                wait(|| window.visible_dialog().is_none());
+                break;
+            }
+            if case == 1 {
+                selector.set_selected(0);
+                content.remove(&action);
+            }
+            descendants(chooser.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some("Download"))
+                .unwrap()
+                .emit_clicked();
+            wait(|| {
+                super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .len()
+                    == case + 1
+            });
+            wait(|| window.visible_dialog().is_none());
+            let captured = super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                .lock()
+                .unwrap();
+            let (requests, intent) = &captured.as_ref().unwrap()[case];
+            assert!(intent.is_none());
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].artifacts.len(), 2);
+            assert_eq!(
+                requests[0].library_id,
+                libraries[if case == 0 { 1 } else { 0 }].id
+            );
+            assert!(
+                requests[0]
+                    .destination
+                    .starts_with(&libraries[if case == 0 { 1 } else { 0 }].path)
+            );
+            drop(captured);
+            if case == 0 {
+                content.remove(&action);
+            }
+        }
+        assert_eq!(
+            super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        config.offline_libraries.clear();
+        config.save().unwrap();
+        choose_download_libraries(
+            &window,
+            vec![crate::config::LibraryKind::OfflineInstallers],
+            |_| panic!("missing library cannot submit"),
+        );
+        wait(|| window.visible_dialog().is_some());
+        let chooser = window.visible_dialog().unwrap();
+        wait(|| {
+            descendants(chooser.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                .any(|label| label.text().contains("Configure the missing"))
+        });
+        assert!(
+            !descendants(chooser.upcast_ref())
+                .iter()
+                .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                .any(
+                    |button| button.label().as_deref() == Some("Download") && button.is_sensitive()
+                )
+        );
+        chooser.close();
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG and private GTK; synthetic verification events only, no hashing/network/deletion"]
+    fn verification_feedback_preserves_results_and_rejects_stale_work() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p272-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let session = (online::account_session(), auth::session());
+        let stale = (session.0.wrapping_add(1), session.1);
+        let (sender, _) = mpsc::channel();
+        assert!(verify_product_files(9272001, "Synthetic", &[], None, stale, &sender).is_err());
+        let reservation = crate::profile_reset::reserve().unwrap();
+        assert!(verify_product_files(9272001, "Synthetic", &[], None, session, &sender).is_err());
+        drop(reservation);
+        assert!(!crate::identity::database().exists());
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.VerificationTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.set_content(Some(&content));
+        window.present();
+        for case in 0..7 {
+            let id = 9272001 + case;
+            let button = gtk::Button::with_label("Verify and Repair");
+            let status = gtk::Label::new(Some("Preparing verification…"));
+            let progress = gtk::ProgressBar::new();
+            content.append(&button);
+            content.append(&status);
+            content.append(&progress);
+            button.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            monitor_product_verification(
+                id,
+                if case == 6 { stale } else { session },
+                &button,
+                &status,
+                &progress,
+                receiver,
+            );
+            if case != 6 {
+                sender
+                    .send(VerificationEvent::Progress {
+                        message: "Verifying synthetic file".into(),
+                        fraction: Some(0.5),
+                    })
+                    .unwrap();
+                wait_until(|| status.label() == "Verifying synthetic file");
+                assert!(progress.shows_text());
+                assert_eq!(progress.fraction(), 0.5);
+                assert!(!button.is_sensitive());
+            }
+            let result = match case {
+                0 => Some(Ok(VerificationReport::default())),
+                1 => Some(Ok(VerificationReport {
+                    unavailable: 2,
+                    checksum_errors: vec![
+                        "Checksum unavailable https://example.invalid/?token=SECRET".into(),
+                    ],
+                    ..Default::default()
+                })),
+                2 => Some(Ok(VerificationReport {
+                    checked: 3,
+                    ..Default::default()
+                })),
+                3 => Some(Ok(VerificationReport {
+                    repair_groups: 1,
+                    ..Default::default()
+                })),
+                4 => Some(Err(anyhow::anyhow!(
+                    "synthetic outer failure https://example.invalid/?token=SECRET"
+                ))),
+                _ => None,
+            };
+            if let Some(result) = result {
+                sender.send(VerificationEvent::Finished(result)).unwrap();
+            }
+            drop(sender);
+            wait_until(|| !progress.is_visible());
+            let expected = match case {
+                0 => "No completed downloads",
+                1 => "2 downloaded groups could not be verified",
+                2 => "3 files verified",
+                3 => "1 download groups queued",
+                4 => "synthetic outer failure",
+                5 => "stopped unexpectedly",
+                _ => "Account changed",
+            };
+            assert!(status.label().contains(expected), "{}", status.label());
+            assert!(!status.label().contains("SECRET"));
+            assert_eq!(button.is_sensitive(), case != 6);
+            assert!(
+                window.visible_dialog().is_none(),
+                "completion must not present a dialog"
+            );
+            if case != 6 {
+                let restored = gtk::Label::new(None);
+                restore_verification_display(
+                    id,
+                    &gtk::Button::new(),
+                    &restored,
+                    &gtk::ProgressBar::new(),
+                );
+                assert_eq!(restored.label(), status.label());
+                set_verification_state(
+                    id,
+                    VerificationDisplayState {
+                        session: stale,
+                        message: "stale overwrite".into(),
+                        fraction: None,
+                        running: true,
+                    },
+                );
+                assert_eq!(verification_state(id).unwrap().message, status.label());
+            }
+            content.remove(&button);
+            content.remove(&status);
+            content.remove(&progress);
+        }
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG and private GTK display; uses synthetic patch events only"]
+    fn archive_patch_feedback_handles_terminal_events_and_stale_views() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p268-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        for case in 0..5 {
+            let status = gtk::Label::new(Some("Checking Windows requirements…"));
+            let details = gtk::Label::new(None);
+            let progress = gtk::ProgressBar::new();
+            let buttons = std::array::from_fn(|_| {
+                let button = gtk::Button::new();
+                button.set_sensitive(false);
+                button
+            });
+            let current = Rc::new(std::cell::Cell::new(true));
+            let (sender, receiver) = mpsc::channel();
+            monitor_archive_patch(
+                &status,
+                &details,
+                &progress,
+                buttons.clone(),
+                Rc::new({
+                    let current = current.clone();
+                    move || current.get()
+                }),
+                receiver,
+            );
+            if case == 0 || case == 2 {
+                sender
+                    .send(crate::installation::PatchEvent::Started {
+                        log_path: "/tmp/synthetic-patch.log".into(),
+                    })
+                    .unwrap();
+                wait_until(|| status.label() == "Applying patch…");
+                assert!(details.label().contains("synthetic-patch.log"));
+                assert!(progress.is_visible());
+                assert!(buttons.iter().all(|button| !button.is_sensitive()));
+            }
+            match case {
+                0 => sender
+                    .send(crate::installation::PatchEvent::Complete { exit_code: Some(0) })
+                    .unwrap(),
+                1 => sender
+                    .send(crate::installation::PatchEvent::Failed(
+                        "synthetic failure https://example.invalid/?token=secret".into(),
+                    ))
+                    .unwrap(),
+                4 => current.set(false),
+                _ => {}
+            }
+            drop(sender);
+            wait_until(|| !progress.is_visible());
+            assert_eq!(
+                status.label(),
+                match case {
+                    0 => "Patch complete",
+                    1 => "Patch failed",
+                    4 => "Account or view changed",
+                    _ => "Patch stopped",
+                }
+            );
+            assert!(
+                buttons
+                    .iter()
+                    .all(|button| button.is_sensitive() == (case != 4))
+            );
+            assert!(!details.label().contains("secret"));
+            if case == 2 {
+                assert!(details.label().contains("reporting stopped unexpectedly"));
+            }
+            if case == 3 {
+                assert!(details.label().contains("Finish setup"));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus; never executes a patch"]
+    fn preferred_patch_feedback_handles_empty_inspection_events_and_stale_views() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p261-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![widget.clone()];
+            let mut child = widget.first_child();
+            while let Some(item) = child {
+                result.extend(descendants(&item));
+                child = item.next_sibling();
+            }
+            result
+        }
+        fn label(dialog: &adw::Dialog, contains: &str) -> bool {
+            descendants(dialog.upcast_ref()).iter().any(|widget| {
+                widget
+                    .clone()
+                    .downcast::<gtk::Label>()
+                    .is_ok_and(|label| label.text().contains(contains))
+            })
+        }
+        fn button(dialog: &adw::Dialog, text: &str) -> gtk::Button {
+            descendants(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(text))
+                .unwrap()
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.PatchFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let game = DetailPageModel::game(
+            Game {
+                product_id: 9261001,
+                slug: "synthetic-patch-game".into(),
+                ..Game::default()
+            },
+            false,
+        );
+        let installed = crate::domain::InstalledGame {
+            product_id: game.product_id,
+            library_id: "synthetic".into(),
+            installed_version: Some("1.0".into()),
+            installation_directory: std::env::temp_dir().join("synthetic-patch-game"),
+            installer_revision_id: None,
+            installer_job_id: None,
+            installer_files: vec![],
+            installer_complete: false,
+            installer_operating_system: Some("windows".into()),
+            installer_language: None,
+            compatibility: None,
+            primary_executable: None,
+            launch_arguments: vec![],
+            state: crate::domain::InstallationState::Pending,
+            error: None,
+            installed_at: None,
+            verified_at: None,
+            last_played_at: None,
+            playtime_seconds: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        show_preferred_patch(&window, &model, &game, &installed);
+        let dialog = window.visible_dialog().unwrap();
+        assert!(label(&dialog, "Inspecting downloaded patches"));
+        assert!(!button(&dialog, "Apply Patch").is_visible());
+        wait_until(|| label(&dialog, "No compatible downloaded patch"));
+        assert!(button(&dialog, "Continue with full update…").is_visible());
+        model.borrow_mut().account_epoch += 1;
+        button(&dialog, "Continue with full update…").emit_clicked();
+        assert!(label(&dialog, "Account changed"));
+        assert_eq!(
+            window.visible_dialog(),
+            Some(dialog.clone()),
+            "stale fallback must not open another dialog"
+        );
+        button(&dialog, "Close").emit_clicked();
+        wait_until(|| window.visible_dialog().is_none());
+
+        for case in 0..6 {
+            let status = gtk::Label::new(Some("Checking Windows requirements…"));
+            let progress = gtk::ProgressBar::new();
+            let active = Rc::new(std::cell::Cell::new(true));
+            let closed = Rc::new(std::cell::Cell::new(false));
+            let (sender, receiver) = mpsc::channel();
+            monitor_preferred_patch(
+                &status,
+                &progress,
+                Rc::new({
+                    let active = active.clone();
+                    move || active.get()
+                }),
+                closed.clone(),
+                receiver,
+            );
+            if case == 0 || case == 2 {
+                sender
+                    .send(crate::installation::PatchEvent::Started {
+                        log_path: "/tmp/synthetic-patch.log".into(),
+                    })
+                    .unwrap();
+                wait_until(|| status.label().contains("Applying patch"));
+            }
+            match case {
+                0 => {
+                    sender
+                        .send(crate::installation::PatchEvent::Complete { exit_code: Some(0) })
+                        .unwrap();
+                }
+                1 => {
+                    sender
+                        .send(crate::installation::PatchEvent::Failed(
+                            "synthetic https://example.invalid/?token=secret".into(),
+                        ))
+                        .unwrap();
+                }
+                4 => active.set(false),
+                5 => closed.set(true),
+                _ => {}
+            }
+            drop(sender);
+            if case == 5 {
+                let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                while std::time::Instant::now() < deadline {
+                    while glib::MainContext::default().iteration(false) {}
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(status.label(), "Checking Windows requirements…");
+            } else {
+                wait_until(|| !progress.is_visible());
+                assert!(status.label().contains(match case {
+                    0 => "completed",
+                    1 => "failed",
+                    2 => "reporting stopped",
+                    3 => "preparation stopped",
+                    _ => "Account changed",
+                }));
+                assert!(!status.label().contains("secret"));
+            }
+            assert!(
+                window.visible_dialog().is_none(),
+                "background patch events must not present dialogs"
+            );
+        }
+        window.close();
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/XDG, Xvfb and private D-Bus; exercises GTK action dispatch while sidebar popover detaches"]

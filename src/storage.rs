@@ -94,6 +94,21 @@ pub(crate) fn inspect_libraries_with_store(
     Ok(inspect_with_evidence(
         config,
         &library_evidence(store, None)?,
+        true,
+    ))
+}
+
+/// Root compatibility for targeted game refreshes, without inspecting sibling games.
+/// This omits Game Files child diagnostics; Storage uses the full inspection APIs.
+/// Offline Installers and Extras retain their full typed-content checks.
+pub(crate) fn inspect_libraries_for_refresh(
+    config: &Config,
+    store: &crate::state::StateStore,
+) -> Result<Vec<LibraryStatus>> {
+    Ok(inspect_with_evidence(
+        config,
+        &library_evidence(store, None)?,
+        false,
     ))
 }
 
@@ -107,12 +122,18 @@ fn library_evidence(
         .filter(|file| file.present && root.is_none_or(|root| file.path.starts_with(root)))
         .collect::<Vec<_>>();
     let mut parts = HashMap::new();
-    for product in files
+    let products = files
         .iter()
         .map(|file| file.product_id)
         .collect::<std::collections::HashSet<_>>()
-    {
-        for revision in store.load_all_download_revisions(product)? {
+        .into_iter()
+        .collect::<Vec<_>>();
+    for products in products.chunks(400) {
+        for revision in store
+            .load_download_revisions_for(products, false)?
+            .into_values()
+            .flatten()
+        {
             let kind = if revision.provider_category == DownloadCategory::Bonus {
                 LibraryKind::Extras
             } else {
@@ -152,6 +173,7 @@ fn library_evidence(
 fn inspect_with_evidence(
     config: &Config,
     evidence: &[(PathBuf, LibraryKind)],
+    inspect_game_children: bool,
 ) -> Vec<LibraryStatus> {
     LibraryKind::ALL
         .into_iter()
@@ -163,8 +185,14 @@ fn inspect_with_evidence(
         })
         .map(|(kind, library)| {
             let mut game_issues = Vec::new();
-            let compatibility =
-                library_compatibility(config, kind, library, evidence, &mut game_issues, true);
+            let compatibility = library_compatibility(
+                config,
+                kind,
+                library,
+                evidence,
+                &mut game_issues,
+                inspect_game_children || kind != LibraryKind::GameFiles,
+            );
             LibraryStatus {
                 kind,
                 library_id: library.id.clone(),
@@ -1031,6 +1059,127 @@ fn inspect_archive_files(path: &Path, depth: usize, budget: &mut usize) -> Resul
 mod tests {
     use super::*;
 
+    #[test]
+    fn library_evidence_batches_catalogs_without_changing_scope_or_categories() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("library.sqlite3");
+        let store = crate::state::StateStore::open_at(&database).unwrap();
+        let mut connection = rusqlite::Connection::open(&database).unwrap();
+        let selected = root.path().join("selected");
+        let other = root.path().join("other");
+        let transaction = connection.transaction().unwrap();
+        for product in 1..=500 {
+            transaction.execute(
+                "INSERT INTO download_slots(slot_id,product_id,provider_group_id,provider_category,name,first_seen_at,last_seen_at)
+                 VALUES(?1,?1,'group',?2,'fixture',1,1)",
+                rusqlite::params![product, if product % 2 == 1 { "bonus" } else { "installer" }],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO download_revisions(revision_id,slot_id,manifest_fingerprint,currently_offered,first_seen_at,last_seen_at,retired_at)
+                 VALUES(?1,?1,'fixture',0,1,1,2)", [product],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO download_parts(part_id,revision_id,provider_file_id,part_index,downlink)
+                 VALUES(?1,?1,'file',0,'fixture')", [product],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,part_id)
+                 VALUES(?1,?2,'fixture','extra','fixture',1,?2)",
+                rusqlite::params![(if product == 500 { &other } else { &selected }).join(format!("file-{product}")).to_str().unwrap(), product],
+            ).unwrap();
+        }
+        for (name, kind, part) in [
+            ("legacy", "patch", None),
+            ("missing-part", "extra", Some(9000)),
+            ("cross-product", "extra", Some(500)),
+        ] {
+            transaction.execute(
+                "INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,part_id)
+                 VALUES(?1,1,'fixture',?2,'fixture',1,?3)",
+                rusqlite::params![selected.join(name).to_str().unwrap(), kind, part],
+            ).unwrap();
+        }
+        transaction.execute_batch(
+            "INSERT INTO download_slots VALUES(999,999,'group','bonus',X'FF',NULL,NULL,NULL,1,1);
+             INSERT INTO download_revisions VALUES(999,999,NULL,NULL,'fixture',1,1,1,NULL);
+             INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,present)
+             VALUES('/synthetic/absent',999,'fixture','extra','fixture',1,0);",
+        ).unwrap();
+        transaction.commit().unwrap();
+
+        // Reference the former per-product loading path using exactly the represented
+        // products, including retired revisions. No unrelated catalog is materialized.
+        let started = std::time::Instant::now();
+        let files = store.managed_files().unwrap();
+        let mut categories = HashMap::new();
+        for product in files
+            .iter()
+            .filter(|file| file.present)
+            .map(|file| file.product_id)
+            .collect::<std::collections::HashSet<_>>()
+        {
+            for revision in store.load_all_download_revisions(product).unwrap() {
+                let kind = if revision.provider_category == DownloadCategory::Bonus {
+                    LibraryKind::Extras
+                } else {
+                    LibraryKind::OfflineInstallers
+                };
+                categories.extend(revision.parts.into_iter().map(|part| (part.part_id, kind)));
+            }
+        }
+        let expected = files
+            .into_iter()
+            .filter(|file| file.present)
+            .map(|file| {
+                let kind = file
+                    .part_id
+                    .and_then(|part| categories.get(&part))
+                    .copied()
+                    .unwrap_or(if file.kind == ArtifactKind::Extra {
+                        LibraryKind::Extras
+                    } else {
+                        LibraryKind::OfflineInstallers
+                    });
+                (file.path, kind)
+            })
+            .collect::<Vec<_>>();
+        let previous_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let actual = library_evidence(&store, None).unwrap();
+        eprintln!(
+            "500 product catalogs: per-product {previous_elapsed:?}, batched {:?}",
+            started.elapsed()
+        );
+        assert_eq!(actual, expected);
+        let actual = actual.into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(actual[&selected.join("file-1")], LibraryKind::Extras);
+        assert_eq!(
+            actual[&selected.join("legacy")],
+            LibraryKind::OfflineInstallers
+        );
+        assert_eq!(actual[&selected.join("missing-part")], LibraryKind::Extras);
+        assert_eq!(
+            actual[&selected.join("cross-product")],
+            LibraryKind::OfflineInstallers
+        );
+        let scoped = library_evidence(&store, Some(&selected))
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(scoped[&selected.join("cross-product")], LibraryKind::Extras);
+        assert_eq!(scoped.len(), 502);
+        connection
+            .execute(
+                "UPDATE download_slots SET name=X'FF' WHERE product_id=500",
+                [],
+            )
+            .unwrap();
+        assert!(library_evidence(&store, Some(&selected)).is_ok());
+        assert!(library_evidence(&store, None).is_err());
+        connection.execute("DELETE FROM managed_files", []).unwrap();
+        assert!(library_evidence(&store, None).unwrap().is_empty());
+    }
+
     fn configured(root: &Path) -> Config {
         let mut config = Config::default();
         for (kind, name) in [
@@ -1059,6 +1208,98 @@ mod tests {
     }
 
     #[test]
+    fn targeted_refresh_checks_roots_and_archives_without_scanning_game_siblings() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let config = configured(root.path());
+        let store = crate::state::StateStore::open_at(&root.path().join("state.db")).unwrap();
+        for id in 0..500 {
+            let partial = config.game_libraries[0].path.join(format!("partial-{id}"));
+            fs::create_dir(&partial).unwrap();
+            fs::write(partial.join("incomplete.bin"), b"partial payload").unwrap();
+        }
+        let healthy = config.game_libraries[0].path.join("healthy");
+        marker(&healthy);
+        fs::write(
+            healthy.join("game.sh"),
+            b"inert synthetic executable; never run",
+        )
+        .unwrap();
+        fs::set_permissions(healthy.join("game.sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        let full = inspect_libraries_with_store(&config, &store).unwrap();
+        let full_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let targeted = inspect_libraries_for_refresh(&config, &store).unwrap();
+        eprintln!(
+            "500 partial siblings: full inspection {full_time:?}, targeted roots {:?}",
+            started.elapsed()
+        );
+        assert_eq!(full[0].game_issues.len(), 500);
+        assert!(targeted[0].game_issues.is_empty());
+        assert_eq!(targeted[0].compatibility, LibraryCompatibility::Compatible);
+        assert_eq!(full[0].compatibility, targeted[0].compatibility);
+        assert_eq!(
+            crate::installation::reconcile_installed_products(
+                &store,
+                &config.game_libraries,
+                &[(7, "healthy".into())],
+                &HashMap::new(),
+            )
+            .unwrap()[0]
+                .installation_directory,
+            healthy
+        );
+        assert!(
+            validate_path(
+                &config,
+                LibraryKind::GameFiles,
+                &config.game_libraries[0].path.join("partial-0")
+            )
+            .is_err()
+        );
+
+        for (kind, category) in [
+            (LibraryKind::OfflineInstallers, "extra"),
+            (LibraryKind::Extras, "installer"),
+        ] {
+            fs::create_dir_all(config.libraries(kind)[0].path.join("game").join(category)).unwrap();
+        }
+        let full = inspect_libraries_with_store(&config, &store).unwrap();
+        let targeted = inspect_libraries_for_refresh(&config, &store).unwrap();
+        for index in [1, 2] {
+            assert!(matches!(
+                targeted[index].compatibility,
+                LibraryCompatibility::Incompatible(_)
+            ));
+            assert_eq!(targeted[index].compatibility, full[index].compatibility);
+        }
+        symlink(
+            &config.game_libraries[0].path,
+            root.path().join("linked-games"),
+        )
+        .unwrap();
+        for path in [
+            root.path().join("linked-games"),
+            crate::identity::config_root(),
+            config.offline_libraries[0].path.join("overlap"),
+        ] {
+            let mut invalid = config.clone();
+            invalid.game_libraries[0].path = path;
+            assert!(matches!(
+                inspect_libraries_for_refresh(&invalid, &store).unwrap()[0].compatibility,
+                LibraryCompatibility::Incompatible(_)
+            ));
+        }
+        symlink(root.path(), config.game_libraries[0].path.join(".ludomere")).unwrap();
+        assert!(matches!(
+            inspect_libraries_for_refresh(&config, &store).unwrap()[0].compatibility,
+            LibraryCompatibility::Incompatible(_)
+        ));
+    }
+
+    #[test]
     fn broken_game_entries_do_not_block_healthy_siblings_or_new_targets() {
         let root = tempfile::tempdir().unwrap();
         let config = configured(root.path());
@@ -1069,7 +1310,7 @@ mod tests {
         fs::write(terraria.join("partial.bin"), b"incomplete").unwrap();
         marker(&grim_dawn);
         let check = || {
-            let statuses = inspect_with_evidence(&config, &[]);
+            let statuses = inspect_with_evidence(&config, &[], true);
             assert_eq!(statuses[0].compatibility, LibraryCompatibility::Compatible);
             assert!(
                 statuses[0]
@@ -1132,21 +1373,21 @@ mod tests {
         fs::create_dir_all(&installer).unwrap();
         fs::write(installer.join("setup.exe"), b"inert").unwrap();
         assert!(
-            inspect_with_evidence(&config, &[])
+            inspect_with_evidence(&config, &[], true)
                 .iter()
                 .all(|status| status.compatibility == LibraryCompatibility::Compatible)
         );
         fs::create_dir_all(game.join("installer/windows/en")).unwrap();
         fs::write(game.join("installer/windows/en/setup.exe"), b"inert").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
         fs::remove_dir_all(game.join("installer")).unwrap();
         fs::create_dir_all(game.join("dlc/expansion/extra/any/en")).unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1157,7 +1398,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            inspect_with_evidence(&config, &[])[2].compatibility,
+            inspect_with_evidence(&config, &[], true)[2].compatibility,
             LibraryCompatibility::Incompatible(_)
         ));
         fs::remove_dir_all(&game).unwrap();
@@ -1167,7 +1408,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("setup.exe"), b"inert").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1193,25 +1434,25 @@ mod tests {
         assert!(contained_path(&config.game_libraries[0].path, &game.join("new/file")).is_ok());
         fs::write(game.join(".ludomere/installation.json"), b"broken").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
         config.game_libraries[0].path = root.path().join("absent");
         assert!(matches!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Unavailable(_)
         ));
         config.game_libraries[0].path = crate::identity::data_root().join("runtime-logs/nested");
         assert!(matches!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Incompatible(_)
         ));
         for protected in ["cloud-save-backups", "cloud-save-deletion-recovery"] {
             config.game_libraries[0].path =
                 crate::identity::data_root().join(protected).join("nested");
             assert!(matches!(
-                inspect_with_evidence(&config, &[])[0].compatibility,
+                inspect_with_evidence(&config, &[], true)[0].compatibility,
                 LibraryCompatibility::Incompatible(_)
             ));
         }
@@ -1225,13 +1466,13 @@ mod tests {
         fs::create_dir(&game).unwrap();
         fs::write(game.join("launch.exe"), b"inert").unwrap();
         assert_eq!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Compatible
         );
         fs::remove_file(game.join("launch.exe")).unwrap();
         fs::write(game.join("goggame-7.info"), br#"{"gameId":"7"}"#).unwrap();
         assert_eq!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Compatible
         );
         fs::remove_file(game.join("goggame-7.info")).unwrap();
@@ -1243,7 +1484,7 @@ mod tests {
         fs::create_dir_all(receipt.parent().unwrap()).unwrap();
         fs::write(receipt, serde_json::to_vec(&serde_json::json!({"version":1,"product_id":7,"directory":game,"identity":[metadata.dev(),metadata.ino()]})).unwrap()).unwrap();
         assert_eq!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Compatible
         );
         let artifact: RemoteArtifact = serde_json::from_value(serde_json::json!({"product_id":7,"kind":"extra","name":"language","download_path":"/file","provider_category":"language_pack"})).unwrap();
@@ -1262,7 +1503,7 @@ mod tests {
         fs::create_dir(&game).unwrap();
         fs::write(game.join("content.bin"), b"partial payload").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1282,12 +1523,12 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
         assert!(fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
         assert_eq!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Compatible
         );
         fs::write(game.join("content.bin"), b"changed payload").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1296,7 +1537,7 @@ mod tests {
         fs::write(&outside, b"partial payload").unwrap();
         std::os::unix::fs::symlink(&outside, game.join("content.bin")).unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1305,7 +1546,7 @@ mod tests {
         journal["files"][1]["path"] = serde_json::json!("../outside");
         fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1313,7 +1554,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
         fs::create_dir_all(game.join("installer/windows/en")).unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1334,28 +1575,28 @@ mod tests {
             "version":1,"product_id":7,"directory":game,"identity":[metadata.dev(),metadata.ino()]
         })).unwrap()).unwrap();
         assert_eq!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Compatible
         );
         let outside = root.path().join("prior");
         fs::rename(&game, &outside).unwrap();
         fs::create_dir(&game).unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
         // An independently validated new installation supersedes an old reset receipt.
         marker(&game);
         assert_eq!(
-            inspect_with_evidence(&config, &[])[0].compatibility,
+            inspect_with_evidence(&config, &[], true)[0].compatibility,
             LibraryCompatibility::Compatible
         );
         fs::remove_dir_all(game.join(".ludomere")).unwrap();
         fs::remove_dir(&game).unwrap();
         symlink(&outside, &game).unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[])[0]
+            !inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );

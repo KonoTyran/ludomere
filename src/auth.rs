@@ -109,6 +109,10 @@ enum CredentialStoreIssue {
     Disabled,
     Access,
     Ambiguous,
+    MissingCollection,
+    Dismissed,
+    Timeout,
+    Changed,
 }
 
 impl std::fmt::Display for CredentialStoreIssue {
@@ -116,10 +120,14 @@ impl std::fmt::Display for CredentialStoreIssue {
         formatter.write_str(match self {
             Self::Bus => "GOG sign-in could not contact the session credential service. Check your desktop session D-Bus connection, then try again.",
             Self::Unavailable => "GOG sign-in needs a Secret Service credential provider, but none is available in this desktop session. Enable a compatible desktop keyring, then try again.",
-            Self::Activation => "GOG sign-in could not start the advertised KDE credential service. Check that your desktop wallet is enabled, then try again.",
+            Self::Activation => "GOG sign-in could not start the advertised desktop credential service. Check that your desktop wallet is enabled, then try again.",
             Self::Disabled => "The KDE credential service started, but its Secret Service interface is unavailable. Check that the wallet and its Secret Service API are enabled, then try again.",
             Self::Access => "GOG sign-in could not access the credential store. Unlock your desktop wallet and allow its access prompt, then try again.",
             Self::Ambiguous => "GOG sign-in found duplicate matching login entries in the credential store. Review Ludomere entries in your desktop keyring, then try again.",
+            Self::MissingCollection => "Your credential service has no default wallet. Set up a default wallet in your desktop keyring, then try signing in again.",
+            Self::Dismissed => "The wallet unlock request was canceled. Sign in again and allow your desktop wallet to unlock to save your login.",
+            Self::Timeout => "The credential service did not finish preparing in time. Try signing in again and respond to your desktop wallet prompt.",
+            Self::Changed => "The credential service restarted while preparing your login. Sign in again to use the current wallet service.",
         })
     }
 }
@@ -366,9 +374,20 @@ fn save_token(token: &Token) -> Result<()> {
 }
 
 fn prepare_credential_store(expected: u64) -> Result<()> {
+    check_session(expected, true)?;
     let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
         .map_err(|_| CredentialStoreIssue::Bus)?;
-    prepare_secret_service(|method, parameters| {
+    prepare_credential_connection(&connection, expected, Duration::from_secs(120))
+}
+
+fn prepare_credential_connection(
+    connection: &gio::DBusConnection,
+    expected: u64,
+    prompt_timeout: Duration,
+) -> Result<()> {
+    use gio::glib::variant::ToVariant;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let metadata = |method: &str, parameters: Option<&gio::glib::Variant>| {
         check_session(expected, true)?;
         let response = connection
             .call_sync(
@@ -379,7 +398,7 @@ fn prepare_credential_store(expected: u64) -> Result<()> {
                 parameters,
                 None,
                 gio::DBusCallFlags::NONE,
-                5_000,
+                credential_timeout(deadline)?,
                 gio::Cancellable::NONE,
             )
             .map_err(|_| {
@@ -391,7 +410,253 @@ fn prepare_credential_store(expected: u64) -> Result<()> {
             })?;
         check_session(expected, true)?;
         Ok(response)
-    })
+    };
+    // KWallet may publish its compatibility name before the standard API name.
+    loop {
+        match prepare_secret_service(metadata) {
+            Err(error)
+                if error.downcast_ref::<CredentialStoreIssue>()
+                    == Some(&CredentialStoreIssue::Disabled) =>
+            {
+                credential_timeout(deadline)?;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
+    let standard = ("org.freedesktop.secrets",).to_variant();
+    if !metadata("NameHasOwner", Some(&standard))?
+        .get::<(bool,)>()
+        .ok_or(CredentialStoreIssue::Bus)?
+        .0
+    {
+        // Only reached for the advertised standard service, never an invented provider.
+        metadata(
+            "StartServiceByName",
+            Some(&("org.freedesktop.secrets", 0u32).to_variant()),
+        )?;
+    }
+    let owner = metadata("GetNameOwner", Some(&standard))?
+        .get::<(String,)>()
+        .ok_or(CredentialStoreIssue::Bus)?
+        .0;
+    let store = CredentialConnection {
+        connection,
+        expected,
+        owner: &owner,
+    };
+    let collection = loop {
+        match store.call(
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service",
+            "ReadAlias",
+            Some(&("default",).to_variant()),
+            deadline,
+        ) {
+            Ok(reply) => {
+                let (path,) = reply
+                    .get::<(gio::glib::variant::ObjectPath,)>()
+                    .ok_or(CredentialStoreIssue::Access)?;
+                anyhow::ensure!(
+                    path.as_str() != "/",
+                    CredentialStoreIssue::MissingCollection
+                );
+                break path;
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<gio::glib::Error>()
+                    .is_some_and(|error| {
+                        gio::DBusError::remote_error(error)
+                            .is_some_and(|name| name == "org.freedesktop.DBus.Error.UnknownObject")
+                    }) =>
+            {
+                credential_timeout(deadline)?;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                check_session(expected, true)?;
+                if error.downcast_ref::<CredentialStoreIssue>().is_some() {
+                    return Err(error);
+                }
+                return Err(CredentialStoreIssue::Access.into());
+            }
+        }
+    };
+    if !store.locked(collection.as_str(), deadline)? {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + prompt_timeout;
+    let (_, prompt) = store
+        .call(
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service",
+            "Unlock",
+            Some(&(vec![collection.clone()],).to_variant()),
+            deadline,
+        )?
+        .get::<(
+            Vec<gio::glib::variant::ObjectPath>,
+            gio::glib::variant::ObjectPath,
+        )>()
+        .ok_or(CredentialStoreIssue::Access)?;
+    if prompt.as_str() != "/" {
+        store.unlock_prompt(prompt.as_str(), deadline)?;
+    }
+    anyhow::ensure!(
+        !store.locked(collection.as_str(), deadline)?,
+        CredentialStoreIssue::Access
+    );
+    Ok(())
+}
+
+fn credential_timeout(deadline: std::time::Instant) -> Result<i32> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    anyhow::ensure!(!remaining.is_zero(), CredentialStoreIssue::Timeout);
+    Ok(remaining.as_millis().clamp(1, 5_000) as i32)
+}
+
+struct CredentialConnection<'a> {
+    connection: &'a gio::DBusConnection,
+    expected: u64,
+    owner: &'a str,
+}
+
+impl CredentialConnection<'_> {
+    fn check(&self, deadline: std::time::Instant) -> Result<()> {
+        use gio::glib::variant::ToVariant;
+        check_session(self.expected, true)?;
+        let owner = self
+            .connection
+            .call_sync(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "GetNameOwner",
+                Some(&("org.freedesktop.secrets",).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                credential_timeout(deadline)?,
+                gio::Cancellable::NONE,
+            )
+            .map_err(|_| CredentialStoreIssue::Changed)?;
+        check_session(self.expected, true)?;
+        anyhow::ensure!(
+            owner
+                .get::<(String,)>()
+                .is_some_and(|value| value.0 == self.owner),
+            CredentialStoreIssue::Changed
+        );
+        Ok(())
+    }
+
+    fn call(
+        &self,
+        path: &str,
+        interface: &str,
+        method: &str,
+        parameters: Option<&gio::glib::Variant>,
+        deadline: std::time::Instant,
+    ) -> Result<gio::glib::Variant> {
+        self.check(deadline)?;
+        let response = self.connection.call_sync(
+            Some(self.owner),
+            path,
+            interface,
+            method,
+            parameters,
+            None,
+            gio::DBusCallFlags::NONE,
+            credential_timeout(deadline)?,
+            gio::Cancellable::NONE,
+        );
+        self.check(deadline)?;
+        Ok(response?)
+    }
+
+    fn locked(&self, collection: &str, deadline: std::time::Instant) -> Result<bool> {
+        use gio::glib::variant::ToVariant;
+        self.call(
+            collection,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&("org.freedesktop.Secret.Collection", "Locked").to_variant()),
+            deadline,
+        )?
+        .get::<(gio::glib::Variant,)>()
+        .and_then(|value| value.0.get::<bool>())
+        .ok_or_else(|| CredentialStoreIssue::Access.into())
+    }
+
+    fn unlock_prompt(&self, prompt: &str, deadline: std::time::Instant) -> Result<()> {
+        use gio::glib::variant::ToVariant;
+        let context = gio::glib::MainContext::new();
+        let result = context
+            .with_thread_default(|| -> Result<()> {
+                let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let received = completed.clone();
+                let _subscription = self.connection.subscribe_to_signal(
+                    Some(self.owner),
+                    Some("org.freedesktop.Secret.Prompt"),
+                    Some("Completed"),
+                    Some(prompt),
+                    None,
+                    gio::DBusSignalFlags::NONE,
+                    move |signal| {
+                        let mut result = received.borrow_mut();
+                        if result.is_none() {
+                            *result = Some(
+                                signal
+                                    .parameters
+                                    .get::<(bool, gio::glib::Variant)>()
+                                    .map(|value| value.0),
+                            );
+                        }
+                    },
+                );
+                self.call(
+                    prompt,
+                    "org.freedesktop.Secret.Prompt",
+                    "Prompt",
+                    Some(&("",).to_variant()),
+                    deadline,
+                )?;
+                loop {
+                    self.check(deadline)?;
+                    while context.pending() {
+                        context.iteration(false);
+                    }
+                    if let Some(dismissed) = completed.borrow_mut().take() {
+                        anyhow::ensure!(
+                            !dismissed.ok_or(CredentialStoreIssue::Access)?,
+                            CredentialStoreIssue::Dismissed
+                        );
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+            .map_err(|_| anyhow::Error::from(CredentialStoreIssue::Bus))
+            .and_then(|value| value);
+        if result.is_err() {
+            // Only this operation's pinned prompt; never another provider's dialog.
+            let _ = self.connection.call_sync(
+                Some(self.owner),
+                prompt,
+                "org.freedesktop.Secret.Prompt",
+                "Dismiss",
+                None,
+                None,
+                gio::DBusCallFlags::NONE,
+                250,
+                gio::Cancellable::NONE,
+            );
+        }
+        result
+    }
 }
 
 fn prepare_secret_service(
@@ -695,6 +960,197 @@ fn http_client() -> Result<reqwest::blocking::Client> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn credential_unlock_protocol_uses_private_bus_and_preserves_failed_login_marker() {
+        use gio::glib::variant::{ObjectPath, ToVariant};
+        use std::sync::Arc;
+        if run_in_private_process(
+            "auth::tests::credential_unlock_protocol_uses_private_bus_and_preserves_failed_login_marker",
+        ) {
+            return;
+        }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Case {
+            Unlocked,
+            EarlyCompleted,
+            DelayedObject,
+            Missing,
+            Denied,
+            Dismissed,
+            Malformed,
+            StillLocked,
+            NoPrompt,
+            Timeout,
+            Canceled,
+            OwnerChanged,
+        }
+        struct Provider {
+            case: Case,
+            locked: bool,
+            calls: Vec<String>,
+        }
+        let state = Arc::new(Mutex::new(Provider {
+            case: Case::Unlocked,
+            locked: false,
+            calls: Vec::new(),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let bus = gio::TestDBus::new(gio::TestDBusFlags::NONE);
+        bus.up();
+        let address = bus.bus_address().unwrap().to_string();
+        let flags = gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+            | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION;
+        let (ready_send, ready_receive) = std::sync::mpsc::channel();
+        let server_address = address.clone();
+        let server_state = state.clone();
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let context = gio::glib::MainContext::new();
+            context.with_thread_default(|| {
+                let connection = gio::DBusConnection::for_address_sync(&server_address, flags, None, gio::Cancellable::NONE).unwrap();
+                let node = gio::DBusNodeInfo::for_xml(r#"<node>
+                    <interface name="org.freedesktop.Secret.Service">
+                        <method name="ReadAlias"><arg type="s" direction="in"/><arg type="o" direction="out"/></method>
+                        <method name="Unlock"><arg type="ao" direction="in"/><arg type="ao" direction="out"/><arg type="o" direction="out"/></method>
+                    </interface>
+                    <interface name="org.freedesktop.Secret.Collection"><property name="Locked" type="b" access="read"/></interface>
+                    <interface name="org.freedesktop.Secret.Prompt">
+                        <method name="Prompt"><arg type="s" direction="in"/></method><method name="Dismiss"/>
+                        <signal name="Completed"><arg type="b"/><arg type="v"/></signal>
+                    </interface>
+                </node>"#).unwrap();
+                let mut registrations = Vec::new();
+                for (path, interface) in [
+                    ("/org/freedesktop/secrets", "org.freedesktop.Secret.Service"),
+                    ("/collection", "org.freedesktop.Secret.Collection"),
+                    ("/prompt", "org.freedesktop.Secret.Prompt"),
+                ] {
+                    let method_state = server_state.clone();
+                    let property_state = server_state.clone();
+                    registrations.push(connection.register_object(path, &node.lookup_interface(interface).unwrap())
+                        .property(move |_, _, _, _, property| {
+                            assert_eq!(property, "Locked");
+                            let mut state = property_state.lock().unwrap();
+                            state.calls.push("Locked".into());
+                            state.locked.to_variant()
+                        })
+                        .method_call(move |connection, sender, _, _, method, _, invocation| {
+                            let mut state = method_state.lock().unwrap();
+                            state.calls.push(method.into());
+                            let path = |value: &str| ObjectPath::try_from(value).unwrap();
+                            match method {
+                                "ReadAlias" => {
+                                    if state.case == Case::DelayedObject && state.calls.iter().filter(|call| *call == "ReadAlias").count() == 1 {
+                                        invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownObject", "synthetic startup");
+                                    } else {
+                                        invocation.return_value(Some(&(path(if state.case == Case::Missing { "/" } else { "/collection" }),).to_variant()));
+                                    }
+                                }
+                                "Unlock" => {
+                                    if state.case == Case::Denied {
+                                        invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied", "PRIVATE_PROVIDER_TEXT");
+                                    } else {
+                                        invocation.return_value(Some(&(Vec::<ObjectPath>::new(), path(if state.case == Case::NoPrompt { "/" } else { "/prompt" })).to_variant()));
+                                    }
+                                }
+                                "Prompt" => {
+                                    if state.case == Case::Canceled { invalidate_session(); }
+                                    if state.case == Case::OwnerChanged {
+                                        connection.call_sync(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReleaseName", Some(&("org.freedesktop.secrets",).to_variant()), None, gio::DBusCallFlags::NONE, 1_000, gio::Cancellable::NONE).unwrap();
+                                    }
+                                    if !matches!(state.case, Case::Timeout | Case::Canceled | Case::OwnerChanged) {
+                                        if matches!(state.case, Case::EarlyCompleted | Case::DelayedObject) { state.locked = false; }
+                                        let parameters = if state.case == Case::Malformed { (42u32,).to_variant() } else { (state.case == Case::Dismissed, vec![path("/collection")].to_variant()).to_variant() };
+                                        // Intentionally emit before replying to Prompt: subscription must already exist.
+                                        connection.emit_signal(sender, "/prompt", "org.freedesktop.Secret.Prompt", "Completed", Some(&parameters)).unwrap();
+                                    }
+                                    invocation.return_value(None);
+                                }
+                                "Dismiss" => invocation.return_value(None),
+                                _ => panic!("unexpected method {method}"),
+                            }
+                        }).build().unwrap());
+                }
+                connection.call_sync(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", Some(&("org.freedesktop.secrets", 0u32).to_variant()), None, gio::DBusCallFlags::NONE, 1_000, gio::Cancellable::NONE).unwrap();
+                ready_send.send(()).unwrap();
+                while !server_stop.load(Ordering::Acquire) {
+                    while context.pending() { context.iteration(false); }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                for registration in registrations { connection.unregister_object(registration).unwrap(); }
+                connection.close_sync(gio::Cancellable::NONE).unwrap();
+            }).unwrap();
+        });
+        ready_receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        let connection =
+            gio::DBusConnection::for_address_sync(&address, flags, None, gio::Cancellable::NONE)
+                .unwrap();
+        for case in [
+            Case::Unlocked,
+            Case::EarlyCompleted,
+            Case::DelayedObject,
+            Case::Missing,
+            Case::Denied,
+            Case::Dismissed,
+            Case::Malformed,
+            Case::StillLocked,
+            Case::NoPrompt,
+            Case::Timeout,
+            Case::Canceled,
+            Case::OwnerChanged,
+        ] {
+            *state.lock().unwrap() = Provider {
+                case,
+                locked: case != Case::Unlocked,
+                calls: Vec::new(),
+            };
+            let marker = signed_out_path();
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            fs::write(&marker, b"signed out\n").unwrap();
+            let mut saves = 0;
+            let result = commit_credentials(session(), true, || {
+                prepare_credential_connection(&connection, session(), Duration::from_millis(120))?;
+                saves += 1;
+                Ok(())
+            });
+            let success = matches!(
+                case,
+                Case::Unlocked | Case::EarlyCompleted | Case::DelayedObject
+            );
+            assert_eq!(result.is_ok(), success, "case {case:?}: {result:?}");
+            assert_eq!(saves, usize::from(success), "case {case:?}");
+            assert_eq!(marker.exists(), !success, "case {case:?}");
+            let calls = &state.lock().unwrap().calls;
+            if matches!(case, Case::Timeout | Case::Canceled | Case::OwnerChanged) {
+                assert!(
+                    calls.iter().any(|call| call == "Dismiss"),
+                    "{case:?}: {calls:?}"
+                );
+            }
+            if case == Case::Unlocked {
+                assert!(!calls.iter().any(|call| call == "Unlock"));
+            }
+            if case == Case::EarlyCompleted {
+                assert_eq!(calls.iter().filter(|call| *call == "Locked").count(), 2);
+            }
+            if let Err(error) = result {
+                let message = sign_in_error_message(&error);
+                assert!(!message.contains("PRIVATE_PROVIDER_TEXT"));
+                if case == Case::Timeout {
+                    assert!(message.contains("in time"), "{message}");
+                }
+                if case == Case::Dismissed {
+                    assert!(message.contains("canceled"), "{message}");
+                }
+            }
+        }
+        connection.close_sync(gio::Cancellable::NONE).unwrap();
+        drop(connection);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        bus.down();
+    }
+
     fn run_in_private_process(name: &str) -> bool {
         if std::env::var("LUDOMERE_TEST_AUTH_CHILD").as_deref() == Ok(name) {
             return false;
@@ -971,6 +1427,10 @@ mod tests {
             CredentialStoreIssue::Unavailable,
             CredentialStoreIssue::Activation,
             CredentialStoreIssue::Disabled,
+            CredentialStoreIssue::MissingCollection,
+            CredentialStoreIssue::Dismissed,
+            CredentialStoreIssue::Timeout,
+            CredentialStoreIssue::Changed,
         ] {
             let error = anyhow::anyhow!("PRIVATE_TOKEN")
                 .context(issue)

@@ -747,7 +747,7 @@ fn stream_image_work(
     fetch: impl Fn(&ImageRequest) -> Result<Option<PathBuf>> + Sync,
     mut receive: impl FnMut(ImageWork) -> Result<()>,
 ) -> Result<()> {
-    let jobs = std::sync::Mutex::new(assets);
+    let jobs = std::sync::Mutex::new(std::collections::VecDeque::from(assets));
     let (media_sender, media_receiver) = mpsc::sync_channel(8);
     let stopped = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -770,10 +770,9 @@ fn stream_image_work(
                         let index = priorities
                             .iter()
                             .find_map(|id| jobs.iter().position(|asset| asset.product_id == *id));
-                        if jobs.is_empty() {
-                            None
-                        } else {
-                            Some(jobs.remove(index.unwrap_or(0)))
+                        match index {
+                            Some(index) => jobs.remove(index),
+                            None => jobs.pop_front(),
                         }
                     };
                     let Some(asset) = asset else {
@@ -2981,6 +2980,83 @@ mod tests {
         let hits = server.hits.load(std::sync::atomic::Ordering::Relaxed);
         cache_cover_at(&client, &url, &path).unwrap();
         assert_eq!(server.hits.load(std::sync::atomic::Ordering::Relaxed), hits);
+    }
+
+    #[test]
+    fn image_scheduler_preserves_fifo_and_prioritized_cover_icon_pairs() {
+        let previous = COVER_PRIORITY.lock().unwrap().clone();
+        for priority in [Vec::new(), vec![99, 3]] {
+            prioritize_covers(priority.clone());
+            let jobs = (0..4)
+                .flat_map(|product_id| {
+                    [ImageKind::Cover, ImageKind::Icon].map(|kind| ImageRequest {
+                        product_id,
+                        kind,
+                        url: None,
+                        fallback: None,
+                        cached: None,
+                    })
+                })
+                .collect();
+            // Keep all four workers occupied until their complete admission batch
+            // arrives. Thread wake/send order within each batch is not significant.
+            let (release, wait) = mpsc::channel();
+            let wait = std::sync::Mutex::new(wait);
+            let mut started = Vec::new();
+            let mut finished = Vec::new();
+            let result = stream_image_work(
+                jobs,
+                || true,
+                |_| {
+                    wait.lock().unwrap().recv_timeout(Duration::from_secs(2))?;
+                    Ok(None)
+                },
+                |event| {
+                    match event {
+                        ImageWork::Started(id, kind) => {
+                            started.push((id, matches!(kind, ImageKind::Icon)));
+                            if started.len().is_multiple_of(4) {
+                                for _ in 0..4 {
+                                    release.send(())?;
+                                }
+                            }
+                        }
+                        ImageWork::Finished(id, kind, result) => {
+                            result?;
+                            finished.push((id, matches!(kind, ImageKind::Icon)));
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            prioritize_covers(previous.clone());
+            result.unwrap();
+            for batch in started.chunks_mut(4) {
+                batch.sort_unstable();
+            }
+            let pairs = |first, second| {
+                vec![
+                    (first, false),
+                    (first, true),
+                    (second, false),
+                    (second, true),
+                ]
+            };
+            let mut expected = pairs(0, if priority.is_empty() { 1 } else { 3 });
+            expected.extend(if priority.is_empty() {
+                pairs(2, 3)
+            } else {
+                pairs(1, 2)
+            });
+            assert_eq!(started, expected);
+            finished.sort_unstable();
+            assert_eq!(
+                finished,
+                (0..4)
+                    .flat_map(|id| [(id, false), (id, true)])
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

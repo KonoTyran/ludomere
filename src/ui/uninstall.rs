@@ -56,9 +56,25 @@ impl Preview {
         let id = self.game.product_id;
         let slug = self.game.slug.clone();
         let exact_library = self.exact_library.borrow().clone();
+        let session = (online::account_session(), auth::session());
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = match &exact_library {
+            let _activity = match crate::profile_reset::begin_activity("preparing game removal")
+                .and_then(|activity| {
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "The account changed. Review removal again."
+                    );
+                    Ok(activity)
+                }) {
+                Ok(activity) => activity,
+                Err(error) => {
+                    let _ =
+                        sender.send((Err(format!("{error:#}")), Vec::new(), false, exact_library));
+                    return;
+                }
+            };
+            let mut result = match &exact_library {
                 Some(library) => crate::installation::recovery::prepare_game_directory_reset(
                     &config, id, &slug, library,
                 )
@@ -76,13 +92,7 @@ impl Preview {
                     .then(|| download::managed_downloads(id).map_err(|error| format!("{error:#}")));
                 Ok((choice, downloads, prefix))
             });
-            let recovery_needed = result.as_ref().err().is_some_and(|error| {
-                error
-                    .downcast_ref::<crate::installation::recovery::DamagedOperationRecord>()
-                    .is_some()
-            });
-            let result = result.map_err(|error| format!("{error:#}"));
-            let alternatives = if exact_library.is_none() {
+            let mut alternatives = if exact_library.is_none() {
                 crate::storage::game_directories_for_browsing(&config, &slug)
                     .unwrap_or_default()
                     .into_iter()
@@ -97,7 +107,28 @@ impl Preview {
             } else {
                 Vec::new()
             };
-            let _ = sender.send((result, alternatives, recovery_needed));
+            let mut exact_library = exact_library;
+            if result.is_err()
+                && let [(library, _)] = alternatives.as_slice()
+            {
+                exact_library = Some(library.clone());
+                result = crate::installation::recovery::prepare_game_directory_reset(
+                    &config, id, &slug, library,
+                )
+                .map(|plan| (UninstallPreparation::Recovery(plan), None, None));
+                alternatives.clear();
+            }
+            let recovery_needed = result.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::installation::recovery::DamagedOperationRecord>()
+                    .is_some()
+            });
+            let _ = sender.send((
+                result.map_err(|error| format!("{error:#}")),
+                alternatives,
+                recovery_needed,
+                exact_library,
+            ));
         });
         let preview = self.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
@@ -107,14 +138,15 @@ impl Preview {
             if preview.closed.get() {
                 return glib::ControlFlow::Break;
             }
-            if !preview.valid() {
+            if !preview.valid() || session != (online::account_session(), auth::session()) {
                 dialog.close();
                 return glib::ControlFlow::Break;
             }
             match receiver.try_recv() {
-                Ok((result, alternatives, recovery_needed)) => {
+                Ok((result, alternatives, recovery_needed, exact_library)) => {
                     preview.busy.set(false);
                     preview.retry.set_sensitive(true);
+                    *preview.exact_library.borrow_mut() = exact_library;
                     match result {
                         Ok((choice, downloads, prefix)) => {
                             match &choice {
@@ -140,7 +172,7 @@ impl Preview {
                                         &plan.prefixes,
                                     ));
                                     if preview.exact_library.borrow().is_some() {
-                                        preview.description.set_label(&format!("{}\n\nYou chose a file-only reset instead of the game's uninstaller. The reset removes ALL contents of this exact folder after confirmation, including unrecognized files or saves you placed there. Existing Windows prefixes are kept; no Wine or Proton helper is needed for this file-only reset.", preview.description.label()));
+                                        preview.description.set_label(&format!("{}\n\nThis file-only removal deletes ALL contents of this exact folder after confirmation, including unrecognized files or saves you placed there. Existing Windows prefixes are kept; no Wine or Proton helper is needed.", preview.description.label()));
                                     }
                                     preview.cleanup.set_sensitive(true);
                                     preview.status.set_label(&format!("{} recorded downloaded files ({}). If selected, files finishing while work stops are included. External saves, other games' prefixes, Proton/runtime files, playtime and Ludomere preferences are kept.", plan.downloaded_files, human_size(plan.downloaded_bytes)));
@@ -262,7 +294,7 @@ fn prepare_directory_recovery(preview: &Rc<Preview>) {
             preview.retry.set_sensitive(true);
             match result {
                 Ok(crate::installation::recovery::RecoveryReadiness::Ready) => preview.load(),
-                Ok(crate::installation::recovery::RecoveryReadiness::RestartRequired) => preview.status.set_label("Recovery is prepared. Restart your computer, then return to this game's Uninstall → Review File Reset → Prepare Recovery. No game files have been deleted."),
+                Ok(crate::installation::recovery::RecoveryReadiness::RestartRequired) => preview.status.set_label("Recovery is prepared. Restart your computer, then return to this game's Uninstall → Prepare Recovery (choose the same folder first if more than one copy exists). No game files have been deleted."),
                 Err(error) => preview.status.set_label(&format!("Recovery preparation did not complete: {error:#}. No game files have been deleted.")),
             }
             glib::ControlFlow::Break
@@ -361,17 +393,6 @@ fn show_removal_dialog(
     );
     extra.append(&cleanup);
     let browse = gtk::Button::with_label("Browse Local Files Before Removing");
-    browse.connect_clicked({
-        let window = window.clone();
-        let model = model.clone();
-        let game = game.clone();
-        let epoch = model.borrow().account_epoch;
-        move |_| {
-            if model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
-                browse_game_files(&window, &model, &game);
-            }
-        }
-    });
     extra.append(&browse);
     extra.append(&retry);
     extra.append(&alternatives);
@@ -396,6 +417,23 @@ fn show_removal_dialog(
         busy: Cell::new(false),
         closed: Cell::new(false),
         refresh,
+    });
+    browse.connect_clicked({
+        let preview = Rc::downgrade(&preview);
+        move |button| {
+            if let Some(preview) = preview.upgrade()
+                && preview.valid()
+                && !preview.closed.get()
+            {
+                browse_game_files(
+                    &preview.window,
+                    &preview.model,
+                    &preview.game,
+                    preview.exact_library.borrow().clone(),
+                    button,
+                );
+            }
+        }
     });
     preview.retry.connect_clicked({
         let preview = Rc::downgrade(&preview);
@@ -818,28 +856,42 @@ mod tests {
         let window = adw::ApplicationWindow::new(&app);
         window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
         window.present();
+        super::super::widgets::file_open::DIRECTORY_LAUNCHES
+            .with_borrow_mut(|paths| *paths = Some(Vec::new()));
 
         let dialog = show_uninstall_dialog(&window, &model, &detail, Rc::new(|| {}));
-        wait_until(|| button(dialog.upcast_ref(), "Review File Reset —").is_some());
-        assert!(directory.join("unrecognized-save.bin").exists());
-        button(dialog.upcast_ref(), "Review File Reset —")
-            .unwrap()
-            .emit_clicked();
         wait_until(|| dialog.is_response_enabled("uninstall"));
+        assert!(directory.join("unrecognized-save.bin").exists());
+        assert!(button(dialog.upcast_ref(), "Review File Reset —").is_none());
         assert!(text(dialog.upcast_ref(), &directory.display().to_string()));
         assert!(text(dialog.upcast_ref(), "ALL contents"));
         assert!(text(dialog.upcast_ref(), "prefixes are kept"));
+        // A selected removal copy must not become an all-library folder chooser.
+        let original_config = model.borrow().config.clone();
+        let other_library = root.path().join("other-games");
+        let other_directory = other_library.join(&detail.slug);
+        std::fs::create_dir_all(&other_directory).unwrap();
+        model
+            .borrow_mut()
+            .config
+            .game_libraries
+            .push(crate::config::GameLibrary {
+                id: "other".into(),
+                name: "Other".into(),
+                path: other_library,
+                default: false,
+            });
+        model.borrow().config.save().unwrap();
         button(dialog.upcast_ref(), "Browse Local Files Before Removing")
             .unwrap()
             .emit_clicked();
+        assert!(
+            button(dialog.upcast_ref(), "Opening…").is_some_and(|button| !button.is_sensitive())
+        );
         wait_until(|| {
-            window
-                .visible_dialog()
-                .is_some_and(|visible| visible != dialog)
+            super::super::widgets::file_open::DIRECTORY_LAUNCHES
+                .with_borrow(|paths| paths.as_ref().unwrap() == std::slice::from_ref(&directory))
         });
-        let browse = window.visible_dialog().unwrap();
-        wait_until(|| text(browse.upcast_ref(), &directory.display().to_string()));
-        browse.close();
         wait_until(|| {
             window
                 .visible_dialog()
@@ -852,22 +904,93 @@ mod tests {
             "cancelling review must not delete files"
         );
 
-        browse_recovery_directory(&window, &model, root.path().join("outside"));
+        let multiple = show_uninstall_dialog(&window, &model, &detail, Rc::new(|| {}));
+        wait_until(|| button(multiple.upcast_ref(), "Review File Reset —").is_some());
+        assert!(!multiple.is_response_enabled("uninstall"));
+        button(
+            multiple.upcast_ref(),
+            &format!("Review File Reset — {}", other_directory.display()),
+        )
+        .unwrap()
+        .emit_clicked();
+        wait_until(|| multiple.is_response_enabled("uninstall"));
+        assert!(text(
+            multiple.upcast_ref(),
+            &other_directory.display().to_string()
+        ));
+        assert!(directory.join("unrecognized-save.bin").exists() && other_directory.exists());
+        multiple.close();
+        wait_until(|| window.visible_dialog().is_none());
+
+        let browse_button = gtk::Button::with_label("Browse Files");
+        browse_game_files(&window, &model, &detail, None, &browse_button);
+        wait_until(|| window.visible_dialog().is_some());
+        let choices = window.visible_dialog().unwrap();
+        button(choices.upcast_ref(), &other_directory.display().to_string())
+            .unwrap()
+            .emit_clicked();
+        wait_until(|| {
+            super::super::widgets::file_open::DIRECTORY_LAUNCHES
+                .with_borrow(|paths| paths.as_ref().unwrap().last() == Some(&other_directory))
+        });
+        choices.close();
+        wait_until(|| window.visible_dialog().is_none());
+
+        let link = library.join("link-to-outside");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        browse_recovery_directory(&window, &model, link.clone(), &browse_button);
+        wait_until(|| {
+            super::super::widgets::file_open::DIRECTORY_LAUNCHES
+                .with_borrow(|paths| paths.as_ref().unwrap().last() == Some(&library))
+        });
+        assert!(window.visible_dialog().is_none());
+        std::fs::remove_file(link).unwrap();
+        model.borrow_mut().config = original_config;
+        model.borrow().config.save().unwrap();
+
+        browse_recovery_directory(&window, &model, root.path().join("outside"), &browse_button);
+        wait_until(|| window.visible_dialog().is_some());
         let invalid = window.visible_dialog().unwrap();
         wait_until(|| text(invalid.upcast_ref(), "Could not inspect game files"));
         invalid.close();
         wait_until(|| window.visible_dialog().is_none());
         let mut missing = detail.clone();
         missing.slug = "not-downloaded".into();
-        browse_game_files(&window, &model, &missing);
+        browse_game_files(&window, &model, &missing, None, &browse_button);
+        wait_until(|| window.visible_dialog().is_some());
         let empty = window.visible_dialog().unwrap();
         wait_until(|| text(empty.upcast_ref(), "No game files were found"));
         empty.close();
         wait_until(|| window.visible_dialog().is_none());
 
+        let launches = super::super::widgets::file_open::DIRECTORY_LAUNCHES
+            .with_borrow(|paths| paths.as_ref().unwrap().len());
+        let closed = show_uninstall_dialog(&window, &model, &detail, Rc::new(|| {}));
+        button(closed.upcast_ref(), "Browse Local Files Before Removing")
+            .unwrap()
+            .emit_clicked();
+        closed.close();
+        wait_until(|| {
+            button(closed.upcast_ref(), "Browse Local Files Before Removing")
+                .is_some_and(|button| button.is_sensitive())
+        });
+        assert_eq!(
+            super::super::widgets::file_open::DIRECTORY_LAUNCHES
+                .with_borrow(|paths| paths.as_ref().unwrap().len()),
+            launches
+        );
+
         let stale = show_uninstall_dialog(&window, &model, &detail, Rc::new(|| {}));
+        button(stale.upcast_ref(), "Browse Local Files Before Removing")
+            .unwrap()
+            .emit_clicked();
         model.borrow_mut().account_epoch += 1;
         wait_until(|| window.visible_dialog().is_none());
+        assert_eq!(
+            super::super::widgets::file_open::DIRECTORY_LAUNCHES
+                .with_borrow(|paths| paths.as_ref().unwrap().len()),
+            launches
+        );
         assert!(!stale.is_response_enabled("uninstall"));
         assert!(directory.exists());
 

@@ -17,6 +17,9 @@
   <provides><binary>ludomere</binary></provides>
   <categories><category>Game</category></categories>
   <releases>
+    <release version="0.3.1" date="2026-10-03"/>
+    <release version="0.3.0" date="2026-10-02"/>
+    <release version="0.2.5" date="2026-10-02"/>
     <release version="0.2.4" date="2026-10-02"/>
     <release version="0.2.3" date="2026-10-02"/>
     <release version="0.2.2" date="2026-10-02"/>

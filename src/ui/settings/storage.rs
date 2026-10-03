@@ -659,11 +659,16 @@ fn build_storage_section(
                                 let window = window.clone();
                                 let model = model.clone();
                                 let path = issue.path.clone();
-                                move |_| {
+                                move |button| {
                                     if model.borrow().account_epoch == epoch
                                         && !model.borrow().logout_pending
                                     {
-                                        browse_recovery_directory(&window, &model, path.clone());
+                                        browse_recovery_directory(
+                                            &window,
+                                            &model,
+                                            path.clone(),
+                                            button,
+                                        );
                                     }
                                 }
                             });

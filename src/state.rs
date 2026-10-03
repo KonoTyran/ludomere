@@ -1794,6 +1794,13 @@ impl StateStore {
     }
 
     fn normalized_games_for(&self, product_id: Option<i64>) -> Result<Vec<Game>> {
+        // Keep products and their catalogs in one read snapshot, including after the
+        // product cursor is exhausted. Reuse a caller's transaction when present.
+        let snapshot = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
         let mut statement = self.connection.prepare(
             "SELECT product_id, parent_product_id, product_type, slug, title, release_date,
                     description, changelog, metadata_json, links_json, media_json, currently_owned
@@ -1829,6 +1836,14 @@ impl StateStore {
                 row.get::<_, bool>(11)?,
             ))
         })?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let mut revisions = HashMap::new();
+        let mut builds = HashMap::new();
+        for ids in ids.chunks(400) {
+            revisions.extend(self.load_download_revisions_for(ids, true)?);
+            builds.extend(self.load_galaxy_builds_for(ids)?);
+        }
         let mut bases = Vec::new();
         let mut dlcs = Vec::new();
         for row in rows {
@@ -1845,7 +1860,7 @@ impl StateStore {
                 links_json,
                 media_json,
                 currently_owned,
-            ) = row?;
+            ) = row;
             let mut metadata: crate::domain::ProductMetadata =
                 serde_json::from_str(&metadata_json)?;
             let description = if description.trim().is_empty() {
@@ -1862,8 +1877,7 @@ impl StateStore {
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or_default();
             }
-            let revisions = self.load_current_download_revisions(id)?;
-            let artifacts = revisions_to_artifacts(&revisions);
+            let artifacts = revisions_to_artifacts(&revisions.remove(&id).unwrap_or_default());
             let platforms = media
                 .get("platforms")
                 .cloned()
@@ -1892,7 +1906,7 @@ impl StateStore {
                 .cloned()
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default();
-            let builds = self.load_galaxy_builds(id)?;
+            let builds = builds.remove(&id).unwrap_or_default();
             if product_type == "dlc" {
                 dlcs.push((
                     parent_id,
@@ -1955,16 +1969,22 @@ impl StateStore {
                 });
             }
         }
+        let parents = bases
+            .iter()
+            .enumerate()
+            .map(|(index, game)| (game.product_id, index))
+            .collect::<HashMap<_, _>>();
         for (parent_id, dlc) in dlcs {
-            if let Some(parent) =
-                parent_id.and_then(|id| bases.iter_mut().find(|game| game.product_id == id))
-            {
-                parent.dlcs.push(dlc);
+            if let Some(index) = parent_id.and_then(|id| parents.get(&id)) {
+                bases[*index].dlcs.push(dlc);
             }
         }
         for game in &mut bases {
             game.dlcs.sort_by_key(|dlc| dlc.title.to_lowercase());
             game.dlc_count = game.dlcs.len();
+        }
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
         }
         Ok(bases)
     }
@@ -2542,18 +2562,31 @@ impl StateStore {
     }
 
     pub fn load_galaxy_builds(&self, product_id: i64) -> Result<Vec<GalaxyBuild>> {
-        let mut statement = self.connection.prepare(
+        Ok(self
+            .load_galaxy_builds_for(&[product_id])?
+            .remove(&product_id)
+            .unwrap_or_default())
+    }
+
+    fn load_galaxy_builds_for(
+        &self,
+        product_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<GalaxyBuild>>> {
+        let mut statement = self.connection.prepare(&format!(
             "SELECT build_id, operating_system, version, branch, tags_json, public, generation,
                     repository_url, repository_id, published_at, currently_returned,
-                    first_seen_at, last_seen_at
-             FROM galaxy_builds WHERE product_id = ?1
+                    first_seen_at, last_seen_at, product_id
+             FROM galaxy_builds WHERE product_id IN ({})
              ORDER BY published_at DESC, build_id DESC",
-        )?;
-        let rows = statement.query_map(params![product_id], |row| {
+            std::iter::repeat_n("?", product_ids.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))?;
+        let rows = statement.query_map(rusqlite::params_from_iter(product_ids), |row| {
             let tags: String = row.get(4)?;
             Ok(GalaxyBuild {
                 build_id: row.get(0)?,
-                product_id,
+                product_id: row.get(13)?,
                 operating_system: row.get(1)?,
                 version: row.get(2)?,
                 branch: row.get(3)?,
@@ -2568,7 +2601,11 @@ impl StateStore {
                 last_seen_at: row.get(12)?,
             })
         })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        let mut builds = HashMap::<_, Vec<_>>::new();
+        for build in rows.filter_map(Result::ok) {
+            builds.entry(build.product_id).or_default().push(build);
+        }
+        Ok(builds)
     }
 
     pub fn load_current_download_revisions(
@@ -2587,16 +2624,35 @@ impl StateStore {
         product_id: i64,
         current_only: bool,
     ) -> Result<Vec<DownloadRevision>> {
-        let mut statement = self.connection.prepare(
+        Ok(self
+            .load_download_revisions_for(&[product_id], current_only)?
+            .remove(&product_id)
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn load_download_revisions_for(
+        &self,
+        product_ids: &[i64],
+        current_only: bool,
+    ) -> Result<HashMap<i64, Vec<DownloadRevision>>> {
+        let placeholders = std::iter::repeat_n("?", product_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let parameters = product_ids
+            .iter()
+            .copied()
+            .chain(std::iter::once(i64::from(current_only)))
+            .collect::<Vec<_>>();
+        let mut statement = self.connection.prepare(&format!(
             "SELECT r.revision_id, s.slot_id, s.provider_group_id, s.provider_category,
                     s.name, s.operating_system, s.language_code, s.language_name,
                     r.version, r.total_size, r.manifest_fingerprint, r.currently_offered,
-                    r.first_seen_at, r.last_seen_at, r.retired_at
+                    r.first_seen_at, r.last_seen_at, r.retired_at, s.product_id
              FROM download_revisions r JOIN download_slots s USING(slot_id)
-             WHERE s.product_id = ?1 AND (?2 = 0 OR r.currently_offered = 1)
-             ORDER BY s.provider_category, s.slot_id",
-        )?;
-        let mut rows = statement.query_map(params![product_id, current_only], |row| {
+             WHERE s.product_id IN ({placeholders}) AND (? = 0 OR r.currently_offered = 1)
+             ORDER BY s.provider_category, s.slot_id"
+        ))?;
+        let mut rows = statement.query_map(rusqlite::params_from_iter(&parameters), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -2613,25 +2669,26 @@ impl StateStore {
                 row.get::<_, i64>(12)?,
                 row.get::<_, i64>(13)?,
                 row.get::<_, Option<i64>>(14)?,
+                row.get::<_, i64>(15)?,
             ))
         })?;
         let Some(first) = rows.next().transpose()? else {
-            return Ok(Vec::new());
+            return Ok(HashMap::new());
         };
         // Keep the revision cursor active while reading parts so both queries share
         // the same SQLite read snapshot, even during a manifest refresh.
-        let mut parts_statement = self.connection.prepare(
+        let mut parts_statement = self.connection.prepare(&format!(
             "SELECT p.part_id, p.revision_id, p.provider_file_id, p.part_index,
                     p.expected_size, p.downlink, p.checksum, p.checksum_fetched_at
              FROM download_parts p
              JOIN download_revisions r USING(revision_id)
              JOIN download_slots s USING(slot_id)
-             WHERE s.product_id = ?1 AND (?2 = 0 OR r.currently_offered = 1)
-             ORDER BY p.revision_id, p.part_index",
-        )?;
+             WHERE s.product_id IN ({placeholders}) AND (? = 0 OR r.currently_offered = 1)
+             ORDER BY p.revision_id, p.part_index"
+        ))?;
         let mut parts = HashMap::<i64, Vec<crate::domain::DownloadPart>>::new();
         for part in parts_statement
-            .query_map(params![product_id, current_only], |row| {
+            .query_map(rusqlite::params_from_iter(&parameters), |row| {
                 Ok(crate::domain::DownloadPart {
                     part_id: row.get(0)?,
                     revision_id: row.get(1)?,
@@ -2647,7 +2704,7 @@ impl StateStore {
         {
             parts.entry(part.revision_id).or_default().push(part);
         }
-        let mut revisions = Vec::new();
+        let mut revisions = HashMap::<_, Vec<_>>::new();
         for row in std::iter::once(Ok(first)).chain(rows) {
             let (
                 revision_id,
@@ -2665,26 +2722,30 @@ impl StateStore {
                 first_seen,
                 last_seen,
                 retired_at,
-            ) = row?;
-            revisions.push(DownloadRevision {
-                revision_id,
-                slot_id,
                 product_id,
-                provider_group_id: group_id,
-                provider_category: parse_download_category(&category),
-                name,
-                operating_system: os,
-                language_code,
-                language_name,
-                version,
-                total_size: total_size.map(|value| value as u64),
-                manifest_fingerprint: fingerprint,
-                currently_offered: current,
-                first_seen_at: first_seen,
-                last_seen_at: last_seen,
-                retired_at,
-                parts: parts.remove(&revision_id).unwrap_or_default(),
-            });
+            ) = row?;
+            revisions
+                .entry(product_id)
+                .or_default()
+                .push(DownloadRevision {
+                    revision_id,
+                    slot_id,
+                    product_id,
+                    provider_group_id: group_id,
+                    provider_category: parse_download_category(&category),
+                    name,
+                    operating_system: os,
+                    language_code,
+                    language_name,
+                    version,
+                    total_size: total_size.map(|value| value as u64),
+                    manifest_fingerprint: fingerprint,
+                    currently_offered: current,
+                    first_seen_at: first_seen,
+                    last_seen_at: last_seen,
+                    retired_at,
+                    parts: parts.remove(&revision_id).unwrap_or_default(),
+                });
         }
         Ok(revisions)
     }
@@ -4114,6 +4175,99 @@ mod tests {
             "complete"
         );
     }
+    #[test]
+    fn normalized_library_batch_preserves_catalog_and_single_product_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        assert!(store.normalized_games().unwrap().is_empty());
+        let games = (1..=500)
+            .map(|id| Game {
+                product_id: id,
+                title: format!("Game {id:04}"),
+                slug: format!("game-{id}"),
+                dlcs: vec![crate::domain::Dlc {
+                    product_id: id + 1000,
+                    title: format!("DLC {id:04}"),
+                    owned: id % 2 == 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        store.upsert_normalized_library(&games).unwrap();
+        store.set_favorite(42, true).unwrap();
+        store.add_tag(42, "Keep").unwrap();
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for id in (1..=500).chain(1001..=1500) {
+            transaction.execute("INSERT INTO download_slots(slot_id,product_id,provider_group_id,provider_category,name,first_seen_at,last_seen_at) VALUES(?1,?1,'fixture','installer','Fixture',1,1)", [id]).unwrap();
+            transaction.execute("INSERT INTO download_revisions(revision_id,slot_id,version,total_size,manifest_fingerprint,currently_offered,first_seen_at,last_seen_at) VALUES(?1,?1,'1.0',20,'fixture',1,1,1)", [id]).unwrap();
+            for part in (0..2).rev() {
+                transaction.execute("INSERT INTO download_parts(revision_id,provider_file_id,part_index,expected_size,downlink) VALUES(?1,?2,?3,10,?2)", params![id, format!("file-{id}-{part}"), part]).unwrap();
+            }
+            for published in [1, 2] {
+                transaction.execute("INSERT INTO galaxy_builds(build_id,product_id,operating_system,tags_json,public,generation,repository_url,published_at,currently_returned,first_seen_at,last_seen_at) VALUES(?1,?2,'windows','[]',1,2,'fixture',?3,1,1,1)", params![format!("build-{id}-{published}"), id, published]).unwrap();
+            }
+        }
+        assert!(store.cached_product_game(42).unwrap().is_some());
+        assert!(!store.connection.is_autocommit());
+        transaction.commit().unwrap();
+        let start = std::time::Instant::now();
+        let mut loaded = Vec::new();
+        for _ in 0..10 {
+            loaded = store.normalized_games().unwrap();
+        }
+        eprintln!(
+            "10 normalized reads: 500 games, 500 DLC, 2000 parts/builds: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(loaded.len(), 500);
+        for (index, game) in loaded.iter().enumerate() {
+            assert_eq!(game.product_id, index as i64 + 1);
+            assert_eq!(game.dlcs.len(), 1);
+            assert_eq!(game.dlcs[0].product_id, game.product_id + 1000);
+            assert_eq!(game.dlcs[0].owned, game.product_id % 2 == 0);
+            for (id, artifacts, builds) in [
+                (game.product_id, &game.remote_artifacts, &game.galaxy_builds),
+                (
+                    game.dlcs[0].product_id,
+                    &game.dlcs[0].remote_artifacts,
+                    &game.dlcs[0].galaxy_builds,
+                ),
+            ] {
+                assert_eq!(artifacts.len(), 2);
+                assert!(artifacts.iter().all(|artifact| artifact.product_id == id));
+                assert_eq!(
+                    builds
+                        .iter()
+                        .map(|build| build.published_at)
+                        .collect::<Vec<_>>(),
+                    [Some(2), Some(1)]
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(store.cached_product_game(42).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&loaded[41]).unwrap()
+        );
+        assert_eq!(
+            store.cached_product_game(1042).unwrap().unwrap().product_id,
+            1042
+        );
+        assert!(store.cached_product_game(9999).unwrap().is_none());
+        assert!(store.favorites().unwrap().contains(&42));
+        assert_eq!(store.tags().unwrap()[&42], ["Keep"]);
+        // A narrow lookup must not parse unrelated corrupt product metadata.
+        store
+            .connection
+            .execute(
+                "UPDATE products SET metadata_json='invalid' WHERE product_id=500",
+                [],
+            )
+            .unwrap();
+        assert!(store.cached_product_game(42).unwrap().is_some());
+        assert!(store.normalized_games().is_err());
+    }
+
     #[test]
     fn progressive_core_preserves_omitted_owned_products_rich_cache_and_pack_entitlement() {
         let path = temp_database_path("progressive-core");

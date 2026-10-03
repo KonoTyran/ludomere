@@ -86,13 +86,26 @@ pub(super) fn check_updates(w: &Widgets, model: &Rc<RefCell<AppModel>>, manual: 
                 }
                 glib::ControlFlow::Break
             }
-            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+            Ok(Err(error)) => {
                 if w.live_status.label() == "Checking and queuing game updates…" {
                     show_progress(&w, "");
                 }
                 hold_status_notice(
                     Some(&w.status),
-                    "Game update check failed. Retry from Settings.",
+                    &super::notifications::failure_message(
+                        "Game update check failed. Retry from Settings.",
+                        &format!("{error:#}"),
+                    ),
+                );
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if w.live_status.label() == "Checking and queuing game updates…" {
+                    show_progress(&w, "");
+                }
+                hold_status_notice(
+                    Some(&w.status),
+                    "Game update check stopped unexpectedly. Retry from Settings.",
                 );
                 glib::ControlFlow::Break
             }
@@ -263,8 +276,15 @@ pub(super) fn game_group(
                     status.set_label("Changes save automatically. Blank language inherits the default; editing it does not start a download.");
                     glib::ControlFlow::Break
                 }
-                Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                    status.set_label("Could not load preferences. Close and reopen to retry.");
+                Ok(Err(error)) => {
+                    status.set_label(&super::notifications::failure_message(
+                        "Could not load update preferences. Close and reopen Properties to retry.",
+                        &format!("{error:#}"),
+                    ));
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    status.set_label("Loading update preferences stopped unexpectedly. Close and reopen Properties to retry.");
                     glib::ControlFlow::Break
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

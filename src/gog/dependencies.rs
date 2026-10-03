@@ -78,8 +78,39 @@ impl Dependency {
                 && format!("{:x}", md5::compute(&self.manifest_bytes)) == self.manifest_id,
             "Dependency manifest identity does not match its frozen plan"
         );
-        let manifest = super::depot_manifest::parse(&inflate(&self.manifest_bytes, &|| false)?)
-            .context("Invalid dependency manifest")?;
+        let mut bytes = inflate(&self.manifest_bytes, &|| false)?;
+        if matches!(self.method, Method::GameFiles) {
+            let mut root: serde_json::Value =
+                serde_json::from_slice(&bytes).context("Invalid dependency manifest JSON")?;
+            let mut changed = false;
+            if let Some(items) = root
+                .get_mut("depot")
+                .and_then(|depot| depot.get_mut("items"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for item in items {
+                    if let Some(path) = item.get_mut("path")
+                        && let Some(relative) =
+                            path.as_str().and_then(|path| path.strip_prefix('/'))
+                    {
+                        // Official game-local dependencies can use a depot-root prefix
+                        // (language_setup). Remove only that marker; the normal parser
+                        // and dependency validator still check every remaining component.
+                        *path = serde_json::Value::String(relative.to_owned());
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                bytes = serde_json::to_vec(&root)?;
+                ensure!(
+                    bytes.len() <= MAX_METADATA,
+                    "Dependency metadata exceeds its safety limit"
+                );
+            }
+        }
+        let manifest =
+            super::depot_manifest::parse(&bytes).context("Invalid dependency manifest")?;
         ensure!(
             !matches!(self.method, Method::ScriptInterpreter { .. }) || self.id == "ISI",
             "Unexpected dependency script interpreter"
@@ -254,7 +285,7 @@ fn resolve_catalog(
             {
                 return Err(error);
             }
-            Err(error) => errors.push(format!("{id}: {error}")),
+            Err(error) => errors.push(format!("{id}: {error:#}")),
         }
     }
     ensure!(
@@ -1171,6 +1202,15 @@ mod tests {
                 "",
                 "",
             ),
+            (
+                // Public metadata only, fetched 2026-10-02 from GOG's dependency
+                // catalog build 59705672826648994; compressed bytes hash below.
+                "language_setup",
+                "39757bac2293fab156a465e52c23b552",
+                &include_bytes!("../../tests/fixtures/gog-dependencies/language_setup.zlib")[..],
+                "",
+                "",
+            ),
         ] {
             let catalog = Catalog {
                 depots: vec![CatalogEntry {
@@ -1189,6 +1229,36 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(resolved.entries[0].manifest_id, identity);
+            assert_eq!(resolved.entries[0].manifest_bytes, bytes);
+            let restored: Plan =
+                serde_json::from_slice(&serde_json::to_vec(&resolved).unwrap()).unwrap();
+            restored.validate().unwrap();
+            assert_eq!(restored, resolved);
+            if id == "language_setup" {
+                assert!(
+                    super::super::depot_manifest::parse(&inflate(bytes, &|| false).unwrap())
+                        .is_err()
+                );
+                let parsed = resolved.entries[0].manifest().unwrap();
+                let DepotEntry::File(file) = &parsed.entries[0] else {
+                    panic!("file expected");
+                };
+                assert_eq!(file.path, "language_setup.exe");
+                assert_eq!(file.size, 6_216_288);
+                assert_eq!(
+                    file.sha256.as_deref(),
+                    Some("12fa2e59d74549f1af662068c32063e7fb21aff090e9a5211e5051bf59c84d73")
+                );
+                let mut tampered = resolved.entries[0].clone();
+                tampered.manifest_bytes[0] ^= 1;
+                assert!(
+                    tampered
+                        .manifest()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("identity")
+                );
+            }
             assert_eq!(
                 resolved.entries[0].manifest().unwrap().entries.len(),
                 if id == "DOSBox074" { 14 } else { 1 }
@@ -1202,6 +1272,91 @@ mod tests {
                 _ => assert_eq!(resolved.entries[0].method, Method::GameFiles),
             }
         }
+    }
+
+    #[test]
+    fn dependency_root_paths_retain_safety_checks_and_error_causes() {
+        for path in [
+            "/",
+            "//server/file",
+            "/\\server/file",
+            "\\server\\file",
+            "/C:/file",
+            "C:/file",
+            "/../file",
+            "/dir/../../file",
+            "/dir/./file",
+            "/dir//file",
+            "/bad\nname",
+            "/.ludomere/control",
+            "/__redist/file",
+        ] {
+            let (dependency, _) = fixture(path, b"inert", false);
+            assert!(
+                dependency.manifest().is_err(),
+                "accepted unsafe path {path:?}"
+            );
+        }
+        for method in [
+            Method::Exe {
+                path: "__redist/setup.exe".into(),
+                args: Vec::new(),
+            },
+            Method::Msi {
+                path: "__redist/setup.msi".into(),
+                args: Vec::new(),
+            },
+        ] {
+            let (mut dependency, _) = fixture("/__redist/setup.exe", b"inert", false);
+            dependency.method = method;
+            assert!(
+                dependency.manifest().is_err(),
+                "shared installers must retain strict wire paths"
+            );
+        }
+        let (mut dependency, _) = fixture("/same", b"inert", false);
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&inflate(&dependency.manifest_bytes, &|| false).unwrap())
+                .unwrap();
+        let mut duplicate = root["depot"]["items"][0].clone();
+        duplicate["path"] = serde_json::json!("SAME");
+        root["depot"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        dependency.manifest_bytes = compressed(&serde_json::to_vec(&root).unwrap());
+        dependency.manifest_id = format!("{:x}", md5::compute(&dependency.manifest_bytes));
+        assert!(
+            dependency
+                .manifest()
+                .unwrap_err()
+                .chain()
+                .any(|error| error.to_string().contains("colliding"))
+        );
+
+        let (unsafe_dependency, _) = fixture("/../escape", b"inert", false);
+        let error = resolve_catalog(
+            std::slice::from_ref(&unsafe_dependency.id),
+            "1".into(),
+            Catalog {
+                depots: vec![CatalogEntry {
+                    dependency_id: unsafe_dependency.id.clone(),
+                    readable_name: "Fixture".into(),
+                    manifest: unsafe_dependency.manifest_id.clone(),
+                    executable: Executable {
+                        path: String::new(),
+                        arguments: String::new(),
+                    },
+                }],
+            },
+            |_| Ok(unsafe_dependency.manifest_bytes.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Invalid dependency manifest") && error.contains("unsafe depot path"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1384,7 +1539,7 @@ mod tests {
 
     #[test]
     fn sfc_game_local_files_publish_from_verified_cache_and_preserve_other_files() {
-        let (dependency, _) = fixture("DOSBOX/fixture.conf", b"inert configuration", true);
+        let (dependency, _) = fixture("/DOSBOX/fixture.conf", b"inert configuration", true);
         let plan = plan(dependency.clone());
         let prepared = acquire_with(
             &plan,

@@ -215,10 +215,18 @@ pub(super) fn connect_preferences_recovery(
     button: &gtk::Button,
     status: &gtk::Label,
     refresh: Rc<dyn Fn()>,
-) {
+) -> gtk::Label {
+    let notice = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .visible(false)
+        .build();
     let session = online::account_session();
     button.connect_clicked({
         let status = status.clone();
+        let notice = notice.clone();
         move |button| {
             let Some(window) = button.root().and_downcast::<adw::ApplicationWindow>() else { return; };
             if online::account_session() != session { return; }
@@ -233,6 +241,7 @@ pub(super) fn connect_preferences_recovery(
             let status = status.clone();
             let refresh = refresh.clone();
             let button = button.clone();
+            let notice = notice.clone();
             dialog.choose(Some(&window.clone()), gio::Cancellable::NONE, move |response| {
                 if response != "reset" || !window.is_visible() || online::account_session() != session { return; }
                 button.set_sensitive(false);
@@ -248,13 +257,9 @@ pub(super) fn connect_preferences_recovery(
                     if online::account_session() != session { return glib::ControlFlow::Break; }
                     match result {
                         Ok(backup) => {
+                            notice.set_label(&format!("Proton preferences reset. Choose your default Proton again. Your previous preferences are preserved at:\n{}", backup.display()));
+                            notice.set_visible(true);
                             refresh();
-                            if window.is_visible() {
-                                let done = adw::AlertDialog::builder().heading("Proton preferences reset")
-                                    .body(format!("Choose your default Proton again. Your previous preferences are preserved at:\n{}", backup.display())).build();
-                                done.add_response("close", "Close");
-                                done.present(Some(&window));
-                            }
                         }
                         Err(error) => status.set_label(&format!("Could not reset Proton preferences: {error}. No game files were changed.")),
                     }
@@ -263,6 +268,7 @@ pub(super) fn connect_preferences_recovery(
             });
         }
     });
+    notice
 }
 
 pub(super) fn proton_selection_group_guarded(
@@ -496,10 +502,20 @@ pub(super) fn proton_selection_group_guarded(
                         saved_index.set(index as u32);
                         selected.set_selected(index as u32);
                         browse.set_visible(index as u32 == custom_index.get());
-                        status.set_label(&save_error.borrow_mut().take().unwrap_or_default());
+                        let error = save_error.borrow_mut().take();
+                        let save_initial = !prompt_without_saved
+                            && product_id.is_none()
+                            && saved.is_none()
+                            && paths.borrow().get(index).is_some_and(Option::is_some)
+                            && error.is_none();
+                        status.set_label(&error.unwrap_or_default());
                         buttons.set_sensitive(true);
                         selected.set_sensitive(true);
                         busy.set(false);
+                        if save_initial {
+                            // Discovery selected this row while saves were suppressed as busy.
+                            selected.notify("selected");
+                        }
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {
@@ -663,7 +679,11 @@ pub(super) fn proton_selection_group_guarded(
             }
         }
     });
-    connect_preferences_recovery(&recover, &status, reload.clone());
+    group.add(&connect_preferences_recovery(
+        &recover,
+        &status,
+        reload.clone(),
+    ));
     reload();
     let selected_path = Rc::new(move || {
         let path = paths.borrow().get(selected.selected() as usize).cloned();
@@ -1538,26 +1558,6 @@ pub(super) fn connect_windows_action(
             action(button);
         }
     });
-}
-
-pub(super) fn patch_with_components(
-    window: &adw::ApplicationWindow,
-    game: crate::domain::InstalledGame,
-    patch: PathBuf,
-    target: Option<String>,
-) -> mpsc::Receiver<crate::installation::PatchEvent> {
-    let (sender, receiver) = mpsc::channel();
-    with_windows_components(window, game.product_id, true, None, move || {
-        let events = crate::installation::run_patch(game, patch, target);
-        std::thread::spawn(move || {
-            for event in events {
-                if sender.send(event).is_err() {
-                    break;
-                }
-            }
-        });
-    });
-    receiver
 }
 
 #[cfg(test)]

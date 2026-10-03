@@ -16,6 +16,7 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     page.append(&content);
     let page_epoch = model.borrow().account_epoch;
+    let page_session = online::account_session();
     {
         let page = page.downgrade();
         let model = model.clone();
@@ -27,7 +28,10 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
             if page.upgrade().is_none() {
                 return glib::ControlFlow::Break;
             }
-            if model.borrow().account_epoch == page_epoch {
+            if model.borrow().account_epoch == page_epoch
+                && !model.borrow().logout_pending
+                && online::account_session() == page_session
+            {
                 return glib::ControlFlow::Continue;
             }
             while let Some(child) = content.first_child() {
@@ -55,7 +59,10 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
             };
             let (account, token, online, epoch, generation, session) = {
                 let state = model.borrow();
-                if state.logout_pending || state.account_epoch != page_epoch {
+                if state.logout_pending
+                    || state.account_epoch != page_epoch
+                    || online::account_session() != page_session
+                {
                     return;
                 }
                 (
@@ -81,8 +88,18 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
             status.set_label("Loading achievements…");
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let cached = StateStore::open()
-                    .and_then(|store| store.cached_achievements(&account, product_id));
+                let _activity = match crate::profile_reset::begin_activity("loading achievements") {
+                    Ok(activity) => activity,
+                    Err(error) => {
+                        let _ = sender.send((true, Err(error)));
+                        return;
+                    }
+                };
+                let cached = online::with_account_session(session, || {
+                    StateStore::open()?.cached_achievements(&account, product_id)
+                });
+                let has_cached = cached.as_ref().is_ok_and(Option::is_some);
+                let cache_error = cached.as_ref().err().map(|error| format!("{error:#}"));
                 let _ = sender.send((false, cached));
                 let result = if online {
                     token.as_ref().map_or_else(
@@ -92,10 +109,20 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
                         },
                     )
                 } else {
-                    Err(anyhow::anyhow!(
+                    Err(anyhow::anyhow!(if has_cached {
                         "Offline. Cached achievements remain available."
-                    ))
+                    } else if cache_error.is_some() {
+                        "Offline. Cached achievements could not be loaded."
+                    } else {
+                        "Offline. No cached achievements are available."
+                    }))
                 };
+                let result = result.map_err(|error| match cache_error {
+                    Some(cache_error) => {
+                        error.context(format!("Could not read cached achievements: {cache_error}"))
+                    }
+                    None => error,
+                });
                 let _ = sender.send((true, result));
             });
             let model = model.clone();
@@ -109,6 +136,7 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
                     || model.borrow().account_epoch != epoch
                     || model.borrow().detail_generation != generation
                     || model.borrow().logout_pending
+                    || online::account_session() != session
                 {
                     return glib::ControlFlow::Break;
                 }
@@ -128,7 +156,10 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
                         }
                     }
                     Ok(None) => {}
-                    Err(error) if terminal => status.set_label(&error.to_string()),
+                    Err(error) if terminal => status.set_label(
+                        super::notifications::failure_message("", &format!("{error:#}"))
+                            .trim_start(),
+                    ),
                     Err(_) => {}
                 }
                 if terminal {
@@ -219,4 +250,116 @@ fn render(content: &gtk::Box, cached: &crate::state::CachedAchievements) {
         group.add(&row);
     }
     content.append(&group);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG and private GTK; offline synthetic account only"]
+    fn offline_achievements_explain_cache_errors_retry_and_account_changes() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p274-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn text(widget: &gtk::Widget) -> String {
+            let mut value = widget
+                .downcast_ref::<gtk::Label>()
+                .map(|label| label.label().to_string())
+                .unwrap_or_default();
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                value.push_str(&text(&current));
+                child = current.next_sibling();
+            }
+            value
+        }
+        let model = Rc::new(RefCell::new(AppModel {
+            account_profile: Some(auth::Profile {
+                user_id: "synthetic-account".into(),
+                ..Default::default()
+            }),
+            network_available: false,
+            ..AppModel::default()
+        }));
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var_os("XDG_DATA_HOME").unwrap()));
+        std::fs::create_dir_all(&database).unwrap();
+        let page = achievement_page(&model, 9274001);
+        let controls = page.first_child().unwrap();
+        let spinner = controls
+            .first_child()
+            .and_downcast::<gtk::Spinner>()
+            .unwrap();
+        let status = spinner.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let refresh = controls.last_child().and_downcast::<gtk::Button>().unwrap();
+        let content = page.last_child().and_downcast::<gtk::Box>().unwrap();
+        assert!(spinner.is_spinning());
+        assert!(!refresh.is_sensitive());
+        wait_until(|| refresh.is_sensitive());
+        assert!(!spinner.is_spinning());
+        assert!(
+            status
+                .label()
+                .contains("Could not read cached achievements")
+        );
+        assert!(status.label().contains("Offline"));
+        std::fs::remove_dir(&database).unwrap();
+        refresh.emit_clicked();
+        wait_until(|| refresh.is_sensitive());
+        assert_eq!(
+            status.label(),
+            "Offline. No cached achievements are available."
+        );
+        StateStore::open()
+            .unwrap()
+            .replace_achievements(
+                "synthetic-account",
+                9274001,
+                &[crate::gog::achievements::Achievement {
+                    id: "synthetic".into(),
+                    key: "synthetic".into(),
+                    name: "Synthetic achievement".into(),
+                    description: "Offline fixture".into(),
+                    visible: true,
+                    unlocked_at: None,
+                    progress: None,
+                    progress_max: None,
+                    rarity: None,
+                }],
+            )
+            .unwrap();
+        refresh.emit_clicked();
+        wait_until(|| refresh.is_sensitive());
+        assert_eq!(
+            status.label(),
+            "Offline. Cached achievements remain available."
+        );
+        assert!(text(content.upcast_ref()).contains("Synthetic achievement"));
+        let reservation = crate::profile_reset::reserve().unwrap();
+        refresh.emit_clicked();
+        wait_until(|| refresh.is_sensitive());
+        assert!(status.label().contains("Profile reset"));
+        assert!(text(content.upcast_ref()).contains("Synthetic achievement"));
+        drop(reservation);
+        online::invalidate_library_session();
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!refresh.is_sensitive());
+        assert!(!spinner.is_spinning());
+        assert!(content.first_child().is_none());
+        refresh.emit_clicked();
+        assert!(status.label().contains("Account changed"));
+        assert!(content.first_child().is_none());
+    }
 }

@@ -103,7 +103,7 @@ impl Completion {
             receipt,
             identity: (metadata.dev(), metadata.ino()),
         };
-        result.validate(artifacts)?;
+        result.validate()?;
         Ok(Some(result))
     }
 
@@ -211,9 +211,9 @@ impl Completion {
             .collect()
     }
 
-    pub fn validate(&self, artifacts: &[RemoteArtifact]) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let mut names = HashSet::new();
-        for (file, artifact) in self.receipt.files.iter().zip(artifacts) {
+        for file in &self.receipt.files {
             let name = Path::new(&file.name);
             ensure!(
                 name.components().count() == 1
@@ -230,10 +230,11 @@ impl Completion {
                     && metadata.ino() == file.inode
                     && metadata.len() == file.size
                     && (metadata.mtime(), metadata.mtime_nsec()) == file.modified
-                    && (metadata.ctime(), metadata.ctime_nsec()) == file.changed
-                    && artifact.size_bytes.is_none_or(|size| size == file.size),
+                    && (metadata.ctime(), metadata.ctime_nsec()) == file.changed,
                 "Downloaded file changed before completion could be registered"
             );
+            // Even numeric GOG catalog sizes can be rounded. The receipt binds
+            // the exact file published after the HTTP response completed.
         }
         Ok(())
     }
@@ -288,6 +289,74 @@ mod tests {
         let files = vec![destination.join("server-name.bin")];
         fs::write(&files[0], b"data").unwrap();
         (root, artifacts, destination, staging, files)
+    }
+
+    #[test]
+    fn legacy_display_size_receipt_recovers_without_changing_published_files() {
+        let (_root, mut artifacts, destination, staging, files) = fixture();
+        artifacts[0].size_label = Some("0.1 kB".into());
+        artifacts[0].size_bytes = Some(100);
+        fs::write(&files[0], [b'x'; 104]).unwrap();
+        let result = Completion::record(&staging, &artifacts, &destination, &files);
+        let receipt_bytes = fs::read(staging.join("completion.json")).unwrap();
+        // Older versions left this same receipt after comparing a rounded catalog
+        // display size against the exact published length.
+        assert_eq!(
+            serde_json::from_slice::<Receipt>(&receipt_bytes)
+                .unwrap()
+                .files[0]
+                .size,
+            104
+        );
+        result.unwrap();
+        let loaded = Completion::load(&staging, &artifacts, &destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.files(), files);
+        assert_eq!(
+            fs::read(staging.join("completion.json")).unwrap(),
+            receipt_bytes
+        );
+        assert_eq!(fs::read(&files[0]).unwrap(), [b'x'; 104]);
+        fs::write(&files[0], [b'y'; 104]).unwrap();
+        assert!(Completion::load(&staging, &artifacts, &destination).is_err());
+        fs::remove_file(&files[0]).unwrap();
+        assert!(Completion::load(&staging, &artifacts, &destination).is_err());
+    }
+
+    #[test]
+    fn numeric_catalog_sizes_do_not_override_observed_receipt_identity() {
+        for identity in 0..4 {
+            let (_root, mut artifacts, destination, staging, files) = fixture();
+            artifacts[0].size_bytes = Some(381_681_664);
+            File::options()
+                .write(true)
+                .open(&files[0])
+                .unwrap()
+                .set_len(382_662_456)
+                .unwrap();
+            if identity > 0 {
+                artifacts[0].size_label = Some("0.1 kB".into());
+            }
+            match identity {
+                1 => artifacts[0].provider_group_id = Some("official-group".into()),
+                2 => artifacts[0].provider_file_id = Some("official-file".into()),
+                3 => {
+                    artifacts[0].provider_category =
+                        Some(crate::domain::DownloadCategory::Installer)
+                }
+                _ => {}
+            }
+            Completion::record(&staging, &artifacts, &destination, &files).unwrap();
+            assert_eq!(
+                Completion::load(&staging, &artifacts, &destination)
+                    .unwrap()
+                    .unwrap()
+                    .files(),
+                files
+            );
+            assert_eq!(fs::metadata(&files[0]).unwrap().len(), 382_662_456);
+        }
     }
 
     #[test]
@@ -350,7 +419,7 @@ mod tests {
         assert!(Completion::record(&staging, &artifacts, &destination, &files).is_err());
         assert_eq!(fs::read(staging.join("completion.json")).unwrap(), before);
         fs::hard_link(&files[0], root.path().join("linked")).unwrap();
-        assert!(receipt.validate(&artifacts).is_err());
+        assert!(receipt.validate().is_err());
         assert_eq!(fs::read(&files[0]).unwrap(), b"data");
     }
 }

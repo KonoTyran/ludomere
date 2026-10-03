@@ -1004,6 +1004,139 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires private HOME/all XDG/TMP, GTK display and D-Bus; inert Proton fixtures only"]
+    fn untouched_detected_proton_advances_onboarding_and_preserves_saved_choices() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::var("HOME").unwrap();
+        assert!(home.starts_with("/tmp/ludomere-p280-"));
+        let discovered = std::path::PathBuf::from(home).join(".steam/root/compatibilitytools.d");
+        let versions = [
+            discovered.join("GE-Proton-first"),
+            discovered.join("GE-Proton-second"),
+        ];
+        for path in &versions {
+            std::fs::create_dir_all(path.join("files/bin")).unwrap();
+            for name in ["proton", "files/bin/wine"] {
+                std::fs::write(path.join(name), "inert; never execute\n").unwrap();
+                std::fs::set_permissions(path.join(name), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+            std::fs::write(path.join("toolmanifest.vdf"), "manifest {}").unwrap();
+        }
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.InitialProtonTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let w = Rc::new(window::create_widgets(&app, &Config::default()));
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        w.window.present();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn proton_row(widget: &gtk::Widget) -> Option<adw::ComboRow> {
+            if let Some(row) = widget.downcast_ref::<adw::ComboRow>()
+                && row.title() == "Proton version"
+            {
+                return Some(row.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = proton_row(&widget) {
+                    return Some(row);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let preferences = crate::identity::config_root().join("proton.json");
+        for case in 0..3 {
+            if case == 1 {
+                crate::compatibility::set_default_proton(&versions[1]).unwrap();
+            } else if case == 2 {
+                std::fs::remove_file(&preferences).unwrap();
+                std::fs::remove_dir_all(&discovered).unwrap();
+            }
+            let saved = (case == 1).then(|| std::fs::read(&preferences).unwrap());
+            show_setup(&w, &model, None);
+            let dialog = w.window.visible_dialog().unwrap();
+            let next = find_named_descendant(dialog.upcast_ref(), "setup-next")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            let skip = find_named_descendant(dialog.upcast_ref(), "setup-skip-library")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            let step = find_named_descendant(dialog.upcast_ref(), "setup-step")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            for target in 2..=5 {
+                wait_until(|| next.is_sensitive());
+                if target >= 4 {
+                    skip.emit_clicked();
+                } else {
+                    next.emit_clicked();
+                }
+                wait_until(|| step.label().starts_with(&format!("Step {target} of")));
+            }
+            let row = proton_row(dialog.upcast_ref()).unwrap();
+            wait_until(|| row.is_sensitive() && next.is_sensitive());
+            if case < 2 {
+                let path = proton::saved_proton(None).unwrap().path;
+                let displayed = find_named_descendant(dialog.upcast_ref(), "selected-proton-path")
+                    .and_downcast::<gtk::Label>()
+                    .unwrap();
+                assert!(displayed.label().contains(path.to_str().unwrap()));
+                if case == 1 {
+                    assert_eq!(path, versions[1]);
+                }
+                // No ComboRow selection change: use the initially displayed version.
+                next.emit_clicked();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !step.label().starts_with("Step 6 of") && std::time::Instant::now() < deadline
+                {
+                    while glib::MainContext::default().iteration(false) {}
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    step.label().starts_with("Step 6 of"),
+                    "{}: {}",
+                    step.label(),
+                    find_named_descendant(dialog.upcast_ref(), "setup-status")
+                        .and_downcast::<gtk::Label>()
+                        .unwrap()
+                        .label()
+                );
+                if let Some(saved) = saved {
+                    assert_eq!(std::fs::read(&preferences).unwrap(), saved);
+                }
+            } else {
+                next.emit_clicked();
+                wait_until(|| {
+                    find_named_descendant(dialog.upcast_ref(), "setup-status")
+                        .and_downcast::<gtk::Label>()
+                        .is_some_and(|status| status.label().contains("Select a Proton version"))
+                });
+                assert!(step.label().starts_with("Step 5 of"));
+                assert!(
+                    crate::compatibility::proton_preferences()
+                        .unwrap()
+                        .default
+                        .is_none()
+                );
+            }
+            dialog.close();
+            wait_until(|| w.window.visible_dialog().is_none());
+        }
+        w.window.close();
+    }
+
+    #[test]
     #[ignore = "requires private HOME/all XDG"]
     fn runtime_detection_uses_saved_manifest_without_saving_or_running_helpers() {
         use std::os::unix::fs::PermissionsExt;

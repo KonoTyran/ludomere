@@ -12,6 +12,12 @@ pub(super) fn show_game_settings(
     };
     let window_name = format!("ludomere-game-settings-{}", game.product_id);
     let session = online::account_session();
+    let cloud_session = CloudActionSession {
+        auth: auth::session(),
+        online: session,
+        epoch: model.borrow().account_epoch,
+        model: Rc::downgrade(model),
+    };
     if let Some(existing) = application
         .windows()
         .into_iter()
@@ -152,9 +158,6 @@ pub(super) fn show_game_settings(
     fixes_group.set_description(Some(
         "Recommended fixes are preselected for known games. Changes apply the next time the game launches.",
     ));
-    let overrides = crate::state::StateStore::open()
-        .and_then(|store| store.compatibility_fix_overrides(game.product_id))
-        .unwrap_or_default();
     let recommended = crate::compatibility::recommended_fix_ids(game.product_id);
     let resetting = Rc::new(std::cell::Cell::new(false));
     let fixes_status = gtk::Label::builder().wrap(true).xalign(0.0).build();
@@ -169,8 +172,8 @@ pub(super) fn show_game_settings(
         } else {
             fix.description.clone()
         });
-        row.set_active(overrides.get(&fix.id).copied().unwrap_or(is_recommended));
-        row.set_sensitive(installed.is_some());
+        row.set_active(is_recommended);
+        row.set_sensitive(false);
         let product_id = game.product_id;
         let fix_id = fix.id.clone();
         let resetting = resetting.clone();
@@ -217,7 +220,7 @@ pub(super) fn show_game_settings(
         .set_subtitle("Reset the compatibility-fix switches to shipped recommendations. DLL overrides are unchanged.");
     let reset = gtk::Button::with_label("Reapply Recommended");
     reset.set_valign(gtk::Align::Center);
-    reset.set_sensitive(installed.is_some());
+    reset.set_sensitive(false);
     reset_row.add_suffix(&reset);
     fixes_group.add(&reset_row);
     let product_id = game.product_id;
@@ -226,6 +229,7 @@ pub(super) fn show_game_settings(
         let refresh_after_change = refresh_after_change.clone();
         let group = fixes_group.downgrade();
         let status = fixes_status.clone();
+        let fix_rows = fix_rows.clone();
         move |_| {
             let Some(group) = group.upgrade() else {
                 return;
@@ -252,6 +256,16 @@ pub(super) fn show_game_settings(
             );
         }
     });
+    load_compatibility_fix_preferences(
+        &fixes_group,
+        &fixes_status,
+        fix_rows,
+        &reset,
+        resetting,
+        game.product_id,
+        session,
+        installed.is_some(),
+    );
     compatibility_page.add(&fixes_group);
     let updates_page = adw::PreferencesPage::new();
     updates_page.set_title("Updates");
@@ -390,13 +404,13 @@ pub(super) fn show_game_settings(
             check_inventory.set_sensitive(supported);
             let inventory_game = installed_game.clone();
             let inventory_status = inventory_row.clone();
+            let origin = cloud_session.clone();
             check_inventory.connect_clicked(move |button| {
-                button.set_sensitive(false);
-                inventory_status.set_subtitle("Checking remote save files…");
                 load_cloud_inventory(
                     inventory_game.clone(),
                     inventory_status.clone(),
                     button.clone(),
+                    origin.clone(),
                 );
             });
             inventory_row.add_suffix(&check_inventory);
@@ -462,10 +476,12 @@ pub(super) fn show_game_settings(
             let game = installed_game.clone();
             let locations = locations_state.clone();
             let status = cloud_status.clone();
+            let origin = cloud_session.clone();
             sync_now.connect_clicked(move |button| {
                 run_cloud_action(
                     button,
                     &status,
+                    &origin,
                     crate::cloud_saves::CloudSyncRequest {
                         game: game.clone(),
                         locations: locations.borrow().clone(),
@@ -523,12 +539,14 @@ pub(super) fn show_game_settings(
                 let status = cloud_status.clone();
                 let parent = window.clone();
                 let popover = popover.clone();
+                let origin = cloud_session.clone();
                 button.connect_clicked(move |button| {
                     popover.popdown();
                     confirm_force_cloud_action(
                         &parent,
                         button,
                         &status,
+                        &origin,
                         crate::cloud_saves::CloudSyncRequest {
                             game: game.clone(),
                             locations: locations.borrow().clone(),
@@ -1205,6 +1223,9 @@ fn wire_branch_actions(
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    status.add_css_class("error");
+                    status
+                        .set_label("Branch preparation stopped unexpectedly. Try switching again.");
                     button.set_sensitive(true);
                     glib::ControlFlow::Break
                 }
@@ -1219,10 +1240,6 @@ fn present_source_migration(
     game: &DetailPageModel,
     installed: &crate::domain::InstalledGame,
 ) {
-    let galaxy_preflight = Some(super::download_chooser::cached_galaxy_available(
-        game,
-        &model.borrow().config,
-    ));
     if crate::installation::installation_operation_snapshot(game.product_id).is_some()
         || crate::installation::depot_operation_snapshot_for_product(game.product_id).is_some_and(
             |snapshot| {
@@ -1241,25 +1258,173 @@ fn present_source_migration(
         alert.present(Some(parent));
         return;
     }
-    let config = model.borrow().config.clone();
-    let Ok(store) = StateStore::open() else {
-        return;
-    };
-    let Ok(Some(marker)) =
-        crate::installation::load_installation_marker(&installed.installation_directory)
-    else {
-        return;
-    };
+    let view = MigrationView::new();
+    view.dialog.present(Some(parent));
+    let epoch = model.borrow().account_epoch;
+    let session = online::account_session();
+    let game = game.clone();
+    let installed = installed.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn({
+        let game = game.clone();
+        let installed = installed.clone();
+        move || {
+            let _ = sender.send(prepare_migration_choices(&game, &installed, session));
+        }
+    });
+    let parent = parent.clone();
+    let model = model.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        if view.closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        if model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+            || online::account_session() != session
+        {
+            view.stop("Account changed. Close this dialog and reopen game properties.");
+            return glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(_) => Err(anyhow::anyhow!("Source inspection stopped unexpectedly.")),
+        };
+        view.progress.set_visible(false);
+        match result {
+            Ok(prepared) => wire_migration_choices(&parent, &model, &game, &installed, &view, prepared, epoch, session),
+            Err(error) => view.stop(&format!("Could not inspect installation sources: {error:#}. Close and choose a source again.")),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+#[derive(Clone)]
+struct MigrationView {
+    dialog: adw::Dialog,
+    selector: gtk::DropDown,
+    status: gtk::Label,
+    progress: gtk::ProgressBar,
+    proceed: gtk::Button,
+    close: gtk::Button,
+    closed: Rc<std::cell::Cell<bool>>,
+    started: Rc<std::cell::Cell<bool>>,
+}
+
+impl MigrationView {
+    fn new() -> Self {
+        let dialog = adw::Dialog::builder().content_width(560).build();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        root.append(&adw::HeaderBar::new());
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        body.set_margin_start(20);
+        body.set_margin_end(20);
+        body.set_margin_bottom(20);
+        let heading = gtk::Label::new(Some("Reinstall using another source"));
+        heading.add_css_class("title-2");
+        heading.set_xalign(0.0);
+        body.append(&heading);
+        let selector = gtk::DropDown::new(None::<gtk::StringList>, gtk::Expression::NONE);
+        selector.set_sensitive(false);
+        body.append(&selector);
+        let status = gtk::Label::new(Some(
+            "Inspecting installation sources and saved-game locations…",
+        ));
+        status.set_xalign(0.0);
+        status.set_wrap(true);
+        status.set_selectable(true);
+        body.append(&status);
+        let progress = gtk::ProgressBar::new();
+        body.append(&progress);
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        let close = gtk::Button::with_label("Cancel");
+        let proceed = gtk::Button::with_label("Continue");
+        proceed.add_css_class("destructive-action");
+        proceed.set_sensitive(false);
+        actions.append(&close);
+        actions.append(&proceed);
+        body.append(&actions);
+        root.append(&body);
+        dialog.set_child(Some(&root));
+        close.connect_clicked({
+            let dialog = dialog.downgrade();
+            move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            }
+        });
+        let closed = Rc::new(std::cell::Cell::new(false));
+        dialog.connect_closed({
+            let closed = closed.clone();
+            move |_| closed.set(true)
+        });
+        let weak = progress.downgrade();
+        glib::timeout_add_local(Duration::from_millis(100), {
+            let closed = closed.clone();
+            move || {
+                let Some(progress) = weak.upgrade().filter(|_| !closed.get()) else {
+                    return glib::ControlFlow::Break;
+                };
+                if progress.is_visible() {
+                    progress.pulse();
+                }
+                glib::ControlFlow::Continue
+            }
+        });
+        Self {
+            dialog,
+            selector,
+            status,
+            progress,
+            proceed,
+            close,
+            closed,
+            started: Rc::new(std::cell::Cell::new(false)),
+        }
+    }
+
+    fn stop(&self, message: &str) {
+        self.progress.set_visible(false);
+        self.selector.set_sensitive(false);
+        self.proceed.set_sensitive(false);
+        self.close.set_label("Close");
+        self.status
+            .set_label(super::notifications::failure_message("", message).trim_start());
+    }
+}
+
+struct MigrationChoices {
+    config: Config,
+    marker: crate::installation::InstallationMarker,
+    candidates: crate::installation::InstallerCandidates,
+    choices: Vec<crate::installation::FreshInstallSource>,
+    current: Option<crate::config::PreferredInstallationSource>,
+    locations: Vec<crate::domain::CloudSaveLocation>,
+    galaxy_preflight: Result<(), String>,
+}
+
+fn prepare_migration_choices(
+    game: &DetailPageModel,
+    installed: &crate::domain::InstalledGame,
+    session: u64,
+) -> anyhow::Result<MigrationChoices> {
+    online::with_account_session(session, || Ok(()))?;
+    let _activity = crate::profile_reset::begin_activity("inspecting installation sources")?;
+    let config = crate::storage::read_config()?;
+    let store = online::with_account_session(session, StateStore::open)?;
+    let marker = crate::installation::load_installation_marker(&installed.installation_directory)?
+        .ok_or_else(|| anyhow::anyhow!("The installation record is missing. Use Repair or Review File Reset from the game's Manage menu."))?;
+    let galaxy_preflight = super::download_chooser::cached_galaxy_available(game, &config);
     let candidates = crate::installation::detect_installer_candidates(
         game.product_id,
-        &store
-            .load_all_download_revisions(game.product_id)
-            .unwrap_or_default(),
-        &store.managed_files().unwrap_or_default(),
+        &store.load_all_download_revisions(game.product_id)?,
+        &store.managed_files()?,
         &config,
     );
     let galaxy_available = super::download_chooser::newest_master_windows_build(game).is_some()
-        && galaxy_preflight.as_ref().is_none_or(Result::is_ok);
+        && galaxy_preflight.is_ok();
     let current = match marker.source {
         crate::domain::InstallationSource::GalaxyDepot => {
             Some(crate::config::PreferredInstallationSource::WindowsGalaxy)
@@ -1299,13 +1464,40 @@ fn present_source_migration(
         }
     })
     .collect::<Vec<_>>();
+    let locations = store.cloud_save_record(game.product_id)?.locations;
+    Ok(MigrationChoices {
+        config,
+        marker,
+        candidates,
+        choices,
+        current,
+        locations,
+        galaxy_preflight,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_migration_choices(
+    parent: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    game: &DetailPageModel,
+    installed: &crate::domain::InstalledGame,
+    view: &MigrationView,
+    prepared: MigrationChoices,
+    epoch: u64,
+    session: u64,
+) {
+    let MigrationChoices {
+        config,
+        marker,
+        candidates,
+        choices,
+        current,
+        locations,
+        galaxy_preflight,
+    } = prepared;
     if choices.is_empty() {
-        let alert = adw::AlertDialog::builder()
-            .heading("No alternate installation source")
-            .body("Download an alternate installer or refresh Galaxy metadata first.")
-            .build();
-        alert.add_response("close", "Close");
-        alert.present(Some(parent));
+        view.stop("No alternate installation source is available. Download an alternate installer or refresh Galaxy metadata, then choose a source again.");
         return;
     }
     let labels = choices
@@ -1328,56 +1520,32 @@ fn present_source_migration(
             }
         })
         .collect::<Vec<_>>();
-    let dialog = adw::Dialog::builder().content_width(560).build();
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    root.append(&adw::HeaderBar::new());
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    body.set_margin_start(20);
-    body.set_margin_end(20);
-    body.set_margin_bottom(20);
-    let heading = gtk::Label::new(Some("Reinstall using another source"));
-    heading.add_css_class("title-2");
-    heading.set_xalign(0.0);
-    body.append(&heading);
-    let selector = gtk::DropDown::new(
-        Some(gtk::StringList::new(
-            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
-        )),
-        gtk::Expression::NONE,
-    );
-    body.append(&selector);
+    let selector = view.selector.clone();
+    selector.set_model(Some(&gtk::StringList::new(
+        &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+    )));
+    selector.set_sensitive(true);
+    view.proceed.set_sensitive(true);
     let status_text = galaxy_preflight
         .as_ref()
-        .and_then(|result| result.as_ref().err())
+        .err()
         .map(|error| format!("Galaxy build unavailable: {error}"))
         .unwrap_or_else(|| {
             "The current installation will be removed only after known saves are safely backed up."
                 .into()
         });
-    let status = gtk::Label::new(Some(&status_text));
-    status.set_xalign(0.0);
-    status.set_wrap(true);
-    body.append(&status);
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    actions.set_halign(gtk::Align::End);
-    let cancel = gtk::Button::with_label("Cancel");
-    let proceed = gtk::Button::with_label("Continue");
-    proceed.add_css_class("destructive-action");
-    actions.append(&cancel);
-    actions.append(&proceed);
-    body.append(&actions);
-    root.append(&body);
-    dialog.set_child(Some(&root));
-    {
-        let dialog = dialog.clone();
-        cancel.connect_clicked(move |_| {
-            dialog.close();
-        });
-    }
+    view.status.set_label(&status_text);
     let game = game.clone();
     let installed = installed.clone();
     let choice_parent = parent.clone();
-    let choice_dialog = dialog.clone();
+    let proceed = view.proceed.clone();
+    let dialog = view.dialog.downgrade();
+    let status = view.status.clone();
+    let progress = view.progress.clone();
+    let close = view.close.clone();
+    let closed = view.closed.clone();
+    let started = view.started.clone();
+    let model = model.clone();
     let windows_product = {
         let selector = selector.clone();
         let choices = choices.clone();
@@ -1398,14 +1566,34 @@ fn present_source_migration(
             .then_some(product_id)
         }
     };
-    connect_windows_action(&proceed, parent, false, windows_product, move |_| {
+    connect_windows_action(&proceed, parent, false, windows_product, move |button| {
+        let Some(dialog) = dialog.upgrade() else {
+            return;
+        };
+        let view = MigrationView {
+            dialog,
+            selector: selector.clone(),
+            status: status.clone(),
+            progress: progress.clone(),
+            proceed: button.clone(),
+            close: close.clone(),
+            closed: closed.clone(),
+            started: started.clone(),
+        };
+        if view.closed.get() || view.started.get() {
+            return;
+        }
+        if model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+            || online::account_session() != session
+        {
+            view.stop("Account changed. Close this dialog and reopen game properties.");
+            return;
+        }
         let Some(choice) = choices.get(selector.selected() as usize).copied() else {
             return;
         };
-        let mut locations = store
-            .cloud_save_record(game.product_id)
-            .map(|record| record.locations)
-            .unwrap_or_default();
+        let mut locations = locations.clone();
         let target_os = match choice {
             crate::installation::FreshInstallSource::GalaxyWindows => Some("windows"),
             crate::installation::FreshInstallSource::OfflineInstaller(index) => candidates
@@ -1434,8 +1622,8 @@ fn present_source_migration(
             warning.set_response_appearance("continue", adw::ResponseAppearance::Destructive);
             warning.set_default_response(Some("cancel"));
             warning.set_close_response("cancel");
-            let dialog = choice_dialog.clone();
-            let status = status.clone();
+            let view = view.clone();
+            let model = model.clone();
             let config = config.clone();
             let candidates = candidates.usable.clone();
             let game = game.clone();
@@ -1444,10 +1632,21 @@ fn present_source_migration(
                 Some(&choice_parent),
                 gio::Cancellable::NONE,
                 move |response| {
+                    if view.closed.get() || view.started.get() {
+                        return;
+                    }
+                    if model.borrow().account_epoch != epoch
+                        || model.borrow().logout_pending
+                        || online::account_session() != session
+                    {
+                        view.stop("Account changed. Close this dialog and reopen game properties.");
+                        return;
+                    }
                     if response == "continue" {
                         launch_source_migration(
-                            &dialog,
-                            &status,
+                            &view,
+                            &model,
+                            session,
                             &config,
                             &game,
                             &installed,
@@ -1460,8 +1659,9 @@ fn present_source_migration(
             );
         } else {
             launch_source_migration(
-                &choice_dialog,
-                &status,
+                &view,
+                &model,
+                session,
                 &config,
                 &game,
                 &installed,
@@ -1471,13 +1671,13 @@ fn present_source_migration(
             );
         }
     });
-    dialog.present(Some(parent));
 }
 
 #[allow(clippy::too_many_arguments)]
 fn launch_source_migration(
-    dialog: &adw::Dialog,
-    status: &gtk::Label,
+    view: &MigrationView,
+    model: &Rc<RefCell<AppModel>>,
+    session: u64,
     config: &crate::config::Config,
     game: &DetailPageModel,
     installed: &crate::domain::InstalledGame,
@@ -1485,138 +1685,163 @@ fn launch_source_migration(
     choice: crate::installation::FreshInstallSource,
     saves: Vec<crate::domain::CloudSaveLocation>,
 ) {
-    let Some(library) = config.game_libraries.iter().find(|library| {
-        library.id == installed.library_id
-            || installed.installation_directory.parent() == Some(library.path.as_path())
-    }) else {
-        status.set_label("The installed game's library is unavailable.");
+    if view.closed.get() || view.started.replace(true) {
         return;
-    };
-    let operation_id = format!(
-        "{}-{}",
-        game.product_id,
-        chrono::Utc::now().timestamp_millis()
-    );
-    let target = match choice {
-        crate::installation::FreshInstallSource::OfflineInstaller(index) => {
-            let Some(candidate) = candidates.get(index) else {
-                return;
-            };
-            let now = chrono::Utc::now().timestamp();
-            let plan = crate::domain::InstalledGame {
-                product_id: game.product_id,
-                library_id: library.id.clone(),
-                installed_version: candidate.version.clone(),
-                installation_directory: library.path.join(&game.slug),
-                installer_revision_id: candidate.revision_id,
-                installer_job_id: None,
-                installer_files: candidate.paths.clone(),
-                installer_complete: candidate.complete,
-                installer_operating_system: candidate.operating_system.clone(),
-                installer_language: candidate.language.clone(),
-                compatibility: None,
-                primary_executable: None,
-                launch_arguments: Vec::new(),
-                state: crate::domain::InstallationState::Pending,
-                error: None,
-                installed_at: None,
-                verified_at: None,
-                last_played_at: installed.last_played_at,
-                playtime_seconds: installed.playtime_seconds,
-                created_at: installed.created_at,
-                updated_at: now,
-            };
-            let additional_installers = game
-                .dlcs
-                .iter()
-                .filter(|dlc| dlc.owned)
-                .filter_map(|dlc| {
-                    let store = StateStore::open().ok()?;
-                    let detected = crate::installation::detect_installer_candidates(
-                        dlc.product_id,
-                        &store.load_all_download_revisions(dlc.product_id).ok()?,
-                        &store.managed_files().ok()?,
-                        config,
-                    );
-                    let installer = detected.usable.into_iter().find(|installer| {
-                        installer.method == candidate.method
-                            && installer.version == candidate.version
-                            && installer.complete
-                    })?;
-                    Some(crate::installation::AdditionalInstaller {
-                        product_id: dlc.product_id,
-                        revision_id: installer.revision_id,
-                        version: installer.version,
-                        title: dlc.title.clone(),
-                        files: installer.paths,
-                    })
-                })
-                .collect();
-            crate::installation::source_migration::MigrationTarget::Offline {
-                game: plan,
-                additional_installers,
-                interactive_prompts: false,
-            }
-        }
-        crate::installation::FreshInstallSource::GalaxyWindows => {
-            let Some(build) = game
-                .galaxy_builds
-                .iter()
-                .filter(|build| {
-                    build.generation == 2 && build.currently_returned && build.branch.is_none()
-                })
-                .max_by_key(|build| build.published_at)
-                .cloned()
-            else {
-                return;
-            };
-            let owned_dlc = game
-                .dlcs
-                .iter()
-                .filter(|dlc| dlc.owned)
-                .map(|dlc| dlc.product_id)
-                .collect::<BTreeSet<_>>();
-            let language = game
-                .metadata
-                .localizations
-                .iter()
-                .find(|value| value.language_code.starts_with("en"))
-                .map(|value| value.language_code.clone())
-                .unwrap_or_else(|| "en".into());
-            crate::installation::source_migration::MigrationTarget::Galaxy(
-                crate::gog::depot_service::PrepareOperationRequest {
-                    build,
-                    selection: crate::gog::depot_acquisition::Selection {
-                        language,
-                        bitness: Some("64".into()),
-                        owned_dlc: owned_dlc.clone(),
-                        selected_dlc: owned_dlc,
-                    },
-                    operation_id: format!("migration-{operation_id}"),
-                    kind: crate::domain::DepotOperationKind::Install,
-                    library_id: library.id.clone(),
-                    library_root: library.path.clone(),
-                    slug: game.slug.clone(),
-                },
-            )
-        }
-    };
-    let save_locations = saves
-        .into_iter()
-        .map(
-            |location| crate::installation::source_migration::SaveLocation {
-                name: location.name,
-                path: location.path,
-            },
-        )
-        .collect::<Vec<_>>();
-    status.set_label("Backing up saved games…");
-    let (sender, receiver) = mpsc::channel();
-    let library_path = library.path.clone();
+    }
+    view.selector.set_sensitive(false);
+    view.proceed.set_sensitive(false);
+    view.close.set_label("Close");
+    view.close.set_tooltip_text(Some(
+        "Reinstallation continues if you close this progress view.",
+    ));
+    view.status.set_label("Preparing replacement installation…");
+    view.progress.set_visible(true);
+    let config = config.clone();
+    let game = game.clone();
     let installed = installed.clone();
-    let slug = game.slug.clone();
+    let candidates = candidates.to_vec();
+    let (sender, receiver) = mpsc::channel();
+    let (stages, stage_receiver) = mpsc::sync_channel(8);
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                online::account_session() == session,
+                "Account changed; reopen game properties."
+            );
+            let _activity =
+                crate::profile_reset::begin_activity("preparing installation migration")?;
+            let Some(library) = config.game_libraries.iter().find(|library| {
+                library.id == installed.library_id
+                    || installed.installation_directory.parent() == Some(library.path.as_path())
+            }) else {
+                anyhow::bail!("The installed game's library is unavailable.");
+            };
+            let operation_id = format!(
+                "{}-{}",
+                game.product_id,
+                chrono::Utc::now().timestamp_millis()
+            );
+            let target = match choice {
+                crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+                    let Some(candidate) = candidates.get(index) else {
+                        anyhow::bail!(
+                            "The selected installer is no longer available. Reopen source selection."
+                        );
+                    };
+                    let now = chrono::Utc::now().timestamp();
+                    let plan = crate::domain::InstalledGame {
+                        product_id: game.product_id,
+                        library_id: library.id.clone(),
+                        installed_version: candidate.version.clone(),
+                        installation_directory: library.path.join(&game.slug),
+                        installer_revision_id: candidate.revision_id,
+                        installer_job_id: None,
+                        installer_files: candidate.paths.clone(),
+                        installer_complete: candidate.complete,
+                        installer_operating_system: candidate.operating_system.clone(),
+                        installer_language: candidate.language.clone(),
+                        compatibility: None,
+                        primary_executable: None,
+                        launch_arguments: Vec::new(),
+                        state: crate::domain::InstallationState::Pending,
+                        error: None,
+                        installed_at: None,
+                        verified_at: None,
+                        last_played_at: installed.last_played_at,
+                        playtime_seconds: installed.playtime_seconds,
+                        created_at: installed.created_at,
+                        updated_at: now,
+                    };
+                    let additional_installers = game
+                        .dlcs
+                        .iter()
+                        .filter(|dlc| dlc.owned)
+                        .filter_map(|dlc| {
+                            let store = StateStore::open().ok()?;
+                            let detected = crate::installation::detect_installer_candidates(
+                                dlc.product_id,
+                                &store.load_all_download_revisions(dlc.product_id).ok()?,
+                                &store.managed_files().ok()?,
+                                &config,
+                            );
+                            let installer = detected.usable.into_iter().find(|installer| {
+                                installer.method == candidate.method
+                                    && installer.version == candidate.version
+                                    && installer.complete
+                            })?;
+                            Some(crate::installation::AdditionalInstaller {
+                                product_id: dlc.product_id,
+                                revision_id: installer.revision_id,
+                                version: installer.version,
+                                title: dlc.title.clone(),
+                                files: installer.paths,
+                            })
+                        })
+                        .collect();
+                    crate::installation::source_migration::MigrationTarget::Offline {
+                        game: plan,
+                        additional_installers,
+                        interactive_prompts: false,
+                    }
+                }
+                crate::installation::FreshInstallSource::GalaxyWindows => {
+                    let Some(build) = game
+                        .galaxy_builds
+                        .iter()
+                        .filter(|build| {
+                            build.generation == 2
+                                && build.currently_returned
+                                && build.branch.is_none()
+                        })
+                        .max_by_key(|build| build.published_at)
+                        .cloned()
+                    else {
+                        anyhow::bail!(
+                            "No current Galaxy build is available. Refresh metadata and choose a source again."
+                        );
+                    };
+                    let owned_dlc = game
+                        .dlcs
+                        .iter()
+                        .filter(|dlc| dlc.owned)
+                        .map(|dlc| dlc.product_id)
+                        .collect::<BTreeSet<_>>();
+                    let language = game
+                        .metadata
+                        .localizations
+                        .iter()
+                        .find(|value| value.language_code.starts_with("en"))
+                        .map(|value| value.language_code.clone())
+                        .unwrap_or_else(|| "en".into());
+                    crate::installation::source_migration::MigrationTarget::Galaxy(
+                        crate::gog::depot_service::PrepareOperationRequest {
+                            build,
+                            selection: crate::gog::depot_acquisition::Selection {
+                                language,
+                                bitness: Some("64".into()),
+                                owned_dlc: owned_dlc.clone(),
+                                selected_dlc: owned_dlc,
+                            },
+                            operation_id: format!("migration-{operation_id}"),
+                            kind: crate::domain::DepotOperationKind::Install,
+                            library_id: library.id.clone(),
+                            library_root: library.path.clone(),
+                            slug: game.slug.clone(),
+                        },
+                    )
+                }
+            };
+            let save_locations = saves
+                .into_iter()
+                .map(
+                    |location| crate::installation::source_migration::SaveLocation {
+                        name: location.name,
+                        path: location.path,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let library_path = library.path.clone();
+            let slug = game.slug.clone();
             let current = crate::storage::validate_path(
                 &crate::storage::read_config()?,
                 crate::config::LibraryKind::GameFiles,
@@ -1626,6 +1851,12 @@ fn launch_source_migration(
                 current.path == library_path,
                 "The selected Game Files library changed; reopen source selection."
             );
+            anyhow::ensure!(
+                online::account_session() == session,
+                "Account changed; reopen game properties."
+            );
+            let _ = stages
+                .try_send(crate::installation::source_migration::MigrationPhase::PreparingBackup);
             let mut journal = crate::installation::source_migration::begin_backup(
                 &library_path,
                 &operation_id,
@@ -1639,6 +1870,12 @@ fn launch_source_migration(
                 installed,
                 target,
             )?;
+            anyhow::ensure!(
+                online::account_session() == session,
+                "Account changed; migration stopped before removing the existing installation."
+            );
+            let _ =
+                stages.try_send(crate::installation::source_migration::MigrationPhase::BackedUp);
             let events =
                 crate::installation::source_migration::start(library_path, journal, save_locations);
             loop {
@@ -1652,49 +1889,264 @@ fn launch_source_migration(
                     } => {
                         anyhow::bail!("{message}. Save backup retained at {}", backup.display())
                     }
-                    _ => {}
+                    crate::installation::source_migration::MigrationEvent::Phase(phase) => {
+                        let _ = stages.try_send(phase);
+                    }
                 }
             }
         })();
         let _ = sender.send(result);
     });
-    let status = status.clone();
-    let dialog = dialog.clone();
+    monitor_source_migration(view, model, session, receiver, stage_receiver);
+}
+
+fn monitor_source_migration(
+    view: &MigrationView,
+    model: &Rc<RefCell<AppModel>>,
+    session: u64,
+    receiver: mpsc::Receiver<anyhow::Result<()>>,
+    stages: mpsc::Receiver<crate::installation::source_migration::MigrationPhase>,
+) {
+    let view = view.clone();
+    let model = model.clone();
+    let epoch = model.borrow().account_epoch;
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        if view.closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        if model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+            || online::account_session() != session
+        {
+            view.stop("Account changed. File work already started may still be finishing; reopen game properties to inspect its state.");
+            return glib::ControlFlow::Break;
+        }
+        for phase in stages.try_iter().take(8) {
+            use crate::installation::source_migration::MigrationPhase;
+            view.status.set_label(match phase {
+                MigrationPhase::PreparingBackup => "Backing up saved games…",
+                MigrationPhase::BackedUp => {
+                    "Save backup complete. Preparing and removing the previous installation…"
+                }
+                MigrationPhase::Uninstalled => {
+                    "Previous installation removed. Downloading or installing the replacement…"
+                }
+                MigrationPhase::Installed | MigrationPhase::Restoring => {
+                    "Replacement installed. Restoring saved games…"
+                }
+                MigrationPhase::Complete => "Finishing reinstallation…",
+            });
+        }
         match receiver.try_recv() {
             Ok(Ok(())) => {
-                dialog.close();
+                view.stop("Reinstallation complete.");
                 glib::ControlFlow::Break
             }
             Ok(Err(error)) => {
-                status.add_css_class("error");
-                status.set_label(&format!("Source migration stopped: {error:#}"));
+                view.status.add_css_class("error");
+                view.stop(&format!("Source migration stopped: {error:#}. Close this view and inspect the game's current state before retrying."));
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                view.stop("Reinstallation stopped unexpectedly. Close this view and inspect the game's current state before retrying.");
+                glib::ControlFlow::Break
+            }
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_compatibility_fix_preferences(
+    group: &adw::PreferencesGroup,
+    status: &gtk::Label,
+    rows: Vec<(String, adw::SwitchRow)>,
+    reset: &gtk::Button,
+    resetting: Rc<std::cell::Cell<bool>>,
+    product_id: i64,
+    session: u64,
+    installed: bool,
+) {
+    let retry = gtk::Button::with_label("Retry");
+    retry.set_widget_name("compatibility-fixes-retry");
+    retry.set_halign(gtk::Align::Start);
+    group.add(&retry);
+    let load: Rc<dyn Fn()> = Rc::new({
+        let group = group.downgrade();
+        let retry = retry.downgrade();
+        let status = status.clone();
+        let reset = reset.clone();
+        let loading = Rc::new(std::cell::Cell::new(false));
+        move || {
+            let Some(retry) = retry.upgrade() else { return };
+            if group.upgrade().is_none() || loading.get() {
+                return;
+            }
+            for (_, row) in &rows {
+                row.set_sensitive(false);
+            }
+            reset.set_sensitive(false);
+            if online::account_session() != session {
+                retry.set_sensitive(false);
+                status
+                    .set_label("The account changed. Reopen Properties before changing settings.");
+                return;
+            }
+            loading.set(true);
+            retry.set_visible(false);
+            status.remove_css_class("error");
+            status.set_label("Loading compatibility fixes…");
+            let receiver = update_policies::policy_request(move || {
+                let _activity =
+                    crate::profile_reset::begin_activity("loading compatibility fixes")?;
+                anyhow::ensure!(
+                    online::account_session() == session,
+                    "Account changed; reopen Properties."
+                );
+                StateStore::open()?.compatibility_fix_overrides(product_id)
+            });
+            let group = group.clone();
+            let retry = retry.downgrade();
+            let status = status.clone();
+            let reset = reset.clone();
+            let rows = rows.clone();
+            let loading = loading.clone();
+            let resetting = resetting.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || {
+                let Some(retry) = retry.upgrade().filter(|_| group.upgrade().is_some()) else {
+                    return glib::ControlFlow::Break;
+                };
+                if online::account_session() != session {
+                    status.set_label(
+                        "The account changed. Reopen Properties before changing settings.",
+                    );
+                    retry.set_sensitive(false);
+                    loading.set(false);
+                    return glib::ControlFlow::Break;
+                }
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Compatibility preference loading stopped unexpectedly."
+                    )),
+                };
+                loading.set(false);
+                match result {
+                    Ok(overrides) => {
+                        let recommended = crate::compatibility::recommended_fix_ids(product_id);
+                        resetting.set(true);
+                        for (id, row) in &rows {
+                            row.set_active(
+                                overrides
+                                    .get(id)
+                                    .copied()
+                                    .unwrap_or(recommended.contains(id)),
+                            );
+                            row.set_sensitive(installed);
+                        }
+                        resetting.set(false);
+                        reset.set_sensitive(installed);
+                        status.set_label(if installed {
+                            "Changes apply the next time the game launches."
+                        } else {
+                            "Install this game before changing compatibility fixes."
+                        });
+                    }
+                    Err(error) => {
+                        status.add_css_class("error");
+                        status.set_label(&super::notifications::failure_message(
+                            "Could not load compatibility fixes",
+                            &format!("{error:#}"),
+                        ));
+                        retry.set_visible(true);
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    retry.connect_clicked({
+        let load = load.clone();
+        move |_| load()
+    });
+    load();
+}
+
+#[derive(Clone)]
+struct CloudActionSession {
+    auth: u64,
+    online: u64,
+    epoch: u64,
+    model: std::rc::Weak<RefCell<AppModel>>,
+}
+
+impl CloudActionSession {
+    fn is_current(&self) -> bool {
+        auth::session_is_current(self.auth)
+            && self.online == online::account_session()
+            && self.model.upgrade().is_some_and(|model| {
+                model
+                    .try_borrow()
+                    .is_ok_and(|state| state.account_epoch == self.epoch && !state.logout_pending)
+            })
+    }
+
+    fn check(&self, button: &gtk::Button, status: &gtk::Label) -> bool {
+        let current = self.is_current();
+        if !current {
+            button.set_sensitive(false);
+            status.set_label(
+                "Account changed. Close and reopen game properties before synchronizing saves.",
+            );
+        }
+        current
+    }
 }
 
 fn run_cloud_action(
     button: &gtk::Button,
     status: &gtk::Label,
+    origin: &CloudActionSession,
     request: crate::cloud_saves::CloudSyncRequest,
 ) {
+    if !origin.check(button, status) {
+        return;
+    }
     button.set_sensitive(false);
     status.set_label("Synchronizing…");
     let (sender, receiver) = std::sync::mpsc::channel();
+    let auth_session = origin.auth;
+    let online_session = origin.online;
     std::thread::spawn(move || {
-        sender
-            .send(crate::cloud_saves::sync(request).map_err(|error| format!("{error:#}")))
-            .ok();
+        let result = if online::account_session() == online_session {
+            crate::cloud_saves::sync_for_session(request, auth_session)
+                .map_err(|error| format!("{error:#}"))
+        } else {
+            Err("Account changed before synchronization started.".into())
+        };
+        let _ = sender.send(result);
     });
-    let button = button.clone();
-    let status = status.clone();
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(100),
-        move || match receiver.try_recv() {
+    monitor_cloud_action(button, status, origin, receiver);
+}
+
+fn monitor_cloud_action(
+    button: &gtk::Button,
+    status: &gtk::Label,
+    origin: &CloudActionSession,
+    receiver: mpsc::Receiver<Result<crate::domain::CloudSyncResult, String>>,
+) {
+    let button = button.downgrade();
+    let status = status.downgrade();
+    let origin = origin.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let (Some(button), Some(status)) = (button.upgrade(), status.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if !origin.check(&button, &status) {
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
             Ok(Ok(result)) => {
                 button.set_sensitive(true);
                 if result.conflicts.is_empty() {
@@ -1712,7 +2164,10 @@ fn run_cloud_action(
             }
             Ok(Err(error)) => {
                 button.set_sensitive(true);
-                status.set_label(&error);
+                status.set_label(&super::notifications::failure_message(
+                    "Cloud synchronization failed",
+                    &error,
+                ));
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1721,24 +2176,59 @@ fn run_cloud_action(
                 status.set_label("Cloud-save worker stopped unexpectedly");
                 glib::ControlFlow::Break
             }
-        },
-    );
+        }
+    });
 }
 
 fn load_cloud_inventory(
     game: crate::domain::InstalledGame,
     row: adw::ActionRow,
     button: gtk::Button,
+    origin: CloudActionSession,
 ) {
+    if !origin.is_current() {
+        button.set_sensitive(false);
+        row.set_subtitle(
+            "Account changed. Close and reopen game properties before checking cloud storage.",
+        );
+        return;
+    }
+    button.set_sensitive(false);
+    row.set_subtitle("Checking remote save files…");
     let (sender, receiver) = std::sync::mpsc::channel();
+    let auth_session = origin.auth;
+    let online_session = origin.online;
     std::thread::spawn(move || {
-        sender
-            .send(crate::cloud_saves::inventory(&game).map_err(|error| format!("{error:#}")))
-            .ok();
+        let result = if online::account_session() == online_session {
+            crate::cloud_saves::inventory(&game, auth_session).map_err(|error| format!("{error:#}"))
+        } else {
+            Err("Account changed before checking cloud storage.".into())
+        };
+        let _ = sender.send(result);
     });
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(100),
-        move || match receiver.try_recv() {
+    monitor_cloud_inventory(&row, &button, origin, receiver);
+}
+
+fn monitor_cloud_inventory(
+    row: &adw::ActionRow,
+    button: &gtk::Button,
+    origin: CloudActionSession,
+    receiver: mpsc::Receiver<Result<crate::cloud_saves::CloudSaveInventory, String>>,
+) {
+    let row = row.downgrade();
+    let button = button.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        let (Some(row), Some(button)) = (row.upgrade(), button.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        if !origin.is_current() {
+            button.set_sensitive(false);
+            row.set_subtitle(
+                "Account changed. Close and reopen game properties before checking cloud storage.",
+            );
+            return glib::ControlFlow::Break;
+        }
+        match receiver.try_recv() {
             Ok(Ok(inventory)) => {
                 button.set_sensitive(true);
                 let files = match inventory.file_count {
@@ -1763,7 +2253,10 @@ fn load_cloud_inventory(
             }
             Ok(Err(error)) => {
                 button.set_sensitive(true);
-                row.set_subtitle(&format!("Could not check cloud storage: {error}"));
+                row.set_subtitle(&super::notifications::failure_message(
+                    "Could not check cloud storage",
+                    &error,
+                ));
                 glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1772,16 +2265,20 @@ fn load_cloud_inventory(
                 row.set_subtitle("Cloud-storage check stopped unexpectedly");
                 glib::ControlFlow::Break
             }
-        },
-    );
+        }
+    });
 }
 
 fn confirm_force_cloud_action(
     parent: &adw::ApplicationWindow,
     button: &gtk::Button,
     status: &gtk::Label,
+    origin: &CloudActionSession,
     request: crate::cloud_saves::CloudSyncRequest,
 ) {
+    if !origin.check(button, status) {
+        return;
+    }
     let (heading, body, response) = match request.mode {
         crate::domain::CloudSyncMode::ForceDownload => (
             "Replace local saves?",
@@ -1805,9 +2302,10 @@ fn confirm_force_cloud_action(
     dialog.set_close_response("cancel");
     let button = button.clone();
     let status = status.clone();
+    let origin = origin.clone();
     dialog.choose(Some(parent), gio::Cancellable::NONE, move |response| {
         if response == "force" {
-            run_cloud_action(&button, &status, request);
+            run_cloud_action(&button, &status, &origin, request);
         }
     });
 }
@@ -2045,6 +2543,561 @@ fn info_row(title: &str, value: &str) -> adw::ActionRow {
 #[cfg(test)]
 mod control_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn compatibility_fix_loading_retries_errors_without_saving_defaults() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p264-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let group = adw::PreferencesGroup::new();
+        let status = gtk::Label::new(None);
+        let row = adw::SwitchRow::new();
+        let reset = gtk::Button::with_label("Reapply Recommended");
+        group.add(&status);
+        group.add(&row);
+        group.add(&reset);
+        let resetting = Rc::new(std::cell::Cell::new(false));
+        let changes = Rc::new(std::cell::Cell::new(0));
+        row.connect_active_notify({
+            let resetting = resetting.clone();
+            let changes = changes.clone();
+            move |_| {
+                if !resetting.get() {
+                    changes.set(changes.get() + 1);
+                }
+            }
+        });
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var_os("XDG_DATA_HOME").unwrap()));
+        std::fs::create_dir_all(&database).unwrap();
+        let session = online::account_session();
+        load_compatibility_fix_preferences(
+            &group,
+            &status,
+            vec![("synthetic-fix".into(), row.clone())],
+            &reset,
+            resetting.clone(),
+            9264001,
+            session,
+            true,
+        );
+        assert_eq!(status.label(), "Loading compatibility fixes…");
+        assert!(!row.is_sensitive());
+        assert!(!reset.is_sensitive());
+        wait_until(|| {
+            status
+                .label()
+                .contains("Could not load compatibility fixes")
+        });
+        assert!(!row.is_sensitive());
+        assert!(!reset.is_sensitive());
+        assert_eq!(changes.get(), 0);
+        std::fs::remove_dir(&database).unwrap();
+        StateStore::open()
+            .unwrap()
+            .set_compatibility_fix_override(9264001, "synthetic-fix", true)
+            .unwrap();
+        let retry = find_named_descendant(group.upcast_ref(), "compatibility-fixes-retry")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        assert!(retry.is_visible());
+        retry.emit_clicked();
+        retry.emit_clicked();
+        assert_eq!(status.label(), "Loading compatibility fixes…");
+        wait_until(|| row.is_sensitive());
+        assert!(row.is_active());
+        assert!(reset.is_sensitive());
+        assert!(!retry.is_visible());
+        assert_eq!(
+            changes.get(),
+            0,
+            "initial population must not trigger saves"
+        );
+        assert!(
+            StateStore::open()
+                .unwrap()
+                .compatibility_fix_overrides(9264001)
+                .unwrap()["synthetic-fix"]
+        );
+        for (installed, expected_session) in [(false, session), (true, session.wrapping_add(1))] {
+            let group = adw::PreferencesGroup::new();
+            let status = gtk::Label::new(None);
+            let row = adw::SwitchRow::new();
+            let reset = gtk::Button::new();
+            group.add(&status);
+            group.add(&row);
+            group.add(&reset);
+            load_compatibility_fix_preferences(
+                &group,
+                &status,
+                vec![("synthetic-fix".into(), row.clone())],
+                &reset,
+                Rc::new(std::cell::Cell::new(false)),
+                9264001,
+                expected_session,
+                installed,
+            );
+            wait_until(|| {
+                status.label().contains(if installed {
+                    "account changed"
+                } else {
+                    "Install this game"
+                })
+            });
+            assert!(!row.is_sensitive());
+            assert!(!reset.is_sensitive());
+            assert_eq!(
+                row.is_active(),
+                !installed,
+                "stale session must not apply data"
+            );
+        }
+        let weak = group.downgrade();
+        drop(group);
+        assert!(
+            weak.upgrade().is_none(),
+            "Retry callback must not keep its group alive"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus; no real cloud calls"]
+    fn cloud_actions_reject_stale_confirmation_and_completion() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p267-")
+        );
+        adw::init().unwrap();
+        fn click_response(widget: &gtk::Widget, label: &str) -> bool {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>()
+                && button.label().as_deref() == Some(label)
+            {
+                button.emit_clicked();
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if click_response(&current, label) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.CloudSessionTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let button = gtk::Button::with_label("Sync now");
+        let status = gtk::Label::new(Some("Ready"));
+        content.append(&button);
+        content.append(&status);
+        window.set_content(Some(&content));
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let origin = CloudActionSession {
+            auth: auth::session(),
+            online: online::account_session(),
+            epoch: 0,
+            model: Rc::downgrade(&model),
+        };
+        let mut request = crate::cloud_saves::CloudSyncRequest {
+            game: crate::domain::InstalledGame {
+                product_id: 9267001,
+                library_id: "synthetic".into(),
+                installed_version: None,
+                installation_directory: "/inert/not-a-real-game".into(),
+                installer_revision_id: None,
+                installer_job_id: None,
+                installer_files: vec![],
+                installer_complete: false,
+                installer_operating_system: None,
+                installer_language: None,
+                compatibility: None,
+                primary_executable: None,
+                launch_arguments: vec![],
+                state: crate::domain::InstallationState::Pending,
+                error: None,
+                installed_at: None,
+                verified_at: None,
+                last_played_at: None,
+                playtime_seconds: 0,
+                created_at: 0,
+                updated_at: 0,
+            },
+            locations: vec![],
+            mode: crate::domain::CloudSyncMode::Normal,
+        };
+        let stale_auth = origin.auth.wrapping_add(1);
+        assert!(
+            crate::cloud_saves::sync_for_session(request.clone(), stale_auth)
+                .unwrap_err()
+                .to_string()
+                .contains("session changed")
+        );
+        assert!(
+            crate::cloud_saves::inventory(&request.game, stale_auth)
+                .unwrap_err()
+                .to_string()
+                .contains("session changed")
+        );
+        for stale in [
+            CloudActionSession {
+                auth: origin.auth.wrapping_add(1),
+                ..origin.clone()
+            },
+            CloudActionSession {
+                online: origin.online.wrapping_add(1),
+                ..origin.clone()
+            },
+        ] {
+            button.set_sensitive(true);
+            run_cloud_action(&button, &status, &stale, request.clone());
+            assert!(!button.is_sensitive());
+            assert!(status.label().contains("Account changed"));
+        }
+        model.borrow_mut().logout_pending = true;
+        run_cloud_action(&button, &status, &origin, request.clone());
+        assert!(status.label().contains("Account changed"));
+        model.borrow_mut().logout_pending = false;
+        button.set_sensitive(true);
+        status.set_label("Ready");
+        request.mode = crate::domain::CloudSyncMode::ForceDownload;
+        confirm_force_cloud_action(&window, &button, &status, &origin, request.clone());
+        let dialog = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .unwrap();
+        assert!(click_response(dialog.upcast_ref(), "Cancel"));
+        wait_until(|| window.visible_dialog().is_none());
+        assert_eq!(status.label(), "Ready");
+        assert!(button.is_sensitive());
+        confirm_force_cloud_action(&window, &button, &status, &origin, request.clone());
+        let dialog = window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .unwrap();
+        model.borrow_mut().account_epoch += 1;
+        assert!(click_response(dialog.upcast_ref(), "Force download"));
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!button.is_sensitive());
+        model.borrow_mut().account_epoch = 0;
+
+        let (sender, receiver) = mpsc::channel();
+        button.set_sensitive(false);
+        status.set_label("Synchronizing…");
+        monitor_cloud_action(&button, &status, &origin, receiver);
+        model.borrow_mut().account_epoch += 1;
+        sender
+            .send(Ok(crate::domain::CloudSyncResult::default()))
+            .unwrap();
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!button.is_sensitive());
+        assert!(!status.label().contains("Synchronized:"));
+        model.borrow_mut().account_epoch = 0;
+
+        for outcome in [
+            Some(Ok(crate::domain::CloudSyncResult {
+                uploaded: 2,
+                ..Default::default()
+            })),
+            Some(Err(
+                "synthetic failure https://example.invalid/?token=SECRET".into(),
+            )),
+            None,
+        ] {
+            button.set_sensitive(false);
+            status.set_label("Synchronizing…");
+            let (sender, receiver) = mpsc::channel();
+            monitor_cloud_action(&button, &status, &origin, receiver);
+            let expected = match &outcome {
+                Some(Ok(_)) => "2 uploaded",
+                Some(Err(_)) => "synthetic failure",
+                None => "stopped unexpectedly",
+            };
+            if let Some(result) = outcome {
+                sender.send(result).unwrap();
+            }
+            drop(sender);
+            wait_until(|| status.label().contains(expected));
+            assert!(button.is_sensitive());
+            assert!(!status.label().contains("SECRET"));
+        }
+        let inventory = adw::ActionRow::new();
+        let check = gtk::Button::with_label("Check now");
+        inventory.add_suffix(&check);
+        content.append(&inventory);
+        load_cloud_inventory(
+            request.game,
+            inventory.clone(),
+            check.clone(),
+            CloudActionSession {
+                auth: origin.auth.wrapping_add(1),
+                ..origin.clone()
+            },
+        );
+        assert!(!check.is_sensitive());
+        assert!(inventory.subtitle().unwrap().contains("Account changed"));
+        let (sender, receiver) = mpsc::channel();
+        inventory.set_subtitle("Checking…");
+        monitor_cloud_inventory(&inventory, &check, origin.clone(), receiver);
+        model.borrow_mut().account_epoch += 1;
+        sender
+            .send(Ok(crate::cloud_saves::CloudSaveInventory {
+                file_count: 99,
+                total_size: 0,
+                latest_modified_at: None,
+            }))
+            .unwrap();
+        wait_until(|| inventory.subtitle().unwrap().contains("Account changed"));
+        assert!(!check.is_sensitive());
+        model.borrow_mut().account_epoch = 0;
+        for outcome in [
+            Some(Ok(crate::cloud_saves::CloudSaveInventory {
+                file_count: 1,
+                total_size: 42,
+                latest_modified_at: None,
+            })),
+            Some(Err(
+                "synthetic inventory failure https://example.invalid/?token=SECRET".into(),
+            )),
+            None,
+        ] {
+            inventory.set_subtitle("Checking…");
+            check.set_sensitive(false);
+            let (sender, receiver) = mpsc::channel();
+            monitor_cloud_inventory(&inventory, &check, origin.clone(), receiver);
+            let expected = match &outcome {
+                Some(Ok(_)) => "1 remote save file",
+                Some(Err(_)) => "synthetic inventory failure",
+                None => "stopped unexpectedly",
+            };
+            if let Some(result) = outcome {
+                sender.send(result).unwrap();
+            }
+            drop(sender);
+            wait_until(|| inventory.subtitle().unwrap().contains(expected));
+            assert!(check.is_sensitive());
+            assert!(!inventory.subtitle().unwrap().contains("SECRET"));
+        }
+        window.close();
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/XDG, private GTK display and D-Bus"]
+    fn migration_dialog_reports_stages_errors_close_and_account_changes() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p252-")
+        );
+        adw::init().unwrap();
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.MigrationFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        window.present();
+        let session = online::account_session();
+        let view = MigrationView::new();
+        view.dialog.present(Some(&window));
+        assert!(view.progress.is_visible());
+        assert!(!view.proceed.is_sensitive());
+        let (done, receiver) = mpsc::channel();
+        let (phases, stages) = mpsc::channel();
+        monitor_source_migration(&view, &model, session, receiver, stages);
+        phases
+            .send(crate::installation::source_migration::MigrationPhase::Uninstalled)
+            .unwrap();
+        wait_until(|| view.status.label().contains("installing the replacement"));
+        phases
+            .send(crate::installation::source_migration::MigrationPhase::Restoring)
+            .unwrap();
+        wait_until(|| view.status.label().contains("Restoring saved games"));
+        done.send(Ok(())).unwrap();
+        wait_until(|| view.status.label() == "Reinstallation complete.");
+        assert!(!view.progress.is_visible());
+        assert!(
+            !view.closed.get(),
+            "completion must not navigate or dismiss the view"
+        );
+        view.close.emit_clicked();
+        wait_until(|| view.closed.get());
+        let closed_dialog = view.dialog.downgrade();
+        drop(view);
+        wait_until(|| closed_dialog.upgrade().is_none());
+
+        for change_account in [false, true] {
+            let view = MigrationView::new();
+            view.dialog.present(Some(&window));
+            let (done, receiver) = mpsc::channel();
+            let (_phases, stages) = mpsc::channel();
+            monitor_source_migration(&view, &model, session, receiver, stages);
+            if change_account {
+                model.borrow_mut().account_epoch += 1;
+            }
+            drop(done);
+            wait_until(|| !view.progress.is_visible());
+            assert!(view.status.label().contains(if change_account {
+                "Account changed"
+            } else {
+                "stopped unexpectedly"
+            }));
+            view.close.emit_clicked();
+            wait_until(|| view.closed.get());
+        }
+        let view = MigrationView::new();
+        view.dialog.present(Some(&window));
+        let (done, receiver) = mpsc::channel();
+        let (_phases, stages) = mpsc::channel();
+        monitor_source_migration(&view, &model, session, receiver, stages);
+        done.send(Err(anyhow::anyhow!(
+            "synthetic failure https://example.invalid/?token=secret"
+        )))
+        .unwrap();
+        wait_until(|| !view.progress.is_visible());
+        assert!(view.status.label().contains("synthetic failure"));
+        assert!(!view.status.label().contains("secret"));
+        view.close.emit_clicked();
+        wait_until(|| view.closed.get());
+
+        let game = DetailPageModel::game(
+            Game {
+                product_id: 9252001,
+                slug: "synthetic-game".into(),
+                ..Game::default()
+            },
+            false,
+        );
+        let installed = crate::domain::InstalledGame {
+            product_id: game.product_id,
+            library_id: "missing".into(),
+            installed_version: None,
+            installation_directory: std::env::temp_dir().join("ludomere-p252-absent/game"),
+            installer_revision_id: None,
+            installer_job_id: None,
+            installer_files: vec![],
+            installer_complete: false,
+            installer_operating_system: Some("linux".into()),
+            installer_language: None,
+            compatibility: None,
+            primary_executable: None,
+            launch_arguments: vec![],
+            state: crate::domain::InstallationState::Pending,
+            error: None,
+            installed_at: None,
+            verified_at: None,
+            last_played_at: None,
+            playtime_seconds: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(prepare_migration_choices(&game, &installed, session.wrapping_add(1)).is_err());
+        let reservation = crate::profile_reset::reserve().unwrap();
+        assert!(prepare_migration_choices(&game, &installed, session).is_err());
+        drop(reservation);
+        assert!(!crate::identity::database().exists());
+
+        let ready = MigrationView::new();
+        ready.dialog.present(Some(&window));
+        wire_migration_choices(
+            &window,
+            &model,
+            &game,
+            &installed,
+            &ready,
+            MigrationChoices {
+                config: Config::default(),
+                marker: crate::installation::installation_marker_from_game(&installed, vec![]),
+                candidates: crate::installation::InstallerCandidates::default(),
+                choices: vec![crate::installation::FreshInstallSource::GalaxyWindows],
+                current: Some(crate::config::PreferredInstallationSource::LinuxOffline),
+                locations: vec![],
+                galaxy_preflight: Ok(()),
+            },
+            model.borrow().account_epoch,
+            session,
+        );
+        assert!(ready.proceed.is_sensitive());
+        let ready_dialog = ready.dialog.downgrade();
+        let ready_button = ready.proceed.downgrade();
+        ready.close.emit_clicked();
+        wait_until(|| ready.closed.get());
+        drop(ready);
+        wait_until(|| ready_dialog.upgrade().is_none() && ready_button.upgrade().is_none());
+
+        let view = MigrationView::new();
+        view.dialog.present(Some(&window));
+        let config = Config {
+            game_libraries: vec![],
+            ..Config::default()
+        };
+        launch_source_migration(
+            &view,
+            &model,
+            session,
+            &config,
+            &game,
+            &installed,
+            &[],
+            crate::installation::FreshInstallSource::OfflineInstaller(0),
+            vec![],
+        );
+        assert!(view.started.get());
+        assert!(!view.proceed.is_sensitive());
+        assert_eq!(view.close.label().as_deref(), Some("Close"));
+        launch_source_migration(
+            &view,
+            &model,
+            session,
+            &config,
+            &game,
+            &installed,
+            &[],
+            crate::installation::FreshInstallSource::OfflineInstaller(0),
+            vec![],
+        );
+        wait_until(|| view.status.label().contains("library is unavailable"));
+        assert!(!view.progress.is_visible());
+        view.close.emit_clicked();
+        wait_until(|| view.closed.get());
+        window.close();
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/XDG, private GTK display and D-Bus"]

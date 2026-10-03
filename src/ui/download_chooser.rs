@@ -1,12 +1,61 @@
 use super::*;
 use crate::config::{GameLibrary, LibraryKind};
 
+#[cfg(test)]
+type CapturedDownloads = (
+    Vec<download::DownloadRequest>,
+    Option<download::AutoInstallRequest>,
+);
+#[cfg(test)]
+pub(super) static TEST_DOWNLOAD_QUEUE: std::sync::Mutex<Option<Vec<CapturedDownloads>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) struct DownloadQueueCapture;
+#[cfg(test)]
+impl DownloadQueueCapture {
+    pub(super) fn start() -> Self {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p296-")
+        );
+        let mut capture = TEST_DOWNLOAD_QUEUE.lock().unwrap();
+        assert!(capture.is_none());
+        *capture = Some(Vec::new());
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for DownloadQueueCapture {
+    fn drop(&mut self) {
+        *TEST_DOWNLOAD_QUEUE.lock().unwrap() = None;
+    }
+}
+#[cfg(test)]
+pub(super) fn capture_queued_downloads(
+    requests: Vec<download::DownloadRequest>,
+    install: Option<download::AutoInstallRequest>,
+) -> Result<usize, Box<CapturedDownloads>> {
+    let mut capture = TEST_DOWNLOAD_QUEUE.lock().unwrap();
+    if let Some(capture) = capture.as_mut() {
+        let count = requests.len();
+        for request in &requests {
+            let _ = request.events.send(download::DownloadEvent::Cancelled);
+        }
+        capture.push((requests, install));
+        Ok(count)
+    } else {
+        Err(Box::new((requests, install)))
+    }
+}
+
 pub(super) fn choose_download_libraries(
     window: &adw::ApplicationWindow,
     kinds: Vec<LibraryKind>,
     chosen: impl FnOnce(Vec<(LibraryKind, GameLibrary)>) + 'static,
 ) {
     let session = online::account_session();
+    let auth_session = auth::session();
     let dialog = adw::Dialog::builder()
         .title("Choose download libraries")
         .content_width(620)
@@ -34,7 +83,7 @@ pub(super) fn choose_download_libraries(
             );
         }
     });
-    let confirm = gtk::Button::with_label("Use selected libraries");
+    let confirm = gtk::Button::with_label("Download");
     confirm.add_css_class("suggested-action");
     confirm.set_sensitive(false);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -50,16 +99,23 @@ pub(super) fn choose_download_libraries(
     });
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = crate::storage::read_config().and_then(|config| {
+        let result = (|| -> anyhow::Result<_> {
+            let _activity = crate::profile_reset::begin_activity("loading download libraries")?;
+            anyhow::ensure!(
+                session == online::account_session() && auth_session == auth::session(),
+                "The account changed. Reopen download choices."
+            );
+            let config = crate::storage::read_config()?;
             let statuses = crate::storage::inspect_libraries(&config)?;
             Ok((config, statuses))
-        });
+        })();
         let _ = sender.send(result);
     });
     let pending_choice = Rc::new(RefCell::new(Some(chosen)));
     let dialog_for_result = dialog.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if !active.get() || online::account_session() != session {
+        if !active.get() || online::account_session() != session || auth::session() != auth_session
+        {
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {
@@ -165,7 +221,7 @@ pub(super) fn choose_download_libraries(
                     let active = active.clone();
                     let pending_choice = pending_choice.clone();
                     move |button| {
-                        if online::account_session() != session {
+                        if online::account_session() != session || auth::session() != auth_session {
                             return;
                         }
                         let selected = choices
@@ -183,7 +239,16 @@ pub(super) fn choose_download_libraries(
                         status.set_label("Validating selected libraries…");
                         let (sender, receiver) = mpsc::channel();
                         std::thread::spawn(move || {
-                            let result = crate::storage::read_config().and_then(|config| {
+                            let result = (|| -> anyhow::Result<_> {
+                                let _activity = crate::profile_reset::begin_activity(
+                                    "validating download libraries",
+                                )?;
+                                anyhow::ensure!(
+                                    session == online::account_session()
+                                        && auth_session == auth::session(),
+                                    "The account changed. Reopen download choices."
+                                );
+                                let config = crate::storage::read_config()?;
                                 selected
                                     .into_iter()
                                     .map(|(kind, selected)| {
@@ -199,7 +264,7 @@ pub(super) fn choose_download_libraries(
                                         Ok((kind, library))
                                     })
                                     .collect::<anyhow::Result<Vec<_>>>()
-                            });
+                            })();
                             let _ = sender.send(result);
                         });
                         let button = button.clone();
@@ -208,7 +273,10 @@ pub(super) fn choose_download_libraries(
                         let dialog = dialog.clone();
                         let pending_choice = pending_choice.clone();
                         glib::timeout_add_local(Duration::from_millis(50), move || {
-                            if !active.get() || online::account_session() != session {
+                            if !active.get()
+                                || online::account_session() != session
+                                || auth::session() != auth_session
+                            {
                                 return glib::ControlFlow::Break;
                             }
                             match receiver.try_recv() {
@@ -965,7 +1033,15 @@ pub(super) fn show_install_dialog(
     model: &Rc<RefCell<AppModel>>,
     detail: &DetailPageModel,
 ) {
-    show_install_dialog_with_mode(window, model, detail, false, None);
+    show_install_dialog_with_mode(window, model, detail, false, false);
+}
+
+pub(super) fn show_offline_install_dialog(
+    window: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    detail: &DetailPageModel,
+) {
+    show_install_dialog_with_mode(window, model, detail, false, true);
 }
 
 pub(super) fn cached_galaxy_available(
@@ -1058,34 +1134,15 @@ pub(super) fn show_primary_download(
     model: &Rc<RefCell<AppModel>>,
     detail: &DetailPageModel,
 ) {
-    let depot_first = {
+    let fresh_base = {
         let state = model.borrow();
-        detail.parent_id.is_none()
-            && !state.installed_products.contains(&detail.product_id)
-            && state
-                .games
-                .iter()
-                .find(|game| game.product_id == detail.product_id)
-                .is_some_and(|game| depot_is_preferred_download(&state.config, &game.platforms))
+        detail.parent_id.is_none() && !state.installed_products.contains(&detail.product_id)
     };
-    if depot_first {
+    if fresh_base {
         show_install_dialog(&w.window, model, detail);
     } else {
         show_download_selector(w, model, detail);
     }
-}
-
-fn depot_is_preferred_download(config: &Config, platforms: &crate::domain::Platforms) -> bool {
-    use crate::config::PreferredInstallationSource::*;
-    let windows = platforms.windows || (!platforms.linux && !platforms.macos);
-    config
-        .installation_source_order
-        .iter()
-        .find(|source| match source {
-            LinuxOffline => platforms.linux,
-            WindowsGalaxy | WindowsOffline => windows,
-        })
-        == Some(&WindowsGalaxy)
 }
 
 pub(super) fn show_repair_dialog(
@@ -1237,7 +1294,7 @@ fn start_existing_depot_operation_dialog(
                     let detail = detail.clone();
                     move |_| {
                         if model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
-                            load_install_choices(&pending, &window, &model, &detail, true);
+                            load_install_choices(&pending, &window, &model, &detail, true, false);
                         }
                     }
                 });
@@ -1281,9 +1338,14 @@ fn start_existing_depot_operation_dialog(
             let window = window.clone();
             let model = model.clone();
             let detail = detail.clone();
-            move |_| {
+            let directory = directory.clone();
+            move |button| {
                 if model.borrow().account_epoch == epoch && !model.borrow().logout_pending {
-                    browse_game_files(&window, &model, &detail);
+                    if let Some(directory) = &directory {
+                        browse_recovery_directory(&window, &model, directory.clone(), button);
+                    } else {
+                        browse_game_files(&window, &model, &detail, None, button);
+                    }
                 }
             }
         });
@@ -1475,6 +1537,7 @@ fn present_existing_depot_operation_dialog(
 }
 
 struct InstallPreparation {
+    local_only: bool,
     config: Config,
     existing_installation: Option<crate::domain::InstalledGame>,
     installed_dlc_ids: HashSet<i64>,
@@ -1484,6 +1547,29 @@ struct InstallPreparation {
     galaxy_preflight: Result<(), String>,
     galaxy_selection: crate::gog::depot_acquisition::Selection,
     library_statuses: Vec<crate::storage::LibraryStatus>,
+    remote_installers: Vec<download_selection::ArtifactGroup>,
+    offline_error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum InstallSource {
+    GalaxyWindows,
+    OfflineInstaller(usize),
+    RemoteOffline(usize),
+}
+
+impl InstallSource {
+    fn size(
+        self,
+        candidates: &[crate::installation::InstallerCandidate],
+        remote: &[download_selection::ArtifactGroup],
+    ) -> u64 {
+        match self {
+            Self::GalaxyWindows => 0,
+            Self::OfflineInstaller(index) => candidates[index].total_size,
+            Self::RemoteOffline(index) => remote[index].total_size.unwrap_or(0),
+        }
+    }
 }
 
 fn show_install_dialog_with_mode(
@@ -1491,13 +1577,13 @@ fn show_install_dialog_with_mode(
     model: &Rc<RefCell<AppModel>>,
     detail: &DetailPageModel,
     repair: bool,
-    _galaxy_preflight: Option<Result<(), String>>,
+    local_only: bool,
 ) {
     let dialog = adw::Dialog::builder()
         .content_width(680)
         .content_height(620)
         .build();
-    load_install_choices(&dialog, window, model, detail, repair);
+    load_install_choices(&dialog, window, model, detail, repair, local_only);
     dialog.present(Some(window));
 }
 
@@ -1507,6 +1593,7 @@ fn load_install_choices(
     model: &Rc<RefCell<AppModel>>,
     detail: &DetailPageModel,
     repair: bool,
+    local_only: bool,
 ) {
     let shell = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let header = adw::HeaderBar::new();
@@ -1529,12 +1616,32 @@ fn load_install_choices(
     let prepared_detail = detail.clone();
     let product_id = detail.product_id;
     let session = online::account_session();
+    let auth_session = auth::session();
+    let acquisition = {
+        let state = model.borrow();
+        state
+            .games
+            .iter()
+            .find(|game| game.product_id == product_id)
+            .cloned()
+            .zip(
+                state
+                    .account_token
+                    .as_ref()
+                    .map(|token| token.access_token.clone()),
+            )
+    };
     let preferences = super::update_policies::policy_request(move || {
         online::with_account_session(session, || StateStore::open()?.game_preferences(product_id))
     });
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<InstallPreparation> {
+            let _activity = crate::profile_reset::begin_activity("loading installation choices")?;
+            anyhow::ensure!(
+                online::account_session() == session && auth::session() == auth_session,
+                "The account changed. Reopen installation choices."
+            );
             let preferences = preferences
                 .recv()
                 .map_err(|_| anyhow::anyhow!("Game language preferences stopped loading"))??;
@@ -1563,14 +1670,16 @@ fn load_install_choices(
                             && game.state == crate::domain::InstallationState::Installed
                     });
             let installed_dlc_ids = crate::installation::installed_dlc_ids(&store, id)?;
+            let revisions = store.load_all_download_revisions(id)?;
             let mut candidates = crate::installation::detect_installer_candidates(
                 id,
-                &store.load_all_download_revisions(id)?,
+                &revisions,
                 &managed_files,
                 &config,
             );
             candidates.usable.retain(|candidate| {
                 candidate.method != crate::installation::InstallationMethod::Unsupported
+                    && (!local_only || candidate.complete)
             });
             let mut dlc_candidates = HashMap::new();
             for child in std::iter::once(prepared_detail.product_id).chain(
@@ -1599,7 +1708,60 @@ fn load_install_choices(
                 default_galaxy_selection(&prepared_detail, &config, preferences.as_ref());
             let galaxy_preflight =
                 cached_galaxy_selection_available(&store, &prepared_detail, &galaxy_selection);
+            let mut artifacts = prepared_detail.remote_artifacts.clone();
+            let mut offline_error = None;
+            if !repair
+                && !local_only
+                && existing_installation.is_none()
+                && prepared_detail.parent_id.is_none()
+                && artifacts.is_empty()
+                && let Some((game, token)) = acquisition
+            {
+                match online::fetch_product_section(
+                    &game,
+                    online::DetailSection::Acquisition,
+                    Some(&token),
+                    Some(&galaxy_selection.language),
+                    session,
+                ) {
+                    Ok(game) => artifacts = game.remote_artifacts,
+                    Err(error) => {
+                        offline_error = Some(notifications::failure_message(
+                            "Could not load offline installer choices",
+                            &format!("{error:#}"),
+                        ))
+                    }
+                }
+            }
+            let remote_installers = download_selection::group_artifacts(&artifacts)
+                .into_iter()
+                .filter(|group| {
+                    group.kind == ArtifactKind::Installer
+                        && group.product_id == product_id
+                        && matches!(group.operating_system.as_deref(), Some("windows" | "linux"))
+                })
+                .filter(|group| {
+                    !candidates.usable.iter().any(|candidate| {
+                        candidate.complete
+                            && revisions.iter().any(|revision| {
+                                Some(revision.revision_id) == candidate.revision_id
+                                    && revision.parts.len() == group.artifacts.len()
+                                    && group.artifacts.iter().all(|artifact| {
+                                        revision.parts.iter().any(|part| {
+                                            artifact.provider_group_id.as_deref()
+                                                == Some(revision.provider_group_id.as_str())
+                                                && artifact.provider_file_id.as_deref()
+                                                    == Some(part.provider_file_id.as_str())
+                                                && artifact.download_path == part.downlink
+                                                && artifact.version == revision.version
+                                        })
+                                    })
+                            })
+                    })
+                })
+                .collect();
             Ok(InstallPreparation {
+                local_only,
                 config,
                 existing_installation,
                 installed_dlc_ids,
@@ -1609,6 +1771,8 @@ fn load_install_choices(
                 galaxy_preflight,
                 galaxy_selection,
                 library_statuses,
+                remote_installers,
+                offline_error,
             })
         })();
         let _ = sender.send(result);
@@ -1623,7 +1787,11 @@ fn load_install_choices(
     let model = model.clone();
     let detail = detail.clone();
     glib::timeout_add_local(Duration::from_millis(32), move || {
-        if closed.get() || model.borrow().account_epoch != epoch {
+        if closed.get()
+            || model.borrow().account_epoch != epoch
+            || online::account_session() != session
+            || auth::session() != auth_session
+        {
             dialog.close();
             return glib::ControlFlow::Break;
         }
@@ -1645,7 +1813,9 @@ fn load_install_choices(
                     let window = window.clone();
                     let model = model.clone();
                     let detail = detail.clone();
-                    move |_| load_install_choices(&dialog, &window, &model, &detail, repair)
+                    move |_| {
+                        load_install_choices(&dialog, &window, &model, &detail, repair, local_only)
+                    }
                 });
                 shell.append(&retry);
             }
@@ -1663,6 +1833,7 @@ fn populate_install_dialog(
     preparation: InstallPreparation,
 ) {
     let InstallPreparation {
+        local_only,
         config,
         existing_installation,
         installed_dlc_ids,
@@ -1672,11 +1843,13 @@ fn populate_install_dialog(
         galaxy_preflight,
         galaxy_selection,
         library_statuses,
+        remote_installers,
+        offline_error,
     } = preparation;
-    let galaxy_preflight = Some(galaxy_preflight);
+    let galaxy_preflight = (!local_only).then_some(galaxy_preflight);
     let galaxy_request = {
         let state = model.borrow();
-        (!repair && existing_installation.is_none() && detail.parent_id.is_none())
+        (!repair && !local_only && existing_installation.is_none() && detail.parent_id.is_none())
             .then(|| {
                 state
                     .games
@@ -1726,6 +1899,7 @@ fn populate_install_dialog(
     let galaxy_builds = detail
         .galaxy_builds
         .iter()
+        .filter(|_| !local_only)
         .filter(|build| {
             build.generation == 2
                 && build.currently_returned
@@ -1742,7 +1916,7 @@ fn populate_install_dialog(
         }));
     }
     let galaxy_ready = Rc::new(std::cell::Cell::new(!galaxy_builds.is_empty()));
-    let ranked_sources = if repair || existing_installation.is_some() {
+    let mut ranked_sources = if repair || existing_installation.is_some() {
         Vec::new()
     } else {
         crate::installation::rank_fresh_install_sources(
@@ -1750,23 +1924,90 @@ fn populate_install_dialog(
             &candidates.usable,
             !galaxy_builds.is_empty() || galaxy_request.is_some(),
         )
+        .into_iter()
+        .map(|source| match source {
+            crate::installation::FreshInstallSource::GalaxyWindows => InstallSource::GalaxyWindows,
+            crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+                InstallSource::OfflineInstaller(index)
+            }
+        })
+        .collect::<Vec<_>>()
     };
+    if !repair && !local_only && existing_installation.is_none() {
+        ranked_sources.extend((0..remote_installers.len()).map(InstallSource::RemoteOffline));
+        ranked_sources.sort_by_key(|source| {
+            use crate::config::PreferredInstallationSource::*;
+            let preferred = match source {
+                InstallSource::GalaxyWindows => WindowsGalaxy,
+                InstallSource::OfflineInstaller(index)
+                    if candidates.usable[*index].method
+                        == crate::installation::InstallationMethod::NativeLinux =>
+                {
+                    LinuxOffline
+                }
+                InstallSource::RemoteOffline(index)
+                    if remote_installers[*index].operating_system.as_deref() == Some("linux") =>
+                {
+                    LinuxOffline
+                }
+                _ => WindowsOffline,
+            };
+            let language = match source {
+                InstallSource::RemoteOffline(index) => {
+                    remote_installers[*index].language.as_deref()
+                }
+                InstallSource::OfflineInstaller(index) => {
+                    candidates.usable[*index].language.as_deref()
+                }
+                InstallSource::GalaxyWindows => None,
+            }
+            .unwrap_or("");
+            (
+                config
+                    .installation_source_order
+                    .iter()
+                    .position(|value| *value == preferred)
+                    .unwrap_or(usize::MAX),
+                if config
+                    .installer_language
+                    .as_deref()
+                    .is_some_and(|preferred| preferred.eq_ignore_ascii_case(language))
+                {
+                    0
+                } else if language.eq_ignore_ascii_case("english")
+                    || language.eq_ignore_ascii_case("en")
+                {
+                    1
+                } else {
+                    2
+                },
+            )
+        });
+    }
     let mut source_values = Vec::new();
     for source in &ranked_sources {
         let label = match source {
-            crate::installation::FreshInstallSource::GalaxyWindows => {
-                "Windows · Galaxy build".to_owned()
-            }
-            crate::installation::FreshInstallSource::OfflineInstaller(index) => {
+            InstallSource::GalaxyWindows => "Windows · Depot".to_owned(),
+            InstallSource::OfflineInstaller(index) => {
                 let candidate = &candidates.usable[*index];
                 format!(
-                    "{} · Offline installer · {}",
+                    "{} · Downloaded installer · {} · {}",
                     if candidate.method == crate::installation::InstallationMethod::NativeLinux {
                         "Linux"
                     } else {
                         "Windows"
                     },
-                    candidate.version.as_deref().unwrap_or("Unknown version")
+                    candidate.version.as_deref().unwrap_or("Unknown version"),
+                    candidate.language.as_deref().unwrap_or("Any language")
+                )
+            }
+            InstallSource::RemoteOffline(index) => {
+                let group = &remote_installers[*index];
+                format!(
+                    "{} · Offline installer · {} · {}",
+                    group.operating_system.as_deref().unwrap_or("Any OS"),
+                    group.version.as_deref().unwrap_or("Unknown version"),
+                    group.language.as_deref().unwrap_or("Any language")
                 )
             }
         };
@@ -1779,14 +2020,10 @@ fn populate_install_dialog(
             .collect::<Vec<_>>(),
     );
     let source = gtk::DropDown::new(Some(source_list), gtk::Expression::NONE);
-    let galaxy_selected = Rc::new(std::cell::Cell::new(source_values.first().is_some_and(
-        |(_, value)| {
-            matches!(
-                value,
-                crate::installation::FreshInstallSource::GalaxyWindows
-            )
-        },
-    )));
+    let galaxy_selected =
+        Rc::new(std::cell::Cell::new(source_values.first().is_some_and(
+            |(_, value)| matches!(value, InstallSource::GalaxyWindows),
+        )));
     let candidate_labels = candidates
         .usable
         .iter()
@@ -1809,13 +2046,14 @@ fn populate_install_dialog(
     let preferred_candidate = source_values
         .first()
         .and_then(|(_, source)| match source {
-            crate::installation::FreshInstallSource::OfflineInstaller(index) => Some(*index),
-            crate::installation::FreshInstallSource::GalaxyWindows => None,
+            InstallSource::OfflineInstaller(index) => Some(*index),
+            InstallSource::GalaxyWindows | InstallSource::RemoteOffline(_) => None,
         })
         .or(candidates.preferred)
         .unwrap_or(0);
     candidate.set_selected(preferred_candidate as u32);
     let candidate_menu = gtk::MenuButton::new();
+    candidate_menu.set_widget_name("install-source-menu");
     candidate_menu.set_hexpand(true);
     candidate_menu.set_sensitive(if existing_installation.is_none() && !repair {
         !source_values.is_empty()
@@ -1829,17 +2067,10 @@ fn populate_install_dialog(
     let mut source_choice_buttons = Vec::new();
     if existing_installation.is_none() && !repair {
         for (index, (label, source_value)) in source_values.iter().enumerate() {
-            let size = match source_value {
-                crate::installation::FreshInstallSource::OfflineInstaller(candidate_index) => {
-                    candidates.usable[*candidate_index].total_size
-                }
-                crate::installation::FreshInstallSource::GalaxyWindows => 0,
-            };
+            let size = source_value.size(&candidates.usable, &remote_installers);
             let choice = gtk::Button::new();
-            if matches!(
-                source_value,
-                crate::installation::FreshInstallSource::GalaxyWindows
-            ) {
+            choice.set_widget_name(&format!("install-source-{index}"));
+            if matches!(source_value, InstallSource::GalaxyWindows) {
                 choice.set_sensitive(galaxy_ready.get());
             }
             choice.add_css_class("flat");
@@ -1894,12 +2125,7 @@ fn populate_install_dialog(
         && existing_installation.is_none()
         && !repair
     {
-        let size = match source_value {
-            crate::installation::FreshInstallSource::OfflineInstaller(index) => {
-                candidates.usable[*index].total_size
-            }
-            crate::installation::FreshInstallSource::GalaxyWindows => 0,
-        };
+        let size = source_value.size(&candidates.usable, &remote_installers);
         candidate_menu.set_child(Some(&install_choice_content(
             detail.icon.as_deref(),
             &detail.title,
@@ -2047,8 +2273,8 @@ fn populate_install_dialog(
         });
     }
     let dlc_summary = gtk::Label::new(None);
+    let dlc_menu = gtk::MenuButton::new();
     if !dlc_choices.is_empty() {
-        let dlc_menu = gtk::MenuButton::new();
         dlc_menu.set_hexpand(true);
         dlc_menu.add_css_class("install-dlc-menu");
         dlc_summary.set_xalign(0.0);
@@ -2102,15 +2328,13 @@ fn populate_install_dialog(
         let icon = detail.icon.clone();
         let title = detail.title.clone();
         let source_candidates = candidates.usable.clone();
+        let remote_installers = remote_installers.clone();
         source.connect_selected_notify(move |selector| {
             let selected_index = selector.selected() as usize;
             let Some((label, selected)) = source_values_state.get(selected_index) else {
                 return;
             };
-            let is_galaxy = matches!(
-                selected,
-                crate::installation::FreshInstallSource::GalaxyWindows
-            );
+            let is_galaxy = matches!(selected, InstallSource::GalaxyWindows);
             galaxy_selected_state.set(is_galaxy);
             branch_row_state.set_visible(is_galaxy && branches_state.borrow().len() > 1);
             branch_password_state.set_visible(
@@ -2120,7 +2344,7 @@ fn populate_install_dialog(
                         .get(branch_state.selected() as usize)
                         .is_some_and(Option::is_some),
             );
-            if let crate::installation::FreshInstallSource::OfflineInstaller(index) = selected {
+            if let InstallSource::OfflineInstaller(index) = selected {
                 candidate_state.set_selected(*index as u32);
             }
             for choice in &choices {
@@ -2129,12 +2353,7 @@ fn populate_install_dialog(
                     choice.check.set_sensitive(true);
                 }
             }
-            let size = match selected {
-                crate::installation::FreshInstallSource::OfflineInstaller(index) => {
-                    source_candidates[*index].total_size
-                }
-                crate::installation::FreshInstallSource::GalaxyWindows => 0,
-            };
+            let size = selected.size(&source_candidates, &remote_installers);
             candidate_menu_state.set_child(Some(&install_choice_content(
                 icon.as_deref(),
                 &title,
@@ -2145,12 +2364,7 @@ fn populate_install_dialog(
             )));
             for (index, button) in source_buttons_state.iter().enumerate() {
                 if let Some((label, source)) = source_values_state.get(index) {
-                    let size = match source {
-                        crate::installation::FreshInstallSource::OfflineInstaller(
-                            candidate_index,
-                        ) => source_candidates[*candidate_index].total_size,
-                        crate::installation::FreshInstallSource::GalaxyWindows => 0,
-                    };
+                    let size = source.size(&source_candidates, &remote_installers);
                     button.set_child(Some(&install_choice_content(
                         icon.as_deref(),
                         &title,
@@ -2189,14 +2403,11 @@ fn populate_install_dialog(
         let interactive_prompts = interactive_prompts.clone();
         let values = source_values.clone();
         source.connect_selected_notify(move |selector| {
-            interactive_prompts.set_visible(!values.get(selector.selected() as usize).is_some_and(
-                |(_, source)| {
-                    matches!(
-                        source,
-                        crate::installation::FreshInstallSource::GalaxyWindows
-                    )
-                },
-            ));
+            interactive_prompts.set_visible(
+                !values
+                    .get(selector.selected() as usize)
+                    .is_some_and(|(_, source)| matches!(source, InstallSource::GalaxyWindows)),
+            );
         });
     }
     {
@@ -2239,21 +2450,51 @@ fn populate_install_dialog(
     let installer_detail = adw::ActionRow::new();
     installer_detail.set_use_markup(false);
     body.add(&installer_group);
-    if !repair && existing_installation.is_none() && detail.parent_id.is_none() {
-        let offline = gtk::Button::with_label("Offline installers and extras…");
-        let window = window.clone();
-        let dialog = dialog.clone();
-        let id = detail.product_id;
-        offline.connect_clicked(move |_| {
-            dialog.close();
-            let _ = gtk::prelude::WidgetExt::activate_action(
-                &window,
-                "win.offline-download",
-                Some(&id.to_variant()),
-            );
+    if let Some(error) = offline_error {
+        let row = adw::ActionRow::builder()
+            .title("Offline installer choices unavailable")
+            .subtitle(&error)
+            .build();
+        let retry = gtk::Button::with_label("Retry");
+        row.add_suffix(&retry);
+        installer_group.add(&row);
+        let dialog = dialog.downgrade();
+        let window = window.downgrade();
+        let model = model.clone();
+        let detail = detail.clone();
+        let epoch = model.borrow().account_epoch;
+        retry.connect_clicked(move |_| {
+            if model.borrow().account_epoch == epoch
+                && !model.borrow().logout_pending
+                && let (Some(dialog), Some(window)) = (dialog.upgrade(), window.upgrade())
+            {
+                load_install_choices(&dialog, &window, &model, &detail, repair, local_only);
+            }
         });
-        installer_group.add(&offline);
     }
+
+    let archive_group = adw::PreferencesGroup::builder().title("Save offline installers to").description("All required parts are saved here, then installed automatically into Game Files. Optional DLC can be installed separately. Automatic installation is unattended.").build();
+    let archive_library = gtk::DropDown::from_strings(
+        &config
+            .offline_libraries
+            .iter()
+            .map(|library| library.name.as_str())
+            .collect::<Vec<_>>(),
+    );
+    archive_library.set_widget_name("install-archive-library");
+    archive_library.set_selected(
+        config
+            .offline_libraries
+            .iter()
+            .position(|library| library.default)
+            .unwrap_or(0) as u32,
+    );
+    let archive_path = gtk::Label::new(None);
+    archive_path.set_wrap(true);
+    archive_path.set_selectable(true);
+    archive_group.add(&archive_library);
+    archive_group.add(&archive_path);
+    body.add(&archive_group);
 
     let destination_group = adw::PreferencesGroup::new();
     destination_group.set_title("INSTALL TO GAME FILES:");
@@ -2400,6 +2641,10 @@ fn populate_install_dialog(
     let close = gtk::Button::with_label("Cancel");
     footer.append(&close);
     let install = gtk::Button::new();
+    install.set_widget_name("install-confirm");
+    let queue_spinner = gtk::Spinner::new();
+    queue_spinner.set_visible(false);
+    footer.append(&queue_spinner);
     install.add_css_class("suggested-action");
     install.set_sensitive(
         !config.game_libraries.is_empty()
@@ -2548,7 +2793,7 @@ fn populate_install_dialog(
                         *builds.borrow_mut()=fresh;galaxy_ready.set(!builds.borrow().is_empty());
                         branch_row.set_visible(galaxy_selected.get() && branches.borrow().len()>1);
                         branch_password.set_visible(galaxy_selected.get() && branches.borrow().get(selected).is_some_and(Option::is_some));
-                        for (index,(_,value)) in values.iter().enumerate(){if matches!(value,crate::installation::FreshInstallSource::GalaxyWindows) && let Some(button)=buttons.get(index){button.set_sensitive(galaxy_ready.get());button.set_child(Some(&install_choice_content(icon.as_deref(),&title,"Windows · Galaxy build",0,false,false)));}}
+                        for (index,(_,value)) in values.iter().enumerate(){if matches!(value,InstallSource::GalaxyWindows) && let Some(button)=buttons.get(index){button.set_sensitive(galaxy_ready.get());button.set_child(Some(&install_choice_content(icon.as_deref(),&title,"Windows · Galaxy build",0,false,false)));}}
                         if galaxy_selected.get(){install.set_sensitive(galaxy_ready.get() && has_library);}
                         row.set_subtitle(if galaxy_ready.get(){"Galaxy installation choices are ready"}else{"No current Galaxy build is available"});
                         retry.set_visible(!galaxy_ready.get());
@@ -2681,6 +2926,74 @@ fn populate_install_dialog(
             );
         });
     }
+    let refresh_source: Rc<dyn Fn()> = Rc::new({
+        let source = source.clone();
+        let values = source_values.clone();
+        let archive_library = archive_library.clone();
+        let archive_group = archive_group.clone();
+        let archive_path = archive_path.clone();
+        let libraries = config.offline_libraries.clone();
+        let statuses = library_statuses.clone();
+        let install = install.clone();
+        let galaxy_ready = galaxy_ready.clone();
+        let interactive = interactive_prompts.clone();
+        let dlc_menu = dlc_menu.clone();
+        let candidates = candidates.usable.clone();
+        let candidate = candidate.clone();
+        let dlcs = dlc_choices.clone();
+        let has_target = !config.game_libraries.is_empty();
+        let base_installed = existing_installation.is_some() && !repair;
+        let signed_in = model.borrow().account_token.is_some();
+        move || {
+            let selected = values
+                .get(source.selected() as usize)
+                .map(|(_, source)| *source);
+            let remote = matches!(selected, Some(InstallSource::RemoteOffline(_)));
+            archive_group.set_visible(remote);
+            dlc_menu.set_visible(!remote && !dlcs.is_empty());
+            interactive
+                .set_visible(!remote && !matches!(selected, Some(InstallSource::GalaxyWindows)));
+            if remote {
+                let library = libraries.get(archive_library.selected() as usize);
+                let usable = library.is_some_and(|library| {
+                    statuses.iter().any(|status| {
+                        status.kind == LibraryKind::OfflineInstallers
+                            && status.library_id == library.id
+                            && matches!(
+                                status.compatibility,
+                                crate::storage::LibraryCompatibility::Compatible
+                            )
+                    })
+                });
+                archive_path.set_label(&match library {
+                    Some(library) if usable => library.path.display().to_string(),
+                    Some(library) => format!("{} is unavailable or incompatible. Choose another library or correct it in Storage settings.", library.path.display()),
+                    None => "Configure an Offline Installers library in Storage settings before downloading an installer.".into(),
+                });
+                install.set_label("Download and install");
+                install.set_sensitive(usable && has_target && signed_in);
+            } else if matches!(selected, Some(InstallSource::GalaxyWindows)) {
+                install.set_label("Download and install");
+                install.set_sensitive(galaxy_ready.get() && has_target);
+            } else {
+                update_install_action(
+                    &install,
+                    &candidates,
+                    candidate.selected() as usize,
+                    base_installed,
+                    &dlcs,
+                );
+                if !has_target {
+                    install.set_sensitive(false);
+                }
+            }
+        }
+    });
+    for selector in [&source, &archive_library] {
+        let refresh = refresh_source.clone();
+        selector.connect_selected_notify(move |_| refresh());
+    }
+    refresh_source();
     {
         let candidates = candidates.usable;
         let dlc_choices = dlc_choices.clone();
@@ -2722,14 +3035,24 @@ fn populate_install_dialog(
         });
         let preparing = Rc::new(std::cell::Cell::new(false));
         let preparation_button = install.clone();
+        let remote_sources = source_values.clone();
+        let selected_source = source.clone();
         let windows_product = {
             let model = action_model.clone();
             let galaxy_selected = galaxy_selected.clone();
             let candidates = candidates.clone();
             let candidate = candidate.clone();
             let existing = existing_installation.clone();
+            let source = source.clone();
+            let sources = source_values.clone();
             move || {
                 if model.borrow().account_epoch != action_epoch {
+                    return None;
+                }
+                if sources
+                    .get(source.selected() as usize)
+                    .is_some_and(|(_, source)| matches!(source, InstallSource::RemoteOffline(_)))
+                {
                     return None;
                 }
                 (galaxy_selected.get()
@@ -2746,10 +3069,148 @@ fn populate_install_dialog(
                 .then_some(product_id)
             }
         };
+        let archive_libraries = config.offline_libraries.clone();
+        let title = detail.title.clone();
+        let action_session = (online::account_session(), auth::session());
+        let operation_controls = body.clone();
         connect_windows_action(&install, window, true, windows_product, move |button| {
             if action_model.borrow().account_epoch != action_epoch {
                 status.set_label("Account changed; reopen installation choices.");
                 status.add_css_class("error");
+                return;
+            }
+            if let Some((_, InstallSource::RemoteOffline(index))) =
+                remote_sources.get(selected_source.selected() as usize)
+            {
+                if preparing.replace(true) {
+                    return;
+                }
+                let Some(archive) = archive_libraries
+                    .get(archive_library.selected() as usize)
+                    .cloned()
+                else {
+                    preparing.set(false);
+                    return;
+                };
+                let Some(target) = libraries.get(library.selected() as usize).cloned() else {
+                    preparing.set(false);
+                    return;
+                };
+                let Some(token) = action_model
+                    .borrow()
+                    .account_token
+                    .as_ref()
+                    .map(|token| token.access_token.clone())
+                else {
+                    preparing.set(false);
+                    status.set_label("Sign in before downloading this installer.");
+                    return;
+                };
+                let group = remote_installers[*index].clone();
+                let slug = slug.clone();
+                let title = title.clone();
+                let mut config = action_model.borrow().config.clone();
+                config.interactive_installer_prompts = false;
+                status.set_label("Queuing every required installer part; installation will follow the completed download…");
+                button.set_sensitive(false);
+                operation_controls.set_sensitive(false);
+                queue_spinner.set_visible(true);
+                queue_spinner.start();
+                dialog.set_can_close(false);
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<usize> {
+                        let _activity =
+                            crate::profile_reset::begin_activity("queuing offline installation")?;
+                        anyhow::ensure!(
+                            action_session == (online::account_session(), auth::session()),
+                            "The account changed. Reopen installation choices."
+                        );
+                        let current = crate::storage::read_config()?;
+                        for (kind, selected) in [
+                            (LibraryKind::OfflineInstallers, &archive),
+                            (LibraryKind::GameFiles, &target),
+                        ] {
+                            let fresh =
+                                crate::storage::validate_library(&current, kind, &selected.id)?;
+                            anyhow::ensure!(
+                                fresh.path == selected.path,
+                                "A selected library changed. Reopen installation choices."
+                            );
+                        }
+                        let destination = download::destination(
+                            &archive.path,
+                            &slug,
+                            None,
+                            &group.artifacts.iter().collect::<Vec<_>>(),
+                        );
+                        let (events, _) = mpsc::channel();
+                        let requests = vec![download::DownloadRequest {
+                            artifacts: group.artifacts,
+                            title: title.clone(),
+                            access_token: token,
+                            destination,
+                            library_id: archive.id,
+                            events,
+                        }];
+                        let install = Some(download::AutoInstallRequest {
+                            product_id,
+                            slug,
+                            title,
+                            config,
+                            library_id: target.id,
+                        });
+                        #[cfg(test)]
+                        let (requests, install) = match capture_queued_downloads(requests, install)
+                        {
+                            Ok(count) => return Ok(count),
+                            Err(request) => *request,
+                        };
+                        download::enqueue_with_install(requests, install, action_session.0)
+                    })();
+                    let _ = sender.send(result);
+                });
+                let dialog = dialog.clone();
+                let status = status.clone();
+                let button = button.downgrade();
+                let model = action_model.clone();
+                let preparing = preparing.clone();
+                let operation_controls = operation_controls.clone();
+                let queue_spinner = queue_spinner.clone();
+                glib::timeout_add_local(Duration::from_millis(50), move || {
+                    if model.borrow().account_epoch != action_epoch
+                        || model.borrow().logout_pending
+                        || action_session != (online::account_session(), auth::session())
+                    {
+                        dialog.set_can_close(true);
+                        dialog.close();
+                        return glib::ControlFlow::Break;
+                    }
+                    let result = match receiver.try_recv() {
+                        Ok(result) => result,
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(_) => Err(anyhow::anyhow!("Queue preparation stopped. Try again.")),
+                    };
+                    dialog.set_can_close(true);
+                    preparing.set(false);
+                    operation_controls.set_sensitive(true);
+                    queue_spinner.stop();
+                    queue_spinner.set_visible(false);
+                    match result {
+                        Ok(_) => dialog.close(),
+                        Err(error) => {
+                            status.set_label(&notifications::failure_message(
+                                "Could not queue installation",
+                                &format!("{error:#}"),
+                            ));
+                            if let Some(button) = button.upgrade() {
+                                button.set_sensitive(true);
+                            }
+                            false
+                        }
+                    };
+                    glib::ControlFlow::Break
+                });
                 return;
             }
             if galaxy_selected.get() {
@@ -2882,7 +3343,7 @@ fn populate_install_dialog(
                             preparation_pending.set(false);
                             preparation_button_result.set_sensitive(true);
                             status_result.set_label(&super::notifications::failure_message("", &format!(
-                                "Could not prepare required Depot components: {error:#}\nRetry preparation or choose Offline installers and extras."
+                                "Could not prepare required Depot components: {error:#}\nRetry preparation or select an offline installer from the source menu."
                             )));
                             status_result.add_css_class("error");
                             glib::ControlFlow::Break
@@ -2891,7 +3352,7 @@ fn populate_install_dialog(
                         Err(mpsc::TryRecvError::Disconnected) => {
                             preparation_pending.set(false);
                             preparation_button_result.set_sensitive(true);
-                            status_result.set_label("Preparation stopped. Retry or choose Offline installers and extras.");
+                            status_result.set_label("Preparation stopped. Retry or select an offline installer from the source menu.");
                             glib::ControlFlow::Break
                         }
                     }
@@ -4898,7 +5359,212 @@ pub(super) struct DetailFileManagement {
 
 #[cfg(test)]
 mod installer_version_tests {
-    use super::{depot_is_preferred_download, dlc_summary_text, versions_match};
+    use super::*;
+
+    #[test]
+    #[ignore = "private HOME/all XDG, D-Bus and GTK; captures queues without downloads or helpers"]
+    fn unified_sources_queue_parts_with_initial_and_changed_libraries() {
+        let _capture = DownloadQueueCapture::start();
+        adw::init().unwrap();
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let libraries = (0..3)
+            .map(|index| {
+                let path = root.path().join(format!("library-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                GameLibrary {
+                    id: index.to_string(),
+                    name: format!("Library {index}"),
+                    path,
+                    default: index != 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut config = Config {
+            game_libraries: vec![libraries[0].clone()],
+            offline_libraries: libraries[1..].to_vec(),
+            extras_libraries: vec![],
+            installer_language: Some("English".into()),
+            installation_source_order: vec![
+                crate::config::PreferredInstallationSource::WindowsOffline,
+                crate::config::PreferredInstallationSource::WindowsGalaxy,
+                crate::config::PreferredInstallationSource::LinuxOffline,
+            ],
+            ..Config::default()
+        };
+        config.save().unwrap();
+        let build = serde_json::from_value(serde_json::json!({"build_id":"fixture", "product_id":9296001,"operating_system":"windows","tags":[],"public":true,"generation":2,"repository_url":"https://invalid.test/unused","currently_returned":true,"first_seen_at":0,"last_seen_at":0})).unwrap();
+        let detail = DetailPageModel::game(
+            Game {
+                product_id: 9296001,
+                slug: "fixture".into(),
+                title: "Fixture".into(),
+                galaxy_builds: vec![build],
+                ..Game::default()
+            },
+            false,
+        );
+        let mut artifacts = (1..=2).map(|part| serde_json::from_value::<RemoteArtifact>(serde_json::json!({"product_id":detail.product_id,"kind":"installer","name":"Fixture","operating_system":"windows","language":"English","version":"1","part_number":part,"part_count":2,"provider_group_id":"english","provider_file_id":part.to_string(),"download_path":format!("/synthetic/{part}")})).unwrap()).collect::<Vec<_>>();
+        let mut french = artifacts[0].clone();
+        french.language = Some("French".into());
+        french.provider_group_id = Some("french".into());
+        french.part_count = Some(1);
+        artifacts.push(french);
+        let remote = download_selection::group_artifacts(&artifacts);
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.UnifiedInstallTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel {
+            config: config.clone(),
+            account_token: Some(auth::Token {
+                access_token: "synthetic".into(),
+                refresh_token: String::new(),
+                user_id: "fixture".into(),
+                expires_at: i64::MAX,
+            }),
+            ..AppModel::default()
+        }));
+        for case in 0..4 {
+            if case == 3 {
+                config.offline_libraries = libraries[1..].to_vec();
+                config.save().unwrap();
+                model.borrow_mut().config = config.clone();
+            }
+            if case == 2 {
+                config.offline_libraries.clear();
+                config.save().unwrap();
+                model.borrow_mut().config = config.clone();
+            }
+            let dialog = adw::Dialog::new();
+            let preparation = InstallPreparation {
+                local_only: case == 3,
+                config: config.clone(),
+                existing_installation: None,
+                installed_dlc_ids: HashSet::new(),
+                candidates: crate::installation::InstallerCandidates {
+                    usable: vec![crate::installation::InstallerCandidate {
+                        product_id: detail.product_id,
+                        revision_id: None,
+                        version: Some("local".into()),
+                        operating_system: Some("linux".into()),
+                        language: Some("English".into()),
+                        paths: vec![libraries[1].path.join("fixture.sh")],
+                        launcher: None,
+                        method: crate::installation::InstallationMethod::NativeLinux,
+                        total_size: 4,
+                        currently_offered: false,
+                        complete: true,
+                    }],
+                    incomplete: vec![],
+                    preferred: Some(0),
+                },
+                dlc_candidates: HashMap::new(),
+                mount_points: vec!["fixture".into()],
+                galaxy_preflight: Ok(()),
+                galaxy_selection: default_galaxy_selection(&detail, &config, None),
+                library_statuses: crate::storage::inspect_libraries(&config).unwrap(),
+                remote_installers: remote.clone(),
+                offline_error: None,
+            };
+            populate_install_dialog(&dialog, &window, &model, &detail, false, preparation);
+            dialog.present(Some(&window));
+            wait(|| dialog.is_mapped());
+            let menu = find_named_descendant(dialog.upcast_ref(), "install-source-menu")
+                .and_downcast::<gtk::MenuButton>()
+                .unwrap();
+            let archive = find_named_descendant(dialog.upcast_ref(), "install-archive-library")
+                .and_downcast::<gtk::DropDown>()
+                .unwrap();
+            let install = find_named_descendant(dialog.upcast_ref(), "install-confirm")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            let choice = |index| {
+                find_named_descendant(
+                    menu.popover().unwrap().upcast_ref(),
+                    &format!("install-source-{index}"),
+                )
+                .and_downcast::<gtk::Button>()
+                .unwrap()
+            };
+            if case == 3 {
+                assert!(choice(0).child().is_some());
+                assert!(
+                    find_named_descendant(menu.popover().unwrap().upcast_ref(), "install-source-1")
+                        .is_none(),
+                    "local-only entry must exclude Depot and remote downloads"
+                );
+                assert!(!archive.is_mapped());
+                assert!(install.is_sensitive());
+                dialog.close();
+                wait(|| window.visible_dialog().is_none());
+                continue;
+            }
+            assert!(
+                choice(2).child().is_some() && choice(3).child().is_some(),
+                "Depot and downloaded Linux source remain available"
+            );
+            if case == 2 {
+                assert!(!install.is_sensitive());
+                choice(2).emit_clicked();
+                assert!(install.is_sensitive());
+                dialog.close();
+                wait(|| window.visible_dialog().is_none());
+                continue;
+            }
+            assert_eq!(archive.selected(), 1, "default applies without reselecting");
+            if case == 1 {
+                archive.set_selected(0);
+                choice(1).emit_clicked();
+            }
+            install.emit_clicked();
+            assert!(!install.is_sensitive());
+            wait(|| TEST_DOWNLOAD_QUEUE.lock().unwrap().as_ref().unwrap().len() == case + 1);
+            wait(|| window.visible_dialog().is_none());
+            let captured = TEST_DOWNLOAD_QUEUE.lock().unwrap();
+            let (requests, intent) = &captured.as_ref().unwrap()[case];
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].library_id,
+                libraries[if case == 0 { 2 } else { 1 }].id
+            );
+            assert_eq!(requests[0].artifacts.len(), if case == 0 { 2 } else { 1 });
+            assert_eq!(
+                requests[0].artifacts[0].language.as_deref(),
+                Some(if case == 0 { "English" } else { "French" })
+            );
+            if case == 0 {
+                assert_eq!(
+                    requests[0]
+                        .artifacts
+                        .iter()
+                        .map(|artifact| artifact.part_number.unwrap())
+                        .collect::<Vec<_>>(),
+                    vec![1, 2]
+                );
+            }
+            assert_eq!(intent.as_ref().unwrap().library_id, libraries[0].id);
+            assert!(
+                !intent
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .interactive_installer_prompts
+            );
+            assert!(!requests[0].destination.starts_with(&libraries[0].path));
+        }
+        window.close();
+    }
 
     #[test]
     fn initial_depot_selection_uses_saved_game_language_for_base_and_dlc() {
@@ -5008,39 +5674,6 @@ mod installer_version_tests {
             super::default_galaxy_selection(&detail, &super::Config::default(), None).language,
             "en"
         );
-    }
-
-    #[test]
-    fn primary_download_respects_available_platforms_and_saved_source_preference() {
-        use crate::{
-            config::{Config, PreferredInstallationSource::*},
-            domain::Platforms,
-        };
-        let mut config = Config::default();
-        let windows = Platforms {
-            windows: true,
-            ..Default::default()
-        };
-        let both = Platforms {
-            windows: true,
-            linux: true,
-            ..Default::default()
-        };
-        assert!(depot_is_preferred_download(&config, &windows));
-        assert!(depot_is_preferred_download(&config, &both));
-        assert!(depot_is_preferred_download(&config, &Platforms::default()));
-        assert!(!depot_is_preferred_download(
-            &config,
-            &Platforms {
-                linux: true,
-                ..Default::default()
-            }
-        ));
-        config.installation_source_order = vec![LinuxOffline, WindowsGalaxy, WindowsOffline];
-        assert!(!depot_is_preferred_download(&config, &both));
-        assert!(depot_is_preferred_download(&config, &windows));
-        config.installation_source_order = vec![WindowsOffline, WindowsGalaxy, LinuxOffline];
-        assert!(!depot_is_preferred_download(&config, &windows));
     }
 
     #[test]

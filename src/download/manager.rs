@@ -38,6 +38,7 @@ struct Request {
 }
 
 enum Command {
+    ManagedFilesChanged(i64, (u64, u64)),
     PauseForSignOut(mpsc::Sender<()>),
     Quiesce(Vec<i64>, mpsc::Sender<anyhow::Result<()>>),
     RetainInstallers {
@@ -135,6 +136,18 @@ pub(super) fn subscribe() -> mpsc::Receiver<DownloadManagerEvent> {
     }
     publish_queue_snapshot(&manager().subscribers);
     receiver
+}
+
+pub(crate) fn notify_managed_files_changed(product_id: i64, session: (u64, u64)) {
+    let Ok(_activity) = crate::profile_reset::begin_activity("refreshing downloaded files") else {
+        return;
+    };
+    if session != (crate::online::account_session(), crate::auth::session()) {
+        return;
+    }
+    let _ = manager()
+        .commands
+        .send(Command::ManagedFilesChanged(product_id, session));
 }
 
 pub(super) fn enqueue_backup(request: super::DownloadRequest, session: u64) -> anyhow::Result<()> {
@@ -436,6 +449,15 @@ fn run(
         };
         if let Some(command) = command {
             match command {
+                Command::ManagedFilesChanged(product_id, session) => {
+                    if session != (crate::online::account_session(), crate::auth::session()) {
+                        continue;
+                    }
+                    publish(
+                        &subscribers,
+                        DownloadManagerEvent::ManagedFilesChanged(product_id),
+                    );
+                }
                 Command::PauseForSignOut(reply) => {
                     authentication_available = false;
                     for handle in active.lock().unwrap().values() {
@@ -1897,6 +1919,16 @@ mod tests {
             commands
                 .send(Command::SetAuthentication(authenticated))
                 .unwrap();
+            let current = (crate::online::account_session(), crate::auth::session());
+            for (id, session) in [
+                (product + 1000, current),
+                (product + 2000, (current.0.wrapping_sub(1), current.1)),
+                (product + 3000, (current.0, current.1.wrapping_sub(1))),
+            ] {
+                commands
+                    .send(Command::ManagedFilesChanged(id, session))
+                    .unwrap();
+            }
             commands
                 .send(Command::Terminal(
                     request.clone(),
@@ -1923,9 +1955,14 @@ mod tests {
                     .iter()
                     .all(|intent| intent.state == "waiting")
             );
-            assert!(snapshots.try_iter().any(
-                |event| matches!(event,DownloadManagerEvent::ManagedFilesChanged(id) if id==product)
-            ));
+            let changed = snapshots
+                .try_iter()
+                .filter_map(|event| match event {
+                    DownloadManagerEvent::ManagedFilesChanged(id) => Some(id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(changed, [product + 1000, product]);
             assert_eq!(fs::read(&files[0]).unwrap(), b"data");
         }
     }

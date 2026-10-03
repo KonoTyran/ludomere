@@ -2,7 +2,7 @@ use super::{
     DownloadEvent,
     files::fallback_filename,
     layout::staging_directory,
-    protocol::{download_url, resolve_download_response, response_filename},
+    protocol::{download_url, resolve_download_response, response_filename, response_size},
 };
 use crate::{
     domain::RemoteArtifact,
@@ -195,15 +195,13 @@ pub(super) fn run_transfer(
             result => result?,
         };
         let resumed = existing > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+        let exact_size = response_size(&response, existing)?;
         let filename = response_filename(&response)
             .unwrap_or_else(|| fallback_filename(artifact, index, artifacts.len()));
         let final_path = destination.join(filename);
         if final_path.is_file() {
             let local_size = final_path.metadata()?.len();
-            if artifact
-                .size_bytes
-                .is_none_or(|expected| expected == local_size)
-            {
+            if exact_size == Some(local_size) {
                 downloaded_before_part += local_size;
                 completed.push(final_path);
                 continue;
@@ -269,6 +267,10 @@ pub(super) fn run_transfer(
                 last_update = Instant::now();
             }
         }
+        anyhow::ensure!(
+            exact_size.is_none_or(|size| current == size),
+            "Downloaded response ended before the complete file was received"
+        );
         output.flush()?;
         fs::rename(&temporary, &final_path)?;
         downloaded_before_part += current;
@@ -544,7 +546,7 @@ fn register_completion(
                     !cancelled.load(Ordering::Relaxed),
                     "Download registration cancelled; files preserved"
                 );
-                completion.validate(artifacts)
+                completion.validate()
             },
         )?;
         Ok(())
@@ -673,7 +675,7 @@ mod tests {
         fs::create_dir_all(&destination).unwrap();
         fs::create_dir_all(&staging).unwrap();
         let artifacts: Vec<RemoteArtifact> = serde_json::from_value(serde_json::json!([
-            {"product_id":7,"kind":"installer","name":"Fixture1","size_bytes":4,"download_path":"/never-requested1"},
+            {"product_id":7,"kind":"installer","name":"Fixture1","size_bytes":100,"download_path":"/never-requested1","provider_group_id":"official-group","provider_file_id":"official-file","provider_category":"installer"},
             {"product_id":7,"kind":"installer","name":"Fixture2","size_bytes":4,"download_path":"/never-requested2"}
         ])).unwrap();
         let files = vec![
@@ -725,6 +727,11 @@ mod tests {
             super::super::worker::classify_download_error(&error).kind,
             super::super::DownloadFailureKind::Bookkeeping
         );
+        assert!(
+            super::super::worker::classify_download_error(&error)
+                .message
+                .contains("inert fixture failure")
+        );
         assert!(receiver.try_recv().is_err());
         assert_eq!(
             store.download_job(&id).unwrap().unwrap().state,
@@ -733,12 +740,17 @@ mod tests {
         assert!(store.managed_files().unwrap().is_empty());
         assert!(files.iter().all(|file| fs::read(file).unwrap() == b"data"));
         assert!(staging.join("completion.json").is_file());
+        let preserved_receipt = fs::read(staging.join("completion.json")).unwrap();
         control.execute_batch("DROP TRIGGER fail_index").unwrap();
         let reopened = StateStore::open_at(&path).unwrap();
         let receipt =
             super::super::completion::Completion::load(&staging, &artifacts, &destination)
                 .unwrap()
                 .unwrap();
+        assert_eq!(
+            fs::read(staging.join("completion.json")).unwrap(),
+            preserved_receipt
+        );
         register_completion(
             &reopened,
             receipt,

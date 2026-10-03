@@ -47,6 +47,7 @@ mod worker;
 
 pub use cleanup::{CleanupResult, ManagedDownloads, managed_downloads, managed_downloads_for_kind};
 pub use files::{delete_completed_files, prune_empty_directories};
+pub(crate) use manager::notify_managed_files_changed;
 
 pub fn delete_managed_downloads(files: ManagedDownloads) -> anyhow::Result<CleanupResult> {
     manager::delete_managed_downloads(files, false)
@@ -360,9 +361,20 @@ mod tests {
                 .unwrap_or(0);
             let response_status = if offset > 0 { 206 } else { status };
             let response_body = body.get(offset..).unwrap_or_default();
+            if response_status == 206 {
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Test\r\nContent-Range: bytes {offset}-{}/{}\r\n",
+                    body.len() - 1,
+                    body.len()
+                )
+                .unwrap();
+            } else {
+                write!(stream, "HTTP/1.1 {response_status} Test\r\n").unwrap();
+            }
             write!(
                 stream,
-                "HTTP/1.1 {response_status} Test\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"setup_test.bin\"\r\nConnection: close\r\n\r\n",
+                "Content-Length: {}\r\nContent-Disposition: attachment; filename=\"setup_test.bin\"\r\nConnection: close\r\n\r\n",
                 response_body.len()
             )
             .unwrap();
@@ -443,9 +455,19 @@ mod tests {
                     .unwrap_or(0);
                 let status = if offset > 0 { 206 } else { 200 };
                 let response_body = reply.body.get(offset..).unwrap_or_default();
+                write!(stream, "HTTP/1.1 {status} Test\r\n").unwrap();
+                if status == 206 {
+                    write!(
+                        stream,
+                        "Content-Range: bytes {offset}-{}/{}\r\n",
+                        reply.body.len() - 1,
+                        reply.body.len()
+                    )
+                    .unwrap();
+                }
                 write!(
                     stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nConnection: close\r\n\r\n",
+                    "Content-Length: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nConnection: close\r\n\r\n",
                     response_body.len(),
                     reply.filename
                 )
@@ -490,6 +512,130 @@ mod tests {
             download_url("/downloads/example/en1installer0"),
             "https://www.gog.com/downloads/example/en1installer0"
         );
+    }
+
+    #[test]
+    fn validates_http_payload_boundaries_instead_of_catalog_estimates() {
+        for (status, headers, body, existing, valid) in [
+            (200, "Content-Length: 4\r\n", "abcd", 0, true),
+            (200, "", "abcd", 0, true),
+            (
+                200,
+                "Transfer-Encoding: chunked\r\n",
+                "4\r\nabcd\r\n0\r\n\r\n",
+                0,
+                true,
+            ),
+            (
+                206,
+                "Content-Length: 2\r\nContent-Range: bytes 2-3/4\r\n",
+                "cd",
+                2,
+                true,
+            ),
+            (
+                206,
+                "Content-Length: 2\r\nContent-Range: bytes 0-1/4\r\n",
+                "cd",
+                2,
+                false,
+            ),
+            (
+                206,
+                "Content-Length: 1\r\nContent-Range: bytes 2-2/4\r\n",
+                "c",
+                2,
+                false,
+            ),
+            (206, "Content-Length: 2\r\n", "cd", 2, false),
+            (
+                206,
+                "Content-Length: 2\r\nContent-Range: bytes 2-3/*\r\n",
+                "cd",
+                2,
+                false,
+            ),
+            (
+                206,
+                "Content-Length: 1\r\nContent-Range: bytes 2-3/4\r\n",
+                "c",
+                2,
+                false,
+            ),
+            (
+                206,
+                "Content-Length: 4\r\nContent-Range: bytes 0-3/4\r\n",
+                "abcd",
+                0,
+                false,
+            ),
+            (200, "Content-Length: 8\r\n", "abcd", 0, false),
+            (
+                206,
+                "Content-Length: 4\r\nContent-Range: bytes 2-5/6\r\n",
+                "cd",
+                2,
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                // Invalid headers can cause the client to close before the body write.
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\n{headers}Content-Disposition: attachment; filename=\"boundary.bin\"\r\nConnection: close\r\n\r\n{body}"
+                );
+            });
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("game/installer/windows/english");
+            let artifact = test_artifact(format!("http://{address}/installer"), 3);
+            let staging = staging_directory(
+                &destination,
+                std::slice::from_ref(&artifact),
+                &job_id(&[&artifact]),
+            );
+            fs::create_dir_all(&staging).unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            if existing > 0 {
+                fs::write(staging.join("1.download"), b"ab").unwrap();
+            }
+            let published = destination.join("boundary.bin");
+            if !valid {
+                fs::write(&published, b"existing payload").unwrap();
+            } else if headers.is_empty() || headers.starts_with("Transfer-Encoding") {
+                // Unknown-length responses cannot adopt a same-sized existing file.
+                fs::write(&published, b"old!").unwrap();
+            }
+            let result = run_test_transfer(&artifact, &destination);
+            server.join().unwrap();
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "status={status}, headers={headers:?}: {result:?}"
+            );
+            assert_eq!(
+                fs::read(&published).unwrap(),
+                if valid {
+                    b"abcd".as_slice()
+                } else {
+                    b"existing payload".as_slice()
+                }
+            );
+            if !valid && existing > 0 {
+                assert!(
+                    fs::read(staging.join("1.download"))
+                        .unwrap()
+                        .starts_with(b"ab")
+                );
+            }
+        }
     }
 
     #[test]
@@ -946,6 +1092,7 @@ mod tests {
         let artifact = test_artifact(format!("{base_url}/installer"), body.len());
 
         assert!(run_test_transfer(&artifact, &destination).is_err());
+        assert!(!destination.join("setup_interrupted.bin").exists());
         run_test_transfer(&artifact, &destination).unwrap();
         server.join().unwrap();
 

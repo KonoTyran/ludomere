@@ -139,9 +139,6 @@ pub(super) fn render_detail_page(
         .get(&game.product_id)
         .cloned()
         .map(|game| (game, local.installed_update));
-    let backup_update = local.backup_update;
-    let dlc_action = local.dlc;
-    let current_installer_downloaded = local.downloaded;
     let primary_action = current_primary_action(&model.borrow(), game.product_id, game.parent_id);
     let activity = installed
         .as_ref()
@@ -206,6 +203,9 @@ pub(super) fn render_detail_page(
         let cloud_launch_status = cloud_launch_status.clone();
         let launch_pending = launch_pending.clone();
         download_button.connect_clicked(move |_| {
+            if launch_pending.get() {
+                return;
+            }
             {
                 let state = model.borrow();
                 if state
@@ -346,8 +346,29 @@ pub(super) fn render_detail_page(
                     let retry_button = primary_button.clone();
                     if prompt_for_windows_executable(
                         &widgets.window,
+                        &model,
                         &detail.title,
                         &installed,
+                        &widgets.status,
+                        Rc::new({
+                            let pending = launch_pending.clone();
+                            let button = primary_button.downgrade();
+                            move |busy| {
+                                pending.set(busy);
+                                if let Some(button) = button.upgrade() {
+                                    button.set_sensitive(!busy);
+                                    set_primary_button_content(
+                                        &button,
+                                        if busy {
+                                            "content-loading-symbolic"
+                                        } else {
+                                            "media-playback-start-symbolic"
+                                        },
+                                        if busy { "Preparing launch…" } else { "Play" },
+                                    );
+                                }
+                            }
+                        }),
                         Rc::new(move || retry_button.emit_clicked()),
                     ) {
                         return;
@@ -558,13 +579,7 @@ pub(super) fn render_detail_page(
         primary_actions.add_css_class("download-state");
     }
     primary_actions.append(&download_button);
-    if game.owned
-        && (matches!(
-            primary_action,
-            GamePrimaryAction::DownloadUpdate | GamePrimaryAction::InstallUpdate
-        ) || primary_action == GamePrimaryAction::Play
-            || (primary_action == GamePrimaryAction::Install && !game.remote_artifacts.is_empty()))
-    {
+    if game.owned {
         let alternate_actions = gtk::MenuButton::new();
         alternate_actions.set_widget_name("game-alternate-actions");
         alternate_actions.set_width_request(34);
@@ -577,8 +592,9 @@ pub(super) fn render_detail_page(
         actions.set_margin_end(6);
         actions.set_margin_top(6);
         actions.set_margin_bottom(6);
-        if installed.is_some() {
+        {
             let check = gtk::Button::with_label("Check for Updates");
+            check.set_widget_name("game-check-updates");
             check.set_sensitive(false);
             check.set_visible(false);
             check.add_css_class("flat");
@@ -599,6 +615,10 @@ pub(super) fn render_detail_page(
                         let Some(check) = check.upgrade() else {
                             return;
                         };
+                        if !model.borrow().installed_games.contains_key(&id) {
+                            check.set_visible(false);
+                            return;
+                        }
                         let (config, epoch, online, depot) = {
                             let state = model.borrow();
                             (
@@ -645,6 +665,10 @@ pub(super) fn render_detail_page(
                             let Some(check) = check.upgrade() else {
                                 return glib::ControlFlow::Break;
                             };
+                            if !model.borrow().installed_games.contains_key(&id) {
+                                check.set_visible(false);
+                                return glib::ControlFlow::Break;
+                            }
                             match receiver.try_recv() {
                                 Err(mpsc::TryRecvError::Empty) => {
                                     return glib::ControlFlow::Continue;
@@ -685,13 +709,18 @@ pub(super) fn render_detail_page(
                         popover.popdown();
                     }
                     if let Some(window) = window.upgrade() {
-                        show_manual_update_check(&window, &model, &detail);
+                        let detail =
+                            current_detail(&model.borrow(), detail.product_id, detail.parent_id);
+                        if let Some(detail) = detail {
+                            show_manual_update_check(&window, &model, &detail);
+                        }
                     }
                 }
             });
         }
-        if installed.is_some() {
+        {
             let update = gtk::Button::with_label("Install update");
+            update.set_widget_name("game-install-update");
             update.add_css_class("flat");
             update.set_halign(gtk::Align::Fill);
             update.set_visible(false);
@@ -711,10 +740,11 @@ pub(super) fn render_detail_page(
                             .unwrap_or_default();
                         if let Some(update) = update.upgrade() {
                             update.set_visible(
-                                local.installed_update
-                                    || local.backup_update
-                                    || local.dlc.missing_download
-                                    || local.dlc.missing_install,
+                                local.installed.is_some()
+                                    && (local.installed_update
+                                        || local.backup_update
+                                        || local.dlc.missing_download
+                                        || local.dlc.missing_install),
                             );
                             update.set_label(
                                 if local.installed_update && (local.depot || local.downloaded)
@@ -737,6 +767,11 @@ pub(super) fn render_detail_page(
                 if let Some(popover) = action_popover.upgrade() {
                     popover.popdown();
                 }
+                let Some(detail) =
+                    current_detail(&model.borrow(), detail.product_id, detail.parent_id)
+                else {
+                    return;
+                };
                 let local = model
                     .borrow()
                     .local_actions
@@ -753,31 +788,9 @@ pub(super) fn render_detail_page(
             });
             actions.append(&update);
         }
-        if matches!(
-            primary_action,
-            GamePrimaryAction::DownloadUpdate | GamePrimaryAction::InstallUpdate
-        ) && let Some((installed_game, _)) = installed.clone()
         {
-            let play_current = gtk::Button::with_label("Play");
-            play_current.add_css_class("flat");
-            play_current.set_halign(gtk::Align::Fill);
-            let widgets = w.clone_refs();
-            let title = game.title.clone();
-            let model = model.clone();
-            let action_popover = popover.clone();
-            play_current.connect_clicked(move |_| {
-                action_popover.popdown();
-                launch_installed_game(&widgets, &model, installed_game.clone(), &title);
-            });
-            actions.append(&play_current);
-        }
-        let downloaded_install_alternative = primary_action == GamePrimaryAction::DownloadUpdate
-            && (current_installer_downloaded || backup_update || dlc_action.missing_install);
-        if downloaded_install_alternative || primary_action == GamePrimaryAction::Play {
-            let install_downloaded = gtk::Button::with_label("Install");
-            if primary_action == GamePrimaryAction::Play {
-                install_downloaded.set_label("Manage installed content");
-            }
+            let install_downloaded = gtk::Button::with_label("Manage installed content");
+            install_downloaded.set_widget_name("game-manage-installed");
             install_downloaded.add_css_class("flat");
             install_downloaded.set_halign(gtk::Align::Fill);
             let detail = game.clone();
@@ -786,25 +799,62 @@ pub(super) fn render_detail_page(
             let action_popover = popover.clone();
             install_downloaded.connect_clicked(move |_| {
                 action_popover.popdown();
-                show_install_dialog(&window, &model, &detail);
+                let detail = current_detail(&model.borrow(), detail.product_id, detail.parent_id);
+                if let Some(detail) = detail {
+                    show_install_dialog(&window, &model, &detail);
+                }
             });
             actions.append(&install_downloaded);
         }
+        let install_offline = gtk::Button::with_label("Install from Offline Installer");
+        install_offline.set_widget_name("game-install-offline");
+        install_offline.add_css_class("flat");
+        install_offline.set_halign(gtk::Align::Fill);
+        install_offline.connect_clicked({
+            let model = model.clone();
+            let window = w.window.downgrade();
+            let popover = popover.downgrade();
+            let id = game.product_id;
+            let parent = game.parent_id;
+            move |_| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+                let detail = current_detail(&model.borrow(), id, parent);
+                if let (Some(window), Some(detail)) = (window.upgrade(), detail) {
+                    show_offline_install_dialog(&window, &model, &detail);
+                }
+            }
+        });
+        actions.append(&install_offline);
         let manage_downloads = gtk::Button::with_label("Additional Downloads");
         manage_downloads.add_css_class("flat");
         manage_downloads.set_halign(gtk::Align::Fill);
         let detail = game.clone();
-        let model = model.clone();
+        let download_model = model.clone();
         let widgets = w.clone_refs();
         let action_popover = popover.clone();
         manage_downloads.connect_clicked(move |_| {
             action_popover.popdown();
-            show_download_selector(&widgets, &model, &detail);
+            let detail = current_detail(
+                &download_model.borrow(),
+                detail.product_id,
+                detail.parent_id,
+            );
+            if let Some(detail) = detail {
+                show_download_selector(&widgets, &download_model, &detail);
+            }
         });
         actions.append(&manage_downloads);
         popover.set_child(Some(&actions));
         alternate_actions.set_popover(Some(&popover));
         primary_actions.append(&alternate_actions);
+        refresh_detail_alternate_actions(
+            &primary_actions,
+            &model.borrow(),
+            game.product_id,
+            game.parent_id,
+        );
     }
     action_bar.append(&primary_actions);
     let installation_was_running = installed.as_ref().is_some_and(|(installed, _)| {
@@ -1072,9 +1122,10 @@ pub(super) fn render_detail_page(
         let logs = operation_logs;
         let window = w.window.clone();
         let product_id = game.product_id;
+        let session = online::account_session();
         move |tabs| {
             if tabs.visible_child_name().as_deref() == Some("logs") {
-                refresh_product_logs(&logs, product_id, &window);
+                refresh_product_logs(&logs, product_id, &window, session);
             }
         }
     });
@@ -1129,6 +1180,7 @@ pub(super) fn render_detail_page(
                         game,
                         &window,
                         FilesPageOptions {
+                            model: &files_model,
                             access_token: token.as_deref(),
                             config: &config,
                             library_statuses: &library_statuses,
@@ -1714,78 +1766,6 @@ fn set_primary_button_content(button: &gtk::Button, icon: &str, label: &str) {
     button.set_child(Some(&content));
 }
 
-fn launch_installed_game(
-    widgets: &Widgets,
-    model: &Rc<RefCell<AppModel>>,
-    installed: crate::domain::InstalledGame,
-    title: &str,
-) {
-    let title = title.to_owned();
-    let session = online::account_session();
-    let auth_session = auth::session();
-    let epoch = model.borrow().account_epoch;
-    let receiver = launch_with_components(&widgets.window, installed);
-    let launch_generation = model.borrow().detail_generation;
-    let widgets = widgets.clone_refs();
-    let model = model.clone();
-    let window = widgets.window.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        if auth::session() != auth_session
-            || online::account_session() != session
-            || model.borrow().account_epoch != epoch
-            || model.borrow().logout_pending
-        {
-            return glib::ControlFlow::Break;
-        }
-        match receiver.try_recv() {
-            Ok(
-                event @ (crate::installation::LaunchEvent::EnablementRequired { .. }
-                | crate::installation::LaunchEvent::PreLaunchConflict { .. }
-                | crate::installation::LaunchEvent::LaunchWithoutSyncRequired { .. }
-                | crate::installation::LaunchEvent::SyncWarning(_)
-                | crate::installation::LaunchEvent::PostExitSync(_)
-                | crate::installation::LaunchEvent::PostExitConflict(_)),
-            ) => {
-                present_cloud_launch_event(&window, event);
-                glib::ControlFlow::Continue
-            }
-            Ok(crate::installation::LaunchEvent::Started) => glib::ControlFlow::Continue,
-            Ok(crate::installation::LaunchEvent::CloudSyncStarted(_)) => {
-                glib::ControlFlow::Continue
-            }
-            Ok(crate::installation::LaunchEvent::Exited { .. }) => glib::ControlFlow::Break,
-            Ok(crate::installation::LaunchEvent::PrefixRecoveryRequired {
-                message,
-                game,
-                setup_required,
-            }) => {
-                offer_prefix_recovery(
-                    &window,
-                    &model,
-                    *game,
-                    &title,
-                    &message,
-                    setup_required,
-                    launch_generation,
-                );
-                glib::ControlFlow::Break
-            }
-            Ok(crate::installation::LaunchEvent::Failed(error)) => {
-                show_status(
-                    &widgets,
-                    &notifications::failure_message(
-                        &format!("{title}: Could not run game"),
-                        &error,
-                    ),
-                );
-                glib::ControlFlow::Break
-            }
-            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
-}
-
 #[derive(Clone)]
 struct CloudLaunchStatus {
     panel: gtk::Box,
@@ -1983,88 +1963,7 @@ fn installation_status_panel(
         });
     }
     panel.append(&cancel);
-    let cloud_decline = gtk::Button::with_label("Not now");
-    cloud_decline.set_visible(false);
-    panel.append(&cloud_decline);
-    let cloud_enable = gtk::Button::with_label("Enable cloud saves");
-    cloud_enable.add_css_class("suggested-action");
-    cloud_enable.set_visible(false);
-    panel.append(&cloud_enable);
     let determinate = Rc::new(std::cell::Cell::new(false));
-    for (button, preference) in [
-        (&cloud_decline, crate::domain::CloudSavePreference::Disabled),
-        (&cloud_enable, crate::domain::CloudSavePreference::Enabled),
-    ] {
-        let panel = panel.clone();
-        let heading = heading.clone();
-        let detail = detail.clone();
-        let progress = progress.clone();
-        let determinate = determinate.clone();
-        let decline = cloud_decline.clone();
-        let enable = cloud_enable.clone();
-        let model = model.clone();
-        let refresh = refresh_after_install.clone();
-        button.connect_clicked(move |_| {
-            decline.set_sensitive(false);
-            enable.set_sensitive(false);
-            heading.set_label("SAVING CLOUD-SAVE PREFERENCE");
-            detail.set_label("Saving your choice…");
-            determinate.set(false);
-            progress.set_visible(true);
-            let session = online::account_session();
-            let generation = model.borrow().detail_generation;
-            let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = online::with_account_session(session, || {
-                    StateStore::open()?.set_cloud_save_preference(product_id, preference)
-                });
-                let _ = sender.send(result);
-            });
-            let panel = panel.clone();
-            let heading = heading.clone();
-            let detail = detail.clone();
-            let progress = progress.clone();
-            let decline = decline.clone();
-            let enable = enable.clone();
-            let model = model.clone();
-            let refresh = refresh.clone();
-            glib::timeout_add_local(Duration::from_millis(100), move || {
-                if panel.root().is_none()
-                    || online::account_session() != session
-                    || model.borrow().account_epoch != account_epoch
-                    || model.borrow().logout_pending
-                    || model.borrow().detail_generation != generation
-                {
-                    return glib::ControlFlow::Break;
-                }
-                let result = match receiver.try_recv() {
-                    Ok(result) => result,
-                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!(
-                        "Saving stopped unexpectedly. Choose an option to try again."
-                    )),
-                };
-                progress.set_visible(false);
-                decline.set_sensitive(true);
-                enable.set_sensitive(true);
-                match result {
-                    Ok(()) => {
-                        decline.set_visible(false);
-                        enable.set_visible(false);
-                        panel.set_visible(false);
-                        refresh();
-                    }
-                    Err(error) => {
-                        heading.set_label("COULD NOT SAVE CLOUD-SAVE PREFERENCE");
-                        detail.set_label(
-                            notifications::failure_message("", &error.to_string()).trim_start(),
-                        );
-                    }
-                }
-                glib::ControlFlow::Break
-            });
-        });
-    }
     let receiver = crate::installation::subscribe_installation_events();
     let depot_receiver = crate::installation::subscribe_depot_events();
     let initial_snapshot = crate::installation::installation_operation_snapshot(product_id);
@@ -2078,7 +1977,6 @@ fn installation_status_panel(
     let was_downloading = Rc::new(std::cell::Cell::new(false));
     let was_game_running = Rc::new(std::cell::Cell::new(false));
     let action_visual = Rc::new(std::cell::Cell::new(0_u8));
-    let checking_cloud = Rc::new(std::cell::Cell::new(false));
     let launch_pending = launch_pending.clone();
     let detail_generation = model.borrow().detail_generation;
     let depot_rate = Rc::new(RefCell::new(SmoothedTransferRate::default()));
@@ -2122,6 +2020,17 @@ fn installation_status_panel(
                 .and_then(|(_, parent)| parent);
             current_primary_action(&state, product_id, parent)
         };
+        {
+            let state = model.borrow();
+            let parent = state
+                .detail_target
+                .filter(|(id, _)| *id == product_id)
+                .and_then(|(_, parent)| parent);
+            refresh_detail_alternate_actions(&action_group, &state, product_id, parent);
+            if download_completed && !state.downloaded_products.contains(&product_id) {
+                download_completed = false;
+            }
+        }
         if model.borrow().account_epoch != account_epoch {
             panel_for_poll.set_visible(false);
             if !launch_pending.get() {
@@ -2555,11 +2464,6 @@ fn installation_status_panel(
                 normal_action.label(),
             );
         }
-        if cloud_enable.is_visible() || checking_cloud.get() {
-            view_error.set_visible(false);
-            set_idle_primary_action(&primary_action, &action_group, normal_action);
-            return glib::ControlFlow::Continue;
-        }
         if let Some(snapshot) = depot_snapshot.as_ref().filter(|snapshot| {
             depot_operation_id.as_ref() == Some(&snapshot.operation_id)
                 && matches!(
@@ -2595,8 +2499,25 @@ fn installation_status_panel(
             panel_for_poll.set_visible(true);
             cancel.set_visible(false);
             view_error.set_visible(false);
-            heading.set_label("DOWNLOAD COMPLETE");
-            detail.set_label("Downloaded files are ready. Installer updates still need review from the arrow beside Play.");
+            let blocked = model
+                .borrow()
+                .blocked_auto_installs
+                .values()
+                .any(|id| *id == product_id);
+            heading.set_label(if blocked {
+                "AUTOMATIC INSTALLATION NEEDS ATTENTION"
+            } else {
+                "DOWNLOAD COMPLETE"
+            });
+            if blocked {
+                let state = model.borrow();
+                let reason = state.download_jobs.iter().filter(|job| job.product_id == product_id)
+                    .find_map(|job| job.status_message.as_deref().filter(|message| message.starts_with("Automatic installation needs attention")))
+                    .unwrap_or("Automatic installation could not continue. Finish Windows setup or use Install from Offline Installer to retry.");
+                detail.set_label(notifications::failure_message("", reason).trim_start());
+            } else {
+                detail.set_label("Downloaded files are ready.");
+            }
             progress.set_visible(true);
             progress.set_fraction(1.0);
             determinate.set(true);
@@ -2765,79 +2686,13 @@ fn installation_status_panel(
                 state: crate::domain::InstallationState::Installed,
                 ..
             }) if was_installing.replace(false) => {
-                checking_cloud.set(true);
-                let libraries = model.borrow().config.game_libraries.clone();
-                panel_for_poll.set_visible(true);
-                heading.set_label("CHECKING CLOUD SAVES");
-                detail.set_label("Checking GOG cloud-save support…");
-                progress.set_visible(true);
+                action_visual.set(0);
+                set_idle_primary_action(&primary_action, &action_group, normal_action);
+                panel_for_poll.set_visible(false);
                 cancel.set_visible(false);
-                cloud_decline.set_visible(false);
-                cloud_enable.set_visible(false);
-                primary_action.set_sensitive(true);
+                progress.set_visible(false);
+                determinate.set(false);
                 refresh_after_install();
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let result = (|| {
-                        let store = StateStore::open()?;
-                        let record = store.cloud_save_record(product_id)?;
-                        let game =
-                            crate::installation::reconcile_installed_games(&store, &libraries)?
-                                .into_iter()
-                                .find(|game| game.product_id == product_id)
-                                .ok_or_else(|| anyhow::anyhow!("installed game is unavailable"))?;
-                        let discovery =
-                            crate::cloud_saves::discover_and_store(&game, &record.locations)?;
-                        anyhow::Ok((discovery, record.preference))
-                    })()
-                    .map_err(|error| format!("{error:#}"));
-                    sender.send(result).ok();
-                });
-                let panel = panel_for_poll.clone();
-                let heading = heading.clone();
-                let detail = detail.clone();
-                let progress = progress.clone();
-                let decline = cloud_decline.clone();
-                let enable = cloud_enable.clone();
-                let primary = primary_action.clone();
-                let refresh = refresh_after_install.clone();
-                let checking_cloud = checking_cloud.clone();
-                let model = model.clone();
-                glib::timeout_add_local(Duration::from_millis(100), move || {
-                    if model.borrow().account_epoch != account_epoch
-                        || model.borrow().detail_generation != detail_generation
-                        || panel.root().is_none()
-                    {
-                        checking_cloud.set(false);
-                        return glib::ControlFlow::Break;
-                    }
-                    match receiver.try_recv() {
-                        Ok(Ok((discovery, preference)))
-                            if discovery.availability
-                                == crate::domain::CloudSaveAvailability::Supported
-                                && preference == crate::domain::CloudSavePreference::Undecided =>
-                        {
-                            checking_cloud.set(false);
-                            heading.set_label("CLOUD SAVES AVAILABLE");
-                            detail.set_label(
-                                "Synchronize this game's saves with GOG before launch and after exit?",
-                            );
-                            progress.set_visible(false);
-                            decline.set_visible(true);
-                            enable.set_visible(true);
-                            primary.set_sensitive(true);
-                            glib::ControlFlow::Break
-                        }
-                        Ok(Ok(_)) | Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                            checking_cloud.set(false);
-                            panel.set_visible(false);
-                            refresh();
-                            glib::ControlFlow::Break
-                        }
-                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                    }
-                });
-                return glib::ControlFlow::Continue;
             }
             Some(_) | None => {
                 action_visual.set(0);
@@ -2852,6 +2707,51 @@ fn installation_status_panel(
         glib::ControlFlow::Continue
     });
     panel
+}
+
+fn refresh_detail_alternate_actions(
+    actions: &gtk::Box,
+    model: &AppModel,
+    id: i64,
+    parent: Option<i64>,
+) {
+    let Some(menu) = find_named_descendant(actions.upcast_ref(), "game-alternate-actions")
+        .and_downcast::<gtk::MenuButton>()
+    else {
+        return;
+    };
+    let installed = model.installed_games.contains_key(&id);
+    let offline = parent.is_none()
+        && model
+            .local_actions
+            .get(&id)
+            .is_some_and(|local| local.offline_installer);
+    let action = current_primary_action(model, id, parent);
+    menu.set_visible(
+        installed
+            || offline
+            || matches!(
+                action,
+                GamePrimaryAction::DownloadUpdate | GamePrimaryAction::InstallUpdate
+            )
+            || (parent.is_some() && action == GamePrimaryAction::Install),
+    );
+    let Some(popover) = menu.popover() else {
+        return;
+    };
+    if let Some(button) = find_named_descendant(popover.upcast_ref(), "game-install-offline") {
+        button.set_visible(!installed && offline);
+    }
+    if let Some(button) = find_named_descendant(popover.upcast_ref(), "game-manage-installed") {
+        button.set_visible(installed);
+    }
+    if !installed {
+        for name in ["game-check-updates", "game-install-update"] {
+            if let Some(button) = find_named_descendant(popover.upcast_ref(), name) {
+                button.set_visible(false);
+            }
+        }
+    }
 }
 
 fn set_idle_primary_action(button: &gtk::Button, actions: &gtk::Box, action: GamePrimaryAction) {
@@ -3040,16 +2940,51 @@ pub(super) fn append_official_metadata(
     }
 }
 
-fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::ApplicationWindow) {
+#[derive(Default)]
+struct ProductLogs {
+    files: Vec<(&'static str, std::path::PathBuf)>,
+    installation_error: Option<String>,
+    download_failures: Vec<DownloadJobRecord>,
+    read_error: Option<String>,
+}
+
+fn refresh_product_logs(
+    container: &gtk::Box,
+    product_id: i64,
+    window: &adw::ApplicationWindow,
+    session: u64,
+) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
-    let loading = gtk::Spinner::new();
-    loading.set_size_request(16, 16);
-    loading.start();
+    if online::account_session() != session {
+        container.append(&gtk::Label::new(Some(
+            "Account changed. Reopen the game to view its operation logs.",
+        )));
+        return;
+    }
+    let loading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spinner = gtk::Spinner::new();
+    spinner.set_size_request(16, 16);
+    spinner.start();
+    loading.append(&spinner);
+    loading.append(&gtk::Label::new(Some("Loading operation logs…")));
     container.append(&loading);
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
+        if online::account_session() != session {
+            return;
+        }
+        let _activity = match crate::profile_reset::begin_activity("loading operation logs") {
+            Ok(activity) => activity,
+            Err(error) => {
+                let _ = sender.send(ProductLogs {
+                    read_error: Some(format!("Could not load operation logs: {error:#}")),
+                    ..ProductLogs::default()
+                });
+                return;
+            }
+        };
         let logs = [
             (
                 "Installer log",
@@ -3073,28 +3008,79 @@ fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::App
                 .then_some(snapshot.message)
                 .flatten()
             });
-        let download_failures = StateStore::open()
-            .and_then(|store| store.download_jobs())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|job| job.product_id == product_id && job.state == DownloadState::Failed)
-            .collect::<Vec<_>>();
-        let _ = sender.send((logs, installation_error, download_failures));
+        let (download_failures, read_error) =
+            match StateStore::open().and_then(|store| store.download_jobs()) {
+                Ok(jobs) => (
+                    jobs.into_iter()
+                        .filter(|job| {
+                            job.product_id == product_id && job.state == DownloadState::Failed
+                        })
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!(
+                        "Could not load download failure records: {error:#}"
+                    )),
+                ),
+            };
+        let _ = sender.send(ProductLogs {
+            files: logs,
+            installation_error,
+            download_failures,
+            read_error,
+        });
     });
+    monitor_product_logs(container, product_id, window, session, loading, receiver);
+}
+
+fn monitor_product_logs(
+    container: &gtk::Box,
+    product_id: i64,
+    window: &adw::ApplicationWindow,
+    session: u64,
+    loading: gtk::Box,
+    receiver: mpsc::Receiver<ProductLogs>,
+) {
     let weak = container.downgrade();
     let window = window.clone();
     glib::timeout_add_local(Duration::from_millis(32), move || {
         let Some(container) = weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
+        // Each refresh owns its loading row; an older result must not replace newer content.
+        if container.first_child().as_ref() != Some(loading.upcast_ref()) {
+            return glib::ControlFlow::Break;
+        }
+        if online::account_session() != session {
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
+            }
+            container.append(&gtk::Label::new(Some(
+                "Account changed. Reopen the game to view its operation logs.",
+            )));
+            return glib::ControlFlow::Break;
+        }
         match receiver.try_recv() {
-            Ok((logs, error, failures)) => {
-                render_product_logs(&container, &window, logs, error, failures);
+            Ok(logs) => {
+                render_product_logs(&container, &window, product_id, session, logs);
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(_) => {
-                loading.stop();
+                render_product_logs(
+                    &container,
+                    &window,
+                    product_id,
+                    session,
+                    ProductLogs {
+                        read_error: Some(
+                            "Operation log loading stopped unexpectedly. Please retry.".into(),
+                        ),
+                        ..ProductLogs::default()
+                    },
+                );
                 glib::ControlFlow::Break
             }
         }
@@ -3104,14 +3090,43 @@ fn refresh_product_logs(container: &gtk::Box, product_id: i64, window: &adw::App
 fn render_product_logs(
     container: &gtk::Box,
     window: &adw::ApplicationWindow,
-    logs: Vec<(&str, std::path::PathBuf)>,
-    installation_error: Option<String>,
-    download_failures: Vec<DownloadJobRecord>,
+    product_id: i64,
+    session: u64,
+    logs: ProductLogs,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
-    if logs.is_empty() && download_failures.is_empty() {
+    if let Some(error) = &logs.read_error {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let message = gtk::Label::new(Some(
+            super::notifications::failure_message("", error).trim_start(),
+        ));
+        message.set_wrap(true);
+        message.set_selectable(true);
+        message.set_xalign(0.0);
+        message.set_hexpand(true);
+        message.add_css_class("error");
+        row.append(&message);
+        let retry = gtk::Button::with_label("Retry");
+        retry.set_valign(gtk::Align::Center);
+        retry.connect_clicked({
+            let weak = container.downgrade();
+            let window = window.clone();
+            move |_| {
+                if let Some(container) = weak.upgrade() {
+                    refresh_product_logs(&container, product_id, &window, session);
+                }
+            }
+        });
+        row.append(&retry);
+        container.append(&row);
+    }
+    if logs.files.is_empty()
+        && logs.download_failures.is_empty()
+        && logs.installation_error.is_none()
+        && logs.read_error.is_none()
+    {
         let empty = adw::StatusPage::builder()
             .title("No operation logs for this game")
             .description("Installation and download logs will appear here when available.")
@@ -3120,10 +3135,10 @@ fn render_product_logs(
         container.append(&empty);
         return;
     }
-    if !download_failures.is_empty() {
+    if !logs.download_failures.is_empty() {
         let download_group = adw::PreferencesGroup::new();
         download_group.set_title("Downloads");
-        for job in download_failures {
+        for job in logs.download_failures {
             let row = adw::ExpanderRow::new();
             row.set_title(&job.title);
             let timestamp = chrono::DateTime::from_timestamp(job.updated_at, 0)
@@ -3160,7 +3175,7 @@ fn render_product_logs(
                         Some(&window),
                         gio::Cancellable::NONE,
                         move |response| {
-                            if response == "discard" {
+                            if response == "discard" && online::account_session() == session {
                                 download::remove(&job_id);
                             }
                         },
@@ -3190,10 +3205,13 @@ fn render_product_logs(
     }
     let group = adw::PreferencesGroup::new();
     group.set_title("Installation");
-    if let Some(error) = installation_error {
-        group.set_description(Some(&error));
+    let has_installation_logs = !logs.files.is_empty() || logs.installation_error.is_some();
+    if let Some(error) = logs.installation_error {
+        group.set_description(Some(
+            super::notifications::failure_message("", &error).trim_start(),
+        ));
     }
-    for (title, path) in logs {
+    for (title, path) in logs.files {
         let row = adw::ActionRow::new();
         row.set_title(title);
         row.set_subtitle(&path.display().to_string());
@@ -3213,7 +3231,7 @@ fn render_product_logs(
         row.add_suffix(&open);
         group.add(&row);
     }
-    if group.first_child().is_some() {
+    if has_installation_logs {
         container.append(&group);
     }
 }
@@ -3421,9 +3439,169 @@ mod installation_progress_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn operation_logs_show_partial_failures_retry_and_reject_stale_results() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p255-")
+        );
+        adw::init().unwrap();
+        fn text(widget: &gtk::Widget) -> String {
+            let mut result = widget
+                .clone()
+                .downcast::<gtk::Label>()
+                .map(|label| label.label().to_string())
+                .unwrap_or_default();
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                result.push_str(&text(&current));
+                child = current.next_sibling();
+            }
+            result
+        }
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.OperationLogsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        window.set_content(Some(&container));
+        window.present();
+        let session = online::account_session();
+        let product_id = 9255001;
+        render_product_logs(
+            &container,
+            &window,
+            product_id,
+            session,
+            ProductLogs {
+                installation_error: Some(
+                    "Synthetic installation failure https://example.invalid/?token=secret".into(),
+                ),
+                ..ProductLogs::default()
+            },
+        );
+        assert!(text(container.upcast_ref()).contains("Synthetic installation failure"));
+        assert!(!text(container.upcast_ref()).contains("secret"));
+        assert!(!text(container.upcast_ref()).contains("No operation logs"));
+        render_product_logs(
+            &container,
+            &window,
+            product_id,
+            session,
+            ProductLogs::default(),
+        );
+        assert!(text(container.upcast_ref()).contains("No operation logs"));
+
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var_os("XDG_DATA_HOME").unwrap()));
+        std::fs::create_dir_all(&database).unwrap();
+        let log = crate::installation::installation_log_path(product_id).unwrap();
+        std::fs::write(&log, "synthetic installation output").unwrap();
+        refresh_product_logs(&container, product_id, &window, session);
+        assert!(text(container.upcast_ref()).contains("Loading operation logs"));
+        wait_until(|| {
+            text(container.upcast_ref()).contains("Could not load download failure records")
+        });
+        assert!(text(container.upcast_ref()).contains("Installer log"));
+        assert!(!text(container.upcast_ref()).contains("No operation logs"));
+        let retry = container
+            .first_child()
+            .unwrap()
+            .last_child()
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        std::fs::remove_dir(&database).unwrap();
+        retry.emit_clicked();
+        assert!(text(container.upcast_ref()).contains("Loading operation logs"));
+        wait_until(|| text(container.upcast_ref()).contains("Installer log"));
+        assert!(!text(container.upcast_ref()).contains("Could not load"));
+        assert!(!text(container.upcast_ref()).contains("Retry"));
+
+        for stale_session in [false, true] {
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
+            }
+            let loading = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            container.append(&loading);
+            let (sender, receiver) = mpsc::channel();
+            monitor_product_logs(
+                &container,
+                product_id,
+                &window,
+                if stale_session {
+                    session.wrapping_add(1)
+                } else {
+                    session
+                },
+                loading,
+                receiver,
+            );
+            drop(sender);
+            wait_until(|| {
+                text(container.upcast_ref()).contains(if stale_session {
+                    "Account changed"
+                } else {
+                    "stopped unexpectedly"
+                })
+            });
+            assert_eq!(
+                text(container.upcast_ref()).contains("Retry"),
+                !stale_session
+            );
+        }
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+        let loading = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        container.append(&loading);
+        let (sender, receiver) = mpsc::channel();
+        monitor_product_logs(
+            &container,
+            product_id,
+            &window,
+            session,
+            loading.clone(),
+            receiver,
+        );
+        container.remove(&loading);
+        container.append(&gtk::Label::new(Some("Newer refresh result")));
+        sender
+            .send(ProductLogs {
+                installation_error: Some("Stale result".into()),
+                ..ProductLogs::default()
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(text(container.upcast_ref()), "Newer refresh result");
+        window.close();
+    }
+
+    #[test]
     #[ignore = "requires isolated HOME/all XDG, private D-Bus and Xvfb"]
     fn idle_action_restores_controls_after_repeated_operations_without_replacing_the_page() {
+        assert!(std::env::var("HOME").unwrap().starts_with("/tmp/ludomere-"));
         adw::init().expect("GUI regression requires a display");
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ActionStateTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let widgets = window::create_widgets(&app, &Config::default());
         let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let button = gtk::Button::new();
@@ -3432,6 +3610,101 @@ mod installation_progress_tests {
         actions.append(&button);
         actions.append(&alternate);
         page.append(&actions);
+        let popover = gtk::Popover::new();
+        let menu_items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let offline = gtk::Button::with_label("Install from Offline Installer");
+        offline.set_widget_name("game-install-offline");
+        let manage = gtk::Button::with_label("Manage installed content");
+        manage.set_widget_name("game-manage-installed");
+        menu_items.append(&offline);
+        menu_items.append(&manage);
+        popover.set_child(Some(&menu_items));
+        alternate.set_popover(Some(&popover));
+        let installed = crate::domain::InstalledGame {
+            product_id: 1,
+            library_id: "fixture".into(),
+            installed_version: None,
+            installation_directory: "/synthetic/game".into(),
+            installer_revision_id: None,
+            installer_job_id: None,
+            installer_files: Vec::new(),
+            installer_complete: true,
+            installer_operating_system: Some("linux".into()),
+            installer_language: None,
+            compatibility: None,
+            primary_executable: Some("/synthetic/game/start.sh".into()),
+            launch_arguments: Vec::new(),
+            state: crate::domain::InstallationState::Installed,
+            error: None,
+            installed_at: None,
+            verified_at: None,
+            last_played_at: None,
+            playtime_seconds: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        model.borrow_mut().detail_target = Some((1, None));
+        let panel = installation_status_panel(
+            1,
+            &widgets,
+            (&button, &actions, &Rc::new(RefCell::new(None))),
+            &Rc::new(std::cell::Cell::new(false)),
+            false,
+            &model,
+            Rc::new(|| {}),
+        );
+        page.append(&panel);
+        widgets.window.set_content(Some(&page));
+        widgets.window.present();
+        for (is_installed, has_archive) in [
+            (false, false),
+            (false, true),
+            (true, true),
+            (false, true),
+            (false, false),
+        ] {
+            if is_installed {
+                model
+                    .borrow_mut()
+                    .installed_games
+                    .insert(1, installed.clone());
+            } else {
+                model.borrow_mut().installed_games.remove(&1);
+            }
+            model.borrow_mut().local_actions.insert(
+                1,
+                sections::LocalActionState {
+                    installed: is_installed.then(|| installed.clone()),
+                    offline_installer: has_archive,
+                    // Full backup coverage is deliberately absent: a base installer still works.
+                    coverage: InstallerCoverage::Partial,
+                    ..Default::default()
+                },
+            );
+            model.borrow_mut().local_revision += 1;
+            let action = current_primary_action(&model.borrow(), 1, None);
+            let deadline = std::time::Instant::now() + Duration::from_millis(150);
+            while std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(button.tooltip_text().as_deref(), Some(action.label()));
+            assert_eq!(
+                action,
+                if is_installed {
+                    GamePrimaryAction::Play
+                } else {
+                    GamePrimaryAction::Download
+                }
+            );
+            assert_eq!(offline.get_visible(), has_archive && !is_installed);
+            assert_eq!(manage.get_visible(), is_installed);
+            assert_eq!(alternate.is_visible(), is_installed || has_archive);
+            assert_eq!(alternate.popover(), Some(popover.clone()));
+            assert_eq!(actions.parent().as_ref(), Some(page.upcast_ref()));
+        }
+        model.borrow_mut().detail_generation += 1;
         for action in [
             GamePrimaryAction::Download,
             GamePrimaryAction::Install,
@@ -3466,6 +3739,7 @@ mod installation_progress_tests {
                 "idle poll must not replace the content"
             );
         }
+        widgets.window.close();
     }
 
     #[test]

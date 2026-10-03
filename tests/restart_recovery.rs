@@ -39,8 +39,19 @@ fn recovers_a_partial_download_in_a_fresh_process() {
         first.write_all(&server_body[..300_000]).unwrap();
         first.flush().unwrap();
         wait_for_path(&server_marker);
-        first.write_all(&server_body[300_000..300_001]).unwrap();
-        first.flush().unwrap();
+        // The interrupted client may already have shut down before this final byte.
+        if let Err(error) = first
+            .write_all(&server_body[300_000..300_001])
+            .and_then(|()| first.flush())
+        {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+                "unexpected error writing to interrupted client: {error}"
+            );
+        }
         drop(first);
 
         let (mut resumed, _) = listener.accept().unwrap();
@@ -55,8 +66,8 @@ fn recovers_a_partial_download_in_a_fresh_process() {
         let remaining = &server_body[offset..];
         write!(
             resumed,
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Disposition: attachment; filename=\"setup_restart.bin\"\r\nConnection: close\r\n\r\n",
-            remaining.len()
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {offset}-{}/{}\r\nContent-Disposition: attachment; filename=\"setup_restart.bin\"\r\nConnection: close\r\n\r\n",
+            remaining.len(), server_body.len() - 1, server_body.len()
         )
         .unwrap();
         resumed.write_all(remaining).unwrap();

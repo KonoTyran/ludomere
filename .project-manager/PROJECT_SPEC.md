@@ -1,5 +1,139 @@
 # Project specification
 
+## R108 version 0.3.1 and publication
+
+User requests bump to 0.3.1, successful build verification, then commit/push accumulated changes
+and post a PR comment summarizing new fixes/additions. Full build checks authorized; preserve all
+R101–R107 work. No package build/install or unrelated new features requested.
+
+## R107 unified-download archive visibility and menu cleanup
+
+User reports an offline installer acquired through the primary detail Download flow is not marked
+downloaded in Offline Installers, though Manage → Delete Downloaded Files finds it. Ensure those
+files appear as downloaded and are deletable through the Offline Installers tab, including refresh
+after completion. Remove Delete Downloaded Files from the game's Manage menu. Preserve installed
+game payloads, archive-only downloads, typed storage and prior changes. Focused tests only.
+
+## R106 offline installer handoff and reactive detail actions
+
+User requires offline installer downloads initiated by the large detail Download action to install
+automatically after all required installer parts finish. A locally available offline installer must
+be offered through an arrow action labeled Install from Offline Installer. Main button and actions
+must update in place after installer download/deletion, game installation/uninstallation and related
+state changes. User confirmed: keep Download for an uninstalled base game and put
+Install from Offline Installer in its arrow menu when a usable local installer is available.
+Preserve explicit installation intent, archive-only downloads and prior fixes.
+
+## R105 executable selection and archive deletion UX
+
+User reports Play after offline installation unnecessarily prompts for a sole executable and
+reopens the chooser after selection instead of saving/launching. Automatically use the sole valid
+candidate; retain selection when ambiguous, persist choices and launch correctly. Deleting an
+offline installer from its tab must remove those files and restore the single Download action,
+not a menu with duplicate Download entries/gear icon. Keep game installation intact, ensure
+consistent affected interactions and Notifications success/error feedback. Ask if ambiguities
+arise; otherwise make focused fixes and tests, preserving existing work.
+
+## R104 defer offline-install cloud consent until launch
+
+User reports offline installation initiated through the detail Download action adds two cloud-save
+buttons to the game's status bar. Match Depot behavior: completing installation must not show
+cloud consent controls; keep the existing user-initiated launch consent flow. Preserve completion
+refresh and existing cloud preferences. Scope is this UI inconsistency, with focused verification.
+
+## R103 numeric catalog size mismatch on completed offline download
+
+User now reports exact nested failure: expected381681664 bytes, found382662456 bytes, with the
+bookkeeping summary duplicated. R102's fallback-only exception did not resolve this case.
+Correct catalog-size versus actual transfer validation and preserved-receipt recovery without
+accepting truncated/changed files; remove duplicated error summary. Preserve R101/R102 work and
+all typed-storage/account/path invariants. Focused synthetic verification, no full suite or publish.
+
+## R102 offline transfer completion registration failures
+
+User reports both archive-tab and unified-install downloads transfer files but fail recording
+completion; retry then fails downloaded-file registration/refresh. Diagnose and correct shared
+completion and recovery handling, preserve existing downloaded files and R101 work, retain
+integrity/path/account safety, and verify with focused synthetic regressions. No real credentials,
+game execution, package operation, publication or full-suite run requested.
+
+## R101 functional offline downloads and unified installation selection
+
+User reports Offline Installers download opens a library selector with no download action.
+Replace Use Selected Libraries with Download, initialize and update the selected library on
+opening/change, and start downloads to that destination. Main game Install dialog must offer
+Depot and each offline installer in one source dropdown, remove Offline installers and extras
+navigation, and download all required installer files before automatically installing. Preserve
+typed Game Files/Offline Installers/Extras storage and existing native/Windows safety. No new
+publication or version bump requested; focused tests plus compilation, not a full test suite.
+
+## R100 version 0.3.0 and new upstream PR — 2026-10-02
+
+User requests version0.3.0, ensuring upstream changes merge without conflicts, successful build,
+and a new PR against upstream/main summarizing all new additions/changes/fixes/updates. Commit
+and push existing branch as necessary; preserve all reviewed R94–R99 changes. Full build checks
+authorized; no Arch package install/build or real account/game operations requested.
+
+## R99 GOG language_setup prerequisite failure — 2026-10-02
+
+User reports LEGO Harry Potter Years 1–4, Years 5–7 and LEGO Indiana Jones Depot preparation
+fails with language_setup: Invalid dependency manifest before game transfer. Investigate official
+metadata/parser mismatch, correct evidenced support deficiencies without skipping prerequisites
+or weakening integrity/path checks, and run focused regressions. Preserve R97/R98 uncommitted work;
+no real account/game/helper actions or publication requested.
+
+## R98 single removal confirmation — 2026-10-02
+
+User accepts simplifying Review File Reset: automatically prepare the appropriate removal method
+in the initial uninstall dialog, without an extra review-button press. Preserve explicit final
+confirmation with affected paths/all-contents warnings, direct Browse, optional downloaded-file
+cleanup defaulting off, normal uninstall and existing reset safety. Preserve meaningful choices
+when multiple copies cannot be resolved automatically. No real user-file deletion or publication.
+
+## R97 remove redundant interaction steps — 2026-10-02
+
+User reports Browse Local Files Before Removing opens another modal requiring a second click
+to open the directory, and requests finding/eliminating similar unnecessary modal/button/procedure
+steps. Direct read-only actions with one known destination should execute from the initial click.
+Keep meaningful destination choices and confirmations for destructive actions, downloads or
+execution. Preserve path validation, asynchronous work, visible feedback and account/view guards.
+No real user-file deletion, desktop activation tests, package or publication requested.
+
+## R96 version 0.2.5 and upstream integration — 2026-10-02
+
+User requests bumping to0.2.5, committing and pushing current changes, and checking Kono's new
+upstream commits for a clean merge. Merge if clean; if conflicts arise, explain the differences
+and stop for user decisions rather than resolving them silently. Keep the existing new improvement
+branch and no-PR instruction. No package build/install requested.
+
+## R95 manual-test onboarding and credential failures — 2026-10-02
+
+User reports: initial Proton choice shown during onboarding is not applied; Next incorrectly
+requires choosing another version or reselecting the visible choice. After factory reset, GOG
+authentication succeeds but credential storage fails with the generic save-login message. A
+second login prompts for the KDE wallet password and then loads the library successfully.
+Correct the initial selection and evidenced credential-service readiness/save deficiencies.
+Preserve secure credential storage, existing choices, session/reset guards and explicit wallet
+consent. No real wallet/token access, real factory reset, plaintext fallback or desktop changes.
+Use focused tests and compilation; no full-suite/package/publication work requested.
+
+## R94 bounded autonomous improvement pass — 2026-10-02
+
+User specification: "Until I interrupt you, continue looking for inefficiencies and potential
+improvements to the software. Attempt to improve UX, UI,, and feedback features indicating the
+program is working properly. Each new set of fixes or features should be a separate commit, though
+all new work should go into a single new branch. Do not create a PR yet. Do keep track of any fixes
+you make. I should be back in an hour or two. Do not work for more than two hours. Use subagents
+and the $project-manager skill to asist you. I will not be here to answer questions. Do not break
+existing features. Ensure the build works after each commit."
+
+Start20:53:48 UTC; hard stop22:53:48 UTC on2026-10-02, or earlier user interruption. Scope is
+evidenced efficiency/usability/activity-feedback improvements preserving existing behavior and
+safety. Defer material ambiguous/product-policy decisions while user unavailable. Single new branch
+from merged upstream; local commits per coherent change, validated build after each. No PR/push,
+package installation/build, real profile/game/account actions, dependency/schema/version changes
+or broad architecture rewrite required. Maintain auditable fixes, checks and deferred findings.
+
 ## R93 version 0.2.4 and publication — 2026-10-02
 
 User requests bumping to0.2.4, committing and pushing the reviewed R92 changes, and posting a

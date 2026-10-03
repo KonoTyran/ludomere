@@ -1,9 +1,49 @@
 use super::files::sanitize_filename;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::{
+    StatusCode,
     blocking::{Client, Response},
     header,
 };
+
+/// Exact payload length from the completed HTTP representation, not catalog estimates.
+pub(super) fn response_size(response: &Response, existing: u64) -> Result<Option<u64>> {
+    if response.status() == StatusCode::OK {
+        return Ok(response.content_length());
+    }
+    ensure!(
+        response.status() == StatusCode::PARTIAL_CONTENT && existing > 0,
+        "Unexpected HTTP status for an installer download"
+    );
+    let range = response
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes "))
+        .context("Resumed download has no valid Content-Range")?;
+    let (interval, total) = range
+        .split_once('/')
+        .context("Invalid download Content-Range")?;
+    let (start, end) = interval
+        .split_once('-')
+        .context("Invalid download Content-Range")?;
+    let start: u64 = start.parse().context("Invalid download range start")?;
+    let end: u64 = end.parse().context("Invalid download range end")?;
+    let total: u64 = total
+        .parse()
+        .context("Download range has no valid complete size")?;
+    ensure!(
+        start == existing && end >= start && end.checked_add(1) == Some(total),
+        "Resumed download range does not cover the remaining file"
+    );
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|length| length == total - start),
+        "Resumed download Content-Length does not match its range"
+    );
+    Ok(Some(total))
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct GogDownlinkDescriptor {

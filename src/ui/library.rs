@@ -193,12 +193,22 @@ pub(super) fn rebuild_sidebar_presentation(w: &Widgets, model: &mut AppModel) {
     glib::idle_add_local_once(move || game_list.invalidate_filter());
 }
 
-fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) {
+fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) -> usize {
+    let matching_ids = model
+        .games
+        .iter()
+        .filter(|game| {
+            game_matches_filters(model, game)
+                && (!model.sidebar_playable_only
+                    || model.playable_products.contains(&game.product_id))
+        })
+        .map(|game| game.product_id)
+        .collect::<HashSet<_>>();
     for section in &model.activity_sections {
         let matching = section
             .members
             .iter()
-            .filter(|id| game_matches_sidebar(model, **id))
+            .filter(|id| matching_ids.contains(id))
             .count();
         if let Some(row) = find_list_row(w, &section_name(section.key)) {
             row.set_visible(model.sidebar_sort_mode == SidebarSortMode::LastPlayed && matching > 0);
@@ -220,6 +230,7 @@ fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) {
         }
     }
     w.game_list.invalidate_filter();
+    matching_ids.len()
 }
 
 fn find_list_row(w: &Widgets, name: &str) -> Option<gtk::ListBoxRow> {
@@ -696,7 +707,6 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
         .filter(|(_, state)| state.installed_update)
         .map(|(&id, _)| id)
         .collect();
-    let installed = model.installed_games.values().cloned().collect::<Vec<_>>();
     let running = model
         .games
         .iter()
@@ -728,7 +738,7 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
         &required,
         &titles,
         SidebarInstallationSnapshot {
-            installed: &installed,
+            installed: &model.installed_games,
             updates: &updates,
             dlcs: &dlcs,
             dlc_updates: &dlc_updates,
@@ -740,7 +750,7 @@ pub(super) fn update_sidebar_download_styles(w: &Widgets, model: &AppModel) {
 }
 
 struct SidebarInstallationSnapshot<'a> {
-    installed: &'a [crate::domain::InstalledGame],
+    installed: &'a HashMap<i64, crate::domain::InstalledGame>,
     updates: &'a HashSet<i64>,
     dlcs: &'a HashMap<i64, HashSet<i64>>,
     dlc_updates: &'a HashMap<i64, HashSet<i64>>,
@@ -842,18 +852,6 @@ fn apply_sidebar_download_styles(
     while let Some(widget) = row {
         if let Ok(id) = widget.widget_name().parse::<i64>() {
             let coverage = coverage.get(&id).copied().unwrap_or_default();
-            for class in [
-                "game-state-running",
-                "game-state-downloading",
-                "game-state-installed",
-                "game-state-update",
-                "game-state-backup",
-                "game-state-partial-backup",
-                "game-state-unavailable",
-                "game-state-pending",
-            ] {
-                widget.remove_css_class(class);
-            }
             let active_operation =
                 crate::installation::installation_operation_snapshot(id).filter(|snapshot| {
                     snapshot.queued
@@ -863,13 +861,12 @@ fn apply_sidebar_download_styles(
                                 | crate::domain::InstallationState::Uninstalling
                         )
                 });
-            let installation = installation_state.installed.iter().find(|game| {
-                game.product_id == id
-                    && matches!(
-                        game.state,
-                        crate::domain::InstallationState::Installed
-                            | crate::domain::InstallationState::UninstallFailed
-                    )
+            let installation = installation_state.installed.get(&id).filter(|game| {
+                matches!(
+                    game.state,
+                    crate::domain::InstallationState::Installed
+                        | crate::domain::InstallationState::UninstallFailed
+                )
             });
             let missing_installed_dlc = installation.is_some()
                 && required_dlcs.get(&id).is_some_and(|required| {
@@ -920,20 +917,38 @@ fn apply_sidebar_download_styles(
             };
             let running = installation_state.running.contains(&id);
             let downloading = installation_state.downloading.contains(&id);
-            widget.add_css_class(sidebar_state_class(
-                running,
-                downloading,
-                installation.is_some(),
-                update,
-            ));
-            widget.set_opacity(1.0);
-            widget.set_tooltip_text(Some(if running {
+            let state_class =
+                sidebar_state_class(running, downloading, installation.is_some(), update);
+            for class in [
+                "game-state-running",
+                "game-state-downloading",
+                "game-state-installed",
+                "game-state-update",
+                "game-state-backup",
+                "game-state-partial-backup",
+                "game-state-unavailable",
+                "game-state-pending",
+            ] {
+                if class != state_class && widget.has_css_class(class) {
+                    widget.remove_css_class(class);
+                }
+            }
+            if !widget.has_css_class(state_class) {
+                widget.add_css_class(state_class);
+            }
+            if widget.opacity() != 1.0 {
+                widget.set_opacity(1.0);
+            }
+            let tooltip = if running {
                 "Running"
             } else if downloading {
                 "Downloading"
             } else {
                 tooltip
-            }));
+            };
+            if widget.tooltip_text().as_deref() != Some(tooltip) {
+                widget.set_tooltip_text(Some(tooltip));
+            }
             if let (Some(base_title), Some(title)) = (
                 titles.get(&id),
                 find_named_descendant(&widget, "sidebar-game-title").and_downcast::<gtk::Label>(),
@@ -947,14 +962,459 @@ fn apply_sidebar_download_styles(
                         "Installing"
                     }
                 });
-                title.set_label(&suffix.map_or_else(
-                    || base_title.clone(),
-                    |suffix| format!("{base_title} - {suffix}"),
-                ));
+                if let Some(suffix) = suffix {
+                    let label = format!("{base_title} - {suffix}");
+                    if title.label() != label {
+                        title.set_label(&label);
+                    }
+                } else if title.label() != base_title.as_str() {
+                    title.set_label(base_title);
+                }
             }
         }
         row = widget.next_sibling();
     }
+}
+
+#[test]
+#[ignore = "requires an isolated GTK display and private HOME/all XDG"]
+fn sidebar_refresh_reuses_rows_and_only_changes_updated_styles() {
+    assert!(
+        std::env::var("HOME")
+            .unwrap()
+            .starts_with("/tmp/ludomere-p253-")
+    );
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.ludomere.SidebarRefreshTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let w = window::create_widgets(&app, &Config::default());
+    let installed = (1..=1000)
+        .map(|product_id| {
+            (
+                product_id,
+                crate::domain::InstalledGame {
+                    product_id,
+                    library_id: "inert".into(),
+                    installation_directory: "/inert/unused".into(),
+                    installed_version: None,
+                    installer_revision_id: None,
+                    installer_job_id: None,
+                    installer_files: vec![],
+                    installer_complete: true,
+                    installer_operating_system: Some("linux".into()),
+                    installer_language: None,
+                    compatibility: None,
+                    primary_executable: None,
+                    launch_arguments: vec![],
+                    state: crate::domain::InstallationState::Installed,
+                    error: None,
+                    installed_at: None,
+                    verified_at: None,
+                    last_played_at: None,
+                    playtime_seconds: 0,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let titles = (1..=1000)
+        .map(|id| (id, format!("Game {id}")))
+        .collect::<HashMap<_, _>>();
+    for (&id, title) in &titles {
+        let row = game_row(
+            &Game {
+                product_id: id,
+                title: title.clone(),
+                ..Game::default()
+            },
+            false,
+            false,
+        );
+        row.set_widget_name(&id.to_string());
+        w.game_list.append(&row);
+    }
+    let row = find_list_row(&w, "1").unwrap();
+    row.set_focusable(true);
+    w.window.present();
+    w.game_list.select_row(Some(&row));
+    gtk::prelude::GtkWindowExt::set_focus(&w.window, Some(&row));
+    let focus = gtk::prelude::GtkWindowExt::focus(&w.window).unwrap();
+    let css_changes = Rc::new(std::cell::Cell::new(0usize));
+    let mut child = w.game_list.first_child();
+    while let Some(widget) = child {
+        let changes = css_changes.clone();
+        widget.connect_notify_local(Some("css-classes"), move |_, _| {
+            changes.set(changes.get() + 1)
+        });
+        child = widget.next_sibling();
+    }
+    let apply = |running: &HashSet<i64>,
+                 downloading: &HashSet<i64>,
+                 updates: &HashSet<i64>,
+                 installed: &HashMap<i64, crate::domain::InstalledGame>| {
+        apply_sidebar_download_styles(
+            &w,
+            &HashMap::new(),
+            &HashMap::new(),
+            &titles,
+            SidebarInstallationSnapshot {
+                installed,
+                updates,
+                dlcs: &HashMap::new(),
+                dlc_updates: &HashMap::new(),
+                running,
+                downloading,
+            },
+            false,
+        );
+    };
+    let empty = HashSet::new();
+    let active = HashSet::from([1]);
+    apply(&empty, &empty, &empty, &installed);
+    assert!(row.has_css_class("game-state-installed"));
+    css_changes.set(0);
+    for _ in 0..20 {
+        apply(&empty, &empty, &empty, &installed);
+    }
+    assert_eq!(
+        css_changes.get(),
+        0,
+        "unchanged refreshes must not invalidate row CSS"
+    );
+    for (running, downloading, updates, expected, tooltip) in [
+        (&active, &active, &active, "game-state-running", "Running"),
+        (
+            &empty,
+            &active,
+            &empty,
+            "game-state-downloading",
+            "Downloading",
+        ),
+        (
+            &empty,
+            &empty,
+            &active,
+            "game-state-downloading",
+            "Update available",
+        ),
+        (&empty, &empty, &empty, "game-state-installed", "Installed"),
+    ] {
+        apply(running, downloading, updates, &installed);
+        assert!(row.has_css_class(expected));
+        assert_eq!(row.tooltip_text().as_deref(), Some(tooltip));
+        assert_eq!(
+            row.css_classes()
+                .iter()
+                .filter(|class| class.starts_with("game-state-"))
+                .count(),
+            1
+        );
+    }
+    apply(&empty, &empty, &empty, &HashMap::new());
+    assert!(row.has_css_class("game-state-unavailable"));
+    assert_eq!(w.game_list.selected_row().as_ref(), Some(&row));
+    assert_eq!(
+        gtk::prelude::GtkWindowExt::focus(&w.window).as_ref(),
+        Some(&focus)
+    );
+    assert_eq!(find_list_row(&w, "1").as_ref(), Some(&row));
+    assert_eq!(
+        find_named_descendant(row.upcast_ref(), "sidebar-game-title")
+            .and_downcast::<gtk::Label>()
+            .unwrap()
+            .label(),
+        "Game 1"
+    );
+
+    let previous = installed.values().collect::<Vec<_>>();
+    let comparisons = std::cell::Cell::new(0usize);
+    let before = std::time::Instant::now();
+    for id in 1..=1000 {
+        std::hint::black_box(
+            previous
+                .iter()
+                .find(|game| {
+                    comparisons.set(comparisons.get() + 1);
+                    game.product_id == id
+                })
+                .unwrap(),
+        );
+    }
+    let old_time = before.elapsed();
+    let after = std::time::Instant::now();
+    for id in 1..=1000 {
+        std::hint::black_box(installed.get(&id).unwrap());
+    }
+    println!(
+        "Sidebar installed lookup: {} linear comparisons vs1000 hash lookups; old {:?}, new {:?}",
+        comparisons.get(),
+        old_time,
+        after.elapsed()
+    );
+    assert_eq!(comparisons.get(), 500_500);
+    w.window.close();
+}
+
+#[test]
+fn direct_game_filter_preserves_library_preferences_and_unknown_metadata() {
+    use crate::domain::{Dlc, MetadataSource, MetadataTerm, Platforms};
+    let term = MetadataTerm {
+        provider_id: None,
+        name: "Adventure".into(),
+        slug: "adventure".into(),
+        source: MetadataSource::GamesDb,
+    };
+    let mut featured = Game {
+        product_id: 1,
+        title: "Featured Game".into(),
+        slug: "featured".into(),
+        platforms: Platforms {
+            windows: true,
+            ..Platforms::default()
+        },
+        features: vec!["Cloud saves".into(), "Achievements".into()],
+        languages: vec!["en".into()],
+        dlcs: vec![Dlc {
+            product_id: 101,
+            ..Dlc::default()
+        }],
+        ..Game::default()
+    };
+    featured.metadata.genres.push(term.clone());
+    featured.metadata.game_modes.push(term.clone());
+    featured.metadata.properties.push(term);
+    let games = vec![
+        featured,
+        Game {
+            product_id: 2,
+            title: "Other Game".into(),
+            platforms: Platforms {
+                linux: true,
+                ..Platforms::default()
+            },
+            ..Game::default()
+        },
+    ];
+    type FilterCase = (&'static str, fn(&mut AppModel), &'static [i64]);
+    let cases: &[FilterCase] = &[
+        ("all", |_| {}, &[1, 2]),
+        ("favorite", |m| m.favorites_only = true, &[1]),
+        ("DLC download", |m| m.downloaded_only = true, &[1]),
+        ("installed", |m| m.installed_only = true, &[1]),
+        ("played", |m| m.played_only = true, &[2]),
+        ("unplayed", |m| m.unplayed_only = true, &[1]),
+        (
+            "both play filters",
+            |m| {
+                m.played_only = true;
+                m.unplayed_only = true;
+            },
+            &[1, 2],
+        ),
+        ("Windows", |m| m.windows_only = true, &[1]),
+        ("Linux", |m| m.linux_only = true, &[2]),
+        ("language", |m| m.language_filter = Some("EN".into()), &[1]),
+        ("cloud", |m| m.cloud_saves_only = true, &[1]),
+        ("achievements", |m| m.achievements_only = true, &[1]),
+        (
+            "genre",
+            |m| {
+                m.genre_theme_filters.insert("adventure".into());
+            },
+            &[1],
+        ),
+        (
+            "mode",
+            |m| {
+                m.game_mode_filters.insert("Adventure".into());
+            },
+            &[1],
+        ),
+        (
+            "property",
+            |m| {
+                m.property_filters.insert("Adventure".into());
+            },
+            &[1],
+        ),
+        ("metadata search", |m| m.query = "ADVENTURE".into(), &[1]),
+        ("personal tag search", |m| m.query = "Personal".into(), &[1]),
+        (
+            "tag",
+            |m| {
+                m.tag_filters.insert("Personal".into());
+            },
+            &[1],
+        ),
+        (
+            "hidden",
+            |m| {
+                m.hidden_products.insert(1);
+            },
+            &[2],
+        ),
+        (
+            "show hidden",
+            |m| {
+                m.hidden_products.insert(1);
+                m.show_hidden = true;
+            },
+            &[1, 2],
+        ),
+        (
+            "unknown metadata",
+            |m| {
+                m.cloud_saves_only = true;
+                m.section_states
+                    .remove(&(2, online::DetailSection::Metadata));
+            },
+            &[1, 2],
+        ),
+    ];
+    for (name, configure, expected) in cases {
+        let mut model = AppModel {
+            games: games.clone(),
+            ..AppModel::default()
+        };
+        model.favorites.insert(1);
+        model.downloaded_products.insert(101);
+        model.installed_products.insert(1);
+        model.tags.insert(1, vec!["Personal".into()]);
+        model.product_activity.insert(
+            2,
+            ProductActivity {
+                last_played_at: Some(1),
+                ..ProductActivity::default()
+            },
+        );
+        for id in [1, 2] {
+            model
+                .section_states
+                .insert((id, online::DetailSection::Metadata), SectionState::Ready);
+        }
+        configure(&mut model);
+        assert_eq!(
+            model
+                .games
+                .iter()
+                .filter(|game| game_matches_filters(&model, game))
+                .map(|game| game.product_id)
+                .collect::<Vec<_>>(),
+            *expected,
+            "{name}"
+        );
+        for game in &model.games {
+            assert_eq!(
+                game_matches_filters(&model, game),
+                game_matches_library_filters(&model, game.product_id),
+                "{name}"
+            );
+        }
+        assert!(!game_matches_library_filters(&model, 999));
+    }
+}
+
+#[test]
+#[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+fn filter_counts_reuse_matches_without_changing_rows_selection_or_collapsed_sections() {
+    assert!(
+        std::env::var("HOME")
+            .unwrap()
+            .starts_with("/tmp/ludomere-p260-")
+    );
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.ludomere.FilterCountTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let w = window::create_widgets(&app, &Config::default());
+    let model = Rc::new(RefCell::new(AppModel {
+        games: (1..=1000)
+            .map(|id| Game {
+                product_id: id,
+                title: format!("Synthetic {id}"),
+                ..Game::default()
+            })
+            .collect(),
+        sidebar_sort_mode: SidebarSortMode::LastPlayed,
+        sidebar_playable_only: true,
+        playable_products: (1..=1000).filter(|id| id % 2 != 0).collect(),
+        hidden_products: (1..=1000).filter(|id| id % 4 == 0).collect(),
+        activity_sections: vec![
+            SidebarSection {
+                key: ActivitySectionKey::Recent,
+                label: "RECENT".into(),
+                members: (1..=500).collect(),
+            },
+            SidebarSection {
+                key: ActivitySectionKey::NeverPlayed,
+                label: "NEVER PLAYED".into(),
+                members: (501..=1000).collect(),
+            },
+        ],
+        collapsed_activity_sections: HashSet::from([ActivitySectionKey::NeverPlayed]),
+        ..AppModel::default()
+    }));
+    for section in &model.borrow().activity_sections {
+        w.game_list.append(&activity_section_row(section));
+    }
+    for game in &model.borrow().games {
+        let row = game_row(game, false, false);
+        row.set_widget_name(&game.product_id.to_string());
+        w.game_list.append(&row);
+    }
+    w.game_list.set_filter_func({
+        let model = model.clone();
+        move |row| sidebar_row_visible(&model.borrow(), row)
+    });
+    w.window.present();
+    while glib::MainContext::default().iteration(false) {}
+    let selected = find_list_row(&w, "1").unwrap();
+    selected.set_focusable(true);
+    w.game_list.select_row(Some(&selected));
+    gtk::prelude::GtkWindowExt::set_focus(&w.window, Some(&selected));
+    let focused = gtk::prelude::GtkWindowExt::focus(&w.window);
+    assert_eq!(focused.as_ref(), Some(selected.upcast_ref()));
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "500 games");
+    for section in &model.borrow().activity_sections {
+        let header = find_list_row(&w, &section_name(section.key)).unwrap();
+        assert!(header.is_visible());
+        assert_eq!(
+            find_named_descendant(header.upcast_ref(), "activity-count")
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+                .label(),
+            "(250)"
+        );
+    }
+    assert!(!sidebar_row_visible(
+        &model.borrow(),
+        &find_list_row(&w, "501").unwrap()
+    ));
+    assert_eq!(w.game_list.selected_row(), Some(selected.clone()));
+    assert_eq!(find_list_row(&w, "1"), Some(selected));
+    assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focused);
+    model.borrow_mut().sidebar_playable_only = false;
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "750 games");
+    model.borrow_mut().show_hidden = true;
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "1000 games");
+    model.borrow_mut().query = "absent".into();
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(w.count.label(), "0 games · metadata search incomplete");
+    assert!(
+        !find_list_row(&w, &section_name(ActivitySectionKey::Recent))
+            .unwrap()
+            .is_visible()
+    );
+    w.window.close();
 }
 
 pub(super) fn game_matches_library_filters(model: &AppModel, id: i64) -> bool {
@@ -963,9 +1423,20 @@ pub(super) fn game_matches_library_filters(model: &AppModel, id: i64) -> bool {
     {
         return false;
     }
-    let Some(game) = model.games.iter().find(|game| game.product_id == id) else {
+    model
+        .games
+        .iter()
+        .find(|game| game.product_id == id)
+        .is_some_and(|game| game_matches_filters(model, game))
+}
+
+fn game_matches_filters(model: &AppModel, game: &Game) -> bool {
+    let id = game.product_id;
+    if (!model.show_hidden && model.hidden_products.contains(&id))
+        || !organization::matches_tags(model.tags.get(&id), &model.tag_filters, model.tag_match_all)
+    {
         return false;
-    };
+    }
     if model.favorites_only && !model.favorites.contains(&id) {
         return false;
     }
@@ -1137,13 +1608,8 @@ pub(super) fn sidebar_row_visible(model: &AppModel, row: &gtk::ListBoxRow) -> bo
 }
 
 pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
-    refresh_sidebar_visibility(w, model);
+    let count = refresh_sidebar_visibility(w, model);
     w.home_grid.invalidate_filter();
-    let count = model
-        .games
-        .iter()
-        .filter(|game| game_matches_sidebar(model, game.product_id))
-        .count();
     let incomplete = model
         .games
         .iter()

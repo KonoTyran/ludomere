@@ -638,9 +638,10 @@ fn inspect_game_directory(
         &library.path,
         &directory.join(".ludomere/installation.json"),
         4 * 1024 * 1024,
-    )?;
+    )?
+    .map(|marker| marker.normalize_loaded(directory))
+    .transpose()?;
     if let Some(marker) = &marker {
-        marker.validate()?;
         ensure!(
             marker.slug == name.to_string_lossy(),
             "Installation marker does not match its product directory"

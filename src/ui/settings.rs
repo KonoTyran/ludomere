@@ -193,6 +193,14 @@ pub(super) fn show_settings_page(
     refresh_metadata_button.set_valign(gtk::Align::Center);
     refresh_metadata.add_suffix(&refresh_metadata_button);
     maintenance.add(&refresh_metadata);
+    let refresh_metadata_status = gtk::Label::new(None);
+    refresh_metadata_status.set_margin_top(6);
+    refresh_metadata_status.set_wrap(true);
+    refresh_metadata_status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    refresh_metadata_status.set_selectable(true);
+    refresh_metadata_status.set_xalign(0.0);
+    refresh_metadata_status.set_visible(false);
+    maintenance.add(&refresh_metadata_status);
     let storage_maintenance_page = adw::PreferencesPage::new();
     storage_maintenance_page.set_title("Maintenance");
     storage_maintenance_page.set_icon_name(Some("emblem-system-symbolic"));
@@ -555,21 +563,13 @@ pub(super) fn show_settings_page(
             });
         });
     }
-    {
-        let window = w.window.clone();
-        let status = preference_status.clone();
-        refresh_metadata_button.connect_clicked(move |_| {
-            if let Err(error) =
-                gtk::prelude::WidgetExt::activate_action(&window, "win.refresh", None)
-            {
-                tracing::warn!(%error, "could not activate metadata refresh");
-                status.set_label(&format!(
-                    "Could not start synchronization: {error}. Close Settings and try again."
-                ));
-                status.set_visible(true);
-            }
-        });
-    }
+    wire_metadata_refresh(
+        &w.window,
+        &settings_window,
+        model,
+        &refresh_metadata_button,
+        &refresh_metadata_status,
+    );
     for (index, button) in tile_size_buttons.into_iter().enumerate() {
         let w = w.clone();
         let model = model.clone();
@@ -792,6 +792,225 @@ pub(super) fn show_settings_page(
         });
     }
     settings_window.present();
+}
+
+#[derive(PartialEq, Eq)]
+struct MetadataRefreshSnapshot {
+    epoch: u64,
+    auth: u64,
+    online: u64,
+    generation: u64,
+    logout: bool,
+    signed_in: bool,
+    running: bool,
+    failed: bool,
+    message: Option<String>,
+}
+
+fn wire_metadata_refresh(
+    main: &adw::ApplicationWindow,
+    settings: &adw::ApplicationWindow,
+    model: &Rc<RefCell<AppModel>>,
+    button: &gtk::Button,
+    status: &gtk::Label,
+) {
+    let read = Rc::new({
+        let model = Rc::downgrade(model);
+        move || {
+            let model = model.upgrade()?;
+            let state = model.try_borrow().ok()?;
+            Some(MetadataRefreshSnapshot {
+                epoch: state.account_epoch,
+                auth: auth::session(),
+                online: online::account_session(),
+                generation: state.sync_generation,
+                logout: state.logout_pending,
+                signed_in: state.account_token.is_some(),
+                running: state.sync_running,
+                failed: state.sync_failed,
+                message: state.sync_message.clone(),
+            })
+        }
+    });
+    let initial = read().expect("Settings model must be available when wiring controls");
+    let origin = (initial.epoch, initial.auth, initial.online);
+    let is_current = move |snapshot: &MetadataRefreshSnapshot| {
+        (snapshot.epoch, snapshot.auth, snapshot.online) == origin && !snapshot.logout
+    };
+    let observed = Rc::new(std::cell::Cell::new((initial.generation, initial.running)));
+    let busy = Rc::new(std::cell::Cell::new(false));
+    let live = Rc::new({
+        let settings = settings.downgrade();
+        let button = button.downgrade();
+        let status = status.downgrade();
+        move || {
+            let (settings, button, status) =
+                (settings.upgrade()?, button.upgrade()?, status.upgrade()?);
+            (settings.is_visible()
+                && button.root().as_ref() == Some(settings.upcast_ref())
+                && status.root().as_ref() == Some(settings.upcast_ref()))
+            .then_some((button, status))
+        }
+    });
+    let refresh: Rc<dyn Fn()> = Rc::new({
+        let read = read.clone();
+        let live = live.clone();
+        let observed = observed.clone();
+        let busy = busy.clone();
+        let model = Rc::downgrade(model);
+        move || {
+            let (Some((button, status)), Some(snapshot)) = (live(), read()) else {
+                return;
+            };
+            if busy.replace(true) {
+                return;
+            }
+            let current = is_current(&snapshot);
+            let previous = observed.replace((snapshot.generation, snapshot.running && current));
+            let message = if !current {
+                Some(
+                    "Your account session changed. Close and reopen Settings before refreshing."
+                        .to_owned(),
+                )
+            } else if snapshot.running {
+                Some(notifications::failure_message(
+                    "Library synchronization is running",
+                    snapshot.message.as_deref().unwrap_or("Please wait…"),
+                ))
+            } else if previous.1 || previous.0 != snapshot.generation {
+                let failed_images = model.upgrade().map_or(0, |model| {
+                    let state = model.borrow();
+                    state
+                        .cover_states
+                        .values()
+                        .chain(state.icon_states.values())
+                        .filter(|state| matches!(state, sync::CoverState::Failed(_)))
+                        .count()
+                });
+                Some(if snapshot.failed {
+                    notifications::failure_message(
+                        "Library synchronization failed",
+                        snapshot.message.as_deref().unwrap_or("Try Refresh again."),
+                    )
+                } else if failed_images > 0 {
+                    format!(
+                        "Synchronization finished with {} image failures. Use the main window's image Retry control to try them again.",
+                        failed_images
+                    )
+                } else {
+                    "Library synchronization finished.".to_owned()
+                })
+            } else {
+                None
+            };
+            let label = if snapshot.running && current {
+                "Refreshing…"
+            } else {
+                "Refresh"
+            };
+            if button.label().as_deref() != Some(label) {
+                button.set_label(label);
+            }
+            if let Some(message) = message {
+                if status.text() != message {
+                    status.set_label(&message);
+                }
+                if !status.get_visible() {
+                    status.set_visible(true);
+                }
+            }
+            let unchanged = live().is_some() && read().is_some_and(|now| now == snapshot);
+            busy.set(false);
+            // Last setter: a sensitivity observer can start a fresh request immediately.
+            if unchanged && button.is_sensitive() != (current && !snapshot.running) {
+                button.set_sensitive(current && !snapshot.running);
+            }
+        }
+    });
+    button.connect_clicked({
+        let main = main.downgrade();
+        let read = read.clone();
+        let live = live.clone();
+        let observed = observed.clone();
+        let busy = busy.clone();
+        let refresh = refresh.clone();
+        move |_| {
+            let (Some((button, status)), Some(before), Some(main)) =
+                (live(), read(), main.upgrade())
+            else {
+                return;
+            };
+            if busy.replace(true) {
+                return;
+            }
+            if !is_current(&before) || before.running {
+                busy.set(false);
+                refresh();
+                return;
+            }
+            button.set_sensitive(false);
+            button.set_label("Refreshing…");
+            status.set_label("Requesting library refresh…");
+            status.set_visible(true);
+            if live().is_none() || read().is_none_or(|now| now != before) {
+                busy.set(false);
+                refresh();
+                return;
+            }
+            let result = if main
+                .lookup_action("refresh")
+                .is_some_and(|action| action.is_enabled())
+            {
+                gtk::prelude::WidgetExt::activate_action(&main, "win.refresh", None)
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("The refresh action is unavailable. Close Settings and try again.".into())
+            };
+            let Some(after) = read() else {
+                busy.set(false);
+                return;
+            };
+            if live().is_none() {
+                busy.set(false);
+                return;
+            }
+            if !is_current(&after)
+                || (result.is_ok() && (after.running || after.generation != before.generation))
+            {
+                busy.set(false);
+                refresh();
+                return;
+            }
+            observed.set((after.generation, false));
+            let message = match result {
+                Err(error) => {
+                    notifications::failure_message("Could not start synchronization", &error)
+                }
+                Ok(()) if !before.signed_in && !after.signed_in => {
+                    "Local downloaded-file refresh requested. Sign in to refresh online metadata."
+                        .into()
+                }
+                Ok(()) => {
+                    "The refresh action did not start a synchronization. Try Refresh again.".into()
+                }
+            };
+            button.set_label("Refresh");
+            status.set_label(&message);
+            status.set_visible(true);
+            let unchanged = live().is_some() && read().is_some_and(|now| now == after);
+            busy.set(false);
+            if unchanged {
+                button.set_sensitive(true);
+            }
+        }
+    });
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if live().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        refresh();
+        glib::ControlFlow::Continue
+    });
 }
 
 fn save_preferences(config: &Config, status: &gtk::Label) {
@@ -1164,6 +1383,10 @@ fn settings_account_page(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) -> adw:
         .propagate_natural_height(true)
         .child(&reset_status)
         .build();
+    reset_status
+        .bind_property("visible", &reset_status_scroll, "visible")
+        .sync_create()
+        .build();
     reset.connect_clicked({
         let w = w.clone();
         let model = model.clone();
@@ -1201,19 +1424,38 @@ fn settings_account_page(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) -> adw:
     let connection = adw::PreferencesGroup::new();
     connection.set_title("Connection");
     let status = adw::ActionRow::new();
-    let authenticated = model
-        .borrow()
-        .account_token
-        .as_ref()
-        .is_some_and(|token| token.expires_at > chrono::Utc::now().timestamp());
+    status.set_widget_name("settings-gog-session");
     status.set_title("GOG session");
-    status.set_subtitle(if !model.borrow().network_available {
-        "Offline"
-    } else if authenticated {
-        "Online and authenticated"
-    } else {
-        "Authentication required"
-    });
+    let refresh = {
+        let status = status.downgrade();
+        let model = Rc::downgrade(model);
+        move || {
+            let (Some(status), Some(model)) = (status.upgrade(), model.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            let Ok(model) = model.try_borrow() else {
+                return glib::ControlFlow::Continue;
+            };
+            let subtitle = if !model.network_available {
+                "Offline"
+            } else if !model.logout_pending
+                && model
+                    .account_token
+                    .as_ref()
+                    .is_some_and(|token| token.expires_at > chrono::Utc::now().timestamp())
+            {
+                "Online and authenticated"
+            } else {
+                "Authentication required"
+            };
+            if status.subtitle().as_deref() != Some(subtitle) {
+                status.set_subtitle(subtitle);
+            }
+            glib::ControlFlow::Continue
+        }
+    };
+    let _ = refresh();
+    glib::timeout_add_local(Duration::from_millis(500), refresh);
     connection.add(&status);
     page.add(&connection);
     {
@@ -1248,6 +1490,541 @@ fn clear_replaceable_images_at(cache_root: &std::path::Path) -> std::io::Result<
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "private p390 HOME/all XDG/TMP, GTK and D-Bus; inert refresh action only"]
+    fn maintenance_refresh_observes_current_sync_without_restarting_it() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p390-"),
+                "{key}"
+            );
+        }
+        assert!(!crate::identity::database().exists());
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn tick() {
+            let ready = Rc::new(std::cell::Cell::new(false));
+            glib::timeout_add_local_once(Duration::from_millis(250), {
+                let ready = ready.clone();
+                move || ready.set(true)
+            });
+            wait(|| ready.get());
+        }
+        fn begin(model: &Rc<RefCell<AppModel>>, new_library_session: bool) {
+            // The real library counter is independent of the account counter.
+            let account = online::account_session();
+            let mut state = model
+                .try_borrow_mut()
+                .expect("action must run without caller's model borrow");
+            if new_library_session {
+                state.sync_session = Some(online::begin_library_session());
+            }
+            assert_eq!(online::account_session(), account);
+            state.sync_generation += 1;
+            state.sync_running = true;
+            state.sync_failed = false;
+            state.sync_message = Some("Game list · connecting…".into());
+        }
+        fn host(
+            app: &adw::Application,
+            main: &adw::ApplicationWindow,
+            model: &Rc<RefCell<AppModel>>,
+        ) -> (adw::ApplicationWindow, gtk::Button, gtk::Label) {
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .transient_for(main)
+                .default_width(620)
+                .default_height(400)
+                .build();
+            let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            let row = adw::ActionRow::builder()
+                .title("Refresh all online metadata")
+                .build();
+            let button = gtk::Button::with_label("Refresh");
+            row.add_suffix(&button);
+            let group = adw::PreferencesGroup::new();
+            group.add(&row);
+            root.append(&group);
+            let status = gtk::Label::new(None);
+            status.set_margin_top(6);
+            status.set_wrap(true);
+            status.set_selectable(true);
+            status.set_visible(false);
+            root.append(&status);
+            window.set_content(Some(&root));
+            wire_metadata_refresh(main, &window, model, &button, &status);
+            window.present();
+            wait(|| button.is_mapped());
+            (window, button, status)
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.MaintenanceRefreshTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let main = adw::ApplicationWindow::builder().application(&app).build();
+        let sentinel = gtk::Label::new(Some("Unrelated main progress"));
+        main.set_content(Some(&sentinel));
+        main.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let start_online = Rc::new(std::cell::Cell::new(true));
+        let action = gio::SimpleAction::new("refresh", None);
+        action.connect_activate({
+            let model = model.clone();
+            let calls = calls.clone();
+            let start_online = start_online.clone();
+            move |_, _| {
+                calls.set(calls.get() + 1);
+                if start_online.get() {
+                    begin(&model, true);
+                } else {
+                    drop(
+                        model
+                            .try_borrow_mut()
+                            .expect("local action must not inherit a borrow"),
+                    );
+                }
+            }
+        });
+        // This private window never installs the real win.refresh action.
+        main.add_action(&action);
+        assert_eq!(
+            main.lookup_action("refresh").unwrap(),
+            action.clone().upcast::<gio::Action>()
+        );
+        begin(&model, true);
+        assert_ne!(model.borrow().sync_session, Some(online::account_session()));
+        let (window, button, status) = host(&app, &main, &model);
+        wait(|| status.text().contains("Game list") && !button.is_sensitive());
+        button.emit_clicked();
+        button.emit_clicked();
+        assert_eq!(calls.get(), 0, "observe the already-running operation");
+        model.borrow_mut().sync_running = false;
+        wait(|| button.is_sensitive());
+        assert_eq!(status.text(), "Library synchronization finished.");
+
+        // Label/status notifications cannot recursively dispatch before the busy guard.
+        let label_handler = button.connect_label_notify(|button| button.emit_clicked());
+        let status_handler = status.connect_label_notify({
+            let button = button.downgrade();
+            move |_| {
+                if let Some(button) = button.upgrade() {
+                    button.emit_clicked();
+                }
+            }
+        });
+        button.emit_clicked();
+        assert_eq!(calls.get(), 1);
+        assert!(!button.is_sensitive());
+        button.emit_clicked();
+        assert_eq!(calls.get(), 1);
+        model.borrow_mut().sync_message = Some("Grid images · preparing…".into());
+        wait(|| status.text().contains("Grid images"));
+        assert_eq!(calls.get(), 1);
+        button.disconnect(label_handler);
+        status.disconnect(status_handler);
+        {
+            let mut state = model.borrow_mut();
+            state.sync_running = false;
+            state.sync_failed = true;
+            state.sync_message = Some("Failure access_token=fixture-secret".into());
+        }
+        wait(|| button.is_sensitive());
+        assert!(status.text().contains("failed"));
+        assert!(!status.text().contains("fixture-secret"));
+        let notifications = Rc::new(std::cell::Cell::new(0));
+        let handler = status.connect_label_notify({
+            let notifications = notifications.clone();
+            move |_| notifications.set(notifications.get() + 1)
+        });
+        tick();
+        assert_eq!(notifications.get(), 0, "idle must not replay terminal text");
+        status.disconnect(handler);
+        button.emit_clicked();
+        assert_eq!(calls.get(), 2, "same-page retry after terminal");
+        model
+            .borrow_mut()
+            .cover_states
+            .insert(1, sync::CoverState::Failed("inert".into()));
+        model.borrow_mut().sync_running = false;
+        wait(|| button.is_sensitive());
+        assert!(status.text().contains("1 image failures"));
+        model.borrow_mut().cover_states.clear();
+
+        button.emit_clicked();
+        assert_eq!(calls.get(), 3);
+        let old_library = model.borrow().sync_session;
+        begin(&model, true);
+        assert_ne!(model.borrow().sync_session, old_library);
+        tick();
+        assert!(!button.is_sensitive());
+        let same_library = model.borrow().sync_session;
+        begin(&model, false); // Mirrors image retry's generation-only replacement.
+        assert_eq!(model.borrow().sync_session, same_library);
+        tick();
+        assert_eq!(calls.get(), 3);
+        model.borrow_mut().sync_running = false;
+        wait(|| button.is_sensitive());
+
+        button.emit_clicked();
+        let restarted = Rc::new(std::cell::Cell::new(false));
+        let handler = button.connect_sensitive_notify({
+            let restarted = restarted.clone();
+            move |button| {
+                if button.is_sensitive() && !restarted.replace(true) {
+                    button.emit_clicked();
+                }
+            }
+        });
+        model.borrow_mut().sync_running = false;
+        wait(|| restarted.get());
+        button.disconnect(handler);
+        assert_eq!(calls.get(), 5);
+        tick();
+        assert!(!button.is_sensitive());
+        assert!(status.text().contains("is running"));
+        model.borrow_mut().sync_running = false;
+        wait(|| button.is_sensitive());
+
+        button.emit_clicked();
+        let changed = Rc::new(std::cell::Cell::new(false));
+        let handler = status.connect_label_notify({
+            let changed = changed.clone();
+            let model = model.clone();
+            move |status| {
+                if status.text() == "Library synchronization finished." && !changed.replace(true) {
+                    begin(&model, false);
+                    model.borrow_mut().sync_running = false;
+                }
+            }
+        });
+        model.borrow_mut().sync_running = false;
+        wait(|| changed.get() && button.is_sensitive());
+        status.disconnect(handler);
+        assert_eq!(
+            calls.get(),
+            6,
+            "terminal snapshot change must not strand the control"
+        );
+
+        let handler = status.connect_label_notify({
+            let model = model.clone();
+            move |status| {
+                if status.text() == "Requesting library refresh…" {
+                    begin(&model, true);
+                }
+            }
+        });
+        button.emit_clicked();
+        status.disconnect(handler);
+        assert_eq!(
+            calls.get(),
+            6,
+            "recheck for an external start after setters"
+        );
+        assert!(!button.is_sensitive());
+        model.borrow_mut().sync_running = false;
+        wait(|| button.is_sensitive());
+
+        action.set_enabled(false);
+        button.emit_clicked();
+        assert!(status.text().contains("unavailable"));
+        assert!(button.is_sensitive());
+        main.remove_action("refresh");
+        button.emit_clicked();
+        assert!(status.text().contains("unavailable"));
+        assert_eq!(calls.get(), 6);
+        action.set_enabled(true);
+        main.add_action(&action);
+        start_online.set(false);
+        model.borrow_mut().account_token = Some(auth::Token {
+            access_token: "inert-no-backend".into(),
+            refresh_token: String::new(),
+            user_id: "synthetic".into(),
+            expires_at: 0,
+        });
+        button.emit_clicked();
+        assert!(status.text().contains("did not start"));
+        model.borrow_mut().account_token = None;
+        for expected in [8, 9] {
+            button.emit_clicked();
+            assert_eq!(calls.get(), expected);
+            assert!(
+                status
+                    .text()
+                    .contains("Local downloaded-file refresh requested")
+            );
+            assert!(!status.text().contains("finished"));
+            assert!(button.is_sensitive());
+        }
+        window.destroy();
+
+        start_online.set(true);
+        for case in ["epoch", "logout", "account", "close", "detach", "auth"] {
+            model.borrow_mut().logout_pending = false;
+            model.borrow_mut().sync_running = false;
+            let (window, button, status) = host(&app, &main, &model);
+            button.emit_clicked();
+            let before = calls.get();
+            let text = status.text();
+            match case {
+                "epoch" => model.borrow_mut().account_epoch += 1,
+                "logout" => model.borrow_mut().logout_pending = true,
+                "account" => {
+                    online::invalidate_library_session();
+                    begin(&model, true); // A new library operation never legitimizes a changed account.
+                }
+                "close" => {
+                    window.close();
+                }
+                "detach" => window.set_content(gtk::Widget::NONE),
+                "auth" => auth::invalidate_session(),
+                _ => unreachable!(),
+            }
+            tick();
+            button.emit_clicked();
+            assert_eq!(calls.get(), before, "{case}");
+            if matches!(case, "close" | "detach") {
+                assert_eq!(status.text(), text);
+            } else {
+                assert!(status.text().contains("session changed"), "{case}");
+                assert!(!button.is_sensitive());
+            }
+            window.destroy();
+        }
+        model.borrow_mut().sync_running = false;
+        let (window, button, status) = host(&app, &main, &model);
+        let weak_button = button.downgrade();
+        let weak_status = status.downgrade();
+        window.set_content(gtk::Widget::NONE);
+        drop(button);
+        drop(status);
+        wait(|| weak_button.upgrade().is_none() && weak_status.upgrade().is_none());
+        window.destroy();
+        tick();
+        assert_eq!(sentinel.text(), "Unrelated main progress");
+        assert!(sentinel.get_visible());
+        assert!(!crate::identity::database().exists());
+        assert!(crate::profile_reset::reserve().is_ok());
+        main.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG/TMP under /tmp/ludomere-p359-, GTK and D-Bus"]
+    fn account_session_row_tracks_current_model_without_retaining_destroyed_page() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p359-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn pump(duration: Duration) {
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.AccountStatusTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let config = Config::default();
+        let w = Rc::new(window::create_widgets(&app, &config));
+        let model = Rc::new(RefCell::new(AppModel {
+            config,
+            network_available: false,
+            ..Default::default()
+        }));
+        let page = settings_account_page(&w, &model);
+        let row = find_named_descendant(page.upcast_ref(), "settings-gog-session")
+            .and_downcast::<adw::ActionRow>()
+            .unwrap();
+        assert_eq!(row.subtitle().as_deref(), Some("Offline"));
+        let changes = Rc::new(std::cell::Cell::new(0));
+        row.connect_notify_local(Some("subtitle"), {
+            let changes = changes.clone();
+            move |_, _| changes.set(changes.get() + 1)
+        });
+        let settings = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(600)
+            .default_height(600)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let focus = gtk::Entry::new();
+        content.append(&focus);
+        content.append(&page);
+        settings.set_content(Some(&content));
+        settings.present();
+        wait(|| row.is_mapped());
+        assert!(focus.grab_focus());
+        let original_focus = gtk::prelude::GtkWindowExt::focus(&settings);
+        assert!(original_focus.is_some());
+        let original_page = w.content.visible_child_name();
+        let assert_status = |text: &str| {
+            wait(|| row.subtitle().as_deref() == Some(text));
+            assert_eq!(gtk::prelude::GtkWindowExt::focus(&settings), original_focus);
+            assert_eq!(w.content.visible_child_name(), original_page);
+            assert!(settings.visible_dialog().is_none());
+            assert_eq!(settings.content().as_ref(), Some(content.upcast_ref()));
+        };
+        pump(Duration::from_millis(1100));
+        assert_eq!(changes.get(), 0, "unchanged status must not notify");
+        {
+            let reset_status = find_named_descendant(page.upcast_ref(), "factory-reset-status")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let scroll = reset_status
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            let group = scroll
+                .ancestor(adw::PreferencesGroup::static_type())
+                .and_downcast::<adw::PreferencesGroup>()
+                .unwrap();
+            assert!(!reset_status.get_visible());
+            assert!(!scroll.get_visible());
+            assert!(!scroll.is_mapped());
+            let collapsed_height = group.height();
+            assert!(collapsed_height > 0);
+
+            // Exercise presentation only; never invoke Factory Reset or its worker.
+            reset_status.set_label("Synthetic reset preparation feedback");
+            reset_status.set_visible(true);
+            wait(|| scroll.is_mapped() && group.height() > collapsed_height);
+            let error = format!(
+                "{}\nSynthetic terminal cause. Use Factory Reset above to retry.",
+                "Synthetic complete error detail.\n".repeat(40)
+            );
+            reset_status.set_label(&error);
+            wait(|| scroll.vadjustment().upper() > scroll.vadjustment().page_size());
+            assert!(reset_status.is_mapped());
+            assert_eq!(reset_status.text(), error);
+            assert!(reset_status.is_selectable());
+            assert!(reset_status.wraps());
+            assert_eq!(scroll.max_content_height(), 160);
+            assert_eq!(scroll.vscrollbar_policy(), gtk::PolicyType::Automatic);
+            assert!(scroll.vadjustment().page_size() > 0.0);
+            assert!(scroll.vadjustment().page_size() <= 160.0);
+            scroll.vadjustment().set_value(scroll.vadjustment().upper());
+            assert!(scroll.vadjustment().value() > 0.0);
+            assert_eq!(reset_status.text(), error);
+            reset_status.set_visible(false);
+            wait(|| !scroll.is_mapped() && group.height() == collapsed_height);
+            assert!(!scroll.get_visible());
+            assert_status("Offline");
+        }
+        model.borrow_mut().network_available = true;
+        assert_status("Authentication required");
+        let token = auth::Token {
+            access_token: "synthetic-never-used".into(),
+            refresh_token: "synthetic-never-used".into(),
+            user_id: "synthetic".into(),
+            expires_at: chrono::Utc::now().timestamp() + 60,
+        };
+        model.borrow_mut().account_token = Some(token.clone());
+        assert_status("Online and authenticated");
+        model.borrow_mut().network_available = false;
+        assert_status("Offline");
+        model.borrow_mut().network_available = true;
+        assert_status("Online and authenticated");
+        model
+            .borrow_mut()
+            .account_token
+            .as_mut()
+            .unwrap()
+            .expires_at = chrono::Utc::now().timestamp() - 1;
+        assert_status("Authentication required");
+        let unchanged = changes.get();
+        model.borrow_mut().account_token = None;
+        pump(Duration::from_millis(1100));
+        assert_eq!(changes.get(), unchanged);
+        model.borrow_mut().account_token = Some(token.clone());
+        assert_status("Online and authenticated");
+        model.borrow_mut().logout_pending = true;
+        assert_status("Authentication required");
+        model.borrow_mut().logout_pending = false;
+        assert_status("Online and authenticated");
+        model
+            .borrow_mut()
+            .account_token
+            .as_mut()
+            .unwrap()
+            .expires_at = chrono::Utc::now().timestamp() + 2;
+        assert_status("Authentication required");
+        {
+            let mut held = model.borrow_mut();
+            held.network_available = false;
+            pump(Duration::from_millis(600));
+            assert_eq!(row.subtitle().as_deref(), Some("Authentication required"));
+        }
+        assert_status("Offline");
+        let weak_row = row.downgrade();
+        let count = changes.get();
+        settings.set_content(None::<&gtk::Widget>);
+        content.remove(&page);
+        settings.destroy();
+        drop(row);
+        drop(page);
+        wait(|| weak_row.upgrade().is_none());
+        model.borrow_mut().network_available = true;
+        pump(Duration::from_millis(1100));
+        assert_eq!(
+            changes.get(),
+            count,
+            "destroyed row must receive no updates"
+        );
+        assert!(
+            !crate::identity::database().exists(),
+            "status refresh must not open the profile database"
+        );
+        w.window.destroy();
+    }
 
     #[test]
     #[ignore = "requires private HOME/all XDG, D-Bus and display; never activates a file manager"]

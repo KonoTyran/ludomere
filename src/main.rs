@@ -71,6 +71,7 @@ fn recovery_window(message: String) -> gtk::glib::ExitCode {
         let app_retry = app.clone();
         retry.connect_clicked(move |button| {
             button.set_sensitive(false);
+            button.set_label("Preparing reset…");
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = sender.send(profile_reset::retry_pending().map_err(|error| format!("{error:#}")));
@@ -83,11 +84,13 @@ fn recovery_window(message: String) -> gtk::glib::ExitCode {
                     Ok(Ok(())) => app.quit(),
                     Ok(Err(error)) => {
                         label.set_text(&format!("Reset remains incomplete: {error}"));
+                        button.set_label("Retry reset");
                         button.set_sensitive(true);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
                     Err(_) => {
                         label.set_text("Reset preparation stopped. Close Ludomere and retry.");
+                        button.set_label("Retry reset");
                         button.set_sensitive(true);
                     }
                 }

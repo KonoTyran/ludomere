@@ -1,6 +1,100 @@
 use super::*;
 use crate::config::{GameLibrary, LibraryKind};
 
+pub(super) fn offline_installation_plan(
+    product_id: i64,
+    library: &GameLibrary,
+    slug: &str,
+    candidate: &crate::installation::InstallerCandidate,
+) -> crate::domain::InstalledGame {
+    let now = chrono::Utc::now().timestamp();
+    crate::domain::InstalledGame {
+        product_id,
+        library_id: library.id.clone(),
+        installed_version: candidate.version.clone(),
+        installation_directory: library.path.join(slug),
+        installer_revision_id: candidate.revision_id,
+        installer_job_id: None,
+        installer_files: candidate.paths.clone(),
+        installer_complete: candidate.complete,
+        installer_operating_system: candidate.operating_system.clone(),
+        installer_language: candidate.language.clone(),
+        compatibility: None,
+        primary_executable: None,
+        launch_arguments: Vec::new(),
+        state: crate::domain::InstallationState::Pending,
+        error: None,
+        installed_at: None,
+        verified_at: None,
+        last_played_at: None,
+        playtime_seconds: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+pub(super) fn retain_offline_launch_preferences(
+    plan: &mut crate::domain::InstalledGame,
+    preferences: Option<&crate::domain::GamePreferences>,
+    previous: Option<&crate::domain::InstalledGame>,
+) {
+    plan.launch_arguments = preferences.map_or_else(
+        || previous.map_or_else(Vec::new, |game| game.launch_arguments.clone()),
+        |preferences| preferences.launch_arguments.clone(),
+    );
+    plan.compatibility = if plan
+        .installer_operating_system
+        .as_deref()
+        .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+    {
+        preferences.map_or_else(
+            || previous.and_then(|game| game.compatibility.clone()),
+            |preferences| preferences.compatibility.clone(),
+        )
+    } else {
+        None
+    };
+}
+
+fn prepare_cached_offline_installation<T: Send + 'static>(
+    mut plan: crate::domain::InstalledGame,
+    fresh: bool,
+    session: (u64, u64),
+    enqueue: impl FnOnce(crate::domain::InstalledGame) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<mpsc::Receiver<anyhow::Result<T>>> {
+    anyhow::ensure!(
+        session == (online::account_session(), auth::session()),
+        "Account changed before setup"
+    );
+    let activity = crate::profile_reset::begin_activity("preparing offline installation")?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let _activity = activity;
+            anyhow::ensure!(
+                session == (online::account_session(), auth::session()),
+                "Account changed before setup"
+            );
+            let store = StateStore::open()?;
+            if fresh {
+                let preferences = store.game_preferences(plan.product_id)?;
+                retain_offline_launch_preferences(&mut plan, preferences.as_ref(), None);
+            }
+            online::with_account_session(session.0, || {
+                anyhow::ensure!(auth::session() == session.1, "Account changed before setup");
+                crate::installation::save_game_preferences(&store, &plan)
+            })?;
+            anyhow::ensure!(
+                session == (online::account_session(), auth::session()),
+                "Account changed before setup"
+            );
+            enqueue(plan)
+        })();
+        let _ = sender.send(result);
+    });
+    Ok(receiver)
+}
+
 #[cfg(test)]
 type CapturedDownloads = (
     Vec<download::DownloadRequest>,
@@ -321,6 +415,23 @@ pub(super) fn choose_download_libraries(
 
 pub(super) type ManagedArtifactIdentity = (i64, String, Option<String>);
 
+pub(super) fn current_depot_session(
+    model: &Rc<RefCell<AppModel>>,
+) -> anyhow::Result<crate::gog::depot_service::DepotSession> {
+    let state = model.borrow();
+    anyhow::ensure!(
+        !state.logout_pending,
+        "Sign-out is in progress. Sign in again to continue."
+    );
+    crate::gog::depot_service::DepotSession::new(
+        state
+            .account_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Sign in to GOG before starting a Depot operation."))?,
+        (online::account_session(), auth::session()),
+    )
+}
+
 pub(super) fn review_depot_resume(
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
@@ -329,6 +440,7 @@ pub(super) fn review_depot_resume(
 ) {
     let epoch = model.borrow().account_epoch;
     let session = crate::online::account_session();
+    let authentication = current_depot_session(model);
     let dialog = adw::Dialog::builder()
         .title("Preparing Resume")
         .content_width(560)
@@ -358,19 +470,17 @@ pub(super) fn review_depot_resume(
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<_> {
+            let authentication = authentication?;
+            authentication.validate()?;
             anyhow::ensure!(
-                session == crate::online::account_session(),
+                token == authentication.token.access_token
+                    && session == crate::online::account_session(),
                 "Account changed before Resume preparation"
             );
-            crate::installation::prepare_depot_resume(operation_id, token)
-        })()
-        .and_then(|request| {
-            anyhow::ensure!(
-                session == crate::online::account_session(),
-                "Account changed during Resume preparation"
-            );
-            Ok(request)
-        });
+            let request = crate::installation::prepare_depot_resume(operation_id, token)?;
+            authentication.validate()?;
+            Ok((request, authentication))
+        })();
         let _ = sender.send(result);
     });
     let window = window.clone();
@@ -380,7 +490,7 @@ pub(super) fn review_depot_resume(
             return glib::ControlFlow::Break;
         }
         match receiver.try_recv() {
-            Ok(Ok(request)) => { confirm_depot_plan(&window,&model,request,&dialog); }
+            Ok(Ok((request, authentication))) => { confirm_depot_plan(&window,&model,request,authentication,&dialog); }
             Ok(Err(error)) => status.set_label(&notifications::failure_message("Could not prepare Resume. Close and retry, or use Offline installers and extras from Manage game.",&format!("{error:#}"))),
             Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => status.set_label("Preparation stopped. Close and retry Resume."),
@@ -393,6 +503,7 @@ fn confirm_depot_plan(
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
     request: crate::installation::DepotOperationRequest,
+    authentication: crate::gog::depot_service::DepotSession,
     dialog: &adw::Dialog,
 ) {
     if model.borrow().logout_pending
@@ -417,19 +528,45 @@ fn confirm_depot_plan(
     dialog.set_title("Required game components");
     dialog.set_content_width(600);
     dialog.set_content_height(440);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let header = adw::HeaderBar::new();
+    header.set_widget_name("component-consent-header");
+    root.append(&header);
     let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_vexpand(true);
     body.set_margin_start(18);
     body.set_margin_end(18);
+    body.set_margin_top(18);
     body.set_margin_bottom(18);
-    body.append(&adw::HeaderBar::new());
     let introduction = gtk::Label::new(Some(
         "Install the components this game needs to run. Missing files will be downloaded and setup will run in this game's Windows environment.",
     ));
+    introduction.set_widget_name("component-consent-introduction");
+    introduction.set_xalign(0.0);
     introduction.set_wrap(true);
     introduction.set_visible(needs_review);
     body.append(&introduction);
     let label = gtk::Label::builder()
+        .name("component-consent-description")
         .label(&description)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .yalign(0.0)
+        .valign(gtk::Align::Start)
+        .build();
+    body.append(
+        &gtk::ScrolledWindow::builder()
+            .name("component-consent-description-scroll")
+            .child(&label)
+            .vexpand(true)
+            .min_content_height(32)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+    let status = gtk::Label::builder()
+        .name("component-consent-status")
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .selectable(true)
@@ -437,31 +574,25 @@ fn confirm_depot_plan(
         .build();
     body.append(
         &gtk::ScrolledWindow::builder()
-            .child(&label)
-            .vexpand(true)
-            .min_content_height(100)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build(),
-    );
-    let status = gtk::Label::builder()
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .selectable(true)
-        .build();
-    body.append(
-        &gtk::ScrolledWindow::builder()
+            .name("component-consent-status-scroll")
             .child(&status)
             .max_content_height(140)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build(),
     );
-    let admission_progress = gtk::ProgressBar::builder().visible(false).build();
+    let admission_progress = gtk::ProgressBar::builder()
+        .name("component-consent-admission-progress")
+        .visible(false)
+        .build();
     body.append(&admission_progress);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let cancel = gtk::Button::with_label("Cancel");
+    cancel.set_widget_name("component-consent-cancel");
     let offline = gtk::Button::with_label("Offline installers…");
+    offline.set_widget_name("component-consent-offline");
     let confirm = gtk::Button::with_label("Install required components");
+    confirm.set_widget_name("component-consent-confirm");
     confirm.add_css_class("suggested-action");
     if !needs_review {
         confirm.set_label("Retry");
@@ -471,7 +602,12 @@ fn confirm_depot_plan(
     }
     body.append(&actions);
     actions.set_visible(needs_review);
-    dialog.set_child(Some(&body));
+    root.append(&body);
+    dialog.set_focus(None::<&gtk::Widget>);
+    dialog.set_child(Some(&root));
+    if needs_review {
+        dialog.set_focus(Some(&cancel));
+    }
     cancel.connect_clicked({
         let dialog = dialog.clone();
         move |_| {
@@ -508,10 +644,12 @@ fn confirm_depot_plan(
         admission_progress.set_visible(true);
         admission_progress.pulse();
         let request = request.clone();
+        let authentication = authentication.clone();
         let operation_id = request.operation_id.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<()> {
+                authentication.validate()?;
                 anyhow::ensure!(crate::online::account_session()==session,"Account changed before queuing setup");
                 anyhow::ensure!(crate::installation::enqueue_depot_operation(request),
                     "Operation conflicts with active work or could not be saved. Reopen installation choices to retry.");
@@ -564,12 +702,96 @@ fn confirm_depot_plan(
 enum SetupOperation {
     Depot(String),
     Offline(crate::installation::TrackedInstallation),
+    #[cfg(test)]
+    Fixture(Result<(), String>, String),
+}
+
+fn depot_setup_details(snapshot: &crate::installation::DepotOperationSnapshot) -> String {
+    let mut details = format!("Stage: {}", snapshot.state.replace('_', " "));
+    let component_phase = snapshot.state == "dependencies";
+    let phase_progress = snapshot.total_bytes > 0
+        && matches!(
+            snapshot.state.as_str(),
+            "verifying" | "verifying_existing" | "dependencies" | "extracting"
+        );
+    if phase_progress {
+        details.push_str(&format!(
+            "\n{}: {} / {}",
+            if component_phase {
+                "Component data processed"
+            } else {
+                "Processed"
+            },
+            human_size(snapshot.bytes_completed),
+            human_size(snapshot.total_bytes)
+        ));
+    }
+    if (snapshot.bytes_downloaded > 0 || snapshot.download_total_bytes.is_some())
+        && !(component_phase
+            && phase_progress
+            && snapshot.bytes_downloaded == snapshot.bytes_completed
+            && snapshot.download_total_bytes.is_none())
+    {
+        if !component_phase
+            && snapshot.bytes_downloaded == 0
+            && snapshot.download_total_bytes == Some(0)
+        {
+            details.push_str("\nNo Depot file download required.");
+        } else {
+            details.push_str(&format!(
+                "\n{}: {}{}",
+                if component_phase {
+                    "Component data processed"
+                } else if snapshot.download_total_bytes.is_none() {
+                    "Data processed"
+                } else {
+                    "Depot files downloaded"
+                },
+                human_size(snapshot.bytes_downloaded),
+                snapshot
+                    .download_total_bytes
+                    .filter(|total| *total > 0)
+                    .map(|total| format!(" / {}", human_size(total)))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    if snapshot.bytes_written > 0 || snapshot.total_write_bytes > 0 {
+        details.push_str(&format!(
+            "\nPayload data written this run: {}",
+            human_size(snapshot.bytes_written)
+        ));
+        if snapshot.total_write_bytes > 0 {
+            details.push_str(&format!(
+                "\nFull write estimate: {}\nExisting files can be reused without rewriting them.",
+                human_size(snapshot.total_write_bytes)
+            ));
+        }
+    }
+    details
+}
+
+fn setup_failure_summary(error: &str) -> String {
+    let safe = notifications::failure_message("", error);
+    let cause = safe
+        .split_once(". Log:")
+        .map_or(safe.as_str(), |(cause, _)| cause);
+    let summary = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.is_empty() {
+        "Setup could not finish. Review Details before retrying.".into()
+    } else if summary.chars().count() > 320 {
+        format!("{}…", summary.chars().take(320).collect::<String>())
+    } else {
+        summary
+    }
 }
 
 fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation: SetupOperation) {
     let operation_name = match &operation {
         SetupOperation::Depot(id) => format!("Depot operation: {id}"),
         SetupOperation::Offline(_) => "Offline installer setup (current attempt)".to_owned(),
+        #[cfg(test)]
+        SetupOperation::Fixture(..) => "Synthetic setup attempt".to_owned(),
     };
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.append(&adw::HeaderBar::new());
@@ -578,9 +800,25 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
     body.set_margin_end(20);
     body.set_margin_bottom(20);
     let status = gtk::Label::builder()
+        .name("setup-status")
         .label("Waiting to start setup…")
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .width_chars(1)
+        .lines(3)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .xalign(0.0)
+        .build();
+    let failure = gtk::Label::builder()
+        .name("setup-failure-summary")
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .width_chars(1)
+        .lines(3)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .selectable(true)
+        .xalign(0.0)
+        .visible(false)
         .build();
     let progress = gtk::ProgressBar::new();
     let components = gtk::ProgressBar::builder()
@@ -588,6 +826,7 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
         .visible(false)
         .build();
     let details = gtk::Label::builder()
+        .name("setup-details")
         .label(format!(
             "{operation_name}\nWaiting for this operation to start."
         ))
@@ -600,19 +839,23 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
         .label("Details")
         .child(&details)
         .build();
+    expander.set_margin_start(20);
+    expander.set_margin_end(20);
     let explanation = gtk::Label::builder().label("Closing this dialog lets setup continue in the background. The game will not start automatically.").wrap(true).xalign(0.0).build();
     for widget in [
         status.upcast_ref::<gtk::Widget>(),
+        failure.upcast_ref(),
         progress.upcast_ref(),
         components.upcast_ref(),
         explanation.upcast_ref(),
-        expander.upcast_ref(),
     ] {
         body.append(widget);
     }
+    root.append(&body);
     root.append(
         &gtk::ScrolledWindow::builder()
-            .child(&body)
+            .name("setup-details-scroll")
+            .child(&expander)
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .build(),
@@ -623,6 +866,7 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
     actions.set_margin_bottom(20);
     let stop = gtk::Button::with_label("Stop setup");
     let close = gtk::Button::with_label("Run in background");
+    close.set_widget_name("setup-close");
     actions.append(&stop);
     actions.append(&close);
     root.append(&actions);
@@ -661,6 +905,8 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
                 });
             })
         }
+        #[cfg(test)]
+        SetupOperation::Fixture(..) => Box::new(|| {}),
     };
     let stopping = Rc::new(std::cell::Cell::new(false));
     stop.connect_clicked({
@@ -700,7 +946,13 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
             return glib::ControlFlow::Continue;
         }
         let mut terminal = None;
+        let mut terminal_stopped = false;
         match &operation {
+            #[cfg(test)]
+            SetupOperation::Fixture(result, details) => {
+                stage_details = details.clone();
+                terminal = Some(result.clone());
+            }
             SetupOperation::Offline(tracked) => {
                 loop {
                     match tracked.events.try_recv() {
@@ -736,6 +988,7 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
                             break;
                         }
                         Ok(crate::installation::InstallationEvent::Cancelled) => {
+                            terminal_stopped = true;
                             terminal=Some(Err("Setup was stopped. Any retained backup remains safe; setup may still be required.".into()));
                             break;
                         }
@@ -749,63 +1002,75 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
             }
             SetupOperation::Depot(id) => {
                 if let Some(snapshot) = crate::installation::depot_operation_snapshot(id) {
-                    stage_details = format!("Stage: {}", snapshot.state.replace('_', " "));
-                    if snapshot.total_bytes > 0
-                        && matches!(
-                            snapshot.state.as_str(),
-                            "verifying" | "verifying_existing" | "dependencies" | "extracting"
-                        )
-                    {
-                        stage_details.push_str(&format!(
-                            "\nProcessed: {} / {}",
-                            human_size(snapshot.bytes_completed),
-                            human_size(snapshot.total_bytes)
-                        ));
-                    }
-                    if snapshot.bytes_downloaded > 0 || snapshot.download_total_bytes.is_some() {
-                        stage_details.push_str(&format!(
-                            "\nDownloaded: {}{}",
-                            human_size(snapshot.bytes_downloaded),
-                            snapshot
-                                .download_total_bytes
-                                .map(|total| format!(" / {}", human_size(total)))
-                                .unwrap_or_default()
-                        ));
-                    }
-                    if snapshot.total_write_bytes > 0 {
-                        stage_details.push_str(&format!(
-                            "\nWritten: {} / {}",
-                            human_size(snapshot.bytes_written),
-                            human_size(snapshot.total_write_bytes)
-                        ));
-                    }
+                    stage_details = depot_setup_details(&snapshot);
                     fraction = None;
                     components.set_visible(false);
                     match snapshot.state.as_str() {
-                    "complete" => terminal=Some(Ok(())),
-                    "failed" => terminal=Some(Err(snapshot.error.unwrap_or_else(|| "Setup could not finish. Review the game before retrying.".into()))),
-                    "cancelled" | "abandoned" | "interrupted" | "paused" => terminal=Some(Err(snapshot.error.unwrap_or_else(|| "Setup was stopped. Any retained backup remains safe; setup may still be required.".into()))),
-                    "setup" => {
-                        if let Some(setup)=snapshot.setup {
-                            stage_details.push_str(&format!("\nCurrent step: {}",setup.component));
-                            status.set_label(&if setup.total == 0 { setup.component.clone() } else { format!("Installing: {}", setup.component) });
-                            if setup.total>0 {
-                                stage_details.push_str(&format!("\nComponents completed: {} of {}",setup.completed,setup.total));
-                                components.set_visible(true);
-                                components.set_fraction(setup.completed as f64/setup.total as f64);
-                                components.set_text(Some(&format!("{} of {} components completed",setup.completed,setup.total)));
+                        "complete" => terminal = Some(Ok(())),
+                        "failed" => {
+                            terminal = Some(Err(snapshot.error.unwrap_or_else(|| {
+                                "Setup could not finish. Review the game before retrying.".into()
+                            })))
+                        }
+                        "cancelled" | "abandoned" | "interrupted" | "paused" => {
+                            terminal_stopped = true;
+                            terminal=Some(Err(snapshot.error.unwrap_or_else(|| "Setup was stopped. Any retained backup remains safe; setup may still be required.".into())));
+                        }
+                        "setup" => {
+                            if let Some(setup) = snapshot.setup {
+                                stage_details
+                                    .push_str(&format!("\nCurrent step: {}", setup.component));
+                                status.set_label(&if setup.total == 0 {
+                                    setup.component.clone()
+                                } else {
+                                    format!("Installing: {}", setup.component)
+                                });
+                                if setup.total > 0 {
+                                    stage_details.push_str(&format!(
+                                        "\nComponents completed: {} of {}",
+                                        setup.completed, setup.total
+                                    ));
+                                    components.set_visible(true);
+                                    components
+                                        .set_fraction(setup.completed as f64 / setup.total as f64);
+                                    components.set_text(Some(&format!(
+                                        "{} of {} components completed",
+                                        setup.completed, setup.total
+                                    )));
+                                }
+                            } else {
+                                status.set_label("Applying game setup…");
                             }
-                        } else { status.set_label("Applying game setup…"); }
-                    }
-                    phase => {
-                        status.set_label(match phase { "queued"=>"Waiting to start setup…", "preparing"=>"Reading game download information…", "calculating"=>"Calculating required downloads…", "dependencies"=>"Downloading required components…", "downloading"|"materializing"=>"Downloading game files…", "extracting"=>"Extracting game files…", "verifying"|"verifying_existing"=>"Checking installed files…", "committing"=>"Saving repaired files…", "finalizing"=>"Finishing game installation…", _=>"Preparing game setup…" });
-                        if matches!(phase,"verifying"|"verifying_existing"|"dependencies"|"extracting") && snapshot.total_bytes>0 {
-                            fraction=Some(snapshot.bytes_completed as f64/snapshot.total_bytes as f64);
-                        } else if matches!(phase,"downloading"|"materializing") && let Some(total)=snapshot.download_total_bytes.filter(|total| *total>0) {
-                            fraction=Some(snapshot.bytes_downloaded as f64/total as f64);
+                        }
+                        phase => {
+                            status.set_label(match phase {
+                                "queued" => "Waiting to start setup…",
+                                "preparing" => "Reading game download information…",
+                                "calculating" => "Calculating required downloads…",
+                                "dependencies" => "Preparing required components…",
+                                "downloading" | "materializing" => "Downloading game files…",
+                                "extracting" => "Extracting game files…",
+                                "verifying" | "verifying_existing" => "Checking installed files…",
+                                "committing" => "Saving game files…",
+                                "finalizing" => "Finishing game installation…",
+                                _ => "Preparing game setup…",
+                            });
+                            if matches!(
+                                phase,
+                                "verifying" | "verifying_existing" | "dependencies" | "extracting"
+                            ) && snapshot.total_bytes > 0
+                            {
+                                fraction = Some(
+                                    snapshot.bytes_completed as f64 / snapshot.total_bytes as f64,
+                                );
+                            } else if matches!(phase, "downloading" | "materializing")
+                                && let Some(total) =
+                                    snapshot.download_total_bytes.filter(|total| *total > 0)
+                            {
+                                fraction = Some(snapshot.bytes_downloaded as f64 / total as f64);
+                            }
                         }
                     }
-                }
                 }
             }
         }
@@ -828,24 +1093,39 @@ fn monitor_setup(dialog: &adw::Dialog, model: &Rc<RefCell<AppModel>>, operation:
             stop.set_visible(false);
             close.set_label("Close");
             components.set_visible(false);
+            progress.set_visible(false);
             explanation.set_label("The game has not been launched.");
             match result {
                 Ok(()) => {
+                    if let Some(dialog) = dialog.upgrade() {
+                        dialog.set_title("Setup complete");
+                    }
                     status.set_label("Game setup completed.");
-                    details.set_label(notifications::failure_message("", &format!("{current_details}\n\nResult: Game setup completed. The game was not launched.")).trim_start());
-                    progress.set_fraction(1.0);
+                    details.set_label(notifications::failure_message("", &format!("Result: Game setup completed. The game was not launched.\n\n{current_details}")).trim_start());
                 }
                 Err(error) => {
-                    status.set_label("Game setup did not complete. See Details before retrying.");
+                    if let Some(dialog) = dialog.upgrade() {
+                        dialog.set_title(if terminal_stopped {
+                            "Setup stopped"
+                        } else {
+                            "Setup failed"
+                        });
+                    }
+                    status.set_label(if terminal_stopped {
+                        "Game setup was stopped."
+                    } else {
+                        "Game setup did not complete."
+                    });
+                    failure.set_label(&setup_failure_summary(&error));
+                    failure.set_visible(true);
                     details.set_label(
                         notifications::failure_message(
                             "",
-                            &format!("{current_details}\n\nResult: {error}"),
+                            &format!("Result: {error}\n\n{current_details}"),
                         )
                         .trim_start(),
                     );
                     expander.set_expanded(true);
-                    progress.set_visible(false);
                 }
             }
             finished = true;
@@ -1188,6 +1468,20 @@ pub(super) fn show_update_dialog(
     );
 }
 
+#[cfg(test)]
+type TestDepotInspectionResult = anyhow::Result<
+    Option<(
+        crate::domain::InstalledGame,
+        crate::installation::InstallationMarker,
+    )>,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DEPOT_INSPECTION_RESULT: RefCell<Option<TestDepotInspectionResult>> = const { RefCell::new(None) };
+    static TEST_DEPOT_INSPECTION_DELAYS: RefCell<VecDeque<mpsc::Receiver<()>>> = const { RefCell::new(VecDeque::new()) };
+}
+
 fn start_existing_depot_operation_dialog(
     window: &adw::ApplicationWindow,
     model: &Rc<RefCell<AppModel>>,
@@ -1195,23 +1489,53 @@ fn start_existing_depot_operation_dialog(
     kind: crate::domain::DepotOperationKind,
     directory: Option<std::path::PathBuf>,
 ) {
-    let (config, epoch) = {
+    let (config, epoch, session) = {
         let state = model.borrow();
-        (state.config.clone(), state.account_epoch)
+        if state.logout_pending {
+            return;
+        }
+        (
+            state.config.clone(),
+            state.account_epoch,
+            (online::account_session(), auth::session()),
+        )
     };
     let pending = adw::Dialog::builder()
+        .title(match kind {
+            crate::domain::DepotOperationKind::Update => "Update game",
+            _ => "Repair game",
+        })
         .content_width(420)
         .content_height(180)
         .build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let header = adw::HeaderBar::new();
+    header.set_widget_name("repair-inspection-header");
+    root.append(&header);
     let shell = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    shell.append(&adw::HeaderBar::new());
+    shell.set_margin_start(18);
+    shell.set_margin_end(18);
+    shell.set_margin_top(18);
+    shell.set_margin_bottom(18);
     let spinner = gtk::Spinner::new();
+    spinner.set_widget_name("repair-inspection-spinner");
     spinner.set_spinning(true);
     shell.append(&spinner);
     let label = gtk::Label::new(Some("Checking the installed game…"));
+    label.set_widget_name("repair-inspection-message");
+    label.set_xalign(0.0);
     label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_selectable(true);
     shell.append(&label);
-    pending.set_child(Some(&shell));
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&shell)
+        .build();
+    scroll.set_widget_name("repair-inspection-scroll");
+    root.append(&scroll);
+    pending.set_child(Some(&root));
     pending.present(Some(window));
     let closed = Rc::new(std::cell::Cell::new(false));
     pending.connect_closed({
@@ -1230,43 +1554,90 @@ fn start_existing_depot_operation_dialog(
         .map(|library| library.id.clone());
     let expected_directory = directory.clone();
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<_> {
-            let store = StateStore::open()?;
-            let libraries = config
-                .game_libraries
-                .iter()
-                .filter(|library| {
-                    expected_directory
-                        .as_ref()
-                        .is_none_or(|directory| directory.parent() == Some(library.path.as_path()))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let installed = crate::installation::reconcile_installed_games(&store, &libraries)?
-                .into_iter()
-                .find(|game| {
-                    game.product_id == product_id
-                        && expected_directory
-                            .as_ref()
-                            .is_none_or(|directory| &game.installation_directory == directory)
-                });
-            let Some(installed) = installed else {
-                return Ok(None);
-            };
-            let marker =
-                crate::installation::load_installation_marker(&installed.installation_directory)?;
-            Ok(marker
-                .filter(|marker| marker.source == crate::domain::InstallationSource::GalaxyDepot)
-                .map(|marker| (installed, marker)))
-        })();
-        let _ = sender.send(result);
-    });
+    match crate::profile_reset::begin_activity("inspecting installed game") {
+        Err(error) => {
+            let _ = sender.send(Err(error));
+        }
+        Ok(activity) => {
+            #[cfg(test)]
+            let test_result =
+                TEST_DEPOT_INSPECTION_RESULT.with(|result| result.borrow_mut().take());
+            #[cfg(test)]
+            let delay = TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow_mut().pop_front());
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<_> {
+                    let _activity = activity;
+                    #[cfg(test)]
+                    if let Some(delay) = delay {
+                        delay.recv_timeout(Duration::from_secs(10))?;
+                    }
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "Account changed; inspect the installation again."
+                    );
+                    #[cfg(test)]
+                    if let Some(result) = test_result {
+                        return result;
+                    }
+                    let store = StateStore::open()?;
+                    let libraries = config
+                        .game_libraries
+                        .iter()
+                        .filter(|library| {
+                            expected_directory.as_ref().is_none_or(|directory| {
+                                directory.parent() == Some(library.path.as_path())
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "Account changed; inspect the installation again."
+                    );
+                    let installed =
+                        crate::installation::reconcile_installed_games(&store, &libraries)?
+                            .into_iter()
+                            .find(|game| {
+                                game.product_id == product_id
+                                    && expected_directory.as_ref().is_none_or(|directory| {
+                                        &game.installation_directory == directory
+                                    })
+                            });
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "Account changed; inspect the installation again."
+                    );
+                    let Some(installed) = installed else {
+                        return Ok(None);
+                    };
+                    let marker = crate::installation::load_installation_marker(
+                        &installed.installation_directory,
+                    )?;
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "Account changed; inspect the installation again."
+                    );
+                    Ok(marker
+                        .filter(|marker| {
+                            marker.source == crate::domain::InstallationSource::GalaxyDepot
+                        })
+                        .map(|marker| (installed, marker)))
+                })();
+                let _ = sender.send(result);
+            });
+        }
+    }
     let window = window.clone();
     let model = model.clone();
     let detail = detail.clone();
     glib::timeout_add_local(Duration::from_millis(32), move || {
-        if closed.get() || model.borrow().account_epoch != epoch || model.borrow().logout_pending {
+        if closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        if model.borrow().account_epoch != epoch
+            || model.borrow().logout_pending
+            || session != (online::account_session(), auth::session())
+        {
             pending.close();
             return glib::ControlFlow::Break;
         }
@@ -1281,11 +1652,16 @@ fn start_existing_depot_operation_dialog(
             }
             Ok(Ok(None)) => {
                 spinner.set_spinning(false);
-                label.set_label("No recognized Depot installation is available to repair. Review the reinstall choices, or inspect and reset the existing game folder first. Nothing has been changed.");
+                spinner.set_visible(false);
+                label.set_label(match kind {
+                    crate::domain::DepotOperationKind::Update => "This update tool checks Galaxy Depot installations. Review reinstallation options for other installation sources. Nothing has been changed.",
+                    _ => "This repair tool checks Galaxy Depot installations. For a game installed from an offline installer, review reinstallation options. Nothing has been changed.",
+                });
                 if directory.is_some() {
-                    label.set_label("This folder has no recognized Depot installation to repair. Browse its files or review a reset of this folder, then choose Install Again. Other installed copies are not changed.");
+                    label.set_label("Depot repair is unavailable for this folder. Browse its files or review a reset of this folder, then choose Install Again. Other installed copies are not changed.");
                 }
                 let reinstall = gtk::Button::with_label("Review Reinstallation…");
+                reinstall.set_widget_name("repair-review-reinstallation");
                 reinstall.set_visible(directory.is_none());
                 reinstall.connect_clicked({
                     let pending = pending.clone();
@@ -1302,6 +1678,7 @@ fn start_existing_depot_operation_dialog(
             }
             result => {
                 spinner.set_spinning(false);
+                spinner.set_visible(false);
                 label.set_label(&format!(
                     "Could not inspect the installation: {}",
                     match result {
@@ -1310,6 +1687,7 @@ fn start_existing_depot_operation_dialog(
                     }
                 ));
                 let retry = gtk::Button::with_label("Retry");
+                retry.set_widget_name("repair-inspection-retry");
                 retry.connect_clicked({
                     let pending = pending.clone();
                     let window = window.clone();
@@ -1334,6 +1712,7 @@ fn start_existing_depot_operation_dialog(
             }
         }
         let browse = gtk::Button::with_label("Browse Local Files");
+        browse.set_widget_name("repair-inspection-browse");
         browse.connect_clicked({
             let window = window.clone();
             let model = model.clone();
@@ -1351,6 +1730,7 @@ fn start_existing_depot_operation_dialog(
         });
         shell.append(&browse);
         let reset = gtk::Button::with_label("Review File Reset…");
+        reset.set_widget_name("repair-inspection-reset");
         reset.connect_clicked({
             let pending = pending.clone();
             let window = window.clone();
@@ -1382,6 +1762,7 @@ fn start_existing_depot_operation_dialog(
             }
         });
         shell.append(&reset);
+        pending.set_content_height(400);
         glib::ControlFlow::Break
     });
 }
@@ -1412,12 +1793,6 @@ fn present_existing_depot_operation_dialog(
     dialog.set_default_response(Some("start"));
     dialog.set_close_response("cancel");
     dialog.set_response_appearance("start", adw::ResponseAppearance::Suggested);
-    let user_id = model
-        .borrow()
-        .account_profile
-        .as_ref()
-        .map(|profile| profile.user_id.clone())
-        .unwrap_or_default();
     let branches = marker
         .galaxy_depot
         .as_ref()
@@ -1473,16 +1848,20 @@ fn present_existing_depot_operation_dialog(
         pending.connect_closed({let closed=closed.clone(); move |_|closed.set(true)});
         pending.present(Some(&result_window));
         let session=crate::online::account_session();
+        let authentication = current_depot_session(&model);
         let (sender,receiver)=mpsc::channel();
         std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<crate::installation::DepotOperationRequest> {
+            let result = (|| -> anyhow::Result<_> {
+                let authentication = authentication?;
+                authentication.validate()?;
                 let store = StateStore::open()?;
                 let client = reqwest::blocking::Client::new();
                 let builds = crate::gog::depot_service::list_builds(
                     &store,
                     &client,
+                    &authentication,
                     &crate::gog::depot_service::BuildRequest {
-                        user_id,
+                        user_id: authentication.token.user_id.clone(),
                         product_id,
                         platform: "windows".into(),
                         generation: 2,
@@ -1497,6 +1876,7 @@ fn present_existing_depot_operation_dialog(
                 let request=crate::gog::depot_service::prepare_operation(
                     &store,
                     &client,
+                    &authentication,
                     crate::gog::depot_service::PrepareOperationRequest {
                         build,
                         selection: crate::gog::depot_acquisition::Selection {
@@ -1517,7 +1897,7 @@ fn present_existing_depot_operation_dialog(
                     },
                 )?;
                 anyhow::ensure!(crate::online::account_session()==session,"Account changed during preparation");
-                Ok(request)
+                Ok((request, authentication))
             })();
             let _=sender.send(result);
         });
@@ -1525,7 +1905,7 @@ fn present_existing_depot_operation_dialog(
             if closed.get() { return glib::ControlFlow::Break; }
             if model.borrow().account_epoch != epoch || model.borrow().logout_pending || crate::online::account_session()!=session { pending.close(); return glib::ControlFlow::Break; }
             match receiver.try_recv() {
-                Ok(Ok(request)) => { confirm_depot_plan(&result_window,&model,request,&pending); }
+                Ok(Ok((request, authentication))) => { confirm_depot_plan(&result_window,&model,request,authentication,&pending); }
                 Ok(Err(error)) => status.set_label(&notifications::failure_message("Could not prepare required components. Close and retry, or choose offline installers.", &format!("{error:#}"))),
                 Err(mpsc::TryRecvError::Empty) => { progress.pulse(); return glib::ControlFlow::Continue; }
                 Err(mpsc::TryRecvError::Disconnected) => status.set_label("Preparation stopped. Close and retry, or choose offline installers."),
@@ -1543,7 +1923,6 @@ struct InstallPreparation {
     installed_dlc_ids: HashSet<i64>,
     candidates: crate::installation::InstallerCandidates,
     dlc_candidates: HashMap<i64, crate::installation::InstallerCandidates>,
-    mount_points: Vec<String>,
     galaxy_preflight: Result<(), String>,
     galaxy_selection: crate::gog::depot_acquisition::Selection,
     library_statuses: Vec<crate::storage::LibraryStatus>,
@@ -1699,11 +2078,6 @@ fn load_install_choices(
                     ),
                 );
             }
-            let mount_points = config
-                .game_libraries
-                .iter()
-                .map(|library| settings::storage::filesystem_mount_point(&library.path))
-                .collect();
             let galaxy_selection =
                 default_galaxy_selection(&prepared_detail, &config, preferences.as_ref());
             let galaxy_preflight =
@@ -1767,7 +2141,6 @@ fn load_install_choices(
                 installed_dlc_ids,
                 candidates,
                 dlc_candidates,
-                mount_points,
                 galaxy_preflight,
                 galaxy_selection,
                 library_statuses,
@@ -1832,6 +2205,13 @@ fn populate_install_dialog(
     repair: bool,
     preparation: InstallPreparation,
 ) {
+    dialog.set_content_width(680);
+    dialog.set_content_height(620);
+    dialog.set_title(if repair {
+        "Repair game"
+    } else {
+        "Install game"
+    });
     let InstallPreparation {
         local_only,
         config,
@@ -1839,7 +2219,6 @@ fn populate_install_dialog(
         installed_dlc_ids,
         candidates,
         mut dlc_candidates,
-        mount_points,
         galaxy_preflight,
         galaxy_selection,
         library_statuses,
@@ -1896,6 +2275,17 @@ fn populate_install_dialog(
     let body = adw::PreferencesPage::new();
     let installer_group = adw::PreferencesGroup::new();
     installer_group.set_title("Installer");
+    let galaxy_feedback = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    galaxy_feedback.set_widget_name("install-galaxy-feedback");
+    let galaxy_preflight_label = gtk::Label::new(None);
+    galaxy_preflight_label.set_widget_name("install-galaxy-preflight");
+    galaxy_preflight_label.set_xalign(0.0);
+    galaxy_preflight_label.set_wrap(true);
+    galaxy_preflight_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    galaxy_preflight_label.set_selectable(true);
+    galaxy_preflight_label.set_visible(false);
+    galaxy_feedback.append(&galaxy_preflight_label);
+    installer_group.add(&galaxy_feedback);
     let galaxy_builds = detail
         .galaxy_builds
         .iter()
@@ -1909,11 +2299,12 @@ fn populate_install_dialog(
         .cloned()
         .collect::<Vec<_>>();
     if let Some(Err(error)) = &galaxy_preflight {
-        installer_group.set_description(Some(&if galaxy_request.is_some() {
+        galaxy_preflight_label.set_label(&if galaxy_request.is_some() {
             "Downloaded installers remain available while Galaxy data loads.".into()
         } else {
             format!("Galaxy build unavailable: {error}")
-        }));
+        });
+        galaxy_preflight_label.set_visible(true);
     }
     let galaxy_ready = Rc::new(std::cell::Cell::new(!galaxy_builds.is_empty()));
     let mut ranked_sources = if repair || existing_installation.is_some() {
@@ -2525,6 +2916,7 @@ fn populate_install_dialog(
         .unwrap_or(0);
     library.set_selected(default_library as u32);
     let library_choices = gtk::ListBox::new();
+    library_choices.set_widget_name("install-game-libraries");
     library_choices.set_selection_mode(gtk::SelectionMode::Single);
     library_choices.add_css_class("install-library-list");
     let storage_locked = existing_installation.is_some();
@@ -2532,11 +2924,13 @@ fn populate_install_dialog(
         let row = gtk::ListBoxRow::new();
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         content.append(&gtk::Image::from_icon_name("drive-harddisk-symbolic"));
-        let mount = gtk::Label::new(mount_points.get(index).map(String::as_str));
-        mount.set_xalign(0.0);
-        mount.set_hexpand(true);
-        mount.add_css_class("install-library-path");
-        content.append(&mount);
+        let path = gtk::Label::new(Some(&game_library.path.display().to_string()));
+        path.set_xalign(0.0);
+        path.set_hexpand(true);
+        path.set_wrap(true);
+        path.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        path.add_css_class("install-library-path");
+        content.append(&path);
         if game_library.default {
             let star = gtk::Image::from_icon_name("starred-symbolic");
             star.add_css_class("storage-default-library");
@@ -2546,7 +2940,6 @@ fn populate_install_dialog(
         let free = gtk::Label::new(Some("Calculating…"));
         free.add_css_class("install-library-free");
         content.append(&free);
-        update_install_library_free_space(&game_library.path, &free);
         row.set_child(Some(&content));
         if storage_locked && index != default_library {
             row.add_css_class("dim-label");
@@ -2557,14 +2950,25 @@ fn populate_install_dialog(
             row.set_tooltip_text(Some("This game is installed in this library."));
         }
         library_choices.append(&row);
-        if let Some(status) = library_statuses.iter().find(|status| {
-            status.kind == LibraryKind::GameFiles && status.library_id == game_library.id
-        }) && let crate::storage::LibraryCompatibility::Incompatible(reason)
-        | crate::storage::LibraryCompatibility::Unavailable(reason) = &status.compatibility
+        match library_statuses
+            .iter()
+            .find(|status| {
+                status.kind == LibraryKind::GameFiles && status.library_id == game_library.id
+            })
+            .map(|status| &status.compatibility)
         {
-            row.set_sensitive(false);
-            row.set_tooltip_text(Some(reason));
-            free.set_label("Unavailable");
+            Some(crate::storage::LibraryCompatibility::Compatible) => {
+                update_install_library_free_space(&game_library.path, &free);
+            }
+            Some(
+                crate::storage::LibraryCompatibility::Incompatible(reason)
+                | crate::storage::LibraryCompatibility::Unavailable(reason),
+            ) => {
+                row.set_sensitive(false);
+                row.set_tooltip_text(Some(reason));
+                free.set_label("Unavailable");
+            }
+            None => free.set_label("Unavailable"),
         }
         if index == default_library {
             library_choices.select_row(Some(&row));
@@ -2590,22 +2994,44 @@ fn populate_install_dialog(
     });
     destination_group.add(&library_choices);
     let path_row = adw::ActionRow::new();
+    path_row.set_widget_name("install-destination");
+    path_row.set_title("Installation folder");
     path_row.set_use_markup(false);
+    path_row.set_subtitle_selectable(true);
+    destination_group.add(&path_row);
     body.add(&destination_group);
-
+    let update_destination = {
+        let libraries = config.game_libraries.clone();
+        let existing = existing_installation
+            .as_ref()
+            .map(|installed| installed.installation_directory.clone());
+        let slug = detail.slug.clone();
+        move |library: &gtk::DropDown| {
+            path_row.set_subtitle(
+                &existing
+                    .clone()
+                    .or_else(|| {
+                        libraries
+                            .get(library.selected() as usize)
+                            .map(|library| library.path.join(&slug))
+                    })
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "No game library configured".into()),
+            );
+        }
+    };
+    update_destination(&library);
+    library.connect_selected_notify(update_destination);
     update_install_plan_preview(
         &installer_detail,
-        &path_row,
         &candidates.usable,
         candidate.selected() as usize,
-        &config.game_libraries,
-        library.selected() as usize,
-        &detail.slug,
     );
     let scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&body)
         .build();
+    scroll.set_widget_name("install-choices-scroll");
     root.append(&scroll);
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     footer.add_css_class("download-selector-footer");
@@ -2619,26 +3045,55 @@ fn populate_install_dialog(
     spacer.set_hexpand(true);
     footer.append(&spacer);
     let status = gtk::Label::new(None);
-    status.set_xalign(0.0);
-    status.set_hexpand(true);
-    status.set_wrap(true);
-    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    status.set_selectable(true);
+    status.set_widget_name("install-status");
+    let galaxy_status = gtk::Label::new(None);
+    galaxy_status.set_widget_name("install-galaxy-status");
+    let statuses = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    for label in [&status, &galaxy_status] {
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_selectable(true);
+        statuses.append(label);
+    }
     let status_scroll = gtk::ScrolledWindow::builder()
-        .child(&status)
+        .child(&statuses)
         .max_content_height(160)
         .propagate_natural_height(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
-    status_scroll.set_visible(false);
-    status.connect_label_notify({
-        let status_scroll = status_scroll.clone();
-        move |label| {
-            status_scroll.set_visible(!label.label().is_empty());
+    status_scroll.set_widget_name("install-status-scroll");
+    let refresh_status: Rc<dyn Fn()> = Rc::new({
+        let status_scroll = status_scroll.downgrade();
+        let status = status.downgrade();
+        let galaxy_status = galaxy_status.downgrade();
+        let galaxy_selected = galaxy_selected.clone();
+        move || {
+            let (Some(status_scroll), Some(status), Some(galaxy_status)) = (
+                status_scroll.upgrade(),
+                status.upgrade(),
+                galaxy_status.upgrade(),
+            ) else {
+                return;
+            };
+            status.set_visible(!status.label().is_empty());
+            galaxy_status.set_visible(galaxy_selected.get() && !galaxy_status.label().is_empty());
+            status_scroll.set_visible(status.get_visible() || galaxy_status.get_visible());
         }
     });
+    for label in [&status, &galaxy_status] {
+        let refresh = refresh_status.clone();
+        label.connect_label_notify(move |_| refresh());
+    }
+    source.connect_selected_notify({
+        let refresh = refresh_status.clone();
+        move |_| refresh()
+    });
+    refresh_status();
     root.append(&status_scroll);
     let close = gtk::Button::with_label("Cancel");
+    close.set_widget_name("install-cancel");
     footer.append(&close);
     let install = gtk::Button::new();
     install.set_widget_name("install-confirm");
@@ -2745,7 +3200,7 @@ fn populate_install_dialog(
         row.add_suffix(&spinner);
         let retry = gtk::Button::with_label("Retry");
         row.add_suffix(&retry);
-        installer_group.add(&row);
+        galaxy_feedback.append(&row);
         let closed = Rc::new(std::cell::Cell::new(false));
         dialog.connect_closed({
             let closed = closed.clone();
@@ -2765,7 +3220,7 @@ fn populate_install_dialog(
         let icon = detail.icon.clone();
         let title = detail.title.clone();
         let has_library = !config.game_libraries.is_empty();
-        let installer_group = installer_group.clone();
+        let galaxy_preflight_label = galaxy_preflight_label.clone();
         retry.connect_clicked(move |retry| {
             if closed.get() || model.borrow().account_epoch!=epoch {return;}
             retry.set_sensitive(false);spinner.set_spinning(true);row.set_subtitle("Checking Galaxy installation data…");
@@ -2774,14 +3229,14 @@ fn populate_install_dialog(
             std::thread::spawn(move || {let _=sender.send(online::fetch_product_section(&game,online::DetailSection::Builds,Some(&token),language.as_deref(),session).map_err(|error|error.to_string()));});
             let model=model.clone();let builds=builds.clone();let branches=branches.clone();let closed=closed.clone();
             let spinner=spinner.clone();let row=row.clone();let retry=retry.clone();let branch=branch.clone();let branch_row=branch_row.clone();let branch_password=branch_password.clone();
-            let galaxy_selected=galaxy_selected.clone();let galaxy_ready=galaxy_ready.clone();let install=install.clone();let buttons=buttons.clone();let values=values.clone();let icon=icon.clone();let title=title.clone();let installer_group=installer_group.clone();
+            let galaxy_selected=galaxy_selected.clone();let galaxy_ready=galaxy_ready.clone();let install=install.clone();let buttons=buttons.clone();let values=values.clone();let icon=icon.clone();let title=title.clone();let galaxy_preflight_label=galaxy_preflight_label.clone();
             glib::timeout_add_local(Duration::from_millis(32),move || {
                 if closed.get() || model.borrow().account_epoch!=epoch {return glib::ControlFlow::Break;}
                 let result=match receiver.try_recv(){Ok(result)=>result,Err(mpsc::TryRecvError::Empty)=>return glib::ControlFlow::Continue,Err(_)=>Err("Galaxy metadata loading stopped".into())};
                 spinner.set_spinning(false);retry.set_sensitive(true);
                 match result {
                     Ok(game)=>{
-                        installer_group.set_description(None);
+                        galaxy_preflight_label.set_visible(false);
                         let id=game.product_id;
                         let fresh=game.galaxy_builds.iter().filter(|build|build.generation==2 && build.currently_returned && build.operating_system.eq_ignore_ascii_case("windows")).cloned().collect::<Vec<_>>();
                         if let Some(current)=model.borrow_mut().games.iter_mut().find(|current|current.product_id==id){online::apply_product_section(current,game,online::DetailSection::Builds);}
@@ -2827,11 +3282,7 @@ fn populate_install_dialog(
     }
     {
         let detail_row = installer_detail.clone();
-        let path_row = path_row.clone();
         let candidates = candidates.usable.clone();
-        let libraries = config.game_libraries.clone();
-        let library = library.clone();
-        let slug = detail.slug.clone();
         let install = install.clone();
         let candidate_menu = candidate_menu.clone();
         let candidate_labels = candidate_labels.clone();
@@ -2867,15 +3318,7 @@ fn populate_install_dialog(
                 });
             }
             update_dlc_summary(&dlc_summary, &dlc_choices, repair);
-            update_install_plan_preview(
-                &detail_row,
-                &path_row,
-                &candidates,
-                selected,
-                &libraries,
-                library.selected() as usize,
-                &slug,
-            );
+            update_install_plan_preview(&detail_row, &candidates, selected);
             update_install_action(
                 &install,
                 &candidates,
@@ -2907,25 +3350,6 @@ fn populate_install_dialog(
             }
         });
     }
-    {
-        let detail_row = installer_detail.clone();
-        let path_row = path_row.clone();
-        let candidates = candidates.usable.clone();
-        let libraries = config.game_libraries.clone();
-        let candidate = candidate.clone();
-        let slug = detail.slug.clone();
-        library.connect_selected_notify(move |library| {
-            update_install_plan_preview(
-                &detail_row,
-                &path_row,
-                &candidates,
-                candidate.selected() as usize,
-                &libraries,
-                library.selected() as usize,
-                &slug,
-            );
-        });
-    }
     let refresh_source: Rc<dyn Fn()> = Rc::new({
         let source = source.clone();
         let values = source_values.clone();
@@ -2936,6 +3360,7 @@ fn populate_install_dialog(
         let statuses = library_statuses.clone();
         let install = install.clone();
         let galaxy_ready = galaxy_ready.clone();
+        let galaxy_feedback = galaxy_feedback.clone();
         let interactive = interactive_prompts.clone();
         let dlc_menu = dlc_menu.clone();
         let candidates = candidates.usable.clone();
@@ -2949,6 +3374,7 @@ fn populate_install_dialog(
                 .get(source.selected() as usize)
                 .map(|(_, source)| *source);
             let remote = matches!(selected, Some(InstallSource::RemoteOffline(_)));
+            galaxy_feedback.set_visible(matches!(selected, Some(InstallSource::GalaxyWindows)));
             archive_group.set_visible(remote);
             dlc_menu.set_visible(!remote && !dlcs.is_empty());
             interactive
@@ -3018,12 +3444,6 @@ fn populate_install_dialog(
             .filter(|dlc| dlc.owned)
             .map(|dlc| dlc.product_id)
             .collect::<BTreeSet<_>>();
-        let user_id = model
-            .borrow()
-            .account_profile
-            .as_ref()
-            .map(|profile| profile.user_id.clone())
-            .unwrap_or_default();
         let branch_password = branch_password.clone();
         let action_epoch = model.borrow().account_epoch;
         let action_model = model.clone();
@@ -3214,9 +3634,18 @@ fn populate_install_dialog(
                 return;
             }
             if galaxy_selected.get() {
+                let status = galaxy_status.clone();
                 if preparing.get() {
                     return;
                 }
+                let authentication = match current_depot_session(&action_model) {
+                    Ok(authentication) => authentication,
+                    Err(error) => {
+                        status.set_label(&error.to_string());
+                        status.add_css_class("error");
+                        return;
+                    }
+                };
                 let selected_branch = branches
                     .borrow()
                     .get(branch.selected() as usize)
@@ -3273,7 +3702,7 @@ fn populate_install_dialog(
                     )
                 });
                 let build_request = crate::gog::depot_service::BuildRequest {
-                    user_id: user_id.clone(),
+                    user_id: authentication.token.user_id.clone(),
                     product_id,
                     platform: "windows".into(),
                     generation: 2,
@@ -3288,6 +3717,7 @@ fn populate_install_dialog(
                 });
                 std::thread::spawn(move || {
                     let result = StateStore::open().and_then(|store| {
+                        authentication.validate()?;
                         let preferences = preferences.recv().map_err(|_| {
                             anyhow::anyhow!("Game language preferences stopped loading")
                         })??;
@@ -3296,6 +3726,7 @@ fn populate_install_dialog(
                             let builds = crate::gog::depot_service::list_builds(
                                 &store,
                                 &client,
+                                &authentication,
                                 &build_request,
                             )?;
                             build = builds
@@ -3314,13 +3745,17 @@ fn populate_install_dialog(
                             preferences.as_ref(),
                         )
                         .language;
-                        let operation =
-                            crate::gog::depot_service::prepare_operation(&store, &client, request)?;
+                        let operation = crate::gog::depot_service::prepare_operation(
+                            &store,
+                            &client,
+                            &authentication,
+                            request,
+                        )?;
                         anyhow::ensure!(
                             crate::online::account_session() == session,
                             "Account changed during preparation"
                         );
-                        Ok(operation)
+                        Ok((operation, authentication))
                     });
                     let _ = sender.send(result);
                 });
@@ -3335,8 +3770,14 @@ fn populate_install_dialog(
                         return glib::ControlFlow::Break;
                     }
                     match receiver.try_recv() {
-                        Ok(Ok(request)) => {
-                            confirm_depot_plan(&plan_window, &plan_model, request, &dialog_result);
+                        Ok(Ok((request, authentication))) => {
+                            confirm_depot_plan(
+                                &plan_window,
+                                &plan_model,
+                                request,
+                                authentication,
+                                &dialog_result,
+                            );
                             glib::ControlFlow::Break
                         }
                         Ok(Err(error)) => {
@@ -3366,7 +3807,6 @@ fn populate_install_dialog(
             let Some(library) = libraries.get(library.selected() as usize) else {
                 return;
             };
-            let now = chrono::Utc::now().timestamp();
             let plan = if let Some(mut installed) = existing_installation.clone() {
                 if repair {
                     let Some(candidate) = candidate else { return };
@@ -3380,29 +3820,7 @@ fn populate_install_dialog(
                 installed
             } else {
                 let candidate = candidate.expect("a new installation requires an installer");
-                crate::domain::InstalledGame {
-                    product_id,
-                    library_id: library.id.clone(),
-                    installed_version: candidate.version.clone(),
-                    installation_directory: library.path.join(&slug),
-                    installer_revision_id: candidate.revision_id,
-                    installer_job_id: None,
-                    installer_files: candidate.paths.clone(),
-                    installer_complete: candidate.complete,
-                    installer_operating_system: candidate.operating_system.clone(),
-                    installer_language: candidate.language.clone(),
-                    compatibility: None,
-                    primary_executable: None,
-                    launch_arguments: Vec::new(),
-                    state: crate::domain::InstallationState::Pending,
-                    error: None,
-                    installed_at: None,
-                    verified_at: None,
-                    last_played_at: None,
-                    playtime_seconds: 0,
-                    created_at: now,
-                    updated_at: now,
-                }
+                offline_installation_plan(product_id, library, &slug, candidate)
             };
             {
                 status.remove_css_class("error");
@@ -3443,28 +3861,26 @@ fn populate_install_dialog(
                     .collect::<Vec<_>>();
                 let install_base = repair || existing_installation.is_none();
                 let interactive = interactive_prompts.is_active();
-                let session = online::account_session();
+                let session = action_session;
+                let receiver = match prepare_cached_offline_installation(
+                    plan,
+                    existing_installation.is_none(),
+                    session,
+                    move |plan| {
+                        crate::installation::enqueue_installation_tracked(
+                            plan, additional_installers, install_base, interactive,
+                        ).ok_or_else(|| anyhow::anyhow!("An installation operation is already active, or setup could not be saved"))
+                    },
+                ) {
+                    Ok(receiver) => receiver,
+                    Err(error) => {
+                        status.set_label(&format!("Could not start setup: {error:#}"));
+                        status.add_css_class("error");
+                        return;
+                    }
+                };
                 button.set_sensitive(false);
                 dialog.set_can_close(false);
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let result =
-                        (|| -> anyhow::Result<crate::installation::TrackedInstallation> {
-                            anyhow::ensure!(
-                                online::account_session() == session,
-                                "Account changed before setup"
-                            );
-                            let store = StateStore::open()?;
-                            crate::installation::save_game_preferences(&store, &plan)?;
-                            anyhow::ensure!(
-                                online::account_session() == session,
-                                "Account changed before setup"
-                            );
-                            crate::installation::enqueue_installation_tracked(plan,additional_installers,install_base,interactive)
-                                .ok_or_else(|| anyhow::anyhow!("An installation operation is already active, or setup could not be saved"))
-                        })();
-                    let _ = sender.send(result);
-                });
                 let model = action_model.clone();
                 let dialog = dialog.clone();
                 let status = status.clone();
@@ -3472,7 +3888,7 @@ fn populate_install_dialog(
                 glib::timeout_add_local(Duration::from_millis(100), move || {
                     if model.borrow().account_epoch != action_epoch
                         || model.borrow().logout_pending
-                        || online::account_session() != session
+                        || session != (online::account_session(), auth::session())
                     {
                         dialog.set_can_close(true);
                         dialog.close();
@@ -3749,10 +4165,7 @@ fn update_install_library_free_space(path: &std::path::Path, label: &gtk::Label)
     let label = label.clone();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let free = std::fs::create_dir_all(&path)
-            .ok()
-            .and_then(|()| fs2::available_space(&path).ok());
-        let _ = sender.send(free);
+        let _ = sender.send(install_library_free_space(&path).ok());
     });
     glib::timeout_add_local(Duration::from_millis(100), move || {
         match receiver.try_recv() {
@@ -3773,14 +4186,20 @@ fn update_install_library_free_space(path: &std::path::Path, label: &gtk::Label)
     });
 }
 
+fn install_library_free_space(path: &std::path::Path) -> std::io::Result<u64> {
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "The library path is not a real directory",
+        ));
+    }
+    fs2::available_space(path)
+}
+
 fn update_install_plan_preview(
     method_row: &adw::ActionRow,
-    path_row: &adw::ActionRow,
     candidates: &[crate::installation::InstallerCandidate],
     candidate_index: usize,
-    libraries: &[crate::config::GameLibrary],
-    library_index: usize,
-    slug: &str,
 ) {
     if let Some(candidate) = candidates.get(candidate_index) {
         let (title, method_description) = match candidate.method {
@@ -3809,25 +4228,6 @@ fn update_install_plan_preview(
         ));
         method_row.set_title(title);
     }
-    path_row.set_subtitle(
-        &libraries
-            .get(library_index)
-            .map(|library| {
-                let host = library.path.join(slug).display().to_string();
-                if candidates.get(candidate_index).is_some_and(|candidate| {
-                    candidate.method
-                        == crate::installation::InstallationMethod::WindowsCompatibility
-                }) {
-                    format!(
-                        "{host} · Windows: {}",
-                        crate::compatibility::windows_destination(slug)
-                    )
-                } else {
-                    host
-                }
-            })
-            .unwrap_or_else(|| "No game library configured".to_owned()),
-    );
 }
 
 pub(super) fn show_download_selector(
@@ -4647,66 +5047,114 @@ fn populate_download_selector(
             });
         });
     }
+    poll_download_selector(dialog, model, state, widgets);
+}
+
+fn poll_download_selector(
+    dialog: &gtk::Window,
+    model: &Rc<RefCell<AppModel>>,
+    state: Rc<RefCell<DownloadDialogState>>,
+    widgets: Rc<DownloadDialogWidgets>,
+) {
+    let epoch = model.borrow().account_epoch;
+    let session = (online::account_session(), auth::session());
     refresh_download_selector(&state, &widgets, true);
-    {
-        let dialog = dialog.clone();
-        let state = state.clone();
-        let widgets = widgets.clone();
-        let availability_model = model.clone();
-        let groups = widgets
-            .rows
-            .iter()
-            .map(|row| row.group.clone())
-            .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel();
-        let mut running = false;
-        let mut initialized = false;
-        glib::timeout_add_local(Duration::from_millis(500), move || {
-            if !dialog.is_visible() {
-                return glib::ControlFlow::Break;
+    let dialog = dialog.downgrade();
+    let model = Rc::downgrade(model);
+    let groups = widgets
+        .rows
+        .iter()
+        .map(|row| row.group.clone())
+        .collect::<Vec<_>>();
+    let (sender, receiver) = mpsc::channel();
+    let mut running = false;
+    let mut initialized = false;
+    glib::timeout_add_local(Duration::from_millis(500), move || {
+        let (Some(dialog), Some(model)) = (dialog.upgrade(), model.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        let current = || {
+            let model = model.borrow();
+            dialog.is_visible()
+                && model.account_epoch == epoch
+                && !model.logout_pending
+                && session == (online::account_session(), auth::session())
+        };
+        if !current() {
+            return glib::ControlFlow::Break;
+        }
+        if let Ok((current, available)) = receiver.try_recv() {
+            running = false;
+            let changed = *widgets.artifact_states.borrow() != current
+                || *widgets.libraries_available.borrow() != available;
+            *widgets.artifact_states.borrow_mut() = current;
+            *widgets.libraries_available.borrow_mut() = available;
+            if changed || !initialized {
+                refresh_download_selector(&state, &widgets, !initialized);
+                initialized = true;
             }
-            if let Ok((current, available)) = receiver.try_recv() {
-                running = false;
-                let changed = *widgets.artifact_states.borrow() != current
-                    || *widgets.libraries_available.borrow() != available;
-                *widgets.artifact_states.borrow_mut() = current;
-                *widgets.libraries_available.borrow_mut() = available;
-                if changed || !initialized {
-                    refresh_download_selector(&state, &widgets, !initialized);
-                    initialized = true;
+        }
+        // Refresh emits GTK signals; an observer may retire this chooser.
+        if !current() {
+            return glib::ControlFlow::Break;
+        }
+        if !running {
+            let Ok(activity) = crate::profile_reset::begin_activity("checking download choices")
+            else {
+                return glib::ControlFlow::Continue;
+            };
+            let sender = sender.clone();
+            let groups = groups.clone();
+            let available = model
+                .borrow()
+                .library_statuses
+                .iter()
+                .filter(|status| {
+                    matches!(
+                        status.compatibility,
+                        crate::storage::LibraryCompatibility::Compatible
+                    )
+                })
+                .map(|status| status.kind)
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            let probe = archive_poll_tests::POLL_PROBES.with_borrow_mut(|probes| {
+                probes.as_mut().map(|probes| {
+                    probes
+                        .pop_front()
+                        .expect("missing inert archive poll probe")
+                })
+            });
+            running = true;
+            std::thread::spawn(move || {
+                let _activity = activity;
+                #[cfg(test)]
+                if let Some(probe) = &probe {
+                    archive_poll_tests::hold_poll(&probe.before_read);
                 }
-            }
-            if !running {
-                running = true;
-                let sender = sender.clone();
-                let groups = groups.clone();
-                let available = availability_model
-                    .borrow()
-                    .library_statuses
-                    .iter()
-                    .filter(|status| {
-                        matches!(
-                            status.compatibility,
-                            crate::storage::LibraryCompatibility::Compatible
-                        )
-                    })
-                    .map(|status| status.kind)
-                    .collect::<Vec<_>>();
-                std::thread::spawn(move || {
-                    let paths = managed_artifact_paths();
-                    let states = groups
-                        .into_iter()
-                        .map(|group| {
-                            let state = dialog_artifact_state(&group, &paths);
-                            (group.job_id, state)
-                        })
-                        .collect::<HashMap<_, _>>();
-                    let _ = sender.send((states, available));
+                if session != (online::account_session(), auth::session()) {
+                    return;
+                }
+                let paths = managed_artifact_paths();
+                let states = dialog_artifact_states(&groups, &paths, || {
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "Account changed during download inspection"
+                    );
+                    StateStore::open()?.download_jobs()
                 });
-            }
-            glib::ControlFlow::Continue
-        });
-    }
+                #[cfg(test)]
+                if let Some(probe) = &probe {
+                    archive_poll_tests::hold_poll(&probe.before_publish);
+                }
+                if session != (online::account_session(), auth::session()) {
+                    return;
+                }
+                let _ = sender.send((states, available));
+            });
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 fn cached_artifact_state(
@@ -4845,7 +5293,49 @@ pub(super) fn dialog_artifact_state(
     group: &ArtifactGroup,
     managed_paths: &HashSet<ManagedArtifactIdentity>,
 ) -> DialogArtifactState {
-    let refs = group.artifacts.iter().collect::<Vec<_>>();
+    dialog_artifact_state_with(group, managed_paths, || {
+        matching_download_job(&group.artifacts.iter().collect::<Vec<_>>())
+    })
+}
+
+fn dialog_artifact_states(
+    groups: &[ArtifactGroup],
+    managed_paths: &HashSet<ManagedArtifactIdentity>,
+    load_jobs: impl FnOnce() -> anyhow::Result<Vec<DownloadJobRecord>>,
+) -> HashMap<String, DialogArtifactState> {
+    let jobs = std::cell::LazyCell::new(|| {
+        let mut latest = HashMap::<String, DownloadJobRecord>::new();
+        for job in load_jobs().unwrap_or_default() {
+            if job.artifacts.is_empty() {
+                continue;
+            }
+            let identity = download::job_id(&job.artifacts.iter().collect::<Vec<_>>());
+            // max_by_key in matching_download_job keeps the last database row on ties.
+            if latest
+                .get(&identity)
+                .is_none_or(|previous| job.updated_at >= previous.updated_at)
+            {
+                latest.insert(identity, job);
+            }
+        }
+        latest
+    });
+    groups
+        .iter()
+        .map(|group| {
+            let state = dialog_artifact_state_with(group, managed_paths, || {
+                jobs.get(&group.job_id).cloned()
+            });
+            (group.job_id.clone(), state)
+        })
+        .collect()
+}
+
+fn dialog_artifact_state_with(
+    group: &ArtifactGroup,
+    managed_paths: &HashSet<ManagedArtifactIdentity>,
+    matching_job: impl FnOnce() -> Option<DownloadJobRecord>,
+) -> DialogArtifactState {
     if group.artifacts.iter().all(|artifact| {
         let identity = artifact
             .provider_file_id
@@ -4855,7 +5345,7 @@ pub(super) fn dialog_artifact_state(
     }) {
         return DialogArtifactState::Downloaded;
     }
-    let Some(job) = matching_download_job(&refs) else {
+    let Some(job) = matching_job() else {
         return DialogArtifactState::Available;
     };
     if download_job_is_complete(&job) {
@@ -5358,8 +5848,2499 @@ pub(super) struct DetailFileManagement {
 }
 
 #[cfg(test)]
+mod archive_poll_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    type PollBarrier = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
+    pub(super) struct PollProbe {
+        pub(super) before_read: Option<PollBarrier>,
+        pub(super) before_publish: Option<PollBarrier>,
+    }
+
+    thread_local! {
+        pub(super) static POLL_PROBES: RefCell<Option<VecDeque<PollProbe>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn hold_poll(barrier: &Option<PollBarrier>) {
+        if let Some((entered, release)) = barrier {
+            entered.send(()).unwrap();
+            release
+                .recv_timeout(Duration::from_secs(30))
+                .expect("private poll barrier was not released");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires fresh private p403 HOME/all XDG/TMP and GTK; empty synthetic database only"]
+    fn archive_poll_admits_profile_work_and_rejects_retired_results() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p403-"),
+                "{key}"
+            );
+        }
+        let database = crate::identity::database();
+        assert!(!database.exists());
+        assert!(!Config::path().exists());
+        POLL_PROBES.with_borrow_mut(|probes| *probes = Some(VecDeque::new()));
+        gtk::init().unwrap();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn tick_twice() {
+            let complete = Rc::new(std::cell::Cell::new(false));
+            glib::timeout_add_local_once(Duration::from_millis(1100), {
+                let complete = complete.clone();
+                move || complete.set(true)
+            });
+            wait(|| complete.get());
+        }
+        fn wait_for_entry(receiver: &mpsc::Receiver<()>) {
+            let entered = std::cell::Cell::new(false);
+            wait(|| {
+                if receiver.try_recv().is_ok() {
+                    entered.set(true);
+                }
+                entered.get()
+            });
+        }
+        let barrier = || {
+            let (entered, observed) = mpsc::channel();
+            let (release, proceed) = mpsc::channel();
+            ((entered, proceed), observed, release)
+        };
+        let fixture = || {
+            let window = gtk::Window::new();
+            window.set_default_size(600, 400);
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            let group = group(9403001, true);
+            let check = gtk::CheckButton::with_label("Synthetic archive");
+            body.append(&check);
+            let widgets = Rc::new(DownloadDialogWidgets {
+                rows: vec![DownloadDialogRow {
+                    group: group.clone(),
+                    check,
+                    state: DialogArtifactState::Available,
+                }],
+                products: vec![DownloadDialogProduct {
+                    product_id: group.product_id,
+                    slug: "synthetic".into(),
+                    parent_slug: None,
+                    title: "Synthetic".into(),
+                    artwork: None,
+                    groups: vec![group.clone()],
+                    is_primary: true,
+                }],
+                warnings: HashMap::new(),
+                product_content: HashMap::new(),
+                category_expanders: HashMap::new(),
+                plan_boxes: HashMap::new(),
+                product_toggles: HashMap::new(),
+                language_summary: gtk::Label::new(None),
+                summary: gtk::Label::new(None),
+                confirm: gtk::Button::with_label("Add to Download Queue"),
+                authenticated: false,
+                online: false,
+                artifact_states: RefCell::new(HashMap::new()),
+                libraries_available: RefCell::new(Vec::new()),
+            });
+            body.append(&widgets.language_summary);
+            body.append(&widgets.summary);
+            body.append(&widgets.confirm);
+            let state = Rc::new(RefCell::new(DownloadDialogState {
+                selected_products: HashSet::from([group.product_id]),
+                selected_operating_systems: BTreeSet::from(["windows".into()]),
+                selected_languages: BTreeSet::from(["English".into()]),
+                selected_groups: HashSet::from([group.job_id]),
+                include_extras: false,
+                include_patches: false,
+                applying: false,
+            }));
+            let model = Rc::new(RefCell::new(AppModel {
+                network_available: false,
+                library_statuses: vec![crate::storage::LibraryStatus {
+                    kind: LibraryKind::OfflineInstallers,
+                    library_id: "inert-poll-library".into(),
+                    path: crate::identity::data_root().join("never-created-library"),
+                    compatibility: crate::storage::LibraryCompatibility::Compatible,
+                    game_issues: Vec::new(),
+                }],
+                ..AppModel::default()
+            }));
+            window.set_child(Some(&body));
+            window.present();
+            wait(|| widgets.confirm.is_mapped());
+            (window, model, state, widgets)
+        };
+
+        // No readiness/token requirement: each new origin remains usable when signed out.
+        auth::invalidate_session();
+        for change in ["auth", "account"] {
+            let (window, model, state, widgets) = fixture();
+            let (held, entered, release) = barrier();
+            POLL_PROBES.with_borrow_mut(|probes| {
+                probes.as_mut().unwrap().push_back(PollProbe {
+                    before_read: Some(held),
+                    before_publish: None,
+                })
+            });
+            poll_download_selector(&window, &model, state.clone(), widgets.clone());
+            wait_for_entry(&entered);
+            assert!(
+                crate::profile_reset::reserve()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("checking download choices")
+            );
+            if change == "auth" {
+                auth::invalidate_session();
+            } else {
+                online::invalidate_library_session();
+            }
+            release.send(()).unwrap();
+            wait(|| crate::profile_reset::reserve().is_ok());
+            tick_twice();
+            assert!(
+                !database.exists(),
+                "retired raw origin must stop before opening the database"
+            );
+            assert!(widgets.artifact_states.borrow().is_empty());
+            assert_eq!(state.borrow().selected_groups.len(), 1);
+            assert!(!widgets.confirm.is_sensitive());
+            window.destroy();
+        }
+
+        // Refusal consumes no probe; admission registers before the held worker can enter DB.
+        let (window, model, state, widgets) = fixture();
+        let frozen = crate::profile_reset::reserve().unwrap();
+        let (held, entered, release) = barrier();
+        let (published, ready, publish) = barrier();
+        POLL_PROBES.with_borrow_mut(|probes| {
+            probes.as_mut().unwrap().push_back(PollProbe {
+                before_read: Some(held),
+                before_publish: Some(published),
+            })
+        });
+        poll_download_selector(&window, &model, state.clone(), widgets.clone());
+        tick_twice();
+        assert_eq!(
+            POLL_PROBES.with_borrow(|probes| probes.as_ref().unwrap().len()),
+            1
+        );
+        assert!(entered.try_recv().is_err());
+        assert!(!database.exists());
+        drop(frozen);
+        wait_for_entry(&entered);
+        assert!(crate::profile_reset::reserve().is_err());
+        tick_twice(); // A real GTK timer advances while the worker is held across two poll ticks.
+        assert!(POLL_PROBES.with_borrow(|probes| probes.as_ref().unwrap().is_empty()));
+        assert!(!database.exists());
+        release.send(()).unwrap();
+        wait_for_entry(&ready);
+        assert!(database.is_file());
+        assert!(crate::profile_reset::reserve().is_err());
+        assert!(widgets.artifact_states.borrow().is_empty());
+        let selected = state.borrow().selected_groups.clone();
+        // Mutably borrowing the model from a refresh signal must work, and retirement
+        // there must prevent the next worker dispatch in this same timer callback.
+        widgets.summary.set_label("Waiting for current sample");
+        widgets.summary.connect_notify_local(Some("label"), {
+            let model = Rc::downgrade(&model);
+            move |_, _| model.upgrade().unwrap().borrow_mut().account_epoch += 1
+        });
+        publish.send(()).unwrap();
+        wait(|| model.borrow().account_epoch == 1);
+        wait(|| crate::profile_reset::reserve().is_ok());
+        tick_twice();
+        assert!(
+            widgets
+                .artifact_states
+                .borrow()
+                .values()
+                .all(|value| *value == DialogArtifactState::Available)
+        );
+        assert_eq!(widgets.artifact_states.borrow().len(), 1);
+        assert_eq!(state.borrow().selected_groups, selected);
+        assert!(widgets.summary.label().starts_with("1 download"));
+        assert!(!widgets.confirm.is_sensitive());
+        assert!(model.borrow().account_token.is_none());
+        assert!(!auth::session_is_current(auth::session()));
+        window.destroy();
+
+        // Results already read must not mutate a retired chooser. Owner loss is real Rc
+        // collection, distinct from hiding/closing a still-retained window.
+        for change in [
+            "epoch", "logout", "close", "destroy", "owner", "auth", "account",
+        ] {
+            let (window, model, state, widgets) = fixture();
+            let weak_model = Rc::downgrade(&model);
+            let weak_window = window.downgrade();
+            let mut window = Some(window);
+            let mut model = Some(model);
+            let (held, entered, release) = barrier();
+            POLL_PROBES.with_borrow_mut(|probes| {
+                probes.as_mut().unwrap().push_back(PollProbe {
+                    before_read: None,
+                    before_publish: Some(held),
+                })
+            });
+            poll_download_selector(
+                window.as_ref().unwrap(),
+                model.as_ref().unwrap(),
+                state.clone(),
+                widgets.clone(),
+            );
+            wait_for_entry(&entered);
+            let selected = state.borrow().selected_groups.clone();
+            let summary = widgets.summary.label();
+            let sensitive = widgets.confirm.is_sensitive();
+            match change {
+                "epoch" => model.as_ref().unwrap().borrow_mut().account_epoch += 1,
+                "logout" => model.as_ref().unwrap().borrow_mut().logout_pending = true,
+                "close" => window.as_ref().unwrap().close(),
+                "destroy" => window.take().unwrap().destroy(),
+                "owner" => drop(model.take()),
+                "auth" => auth::invalidate_session(),
+                "account" => online::invalidate_library_session(),
+                _ => unreachable!(),
+            }
+            if change == "owner" {
+                assert!(weak_model.upgrade().is_none());
+            }
+            if change == "destroy" {
+                wait(|| weak_window.upgrade().is_none());
+            }
+            tick_twice();
+            assert!(crate::profile_reset::reserve().is_err());
+            release.send(()).unwrap();
+            wait(|| crate::profile_reset::reserve().is_ok());
+            tick_twice();
+            assert!(widgets.artifact_states.borrow().is_empty());
+            assert_eq!(state.borrow().selected_groups, selected);
+            assert_eq!(widgets.summary.label(), summary);
+            assert_eq!(widgets.confirm.is_sensitive(), sensitive);
+            if let Some(window) = window {
+                window.destroy();
+            }
+        }
+        assert!(
+            POLL_PROBES
+                .with_borrow_mut(Option::take)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(crate::profile_reset::reserve().is_ok());
+        assert!(
+            StateStore::open()
+                .unwrap()
+                .download_jobs()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!Config::path().exists());
+    }
+
+    fn group(product_id: i64, provider: bool) -> ArtifactGroup {
+        let artifacts = (1..=2)
+            .map(|part| {
+                serde_json::from_value::<RemoteArtifact>(serde_json::json!({
+                    "product_id": product_id, "kind": "installer", "name": "Fixture",
+                    "operating_system": "windows", "language": "English", "version": "1",
+                    "part_number": part, "part_count": 2, "size_bytes": 10,
+                    "provider_group_id": provider.then_some("group"),
+                    "provider_category": provider.then_some("installer"),
+                    "provider_file_id": provider.then(|| part.to_string()),
+                    "download_path": format!("/synthetic/{product_id}/{part}")
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        download_selection::group_artifacts(&artifacts)
+            .pop()
+            .unwrap()
+    }
+
+    fn job(
+        group: &ArtifactGroup,
+        id: &str,
+        state: DownloadState,
+        updated_at: i64,
+    ) -> DownloadJobRecord {
+        DownloadJobRecord {
+            job_id: id.into(),
+            product_id: group.product_id,
+            title: "Fixture".into(),
+            artifacts: group.artifacts.clone(),
+            state,
+            destination: PathBuf::from("/unused").join(id),
+            bytes_downloaded: 0,
+            total_bytes: Some(20),
+            completed_files: Vec::new(),
+            error: None,
+            status_message: None,
+            queue_position: None,
+            retry_started_at: None,
+            next_retry_at: None,
+            created_at: 0,
+            updated_at,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn batch_job_matching_preserves_artifact_identity_and_last_row_timestamp_ties() {
+        let official = group(11, true);
+        let legacy = group(12, false);
+        let mut revision = official.artifacts.clone();
+        revision[0].download_path.push_str("-new-revision");
+        revision[0].size_bytes = Some(11);
+        let revision = download_selection::group_artifacts(&revision)
+            .pop()
+            .unwrap();
+        let missing = group(13, true);
+        let groups = [official, legacy, revision, missing];
+        let mut legacy_job = job(
+            &groups[1],
+            "legacy-destination-id",
+            DownloadState::Paused,
+            30,
+        );
+        // The existing matcher trusts the artifacts' identity rather than these stored columns.
+        legacy_job.product_id = -1;
+        let mut empty = job(&groups[0], "empty-artifacts", DownloadState::Queued, 999);
+        empty.artifacts.clear();
+        let mut jobs = vec![
+            job(&groups[0], "old-destination", DownloadState::Queued, 10),
+            job(&groups[0], "new-destination", DownloadState::Failed, 20),
+            job(
+                &groups[0],
+                "tied-last-destination",
+                DownloadState::Queued,
+                20,
+            ),
+            legacy_job,
+            job(&groups[2], "revised-destination", DownloadState::Failed, 40),
+            empty,
+        ];
+        for reverse in [false, true] {
+            if reverse {
+                jobs.reverse();
+            }
+            let calls = std::cell::Cell::new(0);
+            let states = dialog_artifact_states(&groups, &HashSet::new(), || {
+                calls.set(calls.get() + 1);
+                Ok(jobs.clone())
+            });
+            assert_eq!(calls.get(), 1);
+            for group in &groups {
+                let expected = jobs
+                    .iter()
+                    .filter(|job| {
+                        !job.artifacts.is_empty()
+                            && download::job_id(&job.artifacts.iter().collect::<Vec<_>>())
+                                == group.job_id
+                    })
+                    .max_by_key(|job| job.updated_at)
+                    .map_or(DialogArtifactState::Available, |job| {
+                        if job.state == DownloadState::Queued {
+                            DialogArtifactState::Busy
+                        } else {
+                            DialogArtifactState::Resumable
+                        }
+                    });
+                assert!(states[&group.job_id] == expected);
+            }
+            assert!(
+                states[&groups[0].job_id]
+                    == if reverse {
+                        DialogArtifactState::Resumable
+                    } else {
+                        DialogArtifactState::Busy
+                    }
+            );
+            assert!(states[&groups[1].job_id] == DialogArtifactState::Resumable);
+            assert!(states[&groups[2].job_id] == DialogArtifactState::Resumable);
+            assert!(states[&groups[3].job_id] == DialogArtifactState::Available);
+        }
+    }
+
+    #[test]
+    fn batch_job_loader_runs_once_and_managed_groups_keep_independent_fallbacks() {
+        let groups = (1..=100)
+            .map(|id| group(id, id % 2 == 0))
+            .collect::<Vec<_>>();
+        let calls = std::cell::Cell::new(0);
+        let states = dialog_artifact_states(&groups, &HashSet::new(), || {
+            calls.set(calls.get() + 1);
+            Ok(vec![job(&groups[0], "queued", DownloadState::Queued, 1)])
+        });
+        assert_eq!(calls.get(), 1);
+        assert!(states[&groups[0].job_id] == DialogArtifactState::Busy);
+        assert_eq!(
+            states
+                .values()
+                .filter(|state| **state == DialogArtifactState::Available)
+                .count(),
+            99
+        );
+        let mut managed = groups
+            .iter()
+            .flat_map(|group| {
+                group.artifacts.iter().map(|artifact| {
+                    (
+                        group.product_id,
+                        artifact
+                            .provider_file_id
+                            .clone()
+                            .unwrap_or_else(|| artifact.download_path.clone()),
+                        artifact.version.clone(),
+                    )
+                })
+            })
+            .collect::<HashSet<_>>();
+        let states = dialog_artifact_states(&groups, &managed, || {
+            panic!("fully managed groups must not read jobs")
+        });
+        assert!(
+            states
+                .values()
+                .all(|state| *state == DialogArtifactState::Downloaded)
+        );
+        let artifact = &groups[1].artifacts[0];
+        managed.remove(&(
+            groups[1].product_id,
+            artifact.provider_file_id.clone().unwrap(),
+            artifact.version.clone(),
+        ));
+        // Wrong-version and download-path entries cannot replace a provider-file identity.
+        managed.insert((
+            groups[1].product_id,
+            artifact.provider_file_id.clone().unwrap(),
+            Some("old".into()),
+        ));
+        managed.insert((
+            groups[1].product_id,
+            artifact.download_path.clone(),
+            artifact.version.clone(),
+        ));
+        let states = dialog_artifact_states(&groups, &managed, || {
+            anyhow::bail!("inert jobs read failure")
+        });
+        assert!(states[&groups[1].job_id] == DialogArtifactState::Available);
+        assert_eq!(
+            states
+                .values()
+                .filter(|state| **state == DialogArtifactState::Downloaded)
+                .count(),
+            99
+        );
+        // Empty managed input is the unchanged managed-read failure fallback; valid jobs still work.
+        let states = dialog_artifact_states(&groups, &HashSet::new(), || {
+            Ok(vec![job(&groups[1], "paused", DownloadState::Paused, 1)])
+        });
+        assert!(states[&groups[1].job_id] == DialogArtifactState::Resumable);
+    }
+
+    #[test]
+    fn batch_completed_jobs_require_existing_files_and_managed_matches_take_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let groups = [group(14, true)];
+        let path = root.path().join("completed.bin");
+        std::fs::write(&path, b"inert downloaded artifact").unwrap();
+        let mut completed = job(&groups[0], "complete", DownloadState::Complete, 1);
+        for files in [
+            vec![path.clone()],
+            vec![path.clone(), root.path().join("missing")],
+            vec![],
+        ] {
+            completed.completed_files = files;
+            let states =
+                dialog_artifact_states(&groups, &HashSet::new(), || Ok(vec![completed.clone()]));
+            assert!(
+                states[&groups[0].job_id]
+                    == if completed.completed_files == [path.clone()] {
+                        DialogArtifactState::Downloaded
+                    } else {
+                        DialogArtifactState::Resumable
+                    }
+            );
+        }
+        let managed = groups[0]
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    14,
+                    artifact.provider_file_id.clone().unwrap(),
+                    artifact.version.clone(),
+                )
+            })
+            .collect();
+        assert!(
+            dialog_artifact_states(&groups, &managed, || Ok(vec![job(
+                &groups[0],
+                "new-failure",
+                DownloadState::Failed,
+                99
+            )]))[&groups[0].job_id]
+                == DialogArtifactState::Downloaded
+        );
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn batch_poll_results_update_existing_rows_without_resetting_selection_or_focus() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p338-")
+            );
+        }
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ArchivePollTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let focus_target = gtk::Entry::new();
+        body.append(&focus_target);
+        let groups = [group(21, true), group(22, false)];
+        let rows = groups
+            .iter()
+            .map(|group| {
+                let check = gtk::CheckButton::with_label(&group.name);
+                body.append(&check);
+                DownloadDialogRow {
+                    group: group.clone(),
+                    check,
+                    state: DialogArtifactState::Available,
+                }
+            })
+            .collect::<Vec<_>>();
+        let plan_boxes = groups
+            .iter()
+            .map(|group| {
+                let plan = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                body.append(&plan);
+                (group.product_id, plan)
+            })
+            .collect();
+        let widgets = Rc::new(DownloadDialogWidgets {
+            rows,
+            products: groups
+                .iter()
+                .map(|group| DownloadDialogProduct {
+                    product_id: group.product_id,
+                    slug: "fixture".into(),
+                    parent_slug: None,
+                    title: "Fixture".into(),
+                    artwork: None,
+                    groups: vec![group.clone()],
+                    is_primary: true,
+                })
+                .collect(),
+            warnings: HashMap::new(),
+            product_content: HashMap::new(),
+            category_expanders: HashMap::new(),
+            plan_boxes,
+            product_toggles: HashMap::new(),
+            language_summary: gtk::Label::new(None),
+            summary: gtk::Label::new(None),
+            confirm: gtk::Button::with_label("Add to Download Queue"),
+            authenticated: true,
+            online: true,
+            artifact_states: RefCell::new(HashMap::new()),
+            libraries_available: RefCell::new(vec![LibraryKind::OfflineInstallers]),
+        });
+        body.append(&widgets.summary);
+        body.append(&widgets.confirm);
+        let state = Rc::new(RefCell::new(DownloadDialogState {
+            selected_products: HashSet::from([21, 22]),
+            selected_operating_systems: BTreeSet::from(["windows".into()]),
+            selected_languages: BTreeSet::from(["English".into()]),
+            selected_groups: HashSet::new(),
+            include_extras: false,
+            include_patches: false,
+            applying: false,
+        }));
+        window.set_content(Some(&body));
+        window.present();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !focus_target.is_mapped() && std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(focus_target.is_mapped() && focus_target.grab_focus());
+        let focus = gtk::prelude::GtkWindowExt::focus(&window);
+        let checks = widgets
+            .rows
+            .iter()
+            .map(|row| row.check.clone())
+            .collect::<Vec<_>>();
+        *widgets.artifact_states.borrow_mut() =
+            dialog_artifact_states(&groups, &HashSet::new(), || Ok(Vec::new()));
+        refresh_download_selector(&state, &widgets, true);
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.is_active() && check.is_sensitive())
+        );
+        assert!(widgets.summary.text().starts_with("2 downloads"));
+        assert!(widgets.confirm.is_sensitive());
+        *widgets.artifact_states.borrow_mut() =
+            dialog_artifact_states(&groups, &HashSet::new(), || {
+                Ok(vec![
+                    job(&groups[0], "queued", DownloadState::Queued, 1),
+                    job(&groups[1], "failed", DownloadState::Failed, 1),
+                ])
+            });
+        refresh_download_selector(&state, &widgets, false);
+        assert!(!checks[0].is_active() && !checks[0].is_sensitive());
+        assert!(checks[1].is_active() && checks[1].is_sensitive());
+        assert_eq!(
+            state.borrow().selected_groups,
+            HashSet::from([groups[1].job_id.clone()])
+        );
+        assert!(widgets.summary.text().starts_with("1 download"));
+        assert!(!widgets.confirm.is_sensitive());
+        let managed = groups[0]
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                (
+                    21,
+                    artifact.provider_file_id.clone().unwrap(),
+                    artifact.version.clone(),
+                )
+            })
+            .collect();
+        *widgets.artifact_states.borrow_mut() = dialog_artifact_states(&groups, &managed, || {
+            Ok(vec![job(&groups[1], "paused", DownloadState::Paused, 2)])
+        });
+        refresh_download_selector(&state, &widgets, false);
+        assert!(!checks[0].is_active() && checks[0].is_sensitive());
+        assert!(checks[1].is_active() && checks[1].is_sensitive());
+        assert!(widgets.confirm.is_sensitive());
+        assert!(
+            widgets.plan_boxes[&21]
+                .first_child()
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+                .contains("already downloaded")
+        );
+        for (row, check) in widgets.rows.iter().zip(checks) {
+            assert_eq!(row.check, check);
+            assert_eq!(check.parent().as_ref(), Some(body.upcast_ref()));
+        }
+        assert_eq!(window.content().as_ref(), Some(body.upcast_ref()));
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), focus);
+        assert!(window.visible_dialog().is_none());
+        window.destroy();
+    }
+}
+
+#[cfg(test)]
 mod installer_version_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "private p370a HOME/all XDG/TMP, GTK and D-Bus; consent layout only, no admission"]
+    fn component_consent_aligns_text_and_keeps_actions_visible() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p370a-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        install_css();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        #[track_caller]
+        fn inside(widget: &gtk::Widget, container: &gtk::Widget) {
+            assert!(widget.is_mapped());
+            let bounds = widget.compute_bounds(container).unwrap();
+            assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+            assert!(bounds.x() >= 0.0 && bounds.y() >= 0.0, "{bounds:?}");
+            assert!(
+                bounds.x() + bounds.width() <= container.width() as f32 + 1.0,
+                "{bounds:?}"
+            );
+            assert!(
+                bounds.y() + bounds.height() <= container.height() as f32 + 1.0,
+                "{bounds:?}"
+            );
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ComponentConsentTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(900)
+            .default_height(400)
+            .build();
+        let original = gtk::Label::new(Some("Original page"));
+        window.set_content(Some(&original));
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let directory = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("inert-game");
+        let installed: crate::domain::InstalledGame = serde_json::from_value(serde_json::json!({
+            "product_id": 9370001, "library_id": "synthetic", "installation_directory": directory,
+            "installer_files": [], "installer_complete": true, "installer_operating_system": "windows",
+            "launch_arguments": [], "state": "installed", "playtime_seconds": 0, "created_at": 0, "updated_at": 0
+        })).unwrap();
+        let authentication = crate::gog::depot_service::DepotSession::new(
+            auth::Token {
+                access_token: "inert-never-used".into(),
+                refresh_token: String::new(),
+                user_id: "synthetic".into(),
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+            },
+            (online::account_session(), auth::session()),
+        )
+        .unwrap();
+        for long in [false, true] {
+            let plan = crate::gog::dependencies::Plan {
+                version: 1,
+                catalog_build: "synthetic".into(),
+                entries: (0..if long { 24 } else { 3 })
+                    .map(|index| crate::gog::dependencies::Dependency {
+                        id: format!("fixture-{index}"),
+                        name: if long {
+                            format!(
+                                "{} FinalComponent{index}",
+                                "LongUnbrokenComponentName".repeat(12)
+                            )
+                        } else {
+                            format!("Fixture component {index}")
+                        },
+                        manifest_id: String::new(),
+                        manifest_bytes: vec![],
+                        method: crate::gog::dependencies::Method::GameFiles,
+                    })
+                    .collect(),
+            };
+            let expected = crate::installation::dependency_setup::describe(&plan);
+            assert!(
+                !plan.entries.is_empty(),
+                "never enter automatic no-review admission"
+            );
+            let operation_id = format!("p370a-inert-{long}");
+            let request = crate::installation::DepotOperationRequest {
+                account_session: online::account_session(),
+                recovery_generation: crate::installation::recovery::generation(
+                    installed.product_id,
+                ),
+                operation_id: operation_id.clone(),
+                product_id: installed.product_id,
+                build_id: "synthetic".into(),
+                branch: None,
+                kind: crate::domain::DepotOperationKind::Repair,
+                sources: vec![],
+                current_sources: vec![],
+                current_manifest_json: None,
+                library_id: "synthetic".into(),
+                dependencies: vec![],
+                dependency_plan: Some(plan),
+                entitlement_dlc: vec![],
+                library_root: directory.parent().unwrap().to_owned(),
+                slug: "inert-game".into(),
+                destination: directory.clone(),
+                staging_path: directory.join("unused-staging"),
+                target_marker: crate::installation::installation_marker_from_game(
+                    &installed,
+                    vec![],
+                ),
+                access_token: "inert-never-used".into(),
+            };
+            let dialog = adw::Dialog::new();
+            let preparing = gtk::Label::new(Some("Checking required components…"));
+            preparing.set_selectable(true);
+            dialog.set_child(Some(&preparing));
+            dialog.present(Some(&window));
+            wait(|| preparing.is_mapped());
+            drop(preparing);
+            confirm_depot_plan(&window, &model, request, authentication.clone(), &dialog);
+            let root = dialog.child().unwrap();
+            let header = find_named_descendant(&root, "component-consent-header").unwrap();
+            let introduction = find_named_descendant(&root, "component-consent-introduction")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let description = find_named_descendant(&root, "component-consent-description")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let scroll = find_named_descendant(&root, "component-consent-description-scroll")
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            let status = find_named_descendant(&root, "component-consent-status")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let status_scroll = find_named_descendant(&root, "component-consent-status-scroll")
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            let buttons = ["cancel", "offline", "confirm"].map(|name| {
+                find_named_descendant(&root, &format!("component-consent-{name}"))
+                    .and_downcast::<gtk::Button>()
+                    .unwrap()
+            });
+            wait(|| {
+                description.is_mapped()
+                    && description.width() > 0
+                    && buttons[2].height() > 0
+                    && root.height() > 0
+            });
+            assert_eq!(
+                (dialog.content_width(), dialog.content_height()),
+                (600, 440)
+            );
+            assert_eq!(dialog.title(), "Required game components");
+            assert_eq!(dialog.focus().as_ref(), Some(buttons[0].upcast_ref()));
+            for (direction, target) in [
+                (gtk::DirectionType::TabForward, 1),
+                (gtk::DirectionType::TabForward, 2),
+                (gtk::DirectionType::TabBackward, 1),
+                (gtk::DirectionType::TabBackward, 0),
+            ] {
+                assert!(window.child_focus(direction));
+                assert_eq!(dialog.focus().as_ref(), Some(buttons[target].upcast_ref()));
+            }
+            assert!(root.height() <= 400 && root.width() <= 600);
+            assert_eq!(description.text(), expected);
+            assert!(description.wraps() && description.is_selectable());
+            assert_eq!(description.ellipsize(), gtk::pango::EllipsizeMode::None);
+            assert_eq!(buttons[0].label().as_deref(), Some("Cancel"));
+            assert_eq!(buttons[1].label().as_deref(), Some("Offline installers…"));
+            assert_eq!(
+                buttons[2].label().as_deref(),
+                Some("Install required components")
+            );
+            for button in &buttons {
+                assert!(button.is_sensitive());
+                inside(button.upcast_ref(), &root);
+            }
+            // Libadwaita gives headerbar a -1px margin on each side for adjoining borders.
+            let header_origin = header
+                .compute_point(&root, &gtk::graphene::Point::new(0.0, 0.0))
+                .unwrap();
+            assert!(header.is_mapped() && header.height() > 0);
+            assert_eq!(header.parent().as_ref(), Some(&root));
+            assert_eq!((header.margin_start(), header.margin_end()), (0, 0));
+            assert!((-1.0..=0.0).contains(&header_origin.x()));
+            let right = header_origin.x() + header.width() as f32;
+            assert!((root.width() as f32..=root.width() as f32 + 1.0).contains(&right));
+            assert!(header_origin.y() >= 0.0);
+            assert!(header_origin.y() + header.height() as f32 <= root.height() as f32);
+            let header_bounds = header.compute_bounds(&root).unwrap();
+            // Pango origins detect centered text even when label bounds appear aligned.
+            let intro_bounds = introduction.compute_bounds(&root).unwrap();
+            let description_bounds = description.compute_bounds(&root).unwrap();
+            let (intro_x, intro_y) = introduction.layout_offsets();
+            let (text_x, text_y) = description.layout_offsets();
+            let intro_extent = introduction.layout().pixel_extents().1;
+            let text_extent = description.layout().pixel_extents().1;
+            assert!(
+                (intro_bounds.x() + intro_x as f32 + intro_extent.x() as f32
+                    - description_bounds.x()
+                    - text_x as f32
+                    - text_extent.x() as f32)
+                    .abs()
+                    <= 1.0
+            );
+            let gap = description_bounds.y() + text_y as f32 + text_extent.y() as f32
+                - (intro_bounds.y()
+                    + intro_y as f32
+                    + intro_extent.y() as f32
+                    + intro_extent.height() as f32);
+            assert!(
+                (8.0..=24.0).contains(&gap),
+                "paragraph-to-component text gap {gap}px"
+            );
+            if long {
+                wait(|| scroll.vadjustment().upper() > scroll.vadjustment().page_size());
+                scroll.vadjustment().set_value(scroll.vadjustment().upper());
+                wait(|| {
+                    description
+                        .compute_bounds(&scroll)
+                        .is_some_and(|bounds| bounds.y() < 0.0)
+                });
+                let bounds = description.compute_bounds(&scroll).unwrap();
+                assert!(bounds.y() + bounds.height() <= scroll.height() as f32 + 1.0);
+                assert!(description.text().contains("FinalComponent23"));
+            } else {
+                inside(description.upcast_ref(), scroll.upcast_ref());
+            }
+            for button in &buttons {
+                inside(button.upcast_ref(), &root);
+            }
+            assert_eq!(header.compute_bounds(&root).unwrap(), header_bounds);
+            // An admission error must coexist with the component list and action row.
+            let error = format!(
+                "{}Final admission error",
+                "Synthetic admission failure detail. ".repeat(90)
+            );
+            status.set_label(&error);
+            wait(|| {
+                status_scroll.vadjustment().upper() > status_scroll.vadjustment().page_size()
+                    && status_scroll.height() > 0
+            });
+            assert!(root.height() <= 400);
+            assert!(scroll.height() >= 32);
+            for button in &buttons {
+                inside(button.upcast_ref(), &root);
+            }
+            assert_eq!(status.text(), error);
+            status_scroll
+                .vadjustment()
+                .set_value(status_scroll.vadjustment().upper());
+            wait(|| {
+                status.compute_bounds(&status_scroll).is_some_and(|bounds| {
+                    bounds.y() < 0.0
+                        && bounds.y() + bounds.height() <= status_scroll.height() as f32 + 1.0
+                })
+            });
+            let bounds = status.compute_bounds(&status_scroll).unwrap();
+            assert!(bounds.y() + bounds.height() <= status_scroll.height() as f32 + 1.0);
+            assert!(dialog.can_close());
+            assert!(crate::installation::depot_operation_snapshot(&operation_id).is_none());
+            assert_eq!(window.content().as_ref(), Some(original.upcast_ref()));
+            // Only Cancel is exercised, never confirmation, navigation or setup.
+            buttons[0].emit_clicked();
+            wait(|| window.visible_dialog().is_none());
+        }
+        assert!(!crate::identity::database().exists());
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG/TMP under /tmp/ludomere-p355-"]
+    fn cached_offline_preparation_preserves_preferences_before_refused_enqueue() {
+        use crate::compatibility::{
+            CompatibilityBackendKind, GameCompatibilityPreferences, UmuProfile, UmuProfileSource,
+        };
+        use crate::domain::GamePreferences;
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p355-"),
+                "{key}"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let library = GameLibrary {
+            id: "selected".into(),
+            name: "Selected".into(),
+            path: root.path().join("games"),
+            default: true,
+        };
+        let store = StateStore::open().unwrap();
+        let session = (online::account_session(), auth::session());
+        let retained = GameCompatibilityPreferences {
+            backend: CompatibilityBackendKind::Umu,
+            prefix_slug: "previous-location".into(),
+            profile: UmuProfile {
+                game_id: "umu-active".into(),
+                store: "gog".into(),
+                source: UmuProfileSource::GogProductId,
+            },
+            pending_profile: Some(UmuProfile {
+                game_id: "umu-pending".into(),
+                store: "gog".into(),
+                source: UmuProfileSource::GogProductId,
+            }),
+        };
+        for (index, (os, saved)) in [
+            ("linux", 2),
+            ("windows", 2),
+            ("linux", 1),
+            ("windows", 1),
+            ("linux", 0),
+            ("windows", 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as i64 + 1;
+            if saved != 0 {
+                store
+                    .upsert_game_preferences(&GamePreferences {
+                        product_id: id,
+                        executable_path: Some("old.exe".into()),
+                        launch_arguments: if saved == 2 {
+                            vec!["--retained".into()]
+                        } else {
+                            vec![]
+                        },
+                        compatibility: (saved == 2).then_some(retained.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            store.preserve_product_activity(id, Some(100), 234).unwrap();
+            let candidate = crate::installation::InstallerCandidate {
+                product_id: id,
+                revision_id: Some(81),
+                version: Some("chosen-version".into()),
+                operating_system: Some(os.into()),
+                language: Some("Polish".into()),
+                paths: vec![root.path().join(if os == "linux" {
+                    "chosen.sh"
+                } else {
+                    "chosen.exe"
+                })],
+                launcher: None,
+                method: if os == "linux" {
+                    crate::installation::InstallationMethod::NativeLinux
+                } else {
+                    crate::installation::InstallationMethod::WindowsCompatibility
+                },
+                total_size: 4,
+                currently_offered: true,
+                complete: true,
+            };
+            // Use the exact constructor and worker called by the cached chooser.
+            let plan = offline_installation_plan(id, &library, "chosen-folder", &candidate);
+            let mut expected = plan.clone();
+            expected.launch_arguments = if saved == 2 {
+                vec!["--retained".into()]
+            } else {
+                vec![]
+            };
+            expected.compatibility = (os == "windows" && saved == 2).then_some(retained.clone());
+            let (captured, capture) = mpsc::channel();
+            let (release, waiting) = mpsc::channel();
+            let result = prepare_cached_offline_installation(
+                plan,
+                true,
+                session,
+                move |plan| -> anyhow::Result<()> {
+                    captured.send(plan)?;
+                    waiting.recv()?;
+                    anyhow::bail!("synthetic enqueue refusal")
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                capture.recv_timeout(Duration::from_secs(5)).unwrap(),
+                expected
+            );
+            assert!(
+                crate::profile_reset::reserve()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("preparing offline installation")
+            );
+            release.send(()).unwrap();
+            assert!(
+                result
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("synthetic enqueue refusal")
+            );
+            assert!(crate::profile_reset::reserve().is_ok());
+            let after = store.game_preferences(id).unwrap().unwrap();
+            assert_eq!(after.launch_arguments, expected.launch_arguments);
+            assert_eq!(
+                after.compatibility,
+                (saved == 2).then_some(retained.clone())
+            );
+            assert_eq!(
+                after.executable_path, None,
+                "old executable must not select the new source launcher"
+            );
+            assert_eq!(store.product_activity(id).unwrap(), (Some(100), 234));
+            assert!(
+                !library.path.exists(),
+                "preparation never creates payloads or prefixes"
+            );
+
+            // Existing repair/DLC plans retain their explicit current choices.
+            expected.launch_arguments = vec!["--current-plan".into()];
+            if let Some(profile) = &mut expected.compatibility {
+                profile.profile.game_id = "umu-current-plan".into();
+            }
+            let result =
+                prepare_cached_offline_installation(expected.clone(), false, session, Ok).unwrap();
+            assert_eq!(
+                result
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+        }
+        let candidate = crate::installation::InstallerCandidate {
+            product_id: 99,
+            revision_id: None,
+            version: None,
+            operating_system: Some("linux".into()),
+            language: None,
+            paths: vec![],
+            launcher: None,
+            method: crate::installation::InstallationMethod::NativeLinux,
+            total_size: 0,
+            currently_offered: false,
+            complete: true,
+        };
+        let plan = offline_installation_plan(99, &library, "new-native", &candidate);
+        let frozen = crate::profile_reset::reserve().unwrap();
+        assert!(
+            prepare_cached_offline_installation(
+                plan.clone(),
+                true,
+                session,
+                |_| -> anyhow::Result<()> { panic!("reset-frozen preparation enqueued") }
+            )
+            .is_err()
+        );
+        drop(frozen);
+        assert!(
+            prepare_cached_offline_installation(
+                plan.clone(),
+                true,
+                (session.0, session.1.wrapping_add(1)),
+                |_| -> anyhow::Result<()> { panic!("stale preparation enqueued") }
+            )
+            .is_err()
+        );
+        assert!(store.game_preferences(99).unwrap().is_none());
+        rusqlite::Connection::open(crate::identity::database())
+            .unwrap()
+            .execute("DROP TABLE game_preferences", [])
+            .unwrap();
+        let result =
+            prepare_cached_offline_installation(plan, true, session, |_| -> anyhow::Result<()> {
+                panic!("failed preference read enqueued")
+            })
+            .unwrap();
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        assert!(crate::profile_reset::reserve().is_ok());
+        assert!(!library.path.exists());
+    }
+
+    #[test]
+    fn library_free_space_checks_never_create_missing_directories() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(install_library_free_space(root.path()).is_ok());
+        for path in [
+            root.path().join("missing"),
+            root.path().join("missing/nested"),
+        ] {
+            assert_eq!(
+                install_library_free_space(&path).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert!(!path.exists());
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        let file = root.path().join("file");
+        std::fs::write(&file, b"inert neighboring file").unwrap();
+        assert_eq!(
+            install_library_free_space(&file).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(root.path(), &link).unwrap();
+        assert_eq!(
+            install_library_free_space(&link).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"inert neighboring file");
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[test]
+    fn setup_failure_summary_preserves_context_and_redacts_diagnostics() {
+        assert_eq!(
+            setup_failure_summary(
+                "Fixture Game\n\nRequired dependency DirectX failed (exit status: 1). Log: /synthetic/install.log\nRepeated diagnostic output"
+            ),
+            "Fixture Game Required dependency DirectX failed (exit status: 1)"
+        );
+        assert_eq!(
+            setup_failure_summary("Fixture: setup failed:\nCannot write prefix registry"),
+            "Fixture: setup failed: Cannot write prefix registry"
+        );
+        let summary = setup_failure_summary(
+            "Request failed access_token=synthetic-secret https://example.invalid/signed?token=secret",
+        );
+        assert!(!summary.contains("synthetic-secret"));
+        assert!(!summary.contains("https://"));
+        assert!(summary.contains("[credential redacted]"));
+        assert!(summary.contains("[URL redacted]"));
+        let summary = setup_failure_summary(&"é".repeat(400));
+        assert_eq!(summary.chars().count(), 321);
+        assert!(summary.ends_with('…'));
+        assert_eq!(
+            setup_failure_summary("\n  "),
+            "Setup could not finish. Review Details before retrying."
+        );
+    }
+
+    fn setup_counter_snapshot(state: &str) -> crate::installation::DepotOperationSnapshot {
+        crate::installation::DepotOperationSnapshot {
+            operation_id: "synthetic-setup-counters".into(),
+            product_id: 1,
+            state: state.into(),
+            bytes_completed: 0,
+            bytes_downloaded: 0,
+            bytes_written: 0,
+            total_write_bytes: 0,
+            total_bytes: 0,
+            download_total_bytes: None,
+            error: None,
+            setup: None,
+        }
+    }
+
+    #[test]
+    fn setup_counters_preserve_actual_values_without_inferred_work() {
+        let mut snapshot = setup_counter_snapshot("complete");
+        snapshot.download_total_bytes = Some(0);
+        snapshot.total_write_bytes = 200;
+        assert_eq!(
+            depot_setup_details(&snapshot),
+            "Stage: complete\nNo Depot file download required.\nPayload data written this run: 0 B\nFull write estimate: 200 B\nExisting files can be reused without rewriting them."
+        );
+        for (state, downloaded, written) in [("materializing", 25, 50), ("complete", 100, 200)] {
+            snapshot.state = state.into();
+            snapshot.bytes_downloaded = downloaded;
+            snapshot.download_total_bytes = Some(100);
+            snapshot.bytes_written = written;
+            assert_eq!(
+                depot_setup_details(&snapshot),
+                format!(
+                    "Stage: {state}\nDepot files downloaded: {downloaded} B / 100 B\nPayload data written this run: {written} B\nFull write estimate: 200 B\nExisting files can be reused without rewriting them."
+                )
+            );
+        }
+        snapshot.download_total_bytes = Some(0);
+        snapshot.total_write_bytes = 0;
+        assert_eq!(
+            depot_setup_details(&snapshot),
+            "Stage: complete\nDepot files downloaded: 100 B\nPayload data written this run: 200 B"
+        );
+        snapshot = setup_counter_snapshot("dependencies");
+        snapshot.bytes_completed = 100;
+        snapshot.total_bytes = 200;
+        // Dependency acquisition also reports verified cached bytes in this field.
+        snapshot.bytes_downloaded = 100;
+        assert_eq!(
+            depot_setup_details(&snapshot),
+            "Stage: dependencies\nComponent data processed: 100 B / 200 B"
+        );
+        snapshot.total_bytes = 0;
+        assert_eq!(
+            depot_setup_details(&snapshot),
+            "Stage: dependencies\nComponent data processed: 100 B"
+        );
+        // Terminal snapshots can retain that count without retaining its origin.
+        for state in ["failed", "interrupted", "paused", "cancelled", "abandoned"] {
+            snapshot.state = state.into();
+            assert_eq!(
+                depot_setup_details(&snapshot),
+                format!("Stage: {state}\nData processed: 100 B")
+            );
+        }
+        snapshot = setup_counter_snapshot("verifying_existing");
+        snapshot.bytes_completed = 50;
+        snapshot.total_bytes = 200;
+        assert_eq!(
+            depot_setup_details(&snapshot),
+            "Stage: verifying existing\nProcessed: 50 B / 200 B"
+        );
+        snapshot = setup_counter_snapshot("downloading");
+        assert_eq!(depot_setup_details(&snapshot), "Stage: downloading");
+        snapshot.download_total_bytes = Some(100);
+        assert_eq!(
+            depot_setup_details(&snapshot),
+            "Stage: downloading\nDepot files downloaded: 0 B / 100 B"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, D-Bus and GTK; synthetic setup results only"]
+    fn setup_outcome_and_close_stay_visible_while_diagnostics_scroll() {
+        assert!(
+            std::env::var("HOME")
+                .unwrap()
+                .starts_with("/tmp/ludomere-p332-")
+        );
+        adw::init().unwrap();
+        fn wait(check: impl Fn() -> bool) {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.SetupFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(800)
+            .default_height(600)
+            .build();
+        let original_page = gtk::Label::new(Some("Original page"));
+        window.set_content(Some(&original_page));
+        window.present();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let error = format!(
+            "Fixture Game\n\nRequired dependency DirectX failed (exit status: 1). Log: /synthetic/install.log\n{}\naccess_token=synthetic-secret https://example.invalid/signed?token=secret\nFinal diagnostic line",
+            "Repeated diagnostic detail with a very long path-like-token/".repeat(150)
+        );
+        for (result, stage) in [
+            (Err(error.clone()), "failed"),
+            (Err(error.clone()), "dependencies"),
+            (Ok(()), "complete"),
+        ] {
+            let dialog = adw::Dialog::builder().content_width(600).build();
+            let failed = result.is_err();
+            let mut snapshot = setup_counter_snapshot(stage);
+            if failed {
+                snapshot.bytes_downloaded = 100;
+                if stage == "dependencies" {
+                    snapshot.bytes_completed = 100;
+                    snapshot.total_bytes = 200;
+                }
+            } else {
+                snapshot.download_total_bytes = Some(0);
+                snapshot.total_write_bytes = 558_300_000;
+            }
+            let counters = depot_setup_details(&snapshot);
+            monitor_setup(
+                &dialog,
+                &model,
+                SetupOperation::Fixture(result, counters.clone()),
+            );
+            // Presentation here is the fixture's direct action, never a worker result.
+            dialog.present(Some(&window));
+            let root = dialog.child().unwrap();
+            let status = find_named_descendant(&root, "setup-status")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let failure = find_named_descendant(&root, "setup-failure-summary")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let scroll = find_named_descendant(&root, "setup-details-scroll")
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            let close = find_named_descendant(&root, "setup-close")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            wait(|| close.is_mapped() && close.label().as_deref() == Some("Close"));
+            // Collapsed expanders retain their child outside the traversable widget tree.
+            let details = scroll
+                .child()
+                .and_downcast::<gtk::Viewport>()
+                .unwrap()
+                .child()
+                .and_downcast::<gtk::Expander>()
+                .unwrap()
+                .child()
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            assert_eq!(dialog.content_height(), 400);
+            assert_eq!(
+                dialog.title(),
+                if failed {
+                    "Setup failed"
+                } else {
+                    "Setup complete"
+                }
+            );
+            assert_eq!(failure.is_visible(), failed);
+            if failed {
+                wait(|| scroll.vadjustment().upper() > scroll.vadjustment().page_size());
+            }
+            assert!(details.text().contains(&counters));
+            assert!(details.is_selectable());
+            assert_eq!(details.ellipsize(), gtk::pango::EllipsizeMode::None);
+            let close_bounds = close.compute_bounds(&root).unwrap();
+            assert!(close_bounds.y() >= 0.0);
+            assert!(close_bounds.y() + close_bounds.height() <= root.height() as f32);
+            assert!(root.height() <= 400);
+            assert!(close.is_sensitive());
+            if failed {
+                assert!(
+                    failure
+                        .text()
+                        .contains("Required dependency DirectX failed")
+                );
+                assert!(!failure.text().contains("Repeated diagnostic"));
+                assert!(!failure.layout().is_ellipsized());
+                assert_eq!(
+                    details.text(),
+                    notifications::failure_message("", &format!(
+                        "Result: {error}\n\nSynthetic setup attempt\n{counters}\n\nRecent stages:\nWaiting to start setup…"
+                    )).trim_start()
+                );
+                let cause_bounds = failure.compute_bounds(&root).unwrap();
+                let status_bounds = status.compute_bounds(&root).unwrap();
+                assert!(cause_bounds.height() > 0.0);
+                assert!(cause_bounds.y() >= 0.0);
+                assert!(
+                    cause_bounds.y() + cause_bounds.height()
+                        <= scroll.compute_bounds(&root).unwrap().y()
+                );
+                scroll.vadjustment().set_value(scroll.vadjustment().upper());
+                wait(|| scroll.vadjustment().value() > 0.0);
+                assert_eq!(failure.compute_bounds(&root).unwrap(), cause_bounds);
+                assert_eq!(status.compute_bounds(&root).unwrap(), status_bounds);
+                assert_eq!(close.compute_bounds(&root).unwrap(), close_bounds);
+            } else {
+                assert_eq!(status.text(), "Game setup completed.");
+                assert!(details.text().starts_with("Result: Game setup completed."));
+            }
+            assert_eq!(window.content().as_ref(), Some(original_page.upcast_ref()));
+            close.emit_clicked();
+            wait(|| window.visible_dialog().is_none());
+        }
+        window.destroy();
+    }
+
+    #[test]
+    fn depot_action_captures_current_token_and_rejects_unavailable_sessions() {
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        assert!(current_depot_session(&model).is_err());
+        model.borrow_mut().account_token = Some(auth::Token {
+            access_token: "first-access".into(),
+            refresh_token: "refresh".into(),
+            user_id: "user".into(),
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+        });
+        let first = current_depot_session(&model).unwrap();
+        model
+            .borrow_mut()
+            .account_token
+            .as_mut()
+            .unwrap()
+            .access_token = "renewed-access".into();
+        assert_eq!(
+            current_depot_session(&model).unwrap().token.access_token,
+            "renewed-access"
+        );
+        assert_eq!(first.token.access_token, "first-access");
+        model.borrow_mut().logout_pending = true;
+        assert!(current_depot_session(&model).is_err());
+        model.borrow_mut().logout_pending = false;
+        model
+            .borrow_mut()
+            .account_token
+            .as_mut()
+            .unwrap()
+            .expires_at = chrono::Utc::now().timestamp();
+        assert!(current_depot_session(&model).is_err());
+        model.borrow_mut().account_token = None;
+        assert!(current_depot_session(&model).is_err());
+    }
+
+    #[test]
+    #[ignore = "private HOME/all XDG/TMP, GTK and D-Bus; actual delayed inspection with synthetic empty libraries"]
+    fn existing_inspection_tracks_activity_and_rejects_stale_requests() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p368-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn delay() -> mpsc::Sender<()> {
+            let (sender, receiver) = mpsc::channel();
+            TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow_mut().push_back(receiver));
+            sender
+        }
+        #[track_caller]
+        fn assert_registered() {
+            let error = crate::profile_reset::reserve().err().unwrap().to_string();
+            assert!(error.contains("inspecting installed game"), "{error}");
+            assert!(TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow().is_empty()));
+        }
+        fn assert_responsive() {
+            let heartbeat = Rc::new(std::cell::Cell::new(false));
+            glib::timeout_add_local_once(Duration::from_millis(100), {
+                let heartbeat = heartbeat.clone();
+                move || heartbeat.set(true)
+            });
+            wait(|| heartbeat.get());
+        }
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var("XDG_DATA_HOME").unwrap()));
+        assert!(
+            !database.exists(),
+            "fixture needs a fresh synthetic profile"
+        );
+        assert!(TEST_DEPOT_INSPECTION_RESULT.with(|result| result.borrow().is_none()));
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.InspectionLifecycleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(640)
+            .default_height(480)
+            .build();
+        let original_page = gtk::Label::new(Some("Original page"));
+        window.set_content(Some(&original_page));
+        window.present();
+        wait(|| window.is_mapped());
+        let model = Rc::new(RefCell::new(AppModel {
+            config: Config {
+                game_libraries: vec![],
+                offline_libraries: vec![],
+                extras_libraries: vec![],
+                ..Config::default()
+            },
+            network_available: false,
+            account_token: None,
+            ..AppModel::default()
+        }));
+        let detail = DetailPageModel::game(
+            Game {
+                product_id: 9368001,
+                slug: "synthetic-inspection".into(),
+                title: "Synthetic inspection".into(),
+                ..Game::default()
+            },
+            false,
+        );
+        let start = || {
+            start_existing_depot_operation_dialog(
+                &window,
+                &model,
+                &detail,
+                crate::domain::DepotOperationKind::Repair,
+                None,
+            );
+        };
+        let message = |dialog: &adw::Dialog| {
+            find_named_descendant(dialog.upcast_ref(), "repair-inspection-message")
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+        };
+
+        // Local inspection needs no authenticated/online account; only generation equality.
+        auth::invalidate_session();
+        assert!(!auth::session_is_current(auth::session()));
+        for invalidate_auth in [true, false] {
+            let epoch = model.borrow().account_epoch;
+            let release = delay();
+            start();
+            let dialog = window.visible_dialog().unwrap();
+            assert_registered();
+            assert_responsive();
+            assert_eq!(message(&dialog).text(), "Checking the installed game…");
+            assert!(!database.exists());
+            if invalidate_auth {
+                auth::invalidate_session();
+            } else {
+                online::invalidate_library_session();
+            }
+            assert_eq!(model.borrow().account_epoch, epoch);
+            wait(|| window.visible_dialog().is_none());
+            assert_registered();
+            release.send(()).unwrap();
+            wait(|| crate::profile_reset::reserve().is_ok());
+            assert_responsive();
+            assert!(!database.exists(), "stale work must stop before DB access");
+            assert!(window.visible_dialog().is_none());
+            assert!(
+                find_named_descendant(dialog.upcast_ref(), "repair-inspection-browse").is_none()
+            );
+            assert_eq!(window.content().as_ref(), Some(original_page.upcast_ref()));
+        }
+
+        let unused = delay();
+        model.borrow_mut().logout_pending = true;
+        start();
+        assert!(window.visible_dialog().is_none());
+        assert_eq!(
+            TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow().len()),
+            1
+        );
+        assert!(crate::profile_reset::reserve().is_ok());
+        TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow_mut().clear());
+        drop(unused);
+        model.borrow_mut().logout_pending = false;
+
+        let frozen = crate::profile_reset::reserve().unwrap();
+        let release = delay();
+        start();
+        let refused = window.visible_dialog().unwrap();
+        wait(|| message(&refused).text().contains("Profile reset"));
+        assert_eq!(
+            TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow().len()),
+            1
+        );
+        assert!(!database.exists());
+        let spinner = find_named_descendant(refused.upcast_ref(), "repair-inspection-spinner")
+            .and_downcast::<gtk::Spinner>()
+            .unwrap();
+        assert!(!spinner.is_spinning() && !spinner.get_visible());
+        let retry = find_named_descendant(refused.upcast_ref(), "repair-inspection-retry")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        assert!(retry.is_sensitive());
+        drop(frozen);
+        retry.emit_clicked();
+        let current = window.visible_dialog().unwrap();
+        assert!(current != refused);
+        assert_registered();
+        assert_responsive();
+        assert!(!database.exists());
+        release.send(()).unwrap();
+        wait(|| {
+            message(&current)
+                .text()
+                .contains("This repair tool checks Galaxy Depot")
+        });
+        wait(|| crate::profile_reset::reserve().is_ok());
+        assert!(database.is_file());
+        assert!(!model.borrow().network_available && model.borrow().account_token.is_none());
+        assert!(!auth::session_is_current(auth::session()));
+        assert!(
+            find_named_descendant(current.upcast_ref(), "repair-review-reinstallation").is_some()
+        );
+        assert!(find_named_descendant(current.upcast_ref(), "repair-inspection-reset").is_some());
+        current.close();
+        wait(|| window.visible_dialog().is_none());
+
+        // This is an actual DB-open/initialization failure, not the P367 injected outcome.
+        let invalid_database = b"deliberately invalid synthetic SQLite database";
+        std::fs::write(&database, invalid_database).unwrap();
+        let release = delay();
+        start();
+        let failed = window.visible_dialog().unwrap();
+        assert_registered();
+        release.send(()).unwrap();
+        wait(|| {
+            message(&failed)
+                .text()
+                .starts_with("Could not inspect the installation:")
+        });
+        wait(|| crate::profile_reset::reserve().is_ok());
+        assert!(find_named_descendant(failed.upcast_ref(), "repair-inspection-retry").is_some());
+        assert_eq!(
+            std::fs::read(&database).unwrap().as_slice(),
+            invalid_database
+        );
+        failed.close();
+        wait(|| window.visible_dialog().is_none());
+
+        let release = delay();
+        start();
+        let closed = window.visible_dialog().unwrap();
+        assert_registered();
+        closed.close();
+        wait(|| window.visible_dialog().is_none());
+        assert_responsive();
+        assert_registered();
+        release.send(()).unwrap();
+        wait(|| crate::profile_reset::reserve().is_ok());
+        assert_responsive();
+        assert!(window.visible_dialog().is_none());
+        assert!(find_named_descendant(closed.upcast_ref(), "repair-inspection-retry").is_none());
+        assert_eq!(window.content().as_ref(), Some(original_page.upcast_ref()));
+        assert!(TEST_DEPOT_INSPECTION_RESULT.with(|result| result.borrow().is_none()));
+        assert!(TEST_DEPOT_INSPECTION_DELAYS.with(|delays| delays.borrow().is_empty()));
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "private HOME/all XDG/TMP, GTK and D-Bus; inert inspection/prepared choices only"]
+    fn repair_inspection_and_reused_chooser_keep_choices_and_controls_visible() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p367-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        install_css();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut found = vec![];
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                found.extend(descendants(&widget));
+                found.push(widget);
+            }
+            found
+        }
+        #[track_caller]
+        fn inside(widget: &gtk::Widget, container: &gtk::Widget) {
+            assert!(widget.is_mapped());
+            let bounds = widget.compute_bounds(container).unwrap();
+            assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+            assert!(bounds.x() >= 0.0 && bounds.y() >= 0.0, "{bounds:?}");
+            assert!(
+                bounds.x() + bounds.width() <= container.width() as f32 + 1.0,
+                "{bounds:?}"
+            );
+            assert!(
+                bounds.y() + bounds.height() <= container.height() as f32 + 1.0,
+                "{bounds:?}"
+            );
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.RepairLayoutTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(900)
+            .default_height(400)
+            .build();
+        let original_page = gtk::Label::new(Some("Original page"));
+        window.set_content(Some(&original_page));
+        window.present();
+        wait(|| window.is_mapped());
+        let config = Config::default();
+        let detail = DetailPageModel::game(
+            Game {
+                product_id: 9367001,
+                slug: "fixture-native".into(),
+                title: "Fixture Native".into(),
+                ..Game::default()
+            },
+            false,
+        );
+        let model = Rc::new(RefCell::new(AppModel {
+            config: config.clone(),
+            ..AppModel::default()
+        }));
+        let long_error = format!(
+            "{}Final inspection cause",
+            "LongDiagnosticToken/".repeat(500)
+        );
+        for (kind, directory, failed) in [
+            (crate::domain::DepotOperationKind::Repair, None, false),
+            (crate::domain::DepotOperationKind::Update, None, false),
+            (
+                crate::domain::DepotOperationKind::Repair,
+                Some(
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap())
+                        .join("synthetic-directory"),
+                ),
+                false,
+            ),
+            (crate::domain::DepotOperationKind::Repair, None, true),
+        ] {
+            TEST_DEPOT_INSPECTION_RESULT.with(|result| {
+                *result.borrow_mut() = Some(if failed {
+                    Err(anyhow::anyhow!(long_error.clone()))
+                } else {
+                    Ok(None)
+                })
+            });
+            start_existing_depot_operation_dialog(
+                &window,
+                &model,
+                &detail,
+                kind,
+                directory.clone(),
+            );
+            let dialog = window.visible_dialog().unwrap();
+            let root = dialog.child().unwrap();
+            let message = find_named_descendant(&root, "repair-inspection-message")
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            let spinner = find_named_descendant(&root, "repair-inspection-spinner")
+                .and_downcast::<gtk::Spinner>()
+                .unwrap();
+            let scroll = find_named_descendant(&root, "repair-inspection-scroll")
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            let header = find_named_descendant(&root, "repair-inspection-header").unwrap();
+            wait(|| !spinner.get_visible() && root.height() >= 330 && scroll.height() > 0);
+            assert!(!spinner.is_spinning());
+            assert_eq!(
+                dialog.title(),
+                if kind == crate::domain::DepotOperationKind::Update {
+                    "Update game"
+                } else {
+                    "Repair game"
+                }
+            );
+            assert!(message.wraps() && message.is_selectable());
+            assert!(
+                root.height() <= 400,
+                "fallback expanded to {}px",
+                root.height()
+            );
+            assert!(window.height() <= 400);
+            let close = descendants(&header)
+                .into_iter()
+                .find(|widget| widget.is::<gtk::Button>() && widget.has_css_class("close"))
+                .unwrap();
+            wait(|| close.is_mapped() && close.width() > 0);
+            inside(&close, &root);
+            let close_bounds = close.compute_bounds(&root).unwrap();
+            let browse = find_named_descendant(&root, "repair-inspection-browse").unwrap();
+            let reset = find_named_descendant(&root, "repair-inspection-reset").unwrap();
+            if failed {
+                assert_eq!(
+                    message.text(),
+                    format!("Could not inspect the installation: {long_error}")
+                );
+                wait(|| scroll.vadjustment().upper() > scroll.vadjustment().page_size());
+                assert!(find_named_descendant(&root, "repair-inspection-retry").is_some());
+                scroll.vadjustment().set_value(scroll.vadjustment().upper());
+                wait(|| {
+                    reset
+                        .compute_bounds(&scroll)
+                        .is_some_and(|b| b.y() + b.height() <= scroll.height() as f32 + 1.0)
+                });
+                assert!(scroll.vadjustment().value() > 0.0);
+                inside(
+                    &find_named_descendant(&root, "repair-inspection-retry").unwrap(),
+                    scroll.upcast_ref(),
+                );
+            } else {
+                assert!(message.text().contains(if directory.is_some() {
+                    "Other installed copies are not changed"
+                } else {
+                    "Nothing has been changed"
+                }));
+                assert!(!message.text().contains("No recognized"));
+                let reinstall =
+                    find_named_descendant(&root, "repair-review-reinstallation").unwrap();
+                assert_eq!(reinstall.get_visible(), directory.is_none());
+                if directory.is_none() {
+                    inside(&reinstall, scroll.upcast_ref());
+                }
+                inside(message.upcast_ref(), scroll.upcast_ref());
+            }
+            for button in [&browse, &reset] {
+                inside(button, scroll.upcast_ref());
+                let bounds = button.compute_bounds(&scroll).unwrap();
+                assert!(bounds.x() >= 18.0);
+                assert!(bounds.x() + bounds.width() <= scroll.width() as f32 - 18.0);
+            }
+            assert_eq!(close.compute_bounds(&root).unwrap(), close_bounds);
+            assert_eq!(window.content().as_ref(), Some(original_page.upcast_ref()));
+            dialog.close();
+            wait(|| window.visible_dialog().is_none());
+        }
+
+        // Reuse an already-mapped inspection-sized dialog, then compare the fresh entry.
+        window.set_default_size(900, 760);
+        wait(|| window.height() >= 700);
+        for reused in [true, false] {
+            let dialog = adw::Dialog::builder()
+                .title("Update game")
+                .content_width(if reused { 420 } else { 680 })
+                .content_height(if reused { 180 } else { 620 })
+                .build();
+            let compact = gtk::Label::new(Some("Inspection complete"));
+            dialog.set_child(Some(&compact));
+            dialog.present(Some(&window));
+            wait(|| compact.is_mapped() && compact.height() > 0);
+            if reused {
+                assert!(compact.height() <= 180);
+            }
+            populate_install_dialog(
+                &dialog,
+                &window,
+                &model,
+                &detail,
+                true,
+                InstallPreparation {
+                    local_only: true,
+                    config: config.clone(),
+                    existing_installation: None,
+                    installed_dlc_ids: HashSet::new(),
+                    candidates: crate::installation::InstallerCandidates {
+                        usable: vec![crate::installation::InstallerCandidate {
+                            product_id: detail.product_id,
+                            revision_id: None,
+                            version: Some("1.2 fixture".into()),
+                            operating_system: Some("linux".into()),
+                            language: Some("English".into()),
+                            paths: vec![],
+                            launcher: None,
+                            method: crate::installation::InstallationMethod::NativeLinux,
+                            total_size: 4,
+                            currently_offered: false,
+                            complete: true,
+                        }],
+                        incomplete: vec![],
+                        preferred: Some(0),
+                    },
+                    dlc_candidates: HashMap::new(),
+                    galaxy_preflight: Ok(()),
+                    galaxy_selection: default_galaxy_selection(&detail, &config, None),
+                    library_statuses: vec![],
+                    remote_installers: vec![],
+                    offline_error: None,
+                },
+            );
+            let root = dialog.child().unwrap();
+            let menu = find_named_descendant(&root, "install-source-menu")
+                .and_downcast::<gtk::MenuButton>()
+                .unwrap();
+            let scroll = find_named_descendant(&root, "install-choices-scroll")
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            let source = descendants(menu.child().unwrap().upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+                .find(|label| label.text() == "linux · English · 1.2 fixture")
+                .unwrap();
+            let cancel = find_named_descendant(&root, "install-cancel")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            let install = find_named_descendant(&root, "install-confirm").unwrap();
+            wait(|| menu.is_mapped() && menu.height() >= 52 && scroll.height() >= 250);
+            assert_eq!(
+                (dialog.content_width(), dialog.content_height()),
+                (680, 620)
+            );
+            assert_eq!(dialog.title(), "Repair game");
+            inside(menu.upcast_ref(), scroll.upcast_ref());
+            inside(source.upcast_ref(), scroll.upcast_ref());
+            let mut ancestor = source.parent();
+            while let Some(widget) = ancestor {
+                if widget.is::<gtk::ScrolledWindow>() {
+                    inside(source.upcast_ref(), &widget);
+                }
+                if widget == root {
+                    break;
+                }
+                ancestor = widget.parent();
+            }
+            for button in [cancel.upcast_ref::<gtk::Widget>(), &install] {
+                inside(button, &root);
+            }
+            // At a smaller parent, the choices remain scrollable and the footer stays reachable.
+            window.set_default_size(900, 400);
+            wait(|| {
+                window.height() <= 400
+                    && root.height() <= 400
+                    && descendants(scroll.upcast_ref())
+                        .into_iter()
+                        .chain(std::iter::once(scroll.clone().upcast()))
+                        .filter_map(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+                        .any(|scroll| {
+                            scroll.vadjustment().page_size() > 0.0
+                                && scroll.vadjustment().upper() > scroll.vadjustment().page_size()
+                        })
+            });
+            for button in [cancel.upcast_ref::<gtk::Widget>(), &install] {
+                inside(button, &root);
+            }
+            let body_scroll = descendants(scroll.upcast_ref())
+                .into_iter()
+                .chain(std::iter::once(scroll.clone().upcast()))
+                .filter_map(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+                .find(|scroll| scroll.vadjustment().upper() > scroll.vadjustment().page_size())
+                .unwrap();
+            body_scroll
+                .vadjustment()
+                .set_value(body_scroll.vadjustment().upper());
+            wait(|| body_scroll.vadjustment().value() > 0.0);
+            for button in [cancel.upcast_ref::<gtk::Widget>(), &install] {
+                inside(button, &root);
+            }
+            assert_eq!(window.content().as_ref(), Some(original_page.upcast_ref()));
+            cancel.emit_clicked();
+            wait(|| window.visible_dialog().is_none());
+            window.set_default_size(900, 760);
+            wait(|| window.height() >= 700);
+        }
+        assert!(!crate::identity::database().exists());
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn install_destinations_and_galaxy_feedback_follow_current_choices() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p346-")
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        install_css();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let libraries = [
+            root.path().join("nested/first-games"),
+            root.path()
+                .join("nested")
+                .join("configured-game-files-with-a-long-path-".repeat(4)),
+            root.path().join("unavailable"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            if index < 2 {
+                std::fs::create_dir_all(&path).unwrap();
+            }
+            GameLibrary {
+                id: index.to_string(),
+                name: format!("Library {index}"),
+                path,
+                default: index == 0,
+            }
+        })
+        .collect::<Vec<_>>();
+        let archive = GameLibrary {
+            id: "archive".into(),
+            name: "Archive".into(),
+            path: root.path().join("offline"),
+            default: true,
+        };
+        std::fs::create_dir(&archive.path).unwrap();
+        let config = Config {
+            game_libraries: libraries.clone(),
+            offline_libraries: vec![archive.clone()],
+            extras_libraries: vec![],
+            installation_source_order: vec![
+                crate::config::PreferredInstallationSource::LinuxOffline,
+                crate::config::PreferredInstallationSource::WindowsOffline,
+                crate::config::PreferredInstallationSource::WindowsGalaxy,
+            ],
+            ..Config::default()
+        };
+        let detail =
+            DetailPageModel::game(
+                Game {
+                    product_id: 9346001,
+                    slug: "fixture-game".into(),
+                    title: "Fixture".into(),
+                    galaxy_builds: vec![serde_json::from_value(serde_json::json!({
+                "build_id":"fixture", "product_id":9346001, "operating_system":"windows",
+                "tags":[], "public":true, "generation":2,
+                "repository_url":"https://invalid.test/unused", "currently_returned":true,
+                "first_seen_at":0, "last_seen_at":0
+            })).unwrap()],
+                    ..Game::default()
+                },
+                false,
+            );
+        let candidates = ["linux", "windows"]
+            .into_iter()
+            .map(|os| crate::installation::InstallerCandidate {
+                product_id: detail.product_id,
+                revision_id: None,
+                version: Some("1".into()),
+                operating_system: Some(os.into()),
+                language: Some("English".into()),
+                paths: vec![archive.path.join(format!("fixture-{os}"))],
+                launcher: None,
+                method: if os == "linux" {
+                    crate::installation::InstallationMethod::NativeLinux
+                } else {
+                    crate::installation::InstallationMethod::WindowsCompatibility
+                },
+                total_size: 4,
+                currently_offered: false,
+                complete: true,
+            })
+            .collect::<Vec<_>>();
+        let remote =
+            download_selection::group_artifacts(&[serde_json::from_value::<RemoteArtifact>(
+                serde_json::json!({
+                    "product_id":detail.product_id, "kind":"installer", "name":"Fixture",
+                    "operating_system":"windows", "language":"English", "version":"1",
+                    "part_number":1, "part_count":1, "provider_group_id":"english",
+                    "provider_file_id":"part", "download_path":"/synthetic/unused"
+                }),
+            )
+            .unwrap()]);
+        let preparation = |existing_installation, galaxy_preflight| InstallPreparation {
+            local_only: false,
+            config: config.clone(),
+            existing_installation,
+            installed_dlc_ids: HashSet::new(),
+            candidates: crate::installation::InstallerCandidates {
+                usable: candidates.clone(),
+                incomplete: vec![],
+                preferred: Some(0),
+            },
+            dlc_candidates: HashMap::new(),
+            galaxy_preflight,
+            galaxy_selection: default_galaxy_selection(&detail, &config, None),
+            library_statuses: libraries
+                .iter()
+                .map(|library| crate::storage::LibraryStatus {
+                    kind: LibraryKind::GameFiles,
+                    library_id: library.id.clone(),
+                    path: library.path.clone(),
+                    compatibility: if library.id == "2" {
+                        crate::storage::LibraryCompatibility::Unavailable(
+                            "Synthetic unavailable library".into(),
+                        )
+                    } else {
+                        crate::storage::LibraryCompatibility::Compatible
+                    },
+                    game_issues: vec![],
+                })
+                .chain(std::iter::once(crate::storage::LibraryStatus {
+                    kind: LibraryKind::OfflineInstallers,
+                    library_id: archive.id.clone(),
+                    path: archive.path.clone(),
+                    compatibility: crate::storage::LibraryCompatibility::Compatible,
+                    game_issues: vec![],
+                }))
+                .collect(),
+            remote_installers: remote.clone(),
+            offline_error: None,
+        };
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ChooserFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(900)
+            .default_height(760)
+            .build();
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.set_content(Some(&page));
+        window.present();
+        // No token or model game: cached source choices cannot start metadata requests.
+        let model = Rc::new(RefCell::new(AppModel {
+            config: config.clone(),
+            ..AppModel::default()
+        }));
+        let dialog = adw::Dialog::builder()
+            .content_width(680)
+            .content_height(620)
+            .build();
+        populate_install_dialog(
+            &dialog,
+            &window,
+            &model,
+            &detail,
+            false,
+            preparation(None, Ok(())),
+        );
+        dialog.present(Some(&window));
+        wait(|| dialog.is_mapped());
+        let destination = find_named_descendant(dialog.upcast_ref(), "install-destination")
+            .and_downcast::<adw::ActionRow>()
+            .unwrap();
+        let choices = find_named_descendant(dialog.upcast_ref(), "install-game-libraries")
+            .and_downcast::<gtk::ListBox>()
+            .unwrap();
+        let menu = find_named_descendant(dialog.upcast_ref(), "install-source-menu")
+            .and_downcast::<gtk::MenuButton>()
+            .unwrap();
+        let install = find_named_descendant(dialog.upcast_ref(), "install-confirm")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let feedback = find_named_descendant(dialog.upcast_ref(), "install-galaxy-feedback")
+            .and_downcast::<gtk::Box>()
+            .unwrap();
+        let preflight = find_named_descendant(dialog.upcast_ref(), "install-galaxy-preflight")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let galaxy_status = find_named_descendant(dialog.upcast_ref(), "install-galaxy-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let status = find_named_descendant(dialog.upcast_ref(), "install-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let scroll = find_named_descendant(dialog.upcast_ref(), "install-status-scroll")
+            .and_downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        wait(|| destination.is_mapped() && destination.width() > 0);
+        assert!(destination.is_mapped());
+        assert_eq!(
+            destination.subtitle().unwrap(),
+            libraries[0].path.join(&detail.slug).display().to_string()
+        );
+        for (index, library) in libraries.iter().enumerate() {
+            let content = choices.row_at_index(index as i32).unwrap().child().unwrap();
+            let label = content
+                .first_child()
+                .unwrap()
+                .next_sibling()
+                .and_downcast::<gtk::Label>()
+                .unwrap();
+            assert_eq!(label.text(), library.path.display().to_string());
+            assert!(label.wraps());
+        }
+        assert!(!choices.row_at_index(2).unwrap().is_sensitive());
+        assert!(!feedback.is_mapped() && !scroll.is_mapped());
+        assert!(install.is_sensitive());
+        choices.select_row(choices.row_at_index(1).as_ref());
+        assert_eq!(
+            destination.subtitle().unwrap(),
+            libraries[1].path.join(&detail.slug).display().to_string()
+        );
+        let choose = |index| {
+            let button = find_named_descendant(
+                menu.popover().unwrap().upcast_ref(),
+                &format!("install-source-{index}"),
+            )
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+            assert!(button.is_sensitive());
+            button.emit_clicked();
+        };
+        // Local Linux, local Windows, remote Windows, then Depot, in configured order.
+        for index in 0..4 {
+            choose(index);
+            assert_eq!(
+                destination.subtitle().unwrap(),
+                libraries[1].path.join(&detail.slug).display().to_string()
+            );
+            assert_eq!(install.is_sensitive(), index != 2); // remote needs a signed-in account
+        }
+        preflight.set_label("Synthetic Galaxy metadata failure");
+        preflight.set_visible(true);
+        galaxy_status.set_label("Synthetic Galaxy preparation failure");
+        wait(|| feedback.is_mapped() && galaxy_status.is_mapped() && scroll.is_mapped());
+        choose(0);
+        wait(|| !feedback.is_mapped() && !galaxy_status.is_mapped() && !scroll.is_mapped());
+        assert!(menu.grab_focus());
+        let focus = gtk::prelude::GtkWindowExt::focus(&window);
+        let generation = model.borrow().detail_generation;
+        // The production notify wiring must keep a late Galaxy update hidden offline.
+        galaxy_status.set_label("Late synthetic Galaxy preparation failure");
+        preflight.set_label("Late synthetic Galaxy metadata failure");
+        assert!(!feedback.is_visible() && !galaxy_status.is_visible() && !scroll.is_visible());
+        assert!(install.is_sensitive());
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), focus);
+        assert_eq!(model.borrow().detail_generation, generation);
+        status.set_label("Synthetic offline failure");
+        wait(|| status.is_mapped() && scroll.is_mapped());
+        assert!(!galaxy_status.is_mapped());
+        status.set_label("");
+        choose(3);
+        wait(|| galaxy_status.is_mapped() && feedback.is_mapped());
+        assert_eq!(
+            galaxy_status.text(),
+            "Late synthetic Galaxy preparation failure"
+        );
+        assert_eq!(preflight.text(), "Late synthetic Galaxy metadata failure");
+        let content = dialog.child().unwrap();
+        wait(|| destination.width() > 0);
+        assert!(
+            content.width() <= 680,
+            "long paths must not widen the chooser"
+        );
+        assert!(destination.width() <= content.width());
+        assert_eq!(window.content().as_ref(), Some(page.upcast_ref()));
+        dialog.close();
+        wait(|| window.visible_dialog().is_none());
+
+        let installed = crate::domain::InstalledGame {
+            product_id: detail.product_id,
+            library_id: libraries[1].id.clone(),
+            installed_version: Some("1".into()),
+            installation_directory: libraries[1].path.join("actual-existing-folder"),
+            installer_revision_id: None,
+            installer_job_id: None,
+            installer_files: candidates[0].paths.clone(),
+            installer_complete: true,
+            installer_operating_system: Some("linux".into()),
+            installer_language: Some("English".into()),
+            compatibility: None,
+            primary_executable: None,
+            launch_arguments: vec![],
+            state: crate::domain::InstallationState::Installed,
+            error: None,
+            installed_at: None,
+            verified_at: None,
+            last_played_at: None,
+            playtime_seconds: 0,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let dialog = adw::Dialog::builder()
+            .content_width(680)
+            .content_height(620)
+            .build();
+        populate_install_dialog(
+            &dialog,
+            &window,
+            &model,
+            &detail,
+            true,
+            preparation(
+                Some(installed.clone()),
+                Err("Synthetic unavailable Galaxy metadata".into()),
+            ),
+        );
+        dialog.present(Some(&window));
+        wait(|| dialog.is_mapped());
+        let destination = find_named_descendant(dialog.upcast_ref(), "install-destination")
+            .and_downcast::<adw::ActionRow>()
+            .unwrap();
+        wait(|| destination.is_mapped() && destination.width() > 0);
+        let choices = find_named_descendant(dialog.upcast_ref(), "install-game-libraries")
+            .and_downcast::<gtk::ListBox>()
+            .unwrap();
+        assert_eq!(
+            destination.subtitle().unwrap(),
+            installed.installation_directory.display().to_string()
+        );
+        choices.select_row(choices.row_at_index(0).as_ref());
+        assert_eq!(choices.selected_row(), choices.row_at_index(1));
+        assert_eq!(
+            destination.subtitle().unwrap(),
+            installed.installation_directory.display().to_string()
+        );
+        assert!(
+            !find_named_descendant(dialog.upcast_ref(), "install-galaxy-feedback")
+                .unwrap()
+                .is_mapped()
+        );
+        assert!(
+            find_named_descendant(dialog.upcast_ref(), "install-confirm")
+                .unwrap()
+                .is_sensitive()
+        );
+        dialog.close();
+        wait(|| window.visible_dialog().is_none());
+        window.destroy();
+    }
 
     #[test]
     #[ignore = "private HOME/all XDG, D-Bus and GTK; captures queues without downloads or helpers"]
@@ -5470,7 +8451,6 @@ mod installer_version_tests {
                     preferred: Some(0),
                 },
                 dlc_candidates: HashMap::new(),
-                mount_points: vec!["fixture".into()],
                 galaxy_preflight: Ok(()),
                 galaxy_selection: default_galaxy_selection(&detail, &config, None),
                 library_statuses: crate::storage::inspect_libraries(&config).unwrap(),

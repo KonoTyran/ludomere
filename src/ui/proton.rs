@@ -779,7 +779,7 @@ pub(super) fn acquisition_group_guarded(
     if matches!(scope, ComponentScope::Runtime) {
         group.add(&controls);
     }
-    let cancel = gtk::Button::with_label("Cancel download");
+    let cancel = gtk::Button::with_label("Cancel");
     cancel.set_halign(gtk::Align::Start);
     cancel.set_visible(false);
     group.add(&cancel);
@@ -1034,6 +1034,14 @@ pub(super) fn compatibility_message(error: &compatibility::CompatibilityFailure)
     }
 }
 
+#[cfg(test)]
+type TestWindowsCheck = mpsc::Receiver<compatibility::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WINDOWS_CHECKS: RefCell<Option<VecDeque<TestWindowsCheck>>> = const { RefCell::new(None) };
+}
+
 pub(super) fn with_windows_components(
     window: &adw::ApplicationWindow,
     product_id: i64,
@@ -1042,14 +1050,52 @@ pub(super) fn with_windows_components(
     ready: impl FnOnce() + 'static,
 ) -> Rc<std::cell::Cell<bool>> {
     let pending = Rc::new(std::cell::Cell::new(true));
-    if let Some(status) = find_named_descendant(window.upcast_ref(), "application-status-message")
-        .and_downcast::<gtk::Label>()
-    {
-        status.set_label("Checking Windows requirements…");
-    }
+    let progress = find_named_descendant(window.upcast_ref(), "windows-requirements-progress")
+        .and_downcast::<gtk::Box>()
+        .map(|slot| {
+            if let Some(previous) = slot.last_child() {
+                previous.set_visible(false);
+            }
+            let label = gtk::Label::builder()
+                .name("windows-requirements-pending")
+                .label("Checking Windows requirements…")
+                .xalign(0.0)
+                .max_width_chars(24)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            slot.append(&label);
+            slot.set_visible(true);
+            (slot.downgrade(), label.downgrade())
+        });
+    let clear_progress = move || {
+        if let Some((slot, label)) = &progress
+            && let (Some(slot), Some(label)) = (slot.upgrade(), label.upgrade())
+            && label.parent().as_ref() == Some(slot.upcast_ref())
+        {
+            slot.remove(&label);
+            if let Some(remaining) = slot.last_child() {
+                remaining.set_visible(true);
+            }
+            slot.set_visible(slot.first_child().is_some());
+        }
+    };
     let (sender, receiver) = mpsc::channel();
     let session = online::account_session();
+    #[cfg(test)]
+    let fixture = TEST_WINDOWS_CHECKS.with(|checks| {
+        checks
+            .borrow_mut()
+            .as_mut()
+            .map(|checks| checks.pop_front().expect("missing inert Windows check"))
+    });
     std::thread::spawn(move || {
+        #[cfg(test)]
+        if let Some(fixture) = fixture {
+            if let Ok(result) = fixture.recv_timeout(Duration::from_secs(10)) {
+                let _ = sender.send(result);
+            }
+            return;
+        }
         let result = if uninstall_directory.as_ref().is_some_and(|path| {
             crate::installation::load_installation_marker(path)
                 .ok()
@@ -1070,10 +1116,12 @@ pub(super) fn with_windows_components(
     glib::timeout_add_local(Duration::from_millis(50), move || {
         if online::account_session() != session {
             waiting.set(false);
+            clear_progress();
             return glib::ControlFlow::Break;
         }
         let Some(window) = window.upgrade() else {
             waiting.set(false);
+            clear_progress();
             return glib::ControlFlow::Break;
         };
         let result = match receiver.try_recv() {
@@ -1082,15 +1130,9 @@ pub(super) fn with_windows_components(
             Err(_) => Err("Windows check stopped. Use Finish setup to check again.".into()),
         };
         waiting.set(false);
+        clear_progress();
         match result {
             Ok(()) => {
-                if let Some(status) =
-                    find_named_descendant(window.upcast_ref(), "application-status-message")
-                        .and_downcast::<gtk::Label>()
-                    && status.label() == "Checking Windows requirements…"
-                {
-                    status.set_label("Ready");
-                }
                 if let Some(action) = ready.take() {
                     action();
                 }
@@ -1564,6 +1606,317 @@ pub(super) fn connect_windows_action(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[ignore = "private p373 HOME/all XDG/TMP, GTK and D-Bus; inert checks only"]
+    fn windows_checks_keep_owned_progress_out_of_notification_history() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p373-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        install_css();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn queue() -> mpsc::Sender<compatibility::Result<()>> {
+            let (send, receive) = mpsc::channel();
+            TEST_WINDOWS_CHECKS
+                .with(|checks| checks.borrow_mut().as_mut().unwrap().push_back(receive));
+            send
+        }
+        fn children(slot: &gtk::Box) -> Vec<gtk::Widget> {
+            let mut children = Vec::new();
+            let mut child = slot.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                children.push(widget);
+            }
+            children
+        }
+        fn history(w: &Widgets) -> Vec<String> {
+            find_named_descendant(w.window.upcast_ref(), "footer-notifications")
+                .and_downcast::<gtk::Button>()
+                .unwrap()
+                .emit_clicked();
+            wait(|| w.window.visible_dialog().is_some());
+            let dialog = w.window.visible_dialog().unwrap();
+            let list = find_named_descendant(dialog.upcast_ref(), "notification-history")
+                .and_downcast::<gtk::Box>()
+                .unwrap();
+            let result = children(&list)
+                .into_iter()
+                .map(|row| {
+                    row.first_child()
+                        .unwrap()
+                        .downcast::<gtk::Label>()
+                        .unwrap()
+                        .text()
+                        .to_string()
+                })
+                .collect();
+            dialog.close();
+            wait(|| w.window.visible_dialog().is_none());
+            result
+        }
+        fn inside(widget: &gtk::Widget, window: &adw::ApplicationWindow) {
+            assert!(widget.is_mapped() && widget.width() > 0 && widget.height() > 0);
+            let point = widget
+                .compute_point(window, &gtk::graphene::Point::new(0.0, 0.0))
+                .unwrap();
+            assert!(point.x() >= 0.0 && point.y() >= 0.0);
+            assert!(point.x() + widget.width() as f32 <= window.width() as f32 + 1.0);
+            assert!(point.y() + widget.height() as f32 <= window.height() as f32 + 1.0);
+        }
+        TEST_WINDOWS_CHECKS.with(|checks| *checks.borrow_mut() = Some(VecDeque::new()));
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.WindowsFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let w = window::create_widgets(
+            &app,
+            &Config {
+                window_width: 1100,
+                window_height: 600,
+                window_maximized: false,
+                ..Default::default()
+            },
+        );
+        w.finish_setup.set_visible(false);
+        let slot = find_named_descendant(w.window.upcast_ref(), "windows-requirements-progress")
+            .and_downcast::<gtk::Box>()
+            .unwrap();
+        show_status(&w, "Existing terminal result");
+        show_progress(&w, "Existing download progress");
+        w.download_status_progress.set_visible(true);
+        w.download_status_progress.set_fraction(0.4);
+        w.window.present();
+        wait(|| w.live_status.is_mapped() && w.status_bar.height() > 0);
+        assert!(!slot.get_visible() && slot.first_child().is_none());
+        let baseline = w.status_bar.height();
+        let page = w.content.visible_child_name();
+        assert!(w.search.grab_focus());
+        let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
+        assert!(focus.is_some());
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let completed = calls.clone();
+        let release = queue();
+        let pending = with_windows_components(&w.window, 9373001, true, None, move || {
+            completed.set(completed.get() + 1)
+        });
+        wait(|| slot.is_mapped() && w.status_bar.height() > baseline);
+        assert!(pending.get());
+        assert_eq!(children(&slot).len(), 1);
+        assert_eq!(w.status.label(), "Existing terminal result");
+        assert_eq!(w.live_status.label(), "Existing download progress");
+        let heartbeat = Rc::new(std::cell::Cell::new(false));
+        glib::timeout_add_local_once(Duration::from_millis(100), {
+            let heartbeat = heartbeat.clone();
+            move || heartbeat.set(true)
+        });
+        wait(|| heartbeat.get());
+        assert!(pending.get());
+        assert_eq!(w.content.visible_child_name(), page);
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focus);
+        assert!(w.window.visible_dialog().is_none());
+        for widget in [
+            slot.last_child().unwrap(),
+            w.live_status.clone().upcast(),
+            w.status.clone().upcast(),
+            w.download_status_progress.clone().upcast(),
+            find_named_descendant(w.window.upcast_ref(), "footer-notifications").unwrap(),
+            find_named_descendant(w.window.upcast_ref(), "footer-downloads").unwrap(),
+        ] {
+            inside(&widget, &w.window);
+        }
+        let checking = slot.last_child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert_eq!(checking.text(), "Checking Windows requirements…");
+        let extent = checking.layout().pixel_extents().1;
+        let (x, y) = checking.layout_offsets();
+        assert!(extent.width() > 0 && extent.height() > 0);
+        assert!(x + extent.x() < checking.width() && x + extent.x() + extent.width() > 0);
+        assert!(y + extent.y() < checking.height() && y + extent.y() + extent.height() > 0);
+        assert_eq!(history(&w), ["Existing terminal result"]);
+        show_progress(&w, "Newer unrelated progress");
+        release.send(Ok(())).unwrap();
+        wait(|| !pending.get() && w.status_bar.height() == baseline);
+        assert_eq!(calls.get(), 1);
+        assert!(slot.first_child().is_none() && !slot.get_visible());
+        assert_eq!(history(&w), ["Existing terminal result"]);
+        assert_eq!(w.live_status.label(), "Newer unrelated progress");
+        assert!(w.live_status.get_visible());
+        drop(checking);
+
+        // Either completion order must leave the other identical check visible.
+        for newest_first in [false, true] {
+            let a = queue();
+            let b = queue();
+            let first = with_windows_components(&w.window, 9373001, true, None, || {});
+            let second = with_windows_components(&w.window, 9373001, true, None, || {});
+            assert_eq!(children(&slot).len(), 2);
+            assert_eq!(
+                children(&slot)
+                    .iter()
+                    .filter(|child| child.get_visible())
+                    .count(),
+                1
+            );
+            if newest_first {
+                b.send(Ok(())).unwrap();
+            } else {
+                a.send(Ok(())).unwrap();
+            }
+            wait(|| children(&slot).len() == 1);
+            assert!(slot.get_visible() && slot.last_child().unwrap().get_visible());
+            assert_eq!((first.get(), second.get()), (newest_first, !newest_first));
+            if newest_first {
+                a.send(Ok(())).unwrap();
+            } else {
+                b.send(Ok(())).unwrap();
+            }
+            wait(|| !first.get() && !second.get());
+            assert!(slot.first_child().is_none() && !slot.get_visible());
+        }
+
+        // Old cleanup finishes before ready begins another request.
+        let first = queue();
+        let second = queue();
+        let next = Rc::new(RefCell::new(None));
+        let next_request = next.clone();
+        let weak_window = w.window.downgrade();
+        let pending = with_windows_components(&w.window, 9373001, true, None, move || {
+            *next_request.borrow_mut() = Some(with_windows_components(
+                &weak_window.upgrade().unwrap(),
+                9373002,
+                true,
+                None,
+                || {},
+            ));
+        });
+        first.send(Ok(())).unwrap();
+        wait(|| !pending.get() && next.borrow().is_some());
+        assert_eq!(children(&slot).len(), 1);
+        assert!(next.borrow().as_ref().unwrap().get());
+        assert!(slot.get_visible());
+        second.send(Ok(())).unwrap();
+        wait(|| !next.borrow().as_ref().unwrap().get());
+        assert!(slot.first_child().is_none());
+
+        for disconnected in [false, true] {
+            let release = queue();
+            let pending = with_windows_components(&w.window, 9373003, true, None, || {
+                panic!("failed check cannot continue")
+            });
+            if !disconnected {
+                release
+                    .send(Err(compatibility::CompatibilityFailure::RuntimeMissing(
+                        "Synthetic runtime".into(),
+                    )))
+                    .unwrap();
+            }
+            drop(release);
+            wait(|| !pending.get());
+            assert!(slot.first_child().is_none() && !slot.get_visible());
+            if disconnected {
+                assert_eq!(
+                    w.status.label(),
+                    "Windows check stopped. Use Finish setup to check again."
+                );
+            } else {
+                assert!(w.status.label().contains("Synthetic runtime"));
+            }
+            assert!(w.finish_setup.get_visible());
+            assert_eq!(
+                w.finish_setup.action_target_value().unwrap().get::<i64>(),
+                Some(9373003)
+            );
+            assert_eq!(
+                w.status.tooltip_text().as_deref(),
+                Some(w.status.label().as_str())
+            );
+            assert_eq!(history(&w).first().unwrap(), w.status.label().as_str());
+            assert_eq!(w.live_status.label(), "Newer unrelated progress");
+            assert!(w.live_status.get_visible());
+        }
+
+        let release = queue();
+        let before = history(&w);
+        let pending = with_windows_components(&w.window, 9373001, true, None, || {
+            panic!("stale check cannot continue")
+        });
+        online::invalidate_library_session();
+        wait(|| !pending.get());
+        let _ = release.send(Err(compatibility::CompatibilityFailure::ProtonMissing));
+        assert!(slot.first_child().is_none() && !slot.get_visible());
+        assert_eq!(history(&w), before);
+        assert_eq!(w.live_status.label(), "Newer unrelated progress");
+
+        // The feedback slot is optional, never backend eligibility.
+        let minimal = adw::ApplicationWindow::new(&app);
+        let release = queue();
+        let called = calls.clone();
+        let pending = with_windows_components(&minimal, 9373001, true, None, move || {
+            called.set(called.get() + 1)
+        });
+        release.send(Ok(())).unwrap();
+        wait(|| !pending.get());
+        assert_eq!(calls.get(), 2);
+        minimal.destroy();
+
+        // The worker and newly added receiver ownership do not retain a released window.
+        let disposable = adw::ApplicationWindow::new(&app);
+        let owned_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        owned_slot.set_widget_name("windows-requirements-progress");
+        disposable.set_content(Some(&owned_slot));
+        let release = queue();
+        let pending = with_windows_components(&disposable, 9373001, true, None, || {
+            panic!("destroyed window cannot continue")
+        });
+        let weak_label = owned_slot.last_child().unwrap().downgrade();
+        let weak_slot = owned_slot.downgrade();
+        let weak_window = disposable.downgrade();
+        disposable.destroy();
+        drop(owned_slot);
+        drop(disposable);
+        wait(|| {
+            weak_window.upgrade().is_none()
+                && weak_slot.upgrade().is_none()
+                && weak_label.upgrade().is_none()
+                && !pending.get()
+        });
+        let _ = release.send(Ok(()));
+
+        // Identical wording explicitly published elsewhere remains a legitimate notification.
+        show_status(&w, "Checking Windows requirements…");
+        show_status(&w, "Ready");
+        let messages = history(&w);
+        assert_eq!(&messages[..2], ["Ready", "Checking Windows requirements…"]);
+        assert!(!crate::identity::database().exists());
+        TEST_WINDOWS_CHECKS.with(|checks| assert!(checks.borrow_mut().take().unwrap().is_empty()));
+        w.window.destroy();
+    }
 
     #[test]
     #[ignore = "requires private HOME/all XDG, private D-Bus and Xvfb"]

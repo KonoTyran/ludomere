@@ -155,7 +155,7 @@ struct DepotManagerState {
     snapshot_sequence: HashMap<String, u64>,
     next_snapshot_sequence: u64,
     last_event_at: HashMap<String, std::time::Instant>,
-    abandon_requested: std::collections::HashSet<String>,
+    abandon_requested: HashMap<String, (u64, crate::profile_reset::ActivityGuard)>,
     subscribers: Vec<mpsc::Sender<DepotManagerEvent>>,
     shutting_down: bool,
     paused_for_sign_out: bool,
@@ -507,6 +507,7 @@ fn depot_state_is_active(state: &str) -> bool {
             | "extracting"
             | "committing"
             | "finalizing"
+            | "cancelling"
     )
 }
 
@@ -615,6 +616,12 @@ fn enqueue_depot_operation_with(
             .iter()
             .any(|queued| queued.product_id() == request.product_id);
     if manager.active.contains_key(&request.operation_id)
+        || manager.abandon_requested.keys().any(|operation| {
+            manager
+                .snapshots
+                .get(operation)
+                .is_some_and(|snapshot| snapshot.product_id == request.product_id)
+        })
         || manager
             .reservations
             .values()
@@ -642,6 +649,16 @@ fn enqueue_depot_operation_with(
     drop(manager);
     if persist(&request).is_err() {
         let mut manager = DEPOT_MANAGER.lock().unwrap();
+        if manager
+            .abandon_requested
+            .contains_key(&request.operation_id)
+        {
+            drop(manager);
+            thread::spawn(move || {
+                finish_depot_abandon(&request.operation_id, &request.access_token)
+            });
+            return false;
+        }
         manager.active.remove(&request.operation_id);
         manager.reservations.remove(&request.operation_id);
         manager.abandon_requested.remove(&request.operation_id);
@@ -667,6 +684,9 @@ fn enqueue_depot_operation_with(
 
 pub fn cancel_depot_operation(operation_id: &str) -> bool {
     let manager = DEPOT_MANAGER.lock().unwrap();
+    if manager.abandon_requested.contains_key(operation_id) {
+        return false;
+    }
     let Some(cancelled) = manager.active.get(operation_id) else {
         return false;
     };
@@ -675,15 +695,55 @@ pub fn cancel_depot_operation(operation_id: &str) -> bool {
 }
 
 pub fn abandon_depot_operation(operation_id: &str) -> bool {
+    let Some(snapshot) = depot_operation_snapshot(operation_id) else {
+        return false;
+    };
+    abandon_depot_operation_at(operation_id, snapshot.product_id, None)
+}
+
+fn abandon_depot_operation_at(operation_id: &str, product_id: i64, expected: Option<u64>) -> bool {
+    let Ok(activity) = crate::profile_reset::begin_activity("installation cancellation") else {
+        return false;
+    };
+    let Ok((admission, generation)) = super::recovery::try_admit_generation(product_id, expected)
+    else {
+        return false;
+    };
+    let mut manager = DEPOT_MANAGER.lock().unwrap();
+    let Some(mut snapshot) = manager.snapshots.get(operation_id).cloned() else {
+        return false;
+    };
+    if snapshot.product_id != product_id
+        || manager.shutting_down
+        || manager.abandon_requested.contains_key(operation_id)
+        || matches!(
+            snapshot.state.as_str(),
+            "complete" | "cancelled" | "abandoned"
+        )
     {
-        let mut manager = DEPOT_MANAGER.lock().unwrap();
-        if let Some(cancelled) = manager.active.get(operation_id).cloned() {
-            manager.abandon_requested.insert(operation_id.to_owned());
-            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-            return true;
-        }
+        return false;
     }
-    abandon_saved_depot_operation(operation_id).is_ok()
+    manager
+        .abandon_requested
+        .insert(operation_id.to_owned(), (generation, activity));
+    snapshot.state = "cancelling".into();
+    snapshot.error = None;
+    snapshot.setup = None;
+    manager.publish(snapshot);
+    if let Some(cancelled) = manager.active.get(operation_id) {
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    // Track saved-operation cleanup before spawning, including while it waits for the gate.
+    manager.active.insert(
+        operation_id.to_owned(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    drop(manager);
+    drop(admission);
+    let operation_id = operation_id.to_owned();
+    thread::spawn(move || finish_depot_abandon(&operation_id, ""));
+    true
 }
 
 pub fn resume_depot_operation(operation_id: String, access_token: String) -> bool {
@@ -760,39 +820,49 @@ pub fn prepare_depot_resume(
 
 fn publish_depot(snapshot: DepotOperationSnapshot) {
     let mut manager = DEPOT_MANAGER.lock().unwrap();
-    manager.next_snapshot_sequence = manager.next_snapshot_sequence.wrapping_add(1);
-    let sequence = manager.next_snapshot_sequence;
-    manager
-        .snapshot_sequence
-        .insert(snapshot.operation_id.clone(), sequence);
-    let previous = manager
-        .snapshots
-        .insert(snapshot.operation_id.clone(), snapshot.clone());
-    let terminal = matches!(
-        snapshot.state.as_str(),
-        "complete" | "failed" | "cancelled" | "abandoned"
-    );
-    let state_changed = previous.is_none_or(|previous| previous.state != snapshot.state);
-    let now = std::time::Instant::now();
-    let due = manager
-        .last_event_at
-        .get(&snapshot.operation_id)
-        .is_none_or(|last| now.duration_since(*last) >= Duration::from_millis(100));
-    if !terminal && !state_changed && !due {
-        return;
+    // The cancellation owner alone publishes its terminal result, after releasing its reservation.
+    if !manager
+        .abandon_requested
+        .contains_key(&snapshot.operation_id)
+    {
+        manager.publish(snapshot);
     }
-    if terminal {
-        manager.last_event_at.remove(&snapshot.operation_id);
-    } else {
-        manager
+}
+
+impl DepotManagerState {
+    fn publish(&mut self, snapshot: DepotOperationSnapshot) {
+        self.next_snapshot_sequence = self.next_snapshot_sequence.wrapping_add(1);
+        let sequence = self.next_snapshot_sequence;
+        self.snapshot_sequence
+            .insert(snapshot.operation_id.clone(), sequence);
+        let previous = self
+            .snapshots
+            .insert(snapshot.operation_id.clone(), snapshot.clone());
+        let terminal = matches!(
+            snapshot.state.as_str(),
+            "complete" | "failed" | "cancelled" | "abandoned"
+        );
+        let state_changed = previous.is_none_or(|previous| previous.state != snapshot.state);
+        let now = std::time::Instant::now();
+        let due = self
             .last_event_at
-            .insert(snapshot.operation_id.clone(), now);
+            .get(&snapshot.operation_id)
+            .is_none_or(|last| now.duration_since(*last) >= Duration::from_millis(100));
+        if !terminal && !state_changed && !due {
+            return;
+        }
+        if terminal {
+            self.last_event_at.remove(&snapshot.operation_id);
+        } else {
+            self.last_event_at
+                .insert(snapshot.operation_id.clone(), now);
+        }
+        self.subscribers.retain(|subscriber| {
+            subscriber
+                .send(DepotManagerEvent::Snapshot(snapshot.clone()))
+                .is_ok()
+        });
     }
-    manager.subscribers.retain(|subscriber| {
-        subscriber
-            .send(DepotManagerEvent::Snapshot(snapshot.clone()))
-            .is_ok()
-    });
 }
 
 fn run_depot_operation(
@@ -805,6 +875,13 @@ fn run_depot_operation(
         Some(_permit) => run_depot_operation_inner(&request, &cancelled),
         None => Err(crate::download::depot::DepotCancelled.into()),
     };
+    finish_depot_operation(request, result);
+}
+
+fn finish_depot_operation(
+    request: DepotOperationRequest,
+    result: anyhow::Result<DepotOperationSnapshot>,
+) {
     let mut failure_snapshot = None;
     if let Err(error) = &result {
         let was_cancelled = error
@@ -862,25 +939,107 @@ fn run_depot_operation(
             error: (!was_cancelled).then_some(message),
         });
     }
-    let abandon = DEPOT_MANAGER
-        .lock()
-        .unwrap()
-        .abandon_requested
-        .remove(&request.operation_id);
-    if abandon {
-        let _ = abandon_saved_depot_operation(&request.operation_id);
-    } else if let Some(snapshot) = failure_snapshot {
-        publish_depot(snapshot);
-    }
     let mut manager = DEPOT_MANAGER.lock().unwrap();
+    // The final checkpoint may have completed after the last cancellation check. Only the
+    // worker's successful result proves that cleanup and journal removal actually finished.
+    if let Ok(snapshot) = result
+        && (snapshot.state == "complete"
+            || !manager
+                .abandon_requested
+                .contains_key(&request.operation_id))
+    {
+        manager.active.remove(&request.operation_id);
+        manager.reservations.remove(&request.operation_id);
+        manager.abandon_requested.remove(&request.operation_id);
+        manager.publish(snapshot);
+        return;
+    }
+    if manager
+        .abandon_requested
+        .contains_key(&request.operation_id)
+    {
+        drop(manager);
+        finish_depot_abandon(&request.operation_id, &request.access_token);
+        return;
+    }
     manager.active.remove(&request.operation_id);
     manager.reservations.remove(&request.operation_id);
+    if let Some(snapshot) = failure_snapshot {
+        manager.publish(snapshot);
+    }
 }
 
-fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
+fn finish_depot_abandon(operation_id: &str, access_token: &str) {
+    let (mut snapshot, generation) = {
+        let manager = DEPOT_MANAGER.lock().unwrap();
+        (
+            manager.snapshots[operation_id].clone(),
+            manager.abandon_requested[operation_id].0,
+        )
+    };
+    let result = (|| {
+        let _permit = crate::operation_gate::acquire(|| {
+            let shutting_down = DEPOT_MANAGER.lock().unwrap().shutting_down;
+            shutting_down || !super::recovery::current(snapshot.product_id, generation)
+        })
+        .context(
+            "Cancellation stopped before cleanup; temporary files and recovery record were kept",
+        )?;
+        abandon_saved_depot_operation(operation_id, snapshot.product_id, generation)
+    })();
+    snapshot.setup = None;
+    match result {
+        Ok(()) => {
+            snapshot.state = "abandoned".into();
+            snapshot.error = None;
+        }
+        Err(error) => {
+            snapshot.state = "failed".into();
+            let mut message = redact_error(
+                &format!(
+                    "Cancellation cleanup failed: {error:#}. Review the error before retrying cancellation or resuming."
+                ),
+                access_token,
+            );
+            if let Err(error) = update_depot_record(
+                operation_id,
+                "failed",
+                snapshot.bytes_completed,
+                Some(&message),
+                true,
+            ) {
+                message.push(' ');
+                message.push_str(&redact_error(
+                    &format!("The recovery record could not be updated: {error:#}"),
+                    access_token,
+                ));
+            }
+            snapshot.error = Some(message);
+        }
+    }
+    let mut manager = DEPOT_MANAGER.lock().unwrap();
+    manager.active.remove(operation_id);
+    manager.reservations.remove(operation_id);
+    manager.abandon_requested.remove(operation_id);
+    manager.publish(snapshot);
+}
+
+fn abandon_saved_depot_operation(
+    operation_id: &str,
+    product_id: i64,
+    generation: u64,
+) -> anyhow::Result<()> {
     let (journal_path, record) = super::operation_journal::find_depot(operation_id)?;
+    anyhow::ensure!(
+        record.product_id == product_id,
+        "Saved installation identity changed"
+    );
     super::dependency_setup::ensure_setup_quiescent(&record)?;
     let plan: PersistedDepotPlan = serde_json::from_str(&record.plan_json)?;
+    anyhow::ensure!(
+        plan.product_id == product_id,
+        "Saved installation plan identity changed"
+    );
     let request = DepotOperationRequest {
         account_session: crate::online::account_session(),
         recovery_generation: super::recovery::generation(plan.product_id),
@@ -904,6 +1063,24 @@ fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
         access_token: String::new(),
     };
     let (manifest, _) = merge_depot_sources(&request)?;
+    {
+        let _admission = super::recovery::admit_generation(product_id, generation)?;
+        let mut manager = DEPOT_MANAGER.lock().unwrap();
+        anyhow::ensure!(
+            !manager
+                .reservations
+                .iter()
+                .any(|(id, (product, destination))| {
+                    id != operation_id
+                        && (*product == product_id || destination == &request.destination)
+                }),
+            "Another installation owns these files; retry cancellation after it stops"
+        );
+        manager.reservations.insert(
+            operation_id.to_owned(),
+            (product_id, request.destination.clone()),
+        );
+    }
     if request.staging_path.exists() {
         crate::download::depot::abandon_materialization(
             &manifest,
@@ -913,19 +1090,6 @@ fn abandon_saved_depot_operation(operation_id: &str) -> anyhow::Result<()> {
     }
     super::depot_actions::remove_support_staging(&request.staging_path)?;
     super::operation_journal::remove(&journal_path)?;
-    publish_depot(DepotOperationSnapshot {
-        setup: None,
-        operation_id: operation_id.to_owned(),
-        product_id: request.product_id,
-        state: "abandoned".into(),
-        bytes_completed: 0,
-        bytes_downloaded: 0,
-        bytes_written: 0,
-        total_write_bytes: 0,
-        total_bytes: 0,
-        download_total_bytes: None,
-        error: None,
-    });
     Ok(())
 }
 
@@ -995,7 +1159,7 @@ fn prepare_required_dependencies(
 fn run_depot_operation_inner(
     request: &DepotOperationRequest,
     cancelled: &std::sync::atomic::AtomicBool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DepotOperationSnapshot> {
     super::validate_game_library(
         &crate::storage::read_config()?,
         &request.library_id,
@@ -1104,7 +1268,7 @@ fn run_depot_operation_inner(
     let payload_total = target_totals.compressed;
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         update_depot_record(&request.operation_id, "cancelled", 0, None, true)?;
-        publish_depot(DepotOperationSnapshot {
+        return Ok(DepotOperationSnapshot {
             setup: None,
             operation_id: request.operation_id.clone(),
             product_id: request.product_id,
@@ -1117,7 +1281,6 @@ fn run_depot_operation_inner(
             download_total_bytes: None,
             error: None,
         });
-        return Ok(());
     }
     let mut trusted_files = if request.kind == DepotOperationKind::Repair {
         let verification_total = target
@@ -1529,7 +1692,7 @@ fn run_depot_operation_inner(
     cleanup?;
     crate::download::depot::finish_journal(&request.staging_path)?;
     update_depot_record(&request.operation_id, "complete", total, None, true)?;
-    publish_depot(DepotOperationSnapshot {
+    Ok(DepotOperationSnapshot {
         setup: None,
         operation_id: request.operation_id.clone(),
         product_id: request.product_id,
@@ -1541,8 +1704,7 @@ fn run_depot_operation_inner(
         total_bytes: total,
         download_total_bytes: Some(download_total),
         error: None,
-    });
-    Ok(())
+    })
 }
 
 fn publish_depot_progress(
@@ -3572,7 +3734,7 @@ fn start_queued_uninstallation(plan: PersistedUninstallationPlan, session: u64) 
     persist_existing_operation(
         product_id,
         "running",
-        Some("Running native uninstaller"),
+        Some("Follow any prompts in the uninstaller window"),
         None,
         None,
     );
@@ -3583,7 +3745,7 @@ fn start_queued_uninstallation(plan: PersistedUninstallationPlan, session: u64) 
             InstallationOperationSnapshot {
                 product_id,
                 state: crate::domain::InstallationState::Uninstalling,
-                message: Some("Running native uninstaller".into()),
+                message: Some("Follow any prompts in the uninstaller window".into()),
                 percentage: None,
                 queued: false,
             },
@@ -3858,8 +4020,15 @@ pub(super) fn quiesce_recovery(
             .any(|id| ids.contains(id));
         let depot = {
             let manager = DEPOT_MANAGER.lock().unwrap();
-            manager.reservations.iter().any(|(operation, (id, _))| {
-                ids.contains(id) && manager.active.contains_key(operation)
+            manager.active.keys().any(|operation| {
+                manager
+                    .reservations
+                    .get(operation)
+                    .is_some_and(|(id, _)| ids.contains(id))
+                    || manager
+                        .snapshots
+                        .get(operation)
+                        .is_some_and(|snapshot| ids.contains(&snapshot.product_id))
             })
         };
         if !offline && !depot {
@@ -4288,7 +4457,7 @@ fn update_uninstallation_snapshot(product_id: i64, event: &UninstallationEvent) 
     let (state, message) = match event {
         UninstallationEvent::Started => (
             crate::domain::InstallationState::Uninstalling,
-            Some("Running native uninstaller".into()),
+            Some("Follow any prompts in the uninstaller window".into()),
         ),
         UninstallationEvent::Complete => (
             crate::domain::InstallationState::Pending,
@@ -5696,6 +5865,459 @@ mod tests {
         assert!(manager.active.is_empty());
         assert!(manager.reservations.is_empty());
         assert!(manager.paused_for_sign_out);
+    }
+
+    #[test]
+    fn depot_cancellation_rejects_stale_and_blocked_recovery_admission() {
+        let mut request = request(false);
+        request.operation_id = "cancel-recovery-admission-fixture".into();
+        request.product_id = -327;
+        publish_depot_progress(&request, "interrupted", 0, 0, 0, 1, 1);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        DEPOT_MANAGER
+            .lock()
+            .unwrap()
+            .active
+            .insert(request.operation_id.clone(), cancelled.clone());
+        let previous = super::super::recovery::generation(request.product_id);
+        let recovery = super::super::recovery::Reservation::reserve(&[request.product_id]).unwrap();
+        let current = super::super::recovery::generation(request.product_id);
+        // Recovery has invalidated the captured generation and currently blocks fresh admission.
+        for generation in [previous, current] {
+            assert!(!abandon_depot_operation_at(
+                &request.operation_id,
+                request.product_id,
+                Some(generation)
+            ));
+            assert!(!cancelled.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(
+                depot_operation_snapshot(&request.operation_id)
+                    .unwrap()
+                    .state,
+                "interrupted"
+            );
+            assert!(
+                !DEPOT_MANAGER
+                    .lock()
+                    .unwrap()
+                    .abandon_requested
+                    .contains_key(&request.operation_id)
+            );
+        }
+        drop(recovery);
+        assert!(!abandon_depot_operation_at(
+            &request.operation_id,
+            request.product_id,
+            Some(previous)
+        ));
+        // A fresh request can claim this inert active owner once recovery has finished.
+        assert!(abandon_depot_operation(&request.operation_id));
+        assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        let mut manager = DEPOT_MANAGER.lock().unwrap();
+        manager.active.remove(&request.operation_id);
+        manager.abandon_requested.remove(&request.operation_id);
+        manager.snapshots.remove(&request.operation_id);
+        manager.snapshot_sequence.remove(&request.operation_id);
+        manager.last_event_at.remove(&request.operation_id);
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+    fn depot_cancel_refuses_busy_admission_without_blocking_gtk_and_retries() {
+        use gtk::glib;
+        use gtk::prelude::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p348-")
+            );
+        }
+        adw::init().unwrap();
+        let window = gtk::Window::new();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let button = gtk::Button::with_label("Cancel installation");
+        let heartbeat = gtk::Label::new(Some("Waiting"));
+        content.append(&button);
+        content.append(&heartbeat);
+        window.set_child(Some(&content));
+        window.present();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !button.is_mapped() && Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(button.is_mapped());
+
+        let mut request = request(false);
+        request.operation_id = "nonblocking-cancellation-fixture".into();
+        request.product_id = -348;
+        publish_depot_progress(&request, "interrupted", 0, 0, 0, 1, 1);
+        let original = depot_operation_snapshot(&request.operation_id).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        DEPOT_MANAGER
+            .lock()
+            .unwrap()
+            .active
+            .insert(request.operation_id.clone(), cancelled.clone());
+        let (ready, ready_receiver) = mpsc::channel();
+        let (release, release_receiver) = mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder = thread::spawn({
+            let released = released.clone();
+            move || {
+                // Model unrelated enqueue persistence retaining the global admission guard.
+                let _admission = super::super::recovery::admit_generation(-349, 0).unwrap();
+                ready.send(()).unwrap();
+                // A blocking regression must fail after the watchdog, never hang the runner.
+                let _ = release_receiver.recv_timeout(Duration::from_secs(3));
+                released.store(true, Ordering::Release);
+            }
+        });
+        ready_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = Rc::new(Cell::new(None));
+        let returned_while_held = Rc::new(Cell::new(false));
+        button.connect_clicked({
+            let result = result.clone();
+            let returned_while_held = returned_while_held.clone();
+            let released = released.clone();
+            let operation = request.operation_id.clone();
+            move |_| {
+                result.set(Some(abandon_depot_operation(&operation)));
+                returned_while_held.set(!released.load(Ordering::Acquire));
+            }
+        });
+        let heartbeat_while_held = Rc::new(Cell::new(false));
+        glib::idle_add_local_once({
+            let heartbeat = heartbeat.clone();
+            let heartbeat_while_held = heartbeat_while_held.clone();
+            let released = released.clone();
+            move || {
+                heartbeat.set_label("GTK remains responsive");
+                heartbeat_while_held.set(!released.load(Ordering::Acquire));
+            }
+        });
+        button.emit_clicked();
+        let refused = result.get() == Some(false);
+        let returned_before_release = returned_while_held.get();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while heartbeat.text() == "Waiting" && Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            thread::sleep(Duration::from_millis(5));
+        }
+        let unchanged = {
+            let manager = DEPOT_MANAGER.lock().unwrap();
+            manager.snapshots.get(&request.operation_id) == Some(&original)
+                && !manager
+                    .abandon_requested
+                    .contains_key(&request.operation_id)
+                && !cancelled.load(Ordering::Relaxed)
+                && Arc::ptr_eq(
+                    manager.active.get(&request.operation_id).unwrap(),
+                    &cancelled,
+                )
+        };
+        let _ = release.send(());
+        holder.join().unwrap();
+        // Only retry after ownership admission is available. The inert active owner spawns no worker.
+        button.emit_clicked();
+        let retried = result.get() == Some(true) && cancelled.load(Ordering::Relaxed);
+        let generation = super::super::recovery::generation(request.product_id);
+        let registered = {
+            let mut manager = DEPOT_MANAGER.lock().unwrap();
+            let registered = manager
+                .abandon_requested
+                .get(&request.operation_id)
+                .is_some_and(|(captured, _)| *captured == generation)
+                && manager.snapshots[&request.operation_id].state == "cancelling";
+            manager.active.remove(&request.operation_id);
+            manager.abandon_requested.remove(&request.operation_id);
+            manager.snapshots.remove(&request.operation_id);
+            manager.snapshot_sequence.remove(&request.operation_id);
+            manager.last_event_at.remove(&request.operation_id);
+            registered
+        };
+        window.destroy();
+        assert!(
+            refused && returned_before_release,
+            "busy admission must refuse before the holder or watchdog releases it"
+        );
+        assert!(
+            heartbeat_while_held.get(),
+            "GTK heartbeat must run while unrelated admission is held"
+        );
+        assert!(
+            unchanged,
+            "refusal must not change operation ownership, flags or snapshot"
+        );
+        assert!(
+            retried && registered,
+            "retry must register the same cancellation owner and generation"
+        );
+    }
+
+    #[test]
+    fn depot_success_wins_cancellation_after_the_final_checkpoint() {
+        let mut request = request(false);
+        request.operation_id = "cancel-after-completion-fixture".into();
+        request.product_id = -328;
+        let events = subscribe_depot_events();
+        publish_depot_progress(&request, "finalizing", 1, 1, 1, 1, 1);
+        let mut completed = depot_operation_snapshot(&request.operation_id).unwrap();
+        completed.state = "complete".into();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut manager = DEPOT_MANAGER.lock().unwrap();
+            manager
+                .active
+                .insert(request.operation_id.clone(), cancelled);
+            manager.reservations.insert(
+                request.operation_id.clone(),
+                (request.product_id, request.destination.clone()),
+            );
+        }
+        assert!(abandon_depot_operation(&request.operation_id));
+        // The worker's successful checkpoint has already removed its journal. Its typed result
+        // must be published without entering saved-operation cleanup or reading any journal.
+        finish_depot_operation(request.clone(), Ok(completed.clone()));
+        let received = events
+            .try_iter()
+            .filter_map(|DepotManagerEvent::Snapshot(snapshot)| {
+                (snapshot.operation_id == request.operation_id).then_some(snapshot.state)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(received, ["finalizing", "cancelling", "complete"]);
+        assert_eq!(
+            depot_operation_snapshot(&request.operation_id),
+            Some(completed)
+        );
+        assert!(!abandon_depot_operation(&request.operation_id));
+        let mut manager = DEPOT_MANAGER.lock().unwrap();
+        assert!(!manager.active.contains_key(&request.operation_id));
+        assert!(!manager.reservations.contains_key(&request.operation_id));
+        assert!(
+            !manager
+                .abandon_requested
+                .contains_key(&request.operation_id)
+        );
+        manager.snapshots.remove(&request.operation_id);
+        manager.snapshot_sequence.remove(&request.operation_id);
+        manager.last_event_at.remove(&request.operation_id);
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME/all XDG and no other operation workers"]
+    fn depot_cancellation_keeps_protected_files_and_reports_terminal_cleanup_failure() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p327-")
+            );
+        }
+        let events = subscribe_depot_events();
+        assert!(!abandon_depot_operation("unknown-cancellation-fixture"));
+        for active in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut request = request(false);
+            request.operation_id = format!("cancel-fixture-{active}");
+            request.library_root = root.path().to_owned();
+            request.destination = root.path().join("game");
+            request.staging_path = root.path().join(".ludomere/staging/game.json");
+            request.sources[0].content_root = Some("/".into());
+            request
+                .target_marker
+                .galaxy_depot
+                .as_mut()
+                .unwrap()
+                .manifest_fingerprint
+                .clear();
+            request.sources[0].manifest_json = Some(format!(
+                r#"{{"version":2,"depot":{{"items":[{{"type":"DepotFile","path":"game.dat","flags":[],"chunks":[{{"compressedMd5":"{0}","compressedSize":1,"md5":"{0}","size":1}}]}}]}}}}"#,
+                "1".repeat(32)
+            ));
+            request
+                .target_marker
+                .galaxy_depot
+                .as_mut()
+                .unwrap()
+                .manifest_fingerprint = planned_manifest_identity(&request).unwrap();
+            crate::config::Config {
+                game_libraries: vec![crate::config::GameLibrary {
+                    id: "library".into(),
+                    name: "Fixture".into(),
+                    path: root.path().to_owned(),
+                    default: true,
+                }],
+                ..crate::config::Config::default()
+            }
+            .save()
+            .unwrap();
+            persist_depot_request(&request).unwrap();
+            let (manifest, _) = merge_depot_sources(&request).unwrap();
+            let error = crate::download::depot::materialize_streamed_controlled(
+                &manifest,
+                &request.destination,
+                &request.staging_path,
+                &std::collections::HashSet::new(),
+                |_, _, _| anyhow::bail!("inert transfer interruption"),
+                || false,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("inert transfer interruption"));
+            let part = request.destination.join("game.dat.ludomere.part");
+            std::fs::remove_file(&part).unwrap();
+            std::fs::create_dir(&part).unwrap();
+            std::fs::write(part.join("protected"), b"keep").unwrap();
+            std::fs::write(request.destination.join("game.dat"), b"published game data").unwrap();
+            publish_depot_progress(&request, "interrupted", 0, 0, 0, 1, 1);
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if active {
+                let mut manager = DEPOT_MANAGER.lock().unwrap();
+                manager
+                    .active
+                    .insert(request.operation_id.clone(), cancelled.clone());
+                manager.reservations.insert(
+                    request.operation_id.clone(),
+                    (request.product_id, request.destination.clone()),
+                );
+            }
+            let permit = crate::operation_gate::try_acquire().unwrap();
+            assert!(abandon_depot_operation(&request.operation_id));
+            assert_eq!(
+                depot_operation_snapshot(&request.operation_id)
+                    .unwrap()
+                    .state,
+                "cancelling"
+            );
+            assert!(!abandon_depot_operation(&request.operation_id));
+            assert!(!cancel_depot_operation(&request.operation_id));
+            assert!(!resume_depot_operation(
+                request.operation_id.clone(),
+                "unused-inert-token".into()
+            ));
+            publish_depot_progress(&request, "materializing", 0, 0, 0, 1, 1);
+            assert_eq!(
+                depot_operation_snapshot(&request.operation_id)
+                    .unwrap()
+                    .state,
+                "cancelling"
+            );
+            assert!(
+                DEPOT_MANAGER
+                    .try_lock()
+                    .unwrap()
+                    .active
+                    .contains_key(&request.operation_id)
+            );
+            let worker = active.then(|| {
+                let request = request.clone();
+                thread::spawn(move || run_depot_operation(request, cancelled))
+            });
+            // Acceptance and snapshot reads finish while cleanup cannot yet run.
+            assert_eq!(std::fs::read(part.join("protected")).unwrap(), b"keep");
+            drop(permit);
+            loop {
+                let DepotManagerEvent::Snapshot(snapshot) =
+                    events.recv_timeout(Duration::from_secs(5)).unwrap();
+                if snapshot.operation_id == request.operation_id && snapshot.state == "failed" {
+                    assert_eq!(snapshot.product_id, request.product_id);
+                    assert!(
+                        snapshot
+                            .error
+                            .as_deref()
+                            .unwrap()
+                            .contains("temporary path is a directory")
+                    );
+                    assert!(
+                        !snapshot
+                            .error
+                            .as_deref()
+                            .unwrap()
+                            .contains(&request.access_token)
+                    );
+                    break;
+                }
+            }
+            if let Some(worker) = worker {
+                worker.join().unwrap();
+            }
+            let journal = super::super::operation_journal::depot_path(&request.staging_path);
+            assert!(journal.is_file() && request.staging_path.is_file());
+            assert_eq!(std::fs::read(part.join("protected")).unwrap(), b"keep");
+            {
+                let manager = DEPOT_MANAGER.lock().unwrap();
+                assert!(!manager.active.contains_key(&request.operation_id));
+                assert!(!manager.reservations.contains_key(&request.operation_id));
+                assert!(
+                    !manager
+                        .abandon_requested
+                        .contains_key(&request.operation_id)
+                );
+            }
+            let (_, record) =
+                super::super::operation_journal::find_depot(&request.operation_id).unwrap();
+            assert_eq!(record.state, "failed");
+            // Correct only the synthetic obstruction, then retry the same saved operation.
+            std::fs::remove_dir_all(&part).unwrap();
+            std::fs::write(&part, b"temporary").unwrap();
+            assert!(abandon_depot_operation(&request.operation_id));
+            loop {
+                let DepotManagerEvent::Snapshot(snapshot) =
+                    events.recv_timeout(Duration::from_secs(5)).unwrap();
+                if snapshot.operation_id == request.operation_id && snapshot.state == "abandoned" {
+                    break;
+                }
+                assert!(
+                    snapshot.operation_id != request.operation_id || snapshot.state != "failed"
+                );
+            }
+            assert!(!journal.exists() && !request.staging_path.exists() && !part.exists());
+            assert_eq!(
+                std::fs::read(request.destination.join("game.dat")).unwrap(),
+                b"published game data"
+            );
+            assert!(!abandon_depot_operation(&request.operation_id));
+            publish_depot_progress(&request, "complete", 0, 0, 0, 1, 1);
+            assert!(!abandon_depot_operation(&request.operation_id));
+            // Missing journals alone are not proof of successful worker completion.
+            publish_depot_progress(&request, "interrupted", 0, 0, 0, 1, 1);
+            assert!(abandon_depot_operation(&request.operation_id));
+            loop {
+                let DepotManagerEvent::Snapshot(snapshot) =
+                    events.recv_timeout(Duration::from_secs(5)).unwrap();
+                if snapshot.operation_id != request.operation_id {
+                    continue;
+                }
+                assert_ne!(snapshot.state, "abandoned");
+                if snapshot.state == "failed" {
+                    assert!(snapshot.error.is_some());
+                    assert!(!journal.exists());
+                    break;
+                }
+            }
+        }
     }
 
     #[test]

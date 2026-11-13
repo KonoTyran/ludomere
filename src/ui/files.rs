@@ -1,4 +1,311 @@
 use super::*;
+use std::path::{Path, PathBuf};
+
+struct PreparedFileGroup {
+    group: ArtifactGroup,
+    managed_paths: Vec<PathBuf>,
+    saved_job: Option<DownloadJobRecord>,
+    existing_files: Vec<PathBuf>,
+    invalid_download: bool,
+    completed_folder: Option<PathBuf>,
+    downloaded: bool,
+    represented: Vec<PathBuf>,
+}
+
+struct PreparedProductFiles {
+    installers: Vec<LibraryFile>,
+    patches: Vec<LibraryFile>,
+    extras: Vec<LibraryFile>,
+    groups: Vec<PreparedFileGroup>,
+    retired: Vec<RemoteArtifact>,
+    historical: HashMap<PathBuf, RemoteArtifact>,
+    summary: (usize, u64),
+}
+
+struct PreparedFilesPage {
+    products: HashMap<i64, PreparedProductFiles>,
+    directories: HashSet<PathBuf>,
+}
+
+struct InitialFilesResult {
+    game: DetailPageModel,
+    config: Config,
+    statuses: Vec<crate::storage::LibraryStatus>,
+    prepared: PreparedFilesPage,
+}
+
+#[cfg(test)]
+struct InitialFilesProbe {
+    gtk_thread: std::thread::ThreadId,
+    started: mpsc::Sender<()>,
+    permit: std::sync::Mutex<mpsc::Receiver<()>>,
+    ready: mpsc::Sender<()>,
+    publish: std::sync::Mutex<mpsc::Receiver<()>>,
+    opens: std::sync::atomic::AtomicUsize,
+    jobs: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+static INITIAL_FILES_PROBE: std::sync::Mutex<Option<std::sync::Arc<InitialFilesProbe>>> =
+    std::sync::Mutex::new(None);
+
+fn prepare_files_page(
+    game: &DetailPageModel,
+    config: &Config,
+    statuses: &[crate::storage::LibraryStatus],
+) -> anyhow::Result<PreparedFilesPage> {
+    #[cfg(test)]
+    if let Some(probe) = INITIAL_FILES_PROBE.lock().unwrap().as_ref() {
+        assert_ne!(std::thread::current().id(), probe.gtk_thread);
+        probe
+            .opens
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let store = StateStore::open()?;
+    let mut ids = vec![game.product_id];
+    ids.extend(
+        game.dlcs
+            .iter()
+            .filter(|dlc| dlc.owned)
+            .map(|dlc| dlc.product_id),
+    );
+    let managed = store.managed_files_for_products(&ids)?;
+    #[cfg(test)]
+    if let Some(probe) = INITIAL_FILES_PROBE.lock().unwrap().as_ref() {
+        probe.jobs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let jobs = store.download_jobs()?;
+    let mut result = PreparedFilesPage {
+        products: HashMap::new(),
+        directories: HashSet::from([
+            game.location.clone(),
+            game.location.join("patches"),
+            game.location.join("extras"),
+        ]),
+    };
+    for id in ids {
+        let dlc = game.dlcs.iter().find(|dlc| dlc.product_id == id);
+        let remote = dlc.map_or(game.remote_artifacts.as_slice(), |dlc| {
+            &dlc.remote_artifacts
+        });
+        let local = |kind| {
+            let files = managed
+                .iter()
+                .filter(|file| {
+                    file.product_id == id
+                        && file.kind == kind
+                        && if dlc.is_some() {
+                            file.path.is_file()
+                        } else {
+                            file.present
+                        }
+                })
+                .map(|file| LibraryFile {
+                    name: file.filename.clone(),
+                    path: file.path.clone(),
+                    size: file.size,
+                })
+                .collect::<Vec<_>>();
+            if files.is_empty() && dlc.is_none() {
+                match kind {
+                    ArtifactKind::Installer => game.installers.clone(),
+                    ArtifactKind::Patch => game.patches.clone(),
+                    ArtifactKind::Extra => game.extras.clone(),
+                }
+            } else {
+                files
+            }
+        };
+        let installers = local(ArtifactKind::Installer);
+        let patches = local(ArtifactKind::Patch);
+        let extras = local(ArtifactKind::Extra);
+        let mut historical = HashMap::new();
+        for file in installers.iter().chain(&patches).chain(&extras) {
+            if let Some(parent) = file.path.parent() {
+                result.directories.insert(parent.to_owned());
+            }
+            if let Some(artifact) = store.retired_artifact_for_file(&file.path)? {
+                historical.insert(file.path.clone(), artifact);
+            }
+        }
+        if let Some(dlc) = dlc {
+            let folder = config
+                .default_library(crate::config::LibraryKind::OfflineInstallers)
+                .map(|library| library.path.as_path())
+                .unwrap_or_else(|| Path::new(""))
+                .join(&game.slug)
+                .join("dlc")
+                .join(&dlc.slug);
+            for kind in [
+                ArtifactKind::Installer,
+                ArtifactKind::Patch,
+                ArtifactKind::Extra,
+            ] {
+                result.directories.insert(folder.join(kind.as_str()));
+            }
+        }
+        let mut groups = Vec::new();
+        // Match the existing per-collection grouping boundary, even when provider IDs overlap.
+        for group in [
+            ArtifactKind::Installer,
+            ArtifactKind::Patch,
+            ArtifactKind::Extra,
+        ]
+        .into_iter()
+        .flat_map(|kind| {
+            download_selection::group_artifacts(
+                &remote
+                    .iter()
+                    .filter(|artifact| artifact.kind == kind)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        }) {
+            let refs = group.artifacts.iter().collect::<Vec<_>>();
+            let requested_id = download::job_id(&refs);
+            let saved_job = jobs
+                .iter()
+                .filter(|job| {
+                    !job.artifacts.is_empty()
+                        && download::job_id(&job.artifacts.iter().collect::<Vec<_>>())
+                            == requested_id
+                })
+                .max_by_key(|job| job.updated_at)
+                .cloned();
+            let mut copies = std::collections::BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+            for path in store.current_managed_paths(&refs)? {
+                copies
+                    .entry(path.parent().unwrap_or(&path).to_owned())
+                    .or_default()
+                    .push(path);
+            }
+            let copies = if copies.is_empty() {
+                vec![Vec::new()]
+            } else {
+                copies.into_values().collect()
+            };
+            for managed_paths in copies {
+                let existing_files = if managed_paths.is_empty() {
+                    saved_job
+                        .as_ref()
+                        .filter(|job| job.state == "complete")
+                        .map(|job| job.completed_files.clone())
+                        .unwrap_or_default()
+                } else {
+                    managed_paths.clone()
+                };
+                let usable = existing_files.iter().all(|path| {
+                    matches!(
+                        crate::storage::path_status(statuses, path),
+                        Some(crate::storage::LibraryCompatibility::Compatible)
+                    )
+                });
+                let invalid_download = !existing_files.is_empty()
+                    && (!usable || !artifact_download_is_plausible(&refs, &existing_files));
+                let completed_folder = (!invalid_download)
+                    .then(|| {
+                        managed_paths
+                            .first()
+                            .and_then(|path| path.parent())
+                            .map(Path::to_owned)
+                            .or_else(|| {
+                                saved_job.as_ref().and_then(|job| {
+                                    (job.state == "complete"
+                                        && !job.completed_files.is_empty()
+                                        && job.completed_files.iter().all(|path| path.is_file()))
+                                    .then(|| job.destination.clone())
+                                })
+                            })
+                    })
+                    .flatten();
+                let downloaded = if !managed_paths.is_empty() {
+                    !invalid_download
+                } else {
+                    saved_job.as_ref().is_some_and(|job| {
+                        job.completed_files.iter().all(|path| {
+                            matches!(
+                                crate::storage::path_status(statuses, path),
+                                Some(crate::storage::LibraryCompatibility::Compatible)
+                            )
+                        }) && download_job_is_complete(job)
+                            && artifact_download_is_plausible(&refs, &job.completed_files)
+                    })
+                };
+                let represented = if !managed_paths.is_empty() {
+                    managed_paths.clone()
+                } else {
+                    saved_job
+                        .as_ref()
+                        .filter(|job| download_job_is_complete(job))
+                        .map(|job| job.completed_files.clone())
+                        .unwrap_or_default()
+                };
+                groups.push(PreparedFileGroup {
+                    group: group.clone(),
+                    managed_paths,
+                    saved_job: saved_job.clone(),
+                    existing_files,
+                    invalid_download,
+                    completed_folder,
+                    downloaded,
+                    represented,
+                });
+            }
+        }
+        let mut summary = managed_detail_summary(&managed, &jobs, id);
+        if dlc.is_none() {
+            summary.0 = summary.0.max(installers.len());
+            if summary.1 == 0 {
+                summary.1 = game.disk_usage;
+            }
+        }
+        result.products.insert(
+            id,
+            PreparedProductFiles {
+                installers,
+                patches,
+                extras,
+                groups,
+                historical,
+                retired: if config.show_retired_artifacts {
+                    store
+                        .artifact_catalog(id)?
+                        .into_iter()
+                        .filter(|entry| !entry.currently_offered)
+                        .map(|entry| entry.artifact)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                summary,
+            },
+        );
+    }
+    result
+        .directories
+        .retain(|path| !path.as_os_str().is_empty() && path.is_dir());
+    Ok(result)
+}
+
+fn prepared_folder_button(
+    label: &str,
+    path: &Path,
+    window: &adw::ApplicationWindow,
+    available: bool,
+) -> gtk::Button {
+    let button = gtk::Button::from_icon_name("folder-open-symbolic");
+    button.set_tooltip_text(Some(label));
+    button.set_halign(gtk::Align::Start);
+    button.add_css_class("square-action");
+    button.add_css_class("folder-action");
+    button.set_sensitive(available);
+    let path = path.to_owned();
+    let window = window.clone();
+    button.connect_clicked(move |_| {
+        super::widgets::file_open::open_directory(&path, &window, "folder")
+    });
+    button
+}
 
 /// A read-only recovery affordance: damaged metadata must not prevent inspecting the folder.
 pub(super) fn browse_game_files(
@@ -477,8 +784,12 @@ pub(super) fn detail_file_management(
     manage.set_popover(Some(&manage_popover));
     let hover = gtk::EventControllerMotion::new();
     {
-        let manage_popover = manage_popover.clone();
-        hover.connect_enter(move |_, _, _| manage_popover.popup());
+        let manage_popover = manage_popover.downgrade();
+        hover.connect_enter(move |_, _, _| {
+            if let Some(manage_popover) = manage_popover.upgrade() {
+                manage_popover.popup();
+            }
+        });
     }
     manage.add_controller(hover);
     actions.append(&manage);
@@ -553,15 +864,23 @@ pub(super) fn detail_file_management(
         });
     }
     for action in main_actions {
-        let popover = popover.clone();
-        action.connect_clicked(move |_| popover.popdown());
+        let popover = popover.downgrade();
+        action.connect_clicked(move |_| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+        });
     }
     for action in manage_submenu_actions {
-        let popover = popover.clone();
-        let manage_popover = manage_popover.clone();
+        let popover = popover.downgrade();
+        let manage_popover = manage_popover.downgrade();
         action.connect_clicked(move |_| {
-            manage_popover.popdown();
-            popover.popdown();
+            if let Some(manage_popover) = manage_popover.upgrade() {
+                manage_popover.popdown();
+            }
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
         });
     }
 
@@ -695,8 +1014,9 @@ pub(super) fn archive_deletion_group(
                             });
                         } else {
                             row.set_subtitle(&format!(
-                                "{} files · {}{}",
+                                "{} {} · {}{}",
                                 files.count(),
+                                if files.count() == 1 { "file" } else { "files" },
                                 human_size(files.bytes()),
                                 if files.blocked_libraries().is_empty() {
                                     String::new()
@@ -745,8 +1065,9 @@ pub(super) fn archive_deletion_group(
             content.set_margin_bottom(18);
             content.append(&adw::HeaderBar::new());
             let summary = gtk::Label::new(Some(&format!(
-                "Permanently delete the {} files listed below ({}) for this game and its recorded DLC? Incompatible and unavailable libraries are excluded.",
+                "Permanently delete the {} {} listed below ({}) for this game and its recorded DLC? Incompatible and unavailable libraries are excluded.",
                 files.count(),
+                if files.count() == 1 { "file" } else { "files" },
                 human_size(files.bytes())
             )));
             summary.set_wrap(true);
@@ -1344,6 +1665,285 @@ pub(super) fn build_files_page(
     window: &adw::ApplicationWindow,
     options: FilesPageOptions<'_>,
 ) -> gtk::Box {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.set_widget_name("initial-files-page");
+    let loading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    loading.append(&spinner);
+    let message = gtk::Label::new(Some("Inspecting downloaded files…"));
+    message.set_widget_name("initial-files-status");
+    message.set_xalign(0.0);
+    message.set_wrap(true);
+    message.set_selectable(true);
+    loading.append(&message);
+    let retry = gtk::Button::with_label("Retry");
+    retry.set_widget_name("initial-files-retry");
+    retry.set_visible(false);
+    loading.append(&retry);
+    page.append(&loading);
+    let request = Rc::new(std::cell::Cell::new(1_u64));
+    let requested = Rc::new(std::cell::Cell::new(true));
+    retry.connect_clicked({
+        let request = request.clone();
+        let requested = requested.clone();
+        move |_| {
+            request.set(request.get().wrapping_add(1));
+            requested.set(true);
+        }
+    });
+    let session = (online::account_session(), auth::session());
+    let epoch = options.model.borrow().account_epoch;
+    let generation = options.model.borrow().detail_generation;
+    let target = (game.product_id, game.parent_id);
+    let model = Rc::downgrade(options.model);
+    let weak_page = page.downgrade();
+    let window = window.downgrade();
+    let spinner = spinner.downgrade();
+    let message = message.downgrade();
+    let retry = retry.downgrade();
+    let management = options.management.map(|management| {
+        (
+            management.menu.downgrade(),
+            management.status.downgrade(),
+            management.progress.downgrade(),
+        )
+    });
+    let mut attached = false;
+    let mut pending = None;
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let (Some(model), Some(page), Some(window), Some(spinner), Some(message), Some(retry)) = (
+            model.upgrade(),
+            weak_page.upgrade(),
+            window.upgrade(),
+            spinner.upgrade(),
+            message.upgrade(),
+            retry.upgrade(),
+        ) else {
+            return glib::ControlFlow::Break;
+        };
+        let state = model.borrow();
+        if state.account_epoch != epoch
+            || state.logout_pending
+            || state.detail_generation != generation
+            || state.detail_target != Some(target)
+        {
+            return glib::ControlFlow::Break;
+        }
+        if session != (online::account_session(), auth::session()) {
+            if page.is_ancestor(&window) {
+                spinner.stop();
+                spinner.set_visible(false);
+                retry.set_sensitive(false);
+                retry.set_visible(false);
+                message.set_label(
+                    "Your sign-in session changed. Go to Home, then reopen this game to inspect downloaded files.",
+                );
+            }
+            return glib::ControlFlow::Break;
+        }
+        if !page.is_ancestor(&window) {
+            return if attached {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            };
+        }
+        attached = true;
+        if !window.is_visible() || !page.is_mapped() {
+            return glib::ControlFlow::Continue;
+        }
+        if let Some((revision, active_request, receiver)) = pending.as_ref() {
+            let receiver: &mpsc::Receiver<anyhow::Result<InitialFilesResult>> = receiver;
+            let result = match receiver.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                    "File inspection stopped. Retry to inspect downloaded files."
+                )),
+                Ok(result) => result,
+            };
+            let current = *revision == state.local_revision && *active_request == request.get();
+            pending = None;
+            if !current {
+                requested.set(true);
+            } else {
+                match result {
+                    Ok(InitialFilesResult {
+                        game,
+                        config,
+                        statuses,
+                        prepared,
+                    }) => {
+                        // A changed library choice must be inspected before exposing file actions.
+                        if current_detail(&state, target.0, target.1).is_none_or(|current| {
+                            current.remote_artifacts != game.remote_artifacts
+                                || current.dlcs != game.dlcs
+                                || current.slug != game.slug
+                                || current.location != game.location
+                                || current.title != game.title
+                                || current.disk_usage != game.disk_usage
+                                || current.installers != game.installers
+                                || current.patches != game.patches
+                                || current.extras != game.extras
+                        }) || config != state.config
+                            || statuses != state.library_statuses
+                        {
+                            requested.set(true);
+                        } else {
+                            let installed = state.installed_games.get(&target.0).cloned();
+                            let token = state
+                                .account_token
+                                .as_ref()
+                                .map(|token| token.access_token.clone());
+                            drop(state);
+                            let management =
+                                management.as_ref().and_then(|(menu, status, progress)| {
+                                    Some(DetailFileManagement {
+                                        menu: menu.upgrade()?,
+                                        status: status.upgrade()?,
+                                        progress: progress.upgrade()?,
+                                    })
+                                });
+                            let defaults = InstallerFilterDefaults {
+                                language: config.installer_language.clone(),
+                                windows: config.installer_windows,
+                                linux: config.installer_linux,
+                                macos: config.installer_macos,
+                            };
+                            let content = render_files_page(
+                                &game,
+                                &window,
+                                FilesPageOptions {
+                                    model: &model,
+                                    access_token: token.as_deref(),
+                                    config: &config,
+                                    library_statuses: &statuses,
+                                    installer_defaults: &defaults,
+                                    show_retired_artifacts: config.show_retired_artifacts,
+                                    management: management.as_ref(),
+                                    installed: installed.as_ref(),
+                                },
+                                &prepared,
+                            );
+                            // Update the existing header from the same inspection, without another worker.
+                            if let Some(subtitle) = find_named_descendant(
+                                window.upcast_ref(),
+                                &format!("managed-product-subtitle-{}", target.0),
+                            )
+                            .and_downcast::<gtk::Label>()
+                            {
+                                let text = subtitle.text();
+                                let prefix = text
+                                    .rsplit_once(" · ")
+                                    .map_or(text.as_str(), |(prefix, _)| prefix);
+                                subtitle.set_label(&format!(
+                                    "{prefix} · Downloaded files: {}",
+                                    human_size(prepared.products[&target.0].summary.1)
+                                ));
+                            }
+                            while let Some(child) = page.first_child() {
+                                page.remove(&child);
+                            }
+                            page.append(&content);
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                    Err(error) => {
+                        spinner.stop();
+                        spinner.set_visible(false);
+                        message.set_label(&notifications::failure_message(
+                            "Could not inspect downloaded files",
+                            &format!("{error:#}"),
+                        ));
+                        retry.set_visible(true);
+                        retry.set_sensitive(true);
+                    }
+                }
+            }
+        }
+        if !requested.replace(false) {
+            return glib::ControlFlow::Continue;
+        }
+        let Some(game) = current_detail(&state, target.0, target.1) else {
+            return glib::ControlFlow::Break;
+        };
+        let config = state.config.clone();
+        let statuses = state.library_statuses.clone();
+        let revision = state.local_revision;
+        drop(state);
+        let activity =
+            match crate::profile_reset::begin_activity("loading initial downloaded files") {
+                Ok(activity) => activity,
+                Err(error) => {
+                    spinner.stop();
+                    spinner.set_visible(false);
+                    message.set_label(&notifications::failure_message(
+                        "Could not inspect downloaded files",
+                        &format!("{error:#}"),
+                    ));
+                    retry.set_visible(true);
+                    retry.set_sensitive(true);
+                    return glib::ControlFlow::Continue;
+                }
+            };
+        spinner.set_visible(true);
+        spinner.start();
+        message.set_label("Inspecting downloaded files…");
+        retry.set_sensitive(false);
+        retry.set_visible(false);
+        let (sender, receiver) = mpsc::channel();
+        pending = Some((revision, request.get(), receiver));
+        std::thread::spawn(move || {
+            let _activity = activity;
+            #[cfg(test)]
+            let probe = INITIAL_FILES_PROBE.lock().unwrap().clone();
+            let result = (|| {
+                #[cfg(test)]
+                if let Some(probe) = &probe {
+                    let _ = probe.started.send(());
+                    probe
+                        .permit
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("Synthetic inspection stopped"))?;
+                }
+                anyhow::ensure!(
+                    session == (online::account_session(), auth::session()),
+                    "Account changed before file inspection"
+                );
+                let prepared = prepare_files_page(&game, &config, &statuses)?;
+                anyhow::ensure!(
+                    session == (online::account_session(), auth::session()),
+                    "Account changed during file inspection"
+                );
+                Ok(InitialFilesResult {
+                    game,
+                    config,
+                    statuses,
+                    prepared,
+                })
+            })();
+            #[cfg(test)]
+            if let Some(probe) = &probe {
+                let _ = probe.ready.send(());
+                if probe.publish.lock().unwrap().recv().is_err() {
+                    return;
+                }
+            }
+            let _ = sender.send(result);
+        });
+        glib::ControlFlow::Continue
+    });
+    page
+}
+
+fn render_files_page(
+    game: &DetailPageModel,
+    window: &adw::ApplicationWindow,
+    options: FilesPageOptions<'_>,
+    prepared: &PreparedFilesPage,
+) -> gtk::Box {
     let FilesPageOptions {
         model,
         access_token,
@@ -1402,51 +2002,21 @@ pub(super) fn build_files_page(
         .map(|library| library.path.as_path())
         .unwrap_or_else(|| std::path::Path::new(""));
 
-    let managed = StateStore::open()
-        .and_then(|store| store.managed_files())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|file| file.product_id == game.product_id && file.present)
-        .collect::<Vec<_>>();
-    let local_files = |kind| {
-        managed
-            .iter()
-            .filter(|file| file.kind == kind)
-            .map(|file| LibraryFile {
-                name: file.filename.clone(),
-                path: file.path.clone(),
-                size: file.size,
-            })
-            .collect::<Vec<_>>()
-    };
-    let installers = match local_files(ArtifactKind::Installer) {
-        files if files.is_empty() => game.installers.clone(),
-        files => files,
-    };
-    let patches = match local_files(ArtifactKind::Patch) {
-        files if files.is_empty() => game.patches.clone(),
-        files => files,
-    };
-    let extras = match local_files(ArtifactKind::Extra) {
-        files if files.is_empty() => game.extras.clone(),
-        files => files,
-    };
-    let managed_disk_usage = managed.iter().map(|file| file.size).sum::<u64>();
-    let disk_usage = if managed_disk_usage == 0 {
-        game.disk_usage
-    } else {
-        managed_disk_usage
-    };
+    let product = &prepared.products[&game.product_id];
+    let installers = &product.installers;
+    let patches = &product.patches;
+    let extras = &product.extras;
     let summary = gtk::Label::new(Some(&format!(
         "{} files available  ·  {} local installers  ·  {} on disk",
         game.remote_artifacts.len(),
-        installers.len(),
-        human_size(disk_usage)
+        product.summary.0,
+        human_size(product.summary.1)
     )));
     summary.set_widget_name(&format!("managed-files-summary-{}", game.product_id));
     summary.set_xalign(0.0);
     summary.add_css_class("dim-label");
     page.append(&summary);
+    let refresh_summary = managed_detail_refresher(window, Some(model), &page, game.product_id);
     if let Some(management) = management {
         page.append(&management.status);
         page.append(&management.progress);
@@ -1471,6 +2041,7 @@ pub(super) fn build_files_page(
         .cloned()
         .collect::<Vec<_>>();
     let installer_context = RemoteFileContext {
+        refresh_summary: &refresh_summary,
         model: Some(model),
         product_id: game.product_id,
         product_slug: &game.slug,
@@ -1490,12 +2061,14 @@ pub(super) fn build_files_page(
         "Offline Installers",
         "folder-download-symbolic",
         &remote_installers,
-        &installers,
+        installers,
         &installer_context,
+        prepared,
     ));
     if !remote_patches.is_empty() {
         let patch_folder = game.location.join("patches");
         let patch_context = RemoteFileContext {
+            refresh_summary: &refresh_summary,
             model: Some(model),
             product_id: game.product_id,
             product_slug: &game.slug,
@@ -1515,13 +2088,15 @@ pub(super) fn build_files_page(
             "Patches",
             "view-refresh-symbolic",
             &remote_patches,
-            &patches,
+            patches,
             &patch_context,
+            prepared,
         ));
     }
     if !remote_extras.is_empty() {
         let extras_folder = game.location.join("extras");
         let extras_context = RemoteFileContext {
+            refresh_summary: &refresh_summary,
             model: Some(model),
             product_id: game.product_id,
             product_slug: &game.slug,
@@ -1541,26 +2116,31 @@ pub(super) fn build_files_page(
             "Goodies & Extras",
             "folder-documents-symbolic",
             &remote_extras,
-            &extras,
+            extras,
             &extras_context,
+            prepared,
         ));
     }
     if remote_patches.is_empty() && !patches.is_empty() {
         page.append(&file_collection(
             "Patches",
             "view-refresh-symbolic",
-            &patches,
+            patches,
             &game.location.join("patches"),
             window,
+            prepared
+                .directories
+                .contains(&game.location.join("patches")),
         ));
     }
     if remote_extras.is_empty() && !extras.is_empty() {
         page.append(&file_collection(
             "Goodies & Extras",
             "folder-documents-symbolic",
-            &extras,
+            extras,
             &game.location.join("extras"),
             window,
+            prepared.directories.contains(&game.location.join("extras")),
         ));
     }
     let owned_dlcs = game.dlcs.iter().filter(|dlc| dlc.owned).collect::<Vec<_>>();
@@ -1582,6 +2162,7 @@ pub(super) fn build_files_page(
                 library_statuses,
                 installer_defaults,
                 show_retired_artifacts,
+                prepared,
             ));
         }
     }
@@ -1600,34 +2181,20 @@ fn dlc_file_section(
     library_statuses: &[crate::storage::LibraryStatus],
     installer_defaults: &InstallerFilterDefaults,
     show_retired_artifacts: bool,
+    prepared: &PreparedFilesPage,
 ) -> gtk::Box {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let refresh_summary = managed_detail_refresher(window, Some(model), &section, dlc.product_id);
     section.add_css_class("dlc-files-section");
     let title = gtk::Label::new(Some(&dlc.title));
     title.set_xalign(0.0);
     title.add_css_class("heading");
     section.append(&title);
 
-    let managed = StateStore::open()
-        .and_then(|store| store.managed_files())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|file| file.product_id == dlc.product_id && file.path.is_file())
-        .collect::<Vec<_>>();
-    let local_files = |kind| {
-        managed
-            .iter()
-            .filter(|file| file.kind == kind)
-            .map(|file| LibraryFile {
-                name: file.filename.clone(),
-                path: file.path.clone(),
-                size: file.size,
-            })
-            .collect::<Vec<_>>()
-    };
-    let installers = local_files(ArtifactKind::Installer);
-    let patches = local_files(ArtifactKind::Patch);
-    let extras = local_files(ArtifactKind::Extra);
+    let product = &prepared.products[&dlc.product_id];
+    let installers = &product.installers;
+    let patches = &product.patches;
+    let extras = &product.extras;
     let dlc_root = download_directory
         .join(parent_slug)
         .join("dlc")
@@ -1645,6 +2212,7 @@ fn dlc_file_section(
             }
             let folder = dlc_root.join(kind.as_str());
             let context = RemoteFileContext {
+                refresh_summary: &refresh_summary,
                 model: Some(model),
                 product_id: dlc.product_id,
                 product_slug: &dlc.slug,
@@ -1661,10 +2229,17 @@ fn dlc_file_section(
                 installed: None,
             };
             if remote.is_empty() {
-                container.append(&file_collection(title, icon, local, &folder, window));
+                container.append(&file_collection(
+                    title,
+                    icon,
+                    local,
+                    &folder,
+                    window,
+                    prepared.directories.contains(&folder),
+                ));
             } else {
                 container.append(&remote_file_collection(
-                    title, icon, &remote, local, &context,
+                    title, icon, &remote, local, &context, prepared,
                 ));
             }
         };
@@ -1673,7 +2248,7 @@ fn dlc_file_section(
         "Offline Installers",
         "folder-download-symbolic",
         ArtifactKind::Installer,
-        &installers,
+        installers,
         Some(installer_defaults),
     );
     append_collection(
@@ -1681,7 +2256,7 @@ fn dlc_file_section(
         "Patches",
         "view-refresh-symbolic",
         ArtifactKind::Patch,
-        &patches,
+        patches,
         None,
     );
     append_collection(
@@ -1689,7 +2264,7 @@ fn dlc_file_section(
         "Goodies & Extras",
         "folder-documents-symbolic",
         ArtifactKind::Extra,
-        &extras,
+        extras,
         None,
     );
     section
@@ -1705,6 +2280,7 @@ pub(super) struct InstallerFilterDefaults {
 type InstallerFilterRows = Rc<RefCell<Vec<(gtk::Box, Option<String>, Option<String>)>>>;
 
 struct RemoteFileContext<'a> {
+    refresh_summary: &'a Rc<dyn Fn()>,
     model: Option<&'a Rc<RefCell<AppModel>>>,
     product_id: i64,
     product_slug: &'a str,
@@ -1837,8 +2413,20 @@ fn build_file_action_menu(actions: &gtk::Box) -> gtk::Box {
                 .bind_property("sensitive", proxy, "sensitive")
                 .sync_create()
                 .build();
+        }
+        {
             let source = source.clone();
-            proxy.connect_clicked(move |_| source.emit_clicked());
+            direct.connect_clicked(move |_| source.emit_clicked());
+        }
+        {
+            let source = source.clone();
+            let popover = popover.downgrade();
+            menu_entry.connect_clicked(move |_| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+                source.emit_clicked();
+            });
         }
         source
             .bind_property("visible", &menu_entry, "visible")
@@ -1952,47 +2540,31 @@ fn remote_file_collection(
     files: &[RemoteArtifact],
     local_files: &[LibraryFile],
     context: &RemoteFileContext<'_>,
+    prepared: &PreparedFilesPage,
 ) -> gtk::Box {
-    let state_store = StateStore::open().ok();
-    let (grouped, managed_group_paths): (Vec<_>, Vec<_>) =
-        download_selection::group_artifacts(files)
-            .into_iter()
-            .flat_map(|group| {
-                let artifacts = group.artifacts.iter().collect::<Vec<_>>();
-                let paths = state_store
-                    .as_ref()
-                    .and_then(|store| store.current_managed_paths(&artifacts).ok())
-                    .unwrap_or_default();
-                let mut copies =
-                    std::collections::BTreeMap::<std::path::PathBuf, Vec<std::path::PathBuf>>::new(
-                    );
-                for path in paths {
-                    copies
-                        .entry(path.parent().unwrap_or(&path).to_path_buf())
-                        .or_default()
-                        .push(path);
-                }
-                if copies.is_empty() {
-                    vec![(group, Vec::new())]
-                } else {
-                    copies
-                        .into_values()
-                        .map(|paths| (group.clone(), paths))
-                        .collect()
-                }
-            })
-            .unzip();
+    let product = &prepared.products[&context.product_id];
+    let grouped = product
+        .groups
+        .iter()
+        .filter(|group| {
+            files
+                .first()
+                .is_some_and(|file| file.kind == group.group.kind)
+        })
+        .collect::<Vec<_>>();
     let filter_rows: InstallerFilterRows = Rc::new(RefCell::new(Vec::new()));
     let collection = gtk::Box::new(gtk::Orientation::Vertical, 0);
     collection.add_css_class("file-collection");
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let header = gtk::Box::new(gtk::Orientation::Vertical, 10);
     header.add_css_class("file-collection-header");
-    header.append(&gtk::Image::from_icon_name(icon_name));
+    let heading_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    header.append(&heading_row);
+    heading_row.append(&gtk::Image::from_icon_name(icon_name));
     let heading = gtk::Label::new(Some(title));
     heading.set_xalign(0.0);
     heading.set_hexpand(true);
     heading.add_css_class("section-title");
-    header.append(&heading);
+    heading_row.append(&heading);
     let filter_controls = context.installer_filters.map(|defaults| {
         let mut languages = files
             .iter()
@@ -2017,53 +2589,48 @@ fn remote_file_collection(
                 })
                 .unwrap_or(0) as u32,
         );
-        header.append(&language);
-        let platforms = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-        platforms.add_css_class("installer-platform-filters");
         let windows = gtk::CheckButton::with_label("Windows");
         let linux = gtk::CheckButton::with_label("Linux");
         let macos = gtk::CheckButton::with_label("macOS");
         windows.set_active(defaults.windows);
         linux.set_active(defaults.linux);
         macos.set_active(defaults.macos);
-        platforms.append(&windows);
-        platforms.append(&linux);
-        platforms.append(&macos);
-        header.append(&platforms);
+        let filters = gtk::FlowBox::builder()
+            .homogeneous(false)
+            .selection_mode(gtk::SelectionMode::None)
+            .min_children_per_line(1)
+            .max_children_per_line(4)
+            .column_spacing(10)
+            .row_spacing(6)
+            .build();
+        filters.add_css_class("installer-platform-filters");
+        for control in [
+            language.clone().upcast::<gtk::Widget>(),
+            windows.clone().upcast(),
+            linux.clone().upcast(),
+            macos.clone().upcast(),
+        ] {
+            filters.insert(
+                &gtk::FlowBoxChild::builder()
+                    .focusable(false)
+                    .child(&control)
+                    .build(),
+                -1,
+            );
+        }
+        header.append(&filters);
         (language, language_list, windows, linux, macos)
     });
-    let downloaded = grouped
-        .iter()
-        .zip(&managed_group_paths)
-        .filter(|(group, managed_paths)| {
-            let refs = group.artifacts.iter().collect::<Vec<_>>();
-            if !managed_paths.is_empty() {
-                return managed_paths.iter().all(|path| {
-                    matches!(
-                        crate::storage::path_status(context.library_statuses, path),
-                        Some(crate::storage::LibraryCompatibility::Compatible)
-                    )
-                }) && artifact_download_is_plausible(&refs, managed_paths);
-            }
-            matching_download_job(&refs).is_some_and(|job| {
-                job.completed_files.iter().all(|path| {
-                    matches!(
-                        crate::storage::path_status(context.library_statuses, path),
-                        Some(crate::storage::LibraryCompatibility::Compatible)
-                    )
-                }) && download_job_is_complete(&job)
-                    && artifact_download_is_plausible(&refs, &job.completed_files)
-            })
-        })
-        .count();
+    let downloaded = grouped.iter().filter(|group| group.downloaded).count();
     let count_text = format!("{downloaded}/{} Downloaded", grouped.len());
     let count = gtk::Label::new(Some(&count_text));
     count.add_css_class("dim-label");
-    header.append(&count);
-    header.append(&folder_button(
+    heading_row.append(&count);
+    heading_row.append(&prepared_folder_button(
         &format!("Open {title} folder"),
         context.folder,
         context.window,
+        prepared.directories.contains(context.folder),
     ));
     collection.append(&header);
 
@@ -2075,14 +2642,12 @@ fn remote_file_collection(
         return collection;
     }
     let mut represented_local_files = HashSet::new();
-    for (group, managed_paths) in grouped.iter().zip(&managed_group_paths) {
+    for initial in grouped {
+        let group = &initial.group;
+        let managed_paths = &initial.managed_paths;
         let refs = group.artifacts.iter().collect::<Vec<_>>();
         let file = &group.artifacts[0];
-        if !managed_paths.is_empty() {
-            represented_local_files.extend(managed_paths.iter().cloned());
-        } else if let Some(job) = matching_download_job(&refs).filter(download_job_is_complete) {
-            represented_local_files.extend(job.completed_files);
-        }
+        represented_local_files.extend(initial.represented.iter().cloned());
         let display_name = artifact_display_title(file, context.product_title);
         let mut metadata_parts = [
             file.operating_system.as_deref(),
@@ -2096,7 +2661,10 @@ fn remote_file_collection(
         .map(str::to_owned)
         .collect::<Vec<_>>();
         if let Some(part_count) = file.part_count {
-            metadata_parts.push(format!("{part_count} parts"));
+            metadata_parts.push(format!(
+                "{part_count} {}",
+                if part_count == 1 { "part" } else { "parts" }
+            ));
         }
         if let Some(path) = managed_paths.first().and_then(|path| path.parent()) {
             metadata_parts.push(path.display().to_string());
@@ -2120,7 +2688,7 @@ fn remote_file_collection(
         });
         widgets.row.append(&artifact_download_action(
             &refs,
-            managed_paths,
+            initial,
             &widgets.labels,
             &count,
             context,
@@ -2135,16 +2703,11 @@ fn remote_file_collection(
         collection.append(&widgets.row);
     }
     let retired = if context.show_retired_artifacts {
-        let retired_local_identities = StateStore::open()
-            .ok()
-            .map(|store| {
-                local_files
-                    .iter()
-                    .filter_map(|file| store.retired_artifact_for_file(&file.path).ok().flatten())
-                    .map(|artifact| (artifact.download_path, artifact.version))
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let retired_local_identities = local_files
+            .iter()
+            .filter_map(|file| product.historical.get(&file.path))
+            .map(|artifact| (&artifact.download_path, &artifact.version))
+            .collect::<HashSet<_>>();
         let collection_kind = files.first().map(|file| file.kind).unwrap_or_else(|| {
             if title.to_ascii_lowercase().contains("patch") {
                 ArtifactKind::Patch
@@ -2154,19 +2717,14 @@ fn remote_file_collection(
                 ArtifactKind::Installer
             }
         });
-        StateStore::open()
-            .and_then(|store| store.artifact_catalog(context.product_id))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| !entry.currently_offered)
-            .filter(|entry| entry.artifact.kind == collection_kind)
-            .filter(|entry| {
-                !retired_local_identities.contains(&(
-                    entry.artifact.download_path.clone(),
-                    entry.artifact.version.clone(),
-                ))
+        product
+            .retired
+            .iter()
+            .filter(|artifact| artifact.kind == collection_kind)
+            .filter(|artifact| {
+                !retired_local_identities.contains(&(&artifact.download_path, &artifact.version))
             })
-            .map(|entry| entry.artifact)
+            .cloned()
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -2211,10 +2769,7 @@ fn remote_file_collection(
     for files in historical_groups.values() {
         let file = files[0];
         let historical = file.name.contains("not matched to current GOG manifest");
-        let retired_artifact = StateStore::open()
-            .and_then(|store| store.retired_artifact_for_file(&file.path))
-            .ok()
-            .flatten();
+        let retired_artifact = product.historical.get(&file.path).cloned();
         let display_name = if let Some(artifact) = &retired_artifact {
             artifact_display_title(artifact, context.product_title)
         } else if historical {
@@ -2274,7 +2829,12 @@ fn remote_file_collection(
         });
         let row = widgets.row;
         let local_folder = file.path.parent().unwrap_or(context.folder);
-        let open = folder_button("Show downloaded file", local_folder, context.window);
+        let open = prepared_folder_button(
+            "Show downloaded file",
+            local_folder,
+            context.window,
+            prepared.directories.contains(local_folder),
+        );
         let delete = gtk::Button::from_icon_name("user-trash-symbolic");
         delete.set_tooltip_text(Some("Delete this managed file"));
         let paths = files
@@ -2292,6 +2852,7 @@ fn remote_file_collection(
         let row_for_delete = row.clone();
         let window = context.window.clone();
         let product_id = context.product_id;
+        let refresh_summary = context.refresh_summary.clone();
         let deletion_warning = if retired_artifact.is_some() {
             "This previous version is no longer offered by GOG and most likely cannot be downloaded again."
         } else {
@@ -2315,7 +2876,7 @@ fn remote_file_collection(
             let path = path.clone();
             let row = row_for_delete.clone();
             let button = button.clone();
-            let response_window = window.clone();
+            let refresh_summary = refresh_summary.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response != "delete" {
                     return;
@@ -2324,7 +2885,7 @@ fn remote_file_collection(
                 delete_downloaded_files(product_id, paths, move |result| match result {
                     Ok(()) => {
                         row.set_visible(false);
-                        refresh_managed_detail_labels(&response_window, product_id);
+                        refresh_summary();
                     }
                     Err(error) => {
                         tracing::warn!(%error, path = %path.display(), "could not delete managed file");
@@ -2418,7 +2979,7 @@ pub(super) fn apply_installer_file_filters(
 
 fn artifact_download_action(
     artifacts: &[&RemoteArtifact],
-    managed_paths: &[std::path::PathBuf],
+    initial: &PreparedFileGroup,
     labels: &gtk::Box,
     collection_count: &gtk::Label,
     context: &RemoteFileContext<'_>,
@@ -2428,21 +2989,13 @@ fn artifact_download_action(
 
     let requested_job_id = download::job_id(artifacts);
     let product_id = artifacts[0].product_id;
-    let saved_job = matching_download_job(artifacts);
+    let saved_job = initial.saved_job.clone();
     let job_id = saved_job
         .as_ref()
         .map(|job| job.job_id.clone())
         .unwrap_or(requested_job_id);
     let active_job_id = Rc::new(RefCell::new(job_id.clone()));
-    let existing_files = if managed_paths.is_empty() {
-        saved_job
-            .as_ref()
-            .filter(|job| job.state == "complete")
-            .map(|job| job.completed_files.clone())
-            .unwrap_or_default()
-    } else {
-        managed_paths.to_vec()
-    };
+    let existing_files = initial.existing_files.clone();
     let has_existing_files = !existing_files.is_empty();
     let library_kind = crate::storage::artifact_library_kind(artifacts[0]);
     let local_usable = existing_files.iter().all(|path| {
@@ -2458,24 +3011,8 @@ fn artifact_download_action(
                 crate::storage::LibraryCompatibility::Compatible
             )
     });
-    let invalid_download = !existing_files.is_empty()
-        && (!local_usable || !artifact_download_is_plausible(artifacts, &existing_files));
-    let completed_folder = (!invalid_download)
-        .then(|| {
-            managed_paths
-                .first()
-                .and_then(|path| path.parent())
-                .map(std::path::Path::to_path_buf)
-                .or_else(|| {
-                    saved_job.as_ref().and_then(|job| {
-                        (job.state == "complete"
-                            && !job.completed_files.is_empty()
-                            && job.completed_files.iter().all(|path| path.is_file()))
-                        .then(|| job.destination.clone())
-                    })
-                })
-        })
-        .flatten();
+    let invalid_download = initial.invalid_download;
+    let completed_folder = initial.completed_folder.clone();
     let status_text = if invalid_download {
         "✕"
     } else if completed_folder.is_some() {
@@ -2586,6 +3123,7 @@ fn artifact_download_action(
     let running = Rc::new(RefCell::new(
         None::<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ));
+    let finalizing = Rc::new(std::cell::Cell::new(false));
     if can_run_patch {
         let window = context.window.clone();
         let installed = context.installed.cloned().expect("checked above");
@@ -2605,7 +3143,9 @@ fn artifact_download_action(
         let auth_session = auth::session();
         let target_version =
             crate::installation::patch_target_version(artifacts[0].version.as_deref());
+        let finalizing = finalizing.clone();
         run_patch_button.connect_clicked(move |run_patch_button| {
+            if finalizing.get() { return; }
             if online::account_session() != session || auth::session() != auth_session {
                 status.set_label("Account changed"); status.set_visible(true);
                 details.set_label("Close and reopen this game's files before running a patch."); details.set_visible(true);
@@ -2641,8 +3181,9 @@ fn artifact_download_action(
             let progress = progress.clone();
             let details = details.clone();
             let target_version = target_version.clone();
+            let finalizing = finalizing.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "run" {
+                if response != "run" || finalizing.get() {
                     return;
                 }
                 if online::account_session() != session || auth::session() != auth_session || status.root().is_none() || !window_for_response.is_visible() {
@@ -2663,7 +3204,8 @@ fn artifact_download_action(
                 details.set_label("Preparing the patch. Once started, patch work continues if you leave this view."); details.set_visible(true);
                 let current: Rc<dyn Fn() -> bool> = Rc::new({
                     let status = status.downgrade(); let window = window_for_response.downgrade();
-                    move || online::account_session() == session && auth::session() == auth_session
+                    let finalizing = finalizing.clone();
+                    move || !finalizing.get() && online::account_session() == session && auth::session() == auth_session
                         && status.upgrade().is_some_and(|status| status.root().is_some())
                         && window.upgrade().is_some_and(|window| window.is_visible())
                 });
@@ -2687,7 +3229,11 @@ fn artifact_download_action(
         let progress = progress.clone();
         let download_button = button.clone();
         let discard_button_for_response = discard_button.clone();
+        let finalizing = finalizing.clone();
         discard_button.connect_clicked(move |_| {
+            if finalizing.get() {
+                return;
+            }
             let confirmation = adw::AlertDialog::builder()
                 .heading("Discard this download?")
                 .body(
@@ -2705,8 +3251,9 @@ fn artifact_download_action(
             let progress = progress.clone();
             let download_button = download_button.clone();
             let discard_button = discard_button_for_response.clone();
+            let finalizing = finalizing.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "discard" {
+                if response != "discard" || finalizing.get() {
                     return;
                 }
                 if download::remove(&job_id.borrow()) {
@@ -2730,6 +3277,7 @@ fn artifact_download_action(
     let status_for_download = status.clone();
     let progress_for_download = progress.clone();
     let window_for_download = context.window.clone();
+    let refresh_summary_for_download = context.refresh_summary.clone();
     let count_for_download = collection_count.clone();
     let copy_for_download = download_copy.clone();
     let product_slug = context
@@ -2742,6 +3290,22 @@ fn artifact_download_action(
     let session = online::account_session();
     let copy_requested = Rc::new(std::cell::Cell::new(false));
     let auth_session = auth::session();
+    let origin = context
+        .model
+        .map(|model| (Rc::downgrade(model), model.borrow().account_epoch));
+    let request_current: Rc<dyn Fn() -> bool> = Rc::new({
+        let window = context.window.downgrade();
+        move || {
+            (online::account_session(), auth::session()) == (session, auth_session)
+                && window.upgrade().is_some_and(|window| window.is_visible())
+                && origin.as_ref().is_none_or(|(model, epoch)| {
+                    model.upgrade().is_some_and(|model| {
+                        let model = model.borrow();
+                        model.account_epoch == *epoch && !model.logout_pending
+                    })
+                })
+        }
+    });
     if let Some(model) = context.model {
         let model = Rc::downgrade(model);
         let action = action.downgrade();
@@ -2861,12 +3425,15 @@ fn artifact_download_action(
                                 "✕"
                             });
                             status.set_visible(!files.is_empty());
-                            status.add_css_class(if complete { "success" } else { "error" });
-                            status.set_tooltip_text(Some(if complete {
-                                "Downloaded"
-                            } else {
-                                "Download files are missing or their file sizes do not match."
-                            }));
+                            status.set_tooltip_text(None);
+                            if !files.is_empty() {
+                                status.add_css_class(if complete { "success" } else { "error" });
+                                status.set_tooltip_text(Some(if complete {
+                                    "Downloaded"
+                                } else {
+                                    "Download files are missing or their file sizes do not match."
+                                }));
+                            }
                             button.set_icon_name(if complete {
                                 "folder-open-symbolic"
                             } else {
@@ -2959,13 +3526,22 @@ fn artifact_download_action(
     {
         let copy_requested = copy_requested.clone();
         let button = button.clone();
+        let finalizing = finalizing.clone();
         download_copy.connect_clicked(move |_| {
+            if finalizing.get() {
+                return;
+            }
             copy_requested.set(true);
             button.emit_clicked();
             copy_requested.set(false);
         });
     }
+    let finalizing_for_download = finalizing.clone();
+    let discard_for_download = discard_button.clone();
     button.connect_clicked(move |button| {
+        if finalizing_for_download.get() || !request_current() {
+            return;
+        }
         if let Some(cancellation) = running_for_download.borrow().as_ref() {
             cancellation.store(true, std::sync::atomic::Ordering::Release);
             status_for_download.set_label("Cancelling…");
@@ -2997,7 +3573,7 @@ fn artifact_download_action(
         let status_for_download = status_for_download.clone();
         let progress_for_download = progress_for_download.clone();
         let count_for_download = count_for_download.clone();
-        let window_for_response = window_for_download.clone();
+        let refresh_summary = refresh_summary_for_download.clone();
         let artifacts = artifacts.clone();
         let title = title.clone();
         let product_slug = product_slug.clone();
@@ -3005,13 +3581,13 @@ fn artifact_download_action(
         let active_job_id = active_job_id.clone();
         let download_copy = copy_for_download.clone();
         let counted = counted_for_download.clone();
+        let finalizing = finalizing_for_download.clone();
+        let discard = discard_for_download.clone();
+        let request_current = request_current.clone();
         choose_download_libraries(&window_for_download, vec![library_kind], move |libraries| {
             // File-action proxies invoke an unmounted source button. Its root is not
             // the lifetime of this explicit download request.
-            if online::account_session() != session
-                || auth::session() != auth_session
-                || !window_for_response.is_visible()
-            {
+            if finalizing.get() || !request_current() {
                 return;
             }
             let library = &libraries[0].1;
@@ -3061,7 +3637,9 @@ fn artifact_download_action(
                 let _ = prepared_sender.send(prepared);
             });
             status_for_download.remove_css_class("success");
+            status_for_download.remove_css_class("error");
             status_for_download.add_css_class("dim-label");
+            status_for_download.set_tooltip_text(None);
             status_for_download.set_label("Preparing download…");
             status_for_download.set_visible(true);
             progress_for_download.set_visible(true);
@@ -3077,11 +3655,69 @@ fn artifact_download_action(
             let count_for_response = count_for_download.clone();
             let artifacts_for_validation = artifacts.clone();
             let mut prepared = false;
+            let mut receiver = Some(receiver);
+            let mut inspection: Option<(Vec<PathBuf>, mpsc::Receiver<anyhow::Result<bool>>)> = None;
+            let mut sensitivity = [true; 4];
             glib::timeout_add_local(Duration::from_millis(100), move || {
-                if online::account_session() != session
-                    || auth::session() != auth_session
-                    || !window_for_response.is_visible()
-                {
+                if !request_current() {
+                    return glib::ControlFlow::Break;
+                }
+                if let Some((_, inspected)) = inspection.as_ref() {
+                    let result = match inspected.try_recv() {
+                        Ok(result) => result,
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(_) => Err(anyhow::anyhow!("File inspection stopped unexpectedly")),
+                    };
+                    let (files, inspected) = inspection.take().unwrap();
+                    drop(inspected);
+                    *downloaded_files.borrow_mut() = files.clone();
+                    *folder.borrow_mut() = None;
+                    status.remove_css_class("dim-label");
+                    status.remove_css_class("success");
+                    status.remove_css_class("error");
+                    progress.set_visible(false);
+                    button.set_icon_name("folder-download-symbolic");
+                    delete_button.set_visible(!files.is_empty());
+                    download_copy.set_visible(false);
+                    run_patch_button.set_visible(false);
+                    let usable = result.is_ok();
+                    match result {
+                        Ok(true) => {
+                            *folder.borrow_mut() = files.first().and_then(|path| path.parent()).map(Path::to_path_buf);
+                            status.add_css_class("success");
+                            status.set_label("✓");
+                            status.set_tooltip_text(Some("Downloaded"));
+                            progress.set_fraction(1.0);
+                            button.set_icon_name("folder-open-symbolic");
+                            button.set_tooltip_text(Some("Show downloaded files"));
+                            download_copy.set_visible(true);
+                            run_patch_button.set_visible(can_run_patch);
+                            if !counted.replace(true) {
+                                adjust_downloaded_collection_count(&count_for_response, 1);
+                            }
+                            refresh_summary();
+                        }
+                        Ok(false) => {
+                            status.add_css_class("error");
+                            status.set_label("✕");
+                            status.set_tooltip_text(Some("Download files are missing or their file sizes do not match."));
+                            button.set_tooltip_text(Some("Download all required parts again"));
+                        }
+                        Err(error) => {
+                            status.add_css_class("error");
+                            status.set_label("Could not inspect downloaded files. Use Manage → Refresh local state to retry.");
+                            status.set_wrap(true);
+                            status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                            status.set_max_width_chars(32);
+                            status.set_tooltip_text(Some(&notifications::failure_message("File inspection failed", &error.to_string())));
+                            button.set_tooltip_text(Some("Use Manage → Refresh local state to inspect these files again"));
+                        }
+                    }
+                    for (control, sensitive) in [&delete_button, &download_copy, &run_patch_button, &discard].into_iter().zip(sensitivity) {
+                        control.set_sensitive(sensitive);
+                    }
+                    finalizing.set(false);
+                    button.set_sensitive(usable);
                     return glib::ControlFlow::Break;
                 }
                 if !prepared {
@@ -3094,6 +3730,12 @@ fn artifact_download_action(
                                 None,
                             ) {
                                 Ok(_) => {
+                                    // Queue capture cancels instead of transferring; the fixture
+                                    // can now drive this real receiver with synthetic events.
+                                    assert!(matches!(
+                                        receiver.as_ref().unwrap().try_recv(),
+                                        Ok(download::DownloadEvent::Cancelled)
+                                    ));
                                     prepared = true;
                                     button.set_sensitive(true);
                                     return glib::ControlFlow::Continue;
@@ -3111,6 +3753,8 @@ fn artifact_download_action(
                             status.set_label("Starting…");
                         }
                         Ok(Err(error)) => {
+                            status.remove_css_class("dim-label");
+                            status.add_css_class("error");
                             status.set_label(&format!("Cannot prepare this download: {error}"));
                             progress.set_visible(false);
                             button.set_sensitive(true);
@@ -3121,6 +3765,8 @@ fn artifact_download_action(
                             return glib::ControlFlow::Continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => {
+                            status.remove_css_class("dim-label");
+                            status.add_css_class("error");
                             status.set_label("Download preparation stopped. Retry the download.");
                             progress.set_visible(false);
                             button.set_sensitive(true);
@@ -3128,7 +3774,7 @@ fn artifact_download_action(
                         }
                     }
                 }
-                match receiver.try_recv() {
+                match receiver.as_ref().unwrap().try_recv() {
                     Ok(download::DownloadEvent::Progress { downloaded, total }) => {
                         status.set_label(&match total {
                             Some(total) if total > 0 => format!(
@@ -3153,48 +3799,27 @@ fn artifact_download_action(
                         glib::ControlFlow::Continue
                     }
                     Ok(download::DownloadEvent::Complete { files }) => {
+                        drop(receiver.take());
+                        finalizing.set(true);
                         *running.borrow_mut() = None;
-                        *downloaded_files.borrow_mut() = files.clone();
-                        let artifact_refs = artifacts_for_validation.iter().collect::<Vec<_>>();
-                        if !artifact_download_is_plausible(&artifact_refs, &files) {
-                            *folder.borrow_mut() = None;
-                            status.remove_css_class("dim-label");
-                            status.remove_css_class("success");
-                            status.add_css_class("error");
-                            status.set_label("✕");
-                            status.set_tooltip_text(Some(
-                                "Download files are missing or their file sizes do not match.",
-                            ));
-                            progress.set_visible(false);
-                            button.set_icon_name("folder-download-symbolic");
-                            button.set_tooltip_text(Some("Download all required parts again"));
-                            button.set_sensitive(true);
-                            delete_button.set_visible(true);
-                            run_patch_button.set_visible(false);
-                            glib::ControlFlow::Break
-                        } else {
-                            *folder.borrow_mut() = files
-                                .first()
-                                .and_then(|path| path.parent())
-                                .map(std::path::Path::to_owned);
-                            status.remove_css_class("dim-label");
-                            status.add_css_class("success");
-                            status.set_label("✓");
-                            status.set_tooltip_text(Some("Downloaded"));
-                            progress.set_fraction(1.0);
-                            progress.set_visible(false);
-                            button.set_icon_name("folder-open-symbolic");
-                            button.set_tooltip_text(Some("Show downloaded files"));
-                            button.set_sensitive(true);
-                            delete_button.set_visible(true);
-                            download_copy.set_visible(true);
-                            run_patch_button.set_visible(can_run_patch);
-                            if !counted.replace(true) {
-                                adjust_downloaded_collection_count(&count_for_response, 1);
-                            }
-                            refresh_managed_detail_labels(&window_for_response, product_id);
-                            glib::ControlFlow::Break
+                        sensitivity = [&delete_button, &download_copy, &run_patch_button, &discard].map(|control| control.is_sensitive());
+                        for control in [&button, &delete_button, &download_copy, &run_patch_button, &discard] {
+                            control.set_sensitive(false);
                         }
+                        discard.set_visible(false);
+                        button.set_icon_name("folder-download-symbolic");
+                        button.set_tooltip_text(Some("Inspecting downloaded files"));
+                        status.set_label("Finalizing…");
+                        progress.set_visible(true);
+                        progress.set_fraction(1.0);
+                        progress.set_text(Some("Finalizing…"));
+                        progress.set_show_text(true);
+                        if !request_current() {
+                            return glib::ControlFlow::Break;
+                        }
+                        let inspected = inspect_completed_download(artifacts_for_validation.clone(), files.clone(), (session, auth_session));
+                        inspection = Some((files, inspected));
+                        glib::ControlFlow::Continue
                     }
                     Ok(download::DownloadEvent::Cancelled) => {
                         *running.borrow_mut() = None;
@@ -3207,6 +3832,8 @@ fn artifact_download_action(
                     }
                     Ok(download::DownloadEvent::Failed(error)) => {
                         *running.borrow_mut() = None;
+                        status.remove_css_class("dim-label");
+                        status.add_css_class("error");
                         status.set_label("Failed — retry");
                         status.set_tooltip_text(Some(&error.message));
                         progress.set_visible(false);
@@ -3218,6 +3845,8 @@ fn artifact_download_action(
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         *running.borrow_mut() = None;
+                        status.remove_css_class("dim-label");
+                        status.add_css_class("error");
                         status.set_label("Download stopped unexpectedly — retry");
                         progress.set_visible(false);
                         button.set_icon_name("folder-download-symbolic");
@@ -3245,12 +3874,16 @@ fn artifact_download_action(
         let title = context.product_title.to_owned();
         let can_download = context.access_token.is_some();
         let deleting = gtk::Spinner::new();
+        let refresh_summary = context.refresh_summary.clone();
+        let finalizing = finalizing.clone();
         deleting.set_visible(false);
         if let Some(action) = action.upgrade() {
             action.append(&deleting);
         }
         delete_button.connect_clicked(move |_| {
-            if (online::account_session(), auth::session()) != (session, auth_session) {
+            if finalizing.get()
+                || (online::account_session(), auth::session()) != (session, auth_session)
+            {
                 return;
             }
             let files = downloaded_files.borrow().clone();
@@ -3281,8 +3914,11 @@ fn artifact_download_action(
             let deleting = deleting.clone();
             let title = title.clone();
             let counted = counted.clone();
+            let refresh_summary = refresh_summary.clone();
+            let finalizing = finalizing.clone();
             confirmation.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response != "delete"
+                    || finalizing.get()
                     || (online::account_session(), auth::session()) != (session, auth_session)
                     || !window_for_response.is_visible()
                     || !action.upgrade().is_some_and(|row| row.is_mapped())
@@ -3330,7 +3966,7 @@ fn artifact_download_action(
                             if counted.replace(false) {
                                 adjust_downloaded_collection_count(&count_for_response, -1);
                             }
-                            refresh_managed_detail_labels(&window_for_response, product_id);
+                            refresh_summary();
                             notifications::failure_message(
                                 "",
                                 &format!("{title}: Downloaded files deleted."),
@@ -3466,6 +4102,72 @@ fn delete_downloaded_files(
             }
         }
     });
+}
+
+#[cfg(test)]
+struct CompletedDownloadProbe {
+    entered: mpsc::Sender<()>,
+    permit: mpsc::Receiver<()>,
+    disconnect: bool,
+    checked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMPLETED_DOWNLOADS: RefCell<Option<std::collections::VecDeque<CompletedDownloadProbe>>> = const { RefCell::new(None) };
+}
+
+fn inspect_completed_download(
+    artifacts: Vec<RemoteArtifact>,
+    files: Vec<PathBuf>,
+    session: (u64, u64),
+) -> mpsc::Receiver<anyhow::Result<bool>> {
+    let (sender, receiver) = mpsc::channel();
+    match crate::profile_reset::begin_activity("inspecting completed download") {
+        Err(error) => {
+            let _ = sender.send(Err(error));
+        }
+        Ok(activity) => {
+            #[cfg(test)]
+            let probe = TEST_COMPLETED_DOWNLOADS.with(|probes| {
+                probes.borrow_mut().as_mut().map(|probes| {
+                    probes
+                        .pop_front()
+                        .expect("unplanned completed-download inspection")
+                })
+            });
+            std::thread::spawn(move || {
+                let _activity = activity;
+                let result = (|| {
+                    #[cfg(test)]
+                    if let Some(probe) = probe.as_ref() {
+                        let _ = probe.entered.send(());
+                        probe.permit.recv_timeout(Duration::from_secs(10))?;
+                    }
+                    anyhow::ensure!(
+                        (online::account_session(), auth::session()) == session,
+                        "The account changed before inspecting downloaded files"
+                    );
+                    #[cfg(test)]
+                    if let Some(probe) = probe.as_ref() {
+                        probe
+                            .checked
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    Ok(artifact_download_is_plausible(
+                        &artifacts.iter().collect::<Vec<_>>(),
+                        &files,
+                    ))
+                })();
+                #[cfg(test)]
+                if probe.as_ref().is_some_and(|probe| probe.disconnect) {
+                    return;
+                }
+                let _ = sender.send(result);
+            });
+        }
+    }
+    receiver
 }
 
 fn artifact_download_is_plausible(
@@ -4249,6 +4951,7 @@ pub(super) fn file_collection(
     files: &[crate::domain::LibraryFile],
     folder: &std::path::Path,
     window: &adw::ApplicationWindow,
+    folder_available: bool,
 ) -> gtk::Box {
     let collection = gtk::Box::new(gtk::Orientation::Vertical, 0);
     collection.add_css_class("file-collection");
@@ -4263,10 +4966,11 @@ pub(super) fn file_collection(
     let count = gtk::Label::new(Some(&format!("{} files", files.len())));
     count.add_css_class("dim-label");
     header.append(&count);
-    header.append(&folder_button(
+    header.append(&prepared_folder_button(
         &format!("Open {title} folder"),
         folder,
         window,
+        folder_available,
     ));
     collection.append(&header);
 
@@ -4357,12 +5061,693 @@ fn inferred_local_artifact(file: &LibraryFile) -> Option<RemoteArtifact> {
 }
 
 #[cfg(test)]
+mod initial_files_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::Instant;
+
+    #[track_caller]
+    fn wait(mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            while glib::MainContext::default().iteration(false) {}
+            if check() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial Files condition timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn pump(duration: Duration) {
+        let deadline = Instant::now() + duration;
+        wait(|| Instant::now() >= deadline);
+    }
+
+    fn labels(widget: &gtk::Widget) -> Vec<String> {
+        let mut result = widget
+            .clone()
+            .downcast::<gtk::Label>()
+            .ok()
+            .map(|label| vec![label.text().to_string()])
+            .unwrap_or_default();
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            result.extend(labels(&widget));
+            child = widget.next_sibling();
+        }
+        result
+    }
+
+    struct Fixture {
+        _app: adw::Application,
+        window: adw::ApplicationWindow,
+        host: gtk::Box,
+        focus: gtk::Entry,
+        header: gtk::Label,
+        model: Rc<RefCell<AppModel>>,
+        game: Game,
+        probe: Arc<InitialFilesProbe>,
+        started: mpsc::Receiver<()>,
+        permit: mpsc::Sender<()>,
+        ready: mpsc::Receiver<()>,
+        publish: mpsc::Sender<()>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let home = std::env::var("HOME").unwrap();
+            assert!(home.starts_with("/tmp/ludomere-p354-"));
+            let root = Path::new(&home).parent().unwrap();
+            for key in [
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+            ] {
+                assert!(Path::new(&std::env::var_os(key).unwrap()).starts_with(root));
+            }
+            assert!(
+                crate::identity::database().starts_with(std::env::var_os("XDG_DATA_HOME").unwrap())
+            );
+            adw::init().unwrap();
+            let archives = root.join("archives");
+            std::fs::create_dir_all(&archives).unwrap();
+            let config = Config {
+                offline_libraries: vec![crate::config::GameLibrary {
+                    id: "synthetic-archives".into(),
+                    name: "Synthetic archives".into(),
+                    path: archives.clone(),
+                    default: true,
+                }],
+                game_libraries: vec![],
+                extras_libraries: vec![],
+                show_retired_artifacts: true,
+                installer_windows: true,
+                ..Config::default()
+            };
+            let artifact = |group: &str, part: u32| -> RemoteArtifact {
+                serde_json::from_value(serde_json::json!({
+                    "product_id":9354001, "kind":"installer", "name":group,
+                    "operating_system":"windows", "language":"English", "version":"2",
+                    "download_path":format!("/synthetic/{group}/{part}"),
+                    "part_number":part, "part_count":2, "size_bytes":64,
+                    "provider_group_id":group, "provider_file_id":format!("{group}-{part}"),
+                    "provider_category":"installer"
+                }))
+                .unwrap()
+            };
+            let mut game = Game {
+                product_id: 9354001,
+                title: "Synthetic Files".into(),
+                slug: "synthetic-files".into(),
+                location: archives.join("synthetic-files"),
+                ..Game::default()
+            };
+            let store = StateStore::open().unwrap();
+            let old = (1..=2)
+                .map(|part| {
+                    let mut value = artifact("Complete", part);
+                    value.version = Some("1".into());
+                    value.download_path = format!("/synthetic/old/{part}");
+                    value
+                })
+                .collect::<Vec<_>>();
+            store
+                .cache_download_manifest(game.product_id, &old)
+                .unwrap();
+            let write_parts = |name: &str| {
+                let folder = game.location.join(name);
+                std::fs::create_dir_all(&folder).unwrap();
+                (1..=2)
+                    .map(|part| {
+                        let path = folder.join(format!("setup-{part}.bin"));
+                        std::fs::write(&path, [42_u8; 64]).unwrap();
+                        path
+                    })
+                    .collect::<Vec<_>>()
+            };
+            store
+                .record_completed_artifacts("old", &game.slug, &old, &write_parts("old"))
+                .unwrap();
+            for group in ["Complete", "Paused", "Failed", "Interrupted"] {
+                game.remote_artifacts
+                    .extend((1..=2).map(|part| artifact(group, part)));
+            }
+            store
+                .cache_download_manifest(game.product_id, &game.remote_artifacts)
+                .unwrap();
+            for (index, state) in [
+                DownloadState::Complete,
+                DownloadState::Paused,
+                DownloadState::Failed,
+                DownloadState::Downloading,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let artifacts = &game.remote_artifacts[index * 2..index * 2 + 2];
+                let job_id = download::job_id(&artifacts.iter().collect::<Vec<_>>());
+                let paths = if index == 0 {
+                    write_parts("current")
+                } else {
+                    Vec::new()
+                };
+                store
+                    .save_download_job(&crate::state::DownloadJobUpdate {
+                        job_id: &job_id,
+                        product_id: game.product_id,
+                        title: &game.title,
+                        artifacts,
+                        destination: &game.location.join("current"),
+                        state,
+                        bytes_downloaded: 64,
+                        total_bytes: Some(128),
+                        completed_files: &paths,
+                        error: None,
+                    })
+                    .unwrap();
+                if index == 0 {
+                    store
+                        .record_completed_artifacts(&job_id, &game.slug, artifacts, &paths)
+                        .unwrap();
+                    store
+                        .record_completed_artifacts(
+                            &job_id,
+                            &game.slug,
+                            artifacts,
+                            &write_parts("copy"),
+                        )
+                        .unwrap();
+                }
+            }
+            // Existing persistence decodes malformed artifact JSON as an empty list.
+            // Initial matching must safely ignore that row instead of indexing it.
+            store
+                .save_download_job(&crate::state::DownloadJobUpdate {
+                    job_id: "empty-artifacts",
+                    product_id: game.product_id,
+                    title: "Incomplete saved job",
+                    artifacts: &[],
+                    destination: &game.location,
+                    state: DownloadState::Failed,
+                    bytes_downloaded: 0,
+                    total_bytes: None,
+                    completed_files: &[],
+                    error: None,
+                })
+                .unwrap();
+            let mut dlc_artifact = artifact("DLC Files", 1);
+            dlc_artifact.product_id = 9354002;
+            dlc_artifact.part_count = Some(1);
+            game.dlcs.push(Dlc {
+                product_id: 9354002,
+                owned: true,
+                title: "Synthetic DLC".into(),
+                slug: "synthetic-dlc".into(),
+                remote_artifacts: vec![dlc_artifact],
+                ..Dlc::default()
+            });
+            // Legal legacy metadata can reuse an official group ID across different kinds.
+            for (kind, name) in [
+                (ArtifactKind::Patch, "Synthetic patch"),
+                (ArtifactKind::Extra, "Synthetic extra"),
+            ] {
+                let mut mixed = artifact("Shared legacy ID", 1);
+                mixed.kind = kind;
+                mixed.name = name.into();
+                mixed.part_count = Some(1);
+                mixed.provider_category = None;
+                mixed.provider_file_id = None;
+                game.remote_artifacts.push(mixed);
+            }
+            drop(store);
+            let model = Rc::new(RefCell::new(AppModel {
+                library_statuses: crate::storage::inspect_libraries(&config).unwrap(),
+                config,
+                games: vec![game.clone()],
+                detail_target: Some((game.product_id, None)),
+                ..AppModel::default()
+            }));
+            let app = adw::Application::builder()
+                .application_id("io.github.ludomere.InitialFilesTest")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(gio::Cancellable::NONE).unwrap();
+            let window = adw::ApplicationWindow::new(&app);
+            window.set_default_size(1000, 700);
+            let host = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            let focus = gtk::Entry::new();
+            host.append(&focus);
+            let header =
+                gtk::Label::new(Some("Synthetic Files · Downloaded files: previously known"));
+            header.set_widget_name("managed-product-subtitle-9354001");
+            host.append(&header);
+            let scroll = gtk::ScrolledWindow::builder().child(&host).build();
+            window.set_content(Some(&scroll));
+            window.present();
+            wait(|| focus.is_mapped());
+            focus.grab_focus();
+            let (started_sender, started) = mpsc::channel();
+            let (permit, permit_receiver) = mpsc::channel();
+            let (ready_sender, ready) = mpsc::channel();
+            let (publish, publish_receiver) = mpsc::channel();
+            let probe = Arc::new(InitialFilesProbe {
+                gtk_thread: std::thread::current().id(),
+                started: started_sender,
+                permit: std::sync::Mutex::new(permit_receiver),
+                ready: ready_sender,
+                publish: std::sync::Mutex::new(publish_receiver),
+                opens: 0.into(),
+                jobs: 0.into(),
+            });
+            assert!(
+                INITIAL_FILES_PROBE
+                    .lock()
+                    .unwrap()
+                    .replace(probe.clone())
+                    .is_none()
+            );
+            Self {
+                _app: app,
+                window,
+                host,
+                focus,
+                header,
+                model,
+                game,
+                probe,
+                started,
+                permit,
+                ready,
+                publish,
+            }
+        }
+
+        fn mount(&self) -> gtk::Box {
+            self.model.borrow_mut().detail_generation += 1;
+            let state = self.model.borrow();
+            let page = build_files_page(
+                &DetailPageModel::game(state.games[0].clone(), false),
+                &self.window,
+                FilesPageOptions {
+                    model: &self.model,
+                    access_token: None,
+                    config: &state.config,
+                    library_statuses: &state.library_statuses,
+                    installer_defaults: &InstallerFilterDefaults {
+                        language: None,
+                        windows: true,
+                        linux: false,
+                        macos: false,
+                    },
+                    show_retired_artifacts: true,
+                    management: None,
+                    installed: None,
+                },
+            );
+            drop(state);
+            self.host.append(&page);
+            page
+        }
+
+        fn started(&self) {
+            wait(|| self.started.try_recv().is_ok());
+        }
+        fn prepare(&self) {
+            self.permit.send(()).unwrap();
+            wait(|| self.ready.try_recv().is_ok());
+        }
+        fn loaded(&self, page: &gtk::Box) -> bool {
+            find_named_descendant(page.upcast_ref(), "managed-files-summary-9354001").is_some()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.window.destroy();
+            *INITIAL_FILES_PROBE.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    #[ignore = "requires private p354 HOME/all XDG, D-Bus and GTK; inert local fixture only"]
+    fn initial_files_inspection_is_responsive_and_reuses_prepared_rows() {
+        let fixture = Fixture::new();
+        let connection = rusqlite::Connection::open(crate::identity::database()).unwrap();
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let start = Instant::now();
+        let page = fixture.mount();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        fixture.started();
+        assert!(!fixture.loaded(&page));
+        assert_eq!(
+            labels(page.upcast_ref()),
+            ["Inspecting downloaded files…", "Retry"]
+        );
+        assert!(fixture.header.text().ends_with("previously known"));
+        assert!(
+            crate::profile_reset::reserve().is_err(),
+            "guard must precede worker dispatch"
+        );
+        fixture.permit.send(()).unwrap();
+        let beats = Rc::new(std::cell::Cell::new(0));
+        let heartbeat = glib::timeout_add_local(Duration::from_millis(10), {
+            let beats = beats.clone();
+            move || {
+                beats.set(beats.get() + 1);
+                glib::ControlFlow::Continue
+            }
+        });
+        wait(|| beats.get() >= 12);
+        assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.probe.jobs.load(Ordering::SeqCst), 0);
+        assert!(!fixture.loaded(&page));
+        connection.execute_batch("ROLLBACK").unwrap();
+        wait(|| fixture.ready.try_recv().is_ok());
+        // Keep SQLite unavailable during GTK row construction: any fallback open/read blocks.
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let focus = gtk::prelude::GtkWindowExt::focus(&fixture.window);
+        let render = Instant::now();
+        fixture.publish.send(()).unwrap();
+        wait(|| fixture.loaded(&page));
+        assert!(
+            render.elapsed() < Duration::from_secs(1),
+            "row construction reentered SQLite"
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
+        heartbeat.remove();
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&fixture.window), focus);
+        assert!(fixture.focus.is_mapped());
+        assert!(page.is_ancestor(&fixture.window));
+        let texts = labels(page.upcast_ref());
+        for text in [
+            "✓",
+            "Paused — resume",
+            "Failed — retry",
+            "Interrupted — resume",
+            "Synthetic DLC",
+            "Synthetic patch",
+            "Synthetic extra",
+            "1/4 Downloaded",
+        ] {
+            assert!(
+                texts.iter().any(|label| label == text),
+                "missing {text}: {texts:?}"
+            );
+        }
+        assert!(texts.iter().any(|label| label.contains("Retired")));
+        assert!(
+            texts.iter().any(|label| label.contains("Local")),
+            "additional copy must remain visible"
+        );
+        assert!(fixture.header.text().contains("Downloaded files: 384 B"));
+        assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.probe.jobs.load(Ordering::SeqCst), 1);
+        pump(Duration::from_millis(300));
+        assert!(
+            fixture.started.try_recv().is_err(),
+            "initial completion must not start another worker"
+        );
+        fixture.host.remove(&page);
+        // Older cached local files remain usable before they have managed/job records.
+        connection
+            .execute_batch("DELETE FROM managed_files; DELETE FROM download_jobs")
+            .unwrap();
+        let path = fixture.game.location.join("fallback.bin");
+        std::fs::write(&path, [42_u8; 64]).unwrap();
+        let mut fallback = fixture.game.clone();
+        fallback.remote_artifacts.clear();
+        fallback.dlcs.clear();
+        fallback.installers = vec![LibraryFile {
+            name: "fallback.bin".into(),
+            path,
+            size: 64,
+        }];
+        fallback.disk_usage = 64;
+        fixture.model.borrow_mut().games = vec![fallback];
+        let page = fixture.mount();
+        fixture.started();
+        fixture.prepare();
+        fixture.publish.send(()).unwrap();
+        wait(|| fixture.loaded(&page));
+        assert!(
+            labels(page.upcast_ref())
+                .iter()
+                .any(|label| label.contains("1 local installers  ·  64 B on disk"))
+        );
+        assert!(fixture.header.text().contains("Downloaded files: 64 B"));
+        wait(|| crate::profile_reset::reserve().is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires private p354 HOME/all XDG, D-Bus and GTK; inert local fixture only"]
+    fn initial_files_inspection_retries_and_rejects_stale_results() {
+        let fixture = Fixture::new();
+        let page = fixture.mount();
+        fixture.started();
+        fixture.prepare();
+        let retry = find_named_descendant(page.upcast_ref(), "initial-files-retry")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        fixture.model.borrow_mut().local_revision += 1;
+        // Multiple requests while one inspection is held must coalesce into one latest attempt.
+        retry.emit_clicked();
+        retry.emit_clicked();
+        fixture.publish.send(()).unwrap();
+        fixture.started();
+        assert!(!fixture.loaded(&page));
+        assert!(fixture.header.text().ends_with("previously known"));
+        fixture.prepare();
+        fixture.publish.send(()).unwrap();
+        wait(|| fixture.loaded(&page));
+        assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.probe.jobs.load(Ordering::SeqCst), 2);
+        fixture.host.remove(&page);
+
+        let connection = rusqlite::Connection::open(crate::identity::database()).unwrap();
+        connection
+            .execute_batch("ALTER TABLE managed_files RENAME TO fixture_managed_files")
+            .unwrap();
+        let page = fixture.mount();
+        fixture.started();
+        fixture.prepare();
+        fixture.publish.send(()).unwrap();
+        let retry = find_named_descendant(page.upcast_ref(), "initial-files-retry")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        wait(|| retry.is_mapped() && retry.is_sensitive());
+        assert!(!fixture.loaded(&page));
+        assert!(
+            labels(page.upcast_ref())
+                .iter()
+                .any(|label| label.contains("Could not inspect downloaded files"))
+        );
+        assert!(fixture.header.text().contains("Downloaded files: 384 B"));
+        connection
+            .execute_batch("ALTER TABLE fixture_managed_files RENAME TO managed_files")
+            .unwrap();
+        retry.emit_clicked();
+        fixture.started();
+        fixture.prepare();
+        fixture.publish.send(()).unwrap();
+        wait(|| fixture.loaded(&page));
+        fixture.host.remove(&page);
+
+        let page = fixture.mount();
+        fixture.started();
+        fixture.prepare();
+        let attempts = fixture.probe.opens.load(Ordering::SeqCst);
+        page.set_visible(false);
+        fixture.publish.send(()).unwrap();
+        pump(Duration::from_millis(120));
+        assert!(!fixture.loaded(&page));
+        page.set_visible(true);
+        wait(|| fixture.loaded(&page));
+        assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), attempts);
+        fixture.host.remove(&page);
+
+        for invalidation in [
+            "revision",
+            "retry",
+            "detail",
+            "epoch",
+            "logout",
+            "detach",
+            "auth-ready",
+            "account-ready",
+            "auth",
+            "account",
+            "destroy",
+        ] {
+            fixture.model.borrow_mut().logout_pending = false;
+            let page = fixture.mount();
+            fixture.started();
+            let before = fixture.probe.opens.load(Ordering::SeqCst);
+            if invalidation.ends_with("-ready") {
+                fixture.prepare();
+            }
+            match invalidation {
+                "revision" => fixture.model.borrow_mut().local_revision += 1,
+                "retry" => find_named_descendant(page.upcast_ref(), "initial-files-retry")
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap()
+                    .emit_clicked(),
+                "detail" => fixture.model.borrow_mut().detail_generation += 1,
+                "epoch" => fixture.model.borrow_mut().account_epoch += 1,
+                "logout" => fixture.model.borrow_mut().logout_pending = true,
+                "detach" => fixture.host.remove(&page),
+                "auth" | "auth-ready" => auth::invalidate_session(),
+                "account" | "account-ready" => online::invalidate_library_session(),
+                "destroy" => fixture.window.destroy(),
+                _ => unreachable!(),
+            }
+            if !invalidation.ends_with("-ready") {
+                fixture.prepare();
+            }
+            fixture.publish.send(()).unwrap();
+            pump(Duration::from_millis(120));
+            assert!(!fixture.loaded(&page), "stale {invalidation} painted rows");
+            if matches!(
+                invalidation,
+                "auth" | "account" | "auth-ready" | "account-ready"
+            ) {
+                let status = find_named_descendant(page.upcast_ref(), "initial-files-status")
+                    .unwrap()
+                    .downcast::<gtk::Label>()
+                    .unwrap();
+                assert_eq!(
+                    status.text(),
+                    "Your sign-in session changed. Go to Home, then reopen this game to inspect downloaded files."
+                );
+                assert!(status.is_mapped());
+                let spinner = page
+                    .first_child()
+                    .unwrap()
+                    .first_child()
+                    .unwrap()
+                    .downcast::<gtk::Spinner>()
+                    .unwrap();
+                assert!(!spinner.get_visible());
+            }
+            if matches!(invalidation, "auth" | "account") {
+                assert_eq!(
+                    fixture.probe.opens.load(Ordering::SeqCst),
+                    before,
+                    "obsolete session opened SQLite"
+                );
+            }
+            if matches!(invalidation, "revision" | "retry") {
+                fixture.started();
+                fixture.prepare();
+                fixture.publish.send(()).unwrap();
+                wait(|| fixture.loaded(&page));
+            } else {
+                assert!(
+                    fixture.started.try_recv().is_err(),
+                    "obsolete page scheduled another attempt"
+                );
+            }
+            if page.parent().is_some() {
+                fixture.host.remove(&page);
+            }
+        }
+        wait(|| crate::profile_reset::reserve().is_ok());
+    }
+}
+
+#[cfg(test)]
 mod unified_row_tests {
     use super::*;
 
     #[test]
+    fn completed_archive_plausibility_keeps_local_payload_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("part-one");
+        let mut artifact: RemoteArtifact = serde_json::from_value(serde_json::json!({
+            "product_id": 9383001, "kind": "installer", "name": "Inert",
+            "download_path": "synthetic", "size_bytes": 100
+        }))
+        .unwrap();
+        assert!(!artifact_download_is_plausible(
+            &[&artifact],
+            std::slice::from_ref(&file)
+        ));
+        std::fs::write(&file, b"data").unwrap();
+        // Complete/receipt-sized output is not a substitute for rounded catalog plausibility.
+        assert!(!artifact_download_is_plausible(
+            &[&artifact],
+            std::slice::from_ref(&file)
+        ));
+        std::fs::write(&file, [b'x'; 49]).unwrap();
+        assert!(!artifact_download_is_plausible(
+            &[&artifact],
+            std::slice::from_ref(&file)
+        ));
+        std::fs::write(&file, [b'x'; 50]).unwrap();
+        assert!(artifact_download_is_plausible(
+            &[&artifact],
+            std::slice::from_ref(&file)
+        ));
+        for expected in [None, Some(0)] {
+            artifact.size_bytes = expected;
+            std::fs::write(&file, b"data").unwrap();
+            assert!(artifact_download_is_plausible(
+                &[&artifact],
+                std::slice::from_ref(&file)
+            ));
+            for payload in [
+                b"{\"url\":\"inert\"}".as_slice(),
+                b" \n{\"downlink\":\"inert\"}".as_slice(),
+            ] {
+                std::fs::write(&file, payload).unwrap();
+                assert!(!artifact_download_is_plausible(
+                    &[&artifact],
+                    std::slice::from_ref(&file)
+                ));
+            }
+        }
+        artifact.size_bytes = Some(100);
+        let other = root.path().join("part-two");
+        std::fs::write(&file, [b'x'; 50]).unwrap();
+        std::fs::write(&other, [b'y'; 50]).unwrap();
+        assert!(!artifact_download_is_plausible(
+            &[&artifact, &artifact],
+            std::slice::from_ref(&file)
+        ));
+        assert!(artifact_download_is_plausible(
+            &[&artifact, &artifact],
+            &[file, other]
+        ));
+    }
+
+    #[test]
     #[ignore = "private HOME/all XDG, D-Bus and GTK; deletes only inert fixture archives"]
     fn external_archive_completion_and_deletion_update_existing_rows() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p296-"),
+                "{key}"
+            );
+        }
         let _capture = super::super::download_chooser::DownloadQueueCapture::start();
         adw::init().unwrap();
         fn descendants(widget: &gtk::Widget) -> Vec<gtk::Widget> {
@@ -4374,6 +5759,7 @@ mod unified_row_tests {
             }
             result
         }
+        #[track_caller]
         fn wait(check: impl Fn() -> bool) {
             let deadline = std::time::Instant::now() + Duration::from_secs(8);
             while !check() && std::time::Instant::now() < deadline {
@@ -4444,7 +5830,17 @@ mod unified_row_tests {
             linux: false,
             macos: false,
         };
+        let summary_updates = Rc::new(std::cell::Cell::new(0));
+        let refresh_summary: Rc<dyn Fn()> = Rc::new({
+            let summary_updates = summary_updates.clone();
+            let refresh = managed_detail_refresher(&window, Some(&model), &content, 9306001);
+            move || {
+                summary_updates.set(summary_updates.get() + 1);
+                refresh();
+            }
+        });
         let context = RemoteFileContext {
+            refresh_summary: &refresh_summary,
             model: Some(&model),
             product_id: 9306001,
             product_slug: "fixture",
@@ -4466,6 +5862,19 @@ mod unified_row_tests {
             std::slice::from_ref(&artifact),
             &[],
             &context,
+            &prepare_files_page(
+                &DetailPageModel::game(
+                    Game {
+                        product_id: 9306001,
+                        remote_artifacts: vec![artifact.clone()],
+                        ..Game::default()
+                    },
+                    false,
+                ),
+                &config,
+                &statuses,
+            )
+            .unwrap(),
         );
         let row = collection.last_child().unwrap();
         let count = descendants(collection.upcast_ref())
@@ -4533,11 +5942,13 @@ mod unified_row_tests {
         });
         model.borrow_mut().local_revision += 1;
         wait(|| count.text() == "1/1 Downloaded");
-        assert!(descendants(row.upcast_ref()).iter().any(|widget| {
-            widget
-                .downcast_ref::<gtk::Label>()
-                .is_some_and(|label| label.text() == "✓" && label.is_visible())
-        }));
+        let status = descendants(row.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+            .find(|label| label.text() == "✓" && label.is_visible())
+            .unwrap();
+        assert!(status.has_css_class("success"));
+        assert!(!status.has_css_class("error"));
         assert_eq!(collection.last_child().as_ref(), Some(&row));
         assert_eq!(language.selected(), selected);
         assert_eq!(tabs.visible_child_name().as_deref(), Some("files"));
@@ -4560,8 +5971,11 @@ mod unified_row_tests {
             .find(|button| button.tooltip_text().as_deref() == Some("Delete downloaded files"))
             .unwrap();
         assert!(delete.get_visible() && delete.is_sensitive());
+        menu.popup();
+        wait(|| popover.is_mapped() && delete.is_mapped());
         delete.emit_clicked();
         wait(|| window.visible_dialog().is_some());
+        wait(|| !popover.is_mapped());
         respond(&window, "Cancel");
         wait(|| window.visible_dialog().is_none());
         assert!(file.exists());
@@ -4570,17 +5984,24 @@ mod unified_row_tests {
         let mut invalid = config.clone();
         invalid.offline_libraries.clear();
         invalid.save().unwrap();
+        menu.popup();
+        wait(|| popover.is_mapped() && delete.is_mapped());
         delete.emit_clicked();
         wait(|| window.visible_dialog().is_some());
+        wait(|| !popover.is_mapped());
         respond(&window, "Delete");
         wait(|| notice.text().contains("Could not delete downloaded files"));
+        assert!(status.has_css_class("error"));
         assert!(file.exists());
         assert!(row.is_sensitive());
         assert!(menu.is_visible());
         config.save().unwrap();
         wait(|| window.visible_dialog().is_none());
+        menu.popup();
+        wait(|| popover.is_mapped() && delete.is_mapped());
         delete.emit_clicked();
         wait(|| window.visible_dialog().is_some());
+        wait(|| !popover.is_mapped());
         respond(&window, "Delete");
         wait(|| notice.text().contains("Downloaded files deleted."));
         assert!(!file.exists());
@@ -4597,6 +6018,10 @@ mod unified_row_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(count.text(), "0/1 Downloaded");
+        assert!(!status.is_visible());
+        assert!(!status.has_css_class("error"));
+        assert!(!status.has_css_class("success"));
+        assert!(status.tooltip_text().is_none());
         assert!(!menu.is_visible());
         assert_eq!(direct_buttons(), 1);
         assert!(!delete.is_visible());
@@ -4632,13 +6057,418 @@ mod unified_row_tests {
                 .len()
                 == 1
         });
+        assert!(!status.has_css_class("error"));
+        assert!(status.tooltip_text().is_none());
+        for attempt in 0..3 {
+            let events = super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()[attempt]
+                .0[0]
+                .events
+                .clone();
+            events
+                .send(download::DownloadEvent::Progress {
+                    downloaded: 5,
+                    total: Some(15),
+                })
+                .unwrap();
+            wait(|| status.text().starts_with("Downloading "));
+            assert!(!status.has_css_class("error"));
+            assert!(!status.has_css_class("success"));
+            assert!(status.tooltip_text().is_none());
+            if attempt == 0 {
+                events
+                    .send(download::DownloadEvent::Failed(download::DownloadFailure {
+                        kind: download::DownloadFailureKind::Other,
+                        message: "Synthetic transfer failure".into(),
+                    }))
+                    .unwrap();
+                wait(|| status.text() == "Failed — retry");
+                assert!(status.has_css_class("error"));
+                assert_eq!(
+                    status.tooltip_text().as_deref(),
+                    Some("Synthetic transfer failure")
+                );
+            } else {
+                if attempt == 2 {
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(&file, b"inert installer").unwrap();
+                }
+                let (entered, entry) = mpsc::channel();
+                let (permit, release) = mpsc::channel();
+                TEST_COMPLETED_DOWNLOADS.with(|probes| {
+                    *probes.borrow_mut() = Some(
+                        [CompletedDownloadProbe {
+                            entered,
+                            permit: release,
+                            disconnect: false,
+                            checked: Default::default(),
+                        }]
+                        .into(),
+                    )
+                });
+                let reentered = Rc::new(std::cell::Cell::new(false));
+                let reentry = (attempt == 1).then(|| {
+                    let reentered = reentered.clone();
+                    let status = status.clone();
+                    download.connect_sensitive_notify(move |button| {
+                        if button.is_sensitive() && !reentered.replace(true) {
+                            assert_eq!(status.text(), "✕");
+                            button.emit_clicked();
+                        }
+                    })
+                });
+                let summaries = summary_updates.get();
+                events
+                    .send(download::DownloadEvent::Complete {
+                        files: vec![file.clone()],
+                    })
+                    .unwrap();
+                // A duplicate event must never admit a second inspection or count update.
+                let _ = events.send(download::DownloadEvent::Complete {
+                    files: vec![file.clone()],
+                });
+                let entered = std::cell::Cell::new(false);
+                wait(|| {
+                    if entry.try_recv().is_ok() {
+                        entered.set(true);
+                    }
+                    entered.get()
+                });
+                assert_eq!(status.text(), "Finalizing…");
+                assert_eq!(count.text(), "0/1 Downloaded");
+                assert_eq!(summary_updates.get(), summaries);
+                assert!(crate::profile_reset::reserve().is_err());
+                assert!(
+                    events
+                        .send(download::DownloadEvent::Complete {
+                            files: vec![file.clone()]
+                        })
+                        .is_err()
+                );
+                let heartbeat = Rc::new(std::cell::Cell::new(false));
+                glib::timeout_add_local_once(Duration::from_millis(150), {
+                    let heartbeat = heartbeat.clone();
+                    move || heartbeat.set(true)
+                });
+                // Proxies emit clicked directly, even when their source is insensitive.
+                download.emit_clicked();
+                copy.emit_clicked();
+                delete.emit_clicked();
+                wait(|| heartbeat.get());
+                assert!(window.visible_dialog().is_none());
+                assert_eq!(count.text(), "0/1 Downloaded");
+                permit.send(()).unwrap();
+                wait(|| status.text() == if attempt == 1 { "✕" } else { "✓" });
+                wait(|| crate::profile_reset::reserve().is_ok());
+                assert_eq!(
+                    count.text(),
+                    if attempt == 1 {
+                        "0/1 Downloaded"
+                    } else {
+                        "1/1 Downloaded"
+                    }
+                );
+                assert_eq!(summary_updates.get(), summaries + usize::from(attempt == 2));
+                TEST_COMPLETED_DOWNLOADS.with(|probes| {
+                    assert!(probes.borrow().as_ref().unwrap().is_empty());
+                    *probes.borrow_mut() = None;
+                });
+                assert_eq!(status.has_css_class("error"), attempt == 1);
+                assert_eq!(status.has_css_class("success"), attempt == 2);
+                if let Some(handler) = reentry {
+                    assert!(reentered.get());
+                    download.disconnect(handler);
+                    assert!(window.visible_dialog().is_some());
+                }
+            }
+            if attempt < 2 {
+                // Sensitivity restoration may already have admitted the next request.
+                if window.visible_dialog().is_none() {
+                    if menu.is_visible() {
+                        menu.popup();
+                        wait(|| popover.is_mapped());
+                        descendants(popover.upcast_ref())
+                            .into_iter()
+                            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                            .find(|button| {
+                                button.tooltip_text().as_deref()
+                                    == Some("Download all required parts again")
+                            })
+                            .unwrap()
+                            .emit_clicked();
+                    } else {
+                        download.emit_clicked();
+                    }
+                }
+                wait(|| window.visible_dialog().is_some());
+                wait(|| {
+                    descendants(window.visible_dialog().unwrap().upcast_ref())
+                        .iter()
+                        .filter_map(|widget| widget.downcast_ref::<gtk::Button>())
+                        .any(|button| {
+                            button.label().as_deref() == Some("Download") && button.is_sensitive()
+                        })
+                });
+                respond(&window, "Download");
+                wait(|| status.text() == "Preparing download…");
+                assert!(!status.has_css_class("error"));
+                assert!(status.tooltip_text().is_none());
+                wait(|| {
+                    super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .len()
+                        == attempt + 2
+                });
+            }
+        }
+        assert_eq!(std::fs::read(&payload).unwrap(), b"keep installed game");
+        assert_eq!(collection.last_child().as_ref(), Some(&row));
+        assert_eq!(tabs.visible_child_name().as_deref(), Some("files"));
         window.close();
+
+        // Each new row uses its actual proxy/chooser/captured Complete path.
+        for (index, case) in [
+            "freeze",
+            "disconnect",
+            "epoch",
+            "logout",
+            "online",
+            "close",
+            "auth",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            model.borrow_mut().logout_pending = false;
+            let window = adw::ApplicationWindow::new(&app);
+            let updates = Rc::new(std::cell::Cell::new(0));
+            let refresh: Rc<dyn Fn()> = Rc::new({
+                let updates = updates.clone();
+                move || updates.set(updates.get() + 1)
+            });
+            let context = RemoteFileContext {
+                window: &window,
+                refresh_summary: &refresh,
+                ..context
+            };
+            let prepared = prepare_files_page(
+                &DetailPageModel::game(
+                    Game {
+                        product_id: 9306001,
+                        remote_artifacts: vec![artifact.clone()],
+                        ..Game::default()
+                    },
+                    false,
+                ),
+                &config,
+                &statuses,
+            )
+            .unwrap();
+            let collection = remote_file_collection(
+                "Offline Installers",
+                "folder-download-symbolic",
+                std::slice::from_ref(&artifact),
+                &[],
+                &context,
+                &prepared,
+            );
+            window.set_content(Some(&collection));
+            window.present();
+            wait(|| collection.is_mapped());
+            let proxy = descendants(collection.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| {
+                    button.is_mapped()
+                        && button.tooltip_text().as_deref() == Some("Download all required parts")
+                })
+                .unwrap();
+            let count = descendants(collection.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+                .find(|label| label.text() == "0/1 Downloaded")
+                .unwrap();
+            proxy.emit_clicked();
+            wait(|| window.visible_dialog().is_some());
+            wait(|| {
+                descendants(window.visible_dialog().unwrap().upcast_ref())
+                    .into_iter()
+                    .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                    .any(|button| {
+                        button.label().as_deref() == Some("Download") && button.is_sensitive()
+                    })
+            });
+            respond(&window, "Download");
+            wait(|| {
+                super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .len()
+                    == index + 4
+            });
+            let events = super::super::download_chooser::TEST_DOWNLOAD_QUEUE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()[index + 3]
+                .0[0]
+                .events
+                .clone();
+            wait(|| crate::profile_reset::reserve().is_ok());
+            let reservation = (case == "freeze").then(|| crate::profile_reset::reserve().unwrap());
+            let (entered, entry) = mpsc::channel();
+            let (permit, release) = mpsc::channel();
+            let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            TEST_COMPLETED_DOWNLOADS.with(|probes| {
+                *probes.borrow_mut() = Some(if case == "freeze" {
+                    std::collections::VecDeque::new()
+                } else {
+                    [CompletedDownloadProbe {
+                        entered,
+                        permit: release,
+                        disconnect: case == "disconnect",
+                        checked: checked.clone(),
+                    }]
+                    .into()
+                })
+            });
+            events
+                .send(download::DownloadEvent::Complete {
+                    files: vec![file.clone()],
+                })
+                .unwrap();
+            let status = descendants(collection.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+                .find(|label| label.text() == "Preparing download…")
+                .unwrap();
+            if case != "freeze" {
+                let started = std::cell::Cell::new(false);
+                wait(|| {
+                    if entry.try_recv().is_ok() {
+                        started.set(true);
+                    }
+                    started.get()
+                });
+                assert_eq!(status.text(), "Finalizing…");
+                assert!(crate::profile_reset::reserve().is_err());
+                match case {
+                    "epoch" => model.borrow_mut().account_epoch += 1,
+                    "logout" => model.borrow_mut().logout_pending = true,
+                    "online" => {
+                        online::invalidate_library_session();
+                    }
+                    "auth" => {
+                        auth::invalidate_session();
+                    }
+                    "close" => {
+                        window.close();
+                    }
+                    _ => {}
+                }
+                // The UI receiver retires while a stale/closed worker remains tracked.
+                let heartbeat = Rc::new(std::cell::Cell::new(false));
+                glib::timeout_add_local_once(Duration::from_millis(200), {
+                    let heartbeat = heartbeat.clone();
+                    move || heartbeat.set(true)
+                });
+                wait(|| heartbeat.get());
+                assert!(crate::profile_reset::reserve().is_err());
+                assert_eq!(count.text(), "0/1 Downloaded");
+                assert_eq!(updates.get(), 0);
+                assert!(!checked.load(std::sync::atomic::Ordering::Acquire));
+                permit.send(()).unwrap();
+            }
+            if matches!(case, "freeze" | "disconnect") {
+                wait(|| {
+                    status
+                        .text()
+                        .starts_with("Could not inspect downloaded files.")
+                });
+                assert!(status.text().contains("Manage → Refresh local state"));
+                assert!(status.has_css_class("error"));
+                assert!(!status.has_css_class("success"));
+                assert!(!proxy.is_sensitive());
+                assert!(
+                    descendants(collection.upcast_ref())
+                        .into_iter()
+                        .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                        .any(|button| button.tooltip_text().as_deref()
+                            == Some("Delete downloaded files")
+                            && button.get_visible()
+                            && button.is_sensitive())
+                );
+            }
+            drop(reservation);
+            wait(|| crate::profile_reset::reserve().is_ok());
+            let settled = Rc::new(std::cell::Cell::new(false));
+            glib::timeout_add_local_once(Duration::from_millis(150), {
+                let settled = settled.clone();
+                move || settled.set(true)
+            });
+            wait(|| settled.get());
+            assert_eq!(count.text(), "0/1 Downloaded");
+            assert_eq!(updates.get(), 0);
+            assert_eq!(
+                checked.load(std::sync::atomic::Ordering::Acquire),
+                !matches!(case, "freeze" | "online" | "auth")
+            );
+            if !matches!(case, "freeze" | "disconnect") {
+                assert_eq!(status.text(), "Finalizing…");
+            }
+            TEST_COMPLETED_DOWNLOADS.with(|probes| {
+                assert!(probes.borrow().as_ref().unwrap().is_empty());
+                *probes.borrow_mut() = None;
+            });
+            window.destroy();
+        }
     }
 
     #[test]
-    #[ignore = "requires private GTK"]
+    #[ignore = "private p385 HOME/all XDG/TMP, GTK and D-Bus; inert action handoffs only"]
     fn action_content_changes_preserve_single_or_menu_layout() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p385-"),
+                "{key}"
+            );
+        }
+        assert!(!crate::identity::database().exists());
         adw::init().unwrap();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn nodes(root: &gtk::Widget) -> Vec<gtk::Widget> {
+            let mut result = vec![root.clone()];
+            for child in std::iter::successors(root.first_child(), |child| child.next_sibling()) {
+                result.extend(nodes(&child));
+            }
+            result
+        }
         let sources = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let first = gtk::Button::from_icon_name("folder-open-symbolic");
         let second = gtk::Button::with_label("Download to another library");
@@ -4656,6 +6486,102 @@ mod unified_row_tests {
         second.set_visible(false);
         assert!(direct.is_visible());
         assert!(!menu.is_visible());
+        let menu = menu.downcast::<gtk::MenuButton>().unwrap();
+        let direct = direct.downcast::<gtk::Button>().unwrap();
+        let popover = menu.popover().unwrap();
+        let entry = nodes(popover.upcast_ref())
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+            .find(|button| button.tooltip_text().as_deref() == Some("Download all required parts"))
+            .unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.FileMenuHandoffTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&row);
+        window.set_content(Some(&content));
+        window.present();
+        wait(|| row.is_mapped());
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let detach = Rc::new(std::cell::Cell::new(false));
+        first.connect_clicked({
+            let calls = calls.clone();
+            let detach = detach.clone();
+            let popover = popover.downgrade();
+            let row = row.downgrade();
+            let content = content.downgrade();
+            let window = window.downgrade();
+            move |source| {
+                assert!(
+                    source.root().is_none(),
+                    "source remains deliberately unmounted"
+                );
+                if let Some(popover) = popover.upgrade() {
+                    assert!(
+                        !popover.get_visible(),
+                        "dismissal must precede source dispatch"
+                    );
+                }
+                calls.set(calls.get() + 1);
+                if detach.get() {
+                    content.upgrade().unwrap().remove(&row.upgrade().unwrap());
+                }
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Inert file action")
+                    .body("No file operation will be performed.")
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.present(Some(&window.upgrade().unwrap()));
+            }
+        });
+        let close = || {
+            let dialog = window.visible_dialog().unwrap();
+            let button = nodes(dialog.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some("Close"))
+                .unwrap();
+            wait(|| button.is_mapped() && button.is_sensitive());
+            button.emit_clicked();
+            wait(|| window.visible_dialog().is_none());
+        };
+        second.set_visible(true);
+        for should_detach in [false, true] {
+            detach.set(should_detach);
+            menu.popup();
+            wait(|| popover.is_mapped() && entry.is_mapped());
+            let before = calls.get();
+            entry.emit_clicked();
+            assert_eq!(calls.get(), before + 1);
+            wait(|| !popover.is_mapped() && window.visible_dialog().is_some());
+            if should_detach {
+                assert!(row.parent().is_none());
+            }
+            close();
+            assert_eq!(calls.get(), before + 1);
+            if should_detach {
+                content.append(&row);
+            }
+        }
+        detach.set(false);
+        second.set_visible(false);
+        wait(|| direct.is_mapped() && !menu.is_mapped());
+        direct.emit_clicked();
+        assert_eq!(calls.get(), 3);
+        close();
+        // Holding an entry must not retain its former popup through the new callback.
+        let weak_popover = popover.downgrade();
+        menu.set_popover(gtk::Popover::NONE);
+        drop(popover);
+        wait(|| weak_popover.upgrade().is_none());
+        entry.emit_clicked();
+        assert_eq!(calls.get(), 4);
+        close();
+        assert!(!crate::identity::database().exists());
+        window.destroy();
     }
 
     #[test]
@@ -4713,6 +6639,7 @@ mod unified_row_tests {
         for case in 0..3 {
             let statuses = crate::storage::inspect_libraries(&config).unwrap();
             let context = RemoteFileContext {
+                refresh_summary: &managed_detail_refresher(&window, None, &content, 9296002),
                 model: None,
                 product_id: 9296002,
                 product_slug: "fixture",
@@ -4729,9 +6656,22 @@ mod unified_row_tests {
                 installed: None,
             };
             let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let prepared = prepare_files_page(
+                &DetailPageModel::game(
+                    Game {
+                        product_id: 9296002,
+                        remote_artifacts: artifacts.clone(),
+                        ..Game::default()
+                    },
+                    false,
+                ),
+                &config,
+                &statuses,
+            )
+            .unwrap();
             let action = artifact_download_action(
                 &artifacts.iter().collect::<Vec<_>>(),
-                &[],
+                &prepared.products[&9296002].groups[0],
                 &labels,
                 &gtk::Label::new(None),
                 &context,
@@ -5234,14 +7174,52 @@ mod unified_row_tests {
     }
 
     #[test]
-    #[ignore = "requires isolated HOME/XDG, Xvfb and private D-Bus; exercises GTK action dispatch while sidebar popover detaches"]
-    fn sidebar_visibility_action_precedes_popover_detachment() {
+    #[ignore = "requires private p404 HOME/all XDG/TMP and GTK; unopened actual management components"]
+    fn unopened_management_components_release_with_retained_actions() {
+        exercise_management_components(false);
+    }
+
+    #[test]
+    #[ignore = "requires private p404 HOME/all XDG/TMP and GTK; mapped inert actions, no release claim"]
+    fn mapped_management_actions_preserve_dispatch_and_close_order() {
+        exercise_management_components(true);
+    }
+
+    fn exercise_management_components(mapped: bool) {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p404-")
+            );
+        }
+        assert!(!crate::identity::database().exists());
+        assert!(!Config::path().exists());
         adw::init().expect("private display required");
+        #[track_caller]
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
         let app = adw::Application::builder()
             .application_id("io.github.legendarylinux.Ludomere.HideTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).unwrap();
         let window = adw::ApplicationWindow::new(&app);
+        window.set_default_size(700, 650);
         let list = gtk::ListBox::new();
         let row = gtk::ListBoxRow::new();
         row.set_child(Some(&gtk::Label::new(Some("Fixture game"))));
@@ -5249,6 +7227,7 @@ mod unified_row_tests {
         window.set_content(Some(&list));
         let hidden = Rc::new(std::cell::Cell::new(false));
         let calls = Rc::new(std::cell::Cell::new(0));
+        let events = Rc::new(RefCell::new(Vec::new()));
         list.set_filter_func({
             let hidden = hidden.clone();
             move |_| !hidden.get()
@@ -5258,68 +7237,188 @@ mod unified_row_tests {
             let hidden = hidden.clone();
             let calls = calls.clone();
             let list = list.clone();
+            let events = events.clone();
             move |_, value| {
                 assert_eq!(value.and_then(|value| value.get::<i64>()), Some(42));
                 hidden.set(!hidden.get());
                 calls.set(calls.get() + 1);
+                events.borrow_mut().push("hidden");
                 list.invalidate_filter();
             }
         });
         window.add_action(&action);
-        let button = gtk::Button::with_label("Hide game locally");
-        bind_management_action(&button, &window, "hidden", 42);
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&button));
-        popover.set_parent(&row);
-        popover.connect_closed(|popover| popover.unparent());
-        button.connect_clicked({
-            let popover = popover.clone();
-            move |_| popover.popdown()
-        });
-        window.present();
-        while glib::MainContext::default().iteration(false) {}
-        popover.popup();
-        while glib::MainContext::default().iteration(false) {}
-        button.emit_clicked();
-        while glib::MainContext::default().iteration(false) {}
-        assert_eq!(calls.get(), 1);
-        assert!(hidden.get());
-        assert!(!row.is_child_visible());
-        button.emit_clicked();
-        assert_eq!(calls.get(), 2);
-        assert!(!hidden.get());
-        assert!(row.is_child_visible());
-        if popover.parent().is_some() {
-            popover.unparent();
-        }
         let favorite = Rc::new(std::cell::Cell::new(false));
+        let favorite_calls = Rc::new(std::cell::Cell::new(0));
         let action = gio::SimpleAction::new("favorite", Some(&i64::static_variant_type()));
         action.connect_activate({
             let favorite = favorite.clone();
+            let favorite_calls = favorite_calls.clone();
+            let events = events.clone();
             move |_, value| {
                 assert_eq!(value.and_then(|value| value.get::<i64>()), Some(73));
                 favorite.set(!favorite.get());
+                favorite_calls.set(favorite_calls.get() + 1);
+                events.borrow_mut().push("favorite");
             }
         });
         window.add_action(&action);
-        let button = gtk::Button::with_label("Add to Favorites");
-        bind_management_action(&button, &window, "favorite", 73);
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&button));
-        popover.set_parent(&row);
-        popover.connect_closed(|popover| popover.unparent());
-        button.connect_clicked({
-            let popover = popover.clone();
-            move |_| popover.popdown()
-        });
-        popover.popup();
-        while glib::MainContext::default().iteration(false) {}
-        button.emit_clicked();
-        while glib::MainContext::default().iteration(false) {}
-        assert!(favorite.get());
-        assert!(popover.parent().is_none());
-        button.emit_clicked();
-        assert!(!favorite.get());
+        window.present();
+        wait_until(|| row.is_mapped());
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        for (id, label) in [(42, "Hide game locally"), (73, "Add to Favorites")] {
+            events.borrow_mut().clear();
+            let management = detail_file_management(
+                &DetailPageModel::game(
+                    Game {
+                        product_id: id,
+                        title: "Synthetic management game".into(),
+                        ..Game::default()
+                    },
+                    false,
+                ),
+                &window,
+                &model,
+                None,
+                {
+                    let events = events.clone();
+                    Rc::new(move || events.borrow_mut().push("refresh"))
+                },
+                Rc::new(|| panic!("primary backend action must not run")),
+            );
+            let weak_menu = management.menu.downgrade();
+            let popover = management.menu.popover().unwrap();
+            let actions = popover.child().unwrap();
+            let button = std::iter::successors(actions.first_child(), |child| child.next_sibling())
+                .filter_map(|child| child.downcast::<gtk::Button>().ok())
+                .find(|button| button.label().as_deref() == Some(label))
+                .unwrap();
+            let manage = std::iter::successors(actions.first_child(), |child| child.next_sibling())
+                .find_map(|child| child.downcast::<gtk::MenuButton>().ok())
+                .unwrap();
+            let submenu = manage.popover().unwrap();
+            let controllers = manage.observe_controllers();
+            let hover = (0..controllers.n_items())
+                .find_map(|index| {
+                    controllers
+                        .item(index)?
+                        .downcast::<gtk::EventControllerMotion>()
+                        .ok()
+                })
+                .unwrap();
+            drop(controllers);
+            let refresh = std::iter::successors(submenu.child().unwrap().first_child(), |child| {
+                child.next_sibling()
+            })
+            .filter_map(|child| child.downcast::<gtk::Button>().ok())
+            .find(|button| button.label().as_deref() == Some("Refresh local state"))
+            .unwrap();
+            let weak_outer = popover.downgrade();
+            let weak_submenu = submenu.downgrade();
+            let weak_manage = manage.downgrade();
+            let ever_mapped = Rc::new(std::cell::Cell::new(false));
+            for popup in [&popover, &submenu] {
+                let ever_mapped = ever_mapped.clone();
+                popup.connect_map(move |_| ever_mapped.set(true));
+            }
+            if mapped {
+                management.menu.set_popover(gtk::Popover::NONE);
+                popover.connect_closed({
+                    let events = events.clone();
+                    move |popover| {
+                        events.borrow_mut().push("outer");
+                        popover.unparent();
+                    }
+                });
+                submenu.connect_closed({
+                    let events = events.clone();
+                    move |_| events.borrow_mut().push("submenu")
+                });
+                popover.set_parent(&row);
+                popover.popup();
+                wait_until(|| button.is_mapped());
+                events.borrow_mut().clear();
+                if id == 73 {
+                    hover.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+                    wait_until(|| refresh.is_mapped());
+                    refresh.emit_clicked();
+                    wait_until(|| popover.parent().is_none() && !submenu.is_mapped());
+                    assert_eq!(*events.borrow(), ["refresh", "submenu", "outer"]);
+                    popover.set_parent(&row);
+                    popover.popup();
+                    wait_until(|| button.is_mapped());
+                    events.borrow_mut().clear();
+                }
+                button.emit_clicked();
+                wait_until(|| popover.parent().is_none());
+                assert_eq!(
+                    *events.borrow(),
+                    [if id == 42 { "hidden" } else { "favorite" }, "outer"]
+                );
+                if id == 42 {
+                    assert_eq!(calls.get(), 1);
+                    assert!(hidden.get());
+                    assert!(!row.is_child_visible());
+                } else {
+                    assert_eq!(favorite_calls.get(), 1);
+                    assert!(favorite.get());
+                }
+            } else {
+                assert!(!popover.is_mapped() && !submenu.is_mapped());
+                assert!(!ever_mapped.get());
+            }
+            drop(actions);
+            drop(manage);
+            drop(submenu);
+            drop(popover);
+            drop(management);
+            if !mapped {
+                wait_until(|| {
+                    weak_outer.upgrade().is_none()
+                        && weak_submenu.upgrade().is_none()
+                        && weak_manage.upgrade().is_none()
+                        && weak_menu.upgrade().is_none()
+                });
+                assert!(!ever_mapped.get());
+                assert!(events.borrow().is_empty());
+                hover.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+                assert!(events.borrow().is_empty());
+                button.emit_clicked();
+                assert_eq!(
+                    *events.borrow(),
+                    [if id == 42 { "hidden" } else { "favorite" }]
+                );
+                if id == 42 {
+                    assert_eq!(calls.get(), 1);
+                    assert!(hidden.get() && !row.is_child_visible());
+                } else {
+                    assert_eq!(favorite_calls.get(), 1);
+                    assert!(favorite.get());
+                }
+                refresh.emit_clicked();
+                assert_eq!(
+                    *events.borrow(),
+                    [if id == 42 { "hidden" } else { "favorite" }, "refresh"]
+                );
+            }
+            assert!(window.is_visible() && window.is_mapped());
+            events.borrow_mut().clear();
+            button.emit_clicked();
+            assert_eq!(
+                *events.borrow(),
+                [if id == 42 { "hidden" } else { "favorite" }]
+            );
+            if id == 42 {
+                assert_eq!(calls.get(), 2);
+                assert!(!hidden.get());
+                assert!(row.is_child_visible());
+            } else {
+                assert_eq!(favorite_calls.get(), 2);
+                assert!(!favorite.get());
+            }
+        }
+        assert!(window.visible_dialog().is_none());
+        assert!(!crate::identity::database().exists());
+        assert!(!Config::path().exists());
         window.close();
     }
 

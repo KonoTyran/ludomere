@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 pub struct PrepareDepotRequest<'a> {
-    pub account_session: u64,
+    pub session: &'a crate::gog::depot_service::DepotSession,
     pub recovery_generation: u64,
     pub store: &'a StateStore,
     pub acquisition: &'a Acquisition,
@@ -25,20 +25,15 @@ pub struct PrepareDepotRequest<'a> {
     pub library_id: String,
     pub library_root: PathBuf,
     pub slug: String,
-    pub access_token: String,
 }
 
 pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest> {
+    request.session.validate()?;
     anyhow::ensure!(
         super::recovery::current(request.build.product_id, request.recovery_generation),
         "Game recovery invalidated this preparation; start it again explicitly"
     );
     validate(&request)?;
-    let session = request.account_session;
-    anyhow::ensure!(
-        crate::online::account_session() == session,
-        "Account changed before dependency preparation"
-    );
     let dependency_plan = if request
         .build
         .operating_system
@@ -49,18 +44,20 @@ pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest
             ids.push("ISI".into());
         }
         Some(crate::gog::dependencies::resolve(&ids, || {
-            crate::online::account_session() != session
+            request.session.validate().is_err()
                 || !super::recovery::current(request.build.product_id, request.recovery_generation)
         })?)
     } else {
         None
     };
+    request.session.validate()?;
     anyhow::ensure!(
-        crate::online::account_session() == session
-            && super::recovery::current(request.build.product_id, request.recovery_generation),
+        super::recovery::current(request.build.product_id, request.recovery_generation),
         "Account or recovery changed during dependency preparation"
     );
-    cache_acquisition(request.store, request.acquisition, request.build)?;
+    request
+        .session
+        .commit(|| cache_acquisition(request.store, request.acquisition, request.build))?;
     let now = chrono::Utc::now().timestamp();
     let destination = request.library_root.join(&request.slug);
     let existing = super::marker::load(&destination)?;
@@ -193,7 +190,7 @@ pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest
         &request.operation_id,
     )?;
     let mut operation = DepotOperationRequest {
-        account_session: session,
+        account_session: request.session.account_session,
         recovery_generation: request.recovery_generation,
         operation_id: request.operation_id,
         product_id: base_product,
@@ -212,12 +209,13 @@ pub fn prepare(request: PrepareDepotRequest<'_>) -> Result<DepotOperationRequest
         destination,
         staging_path,
         target_marker: marker.clone(),
-        access_token: request.access_token,
+        access_token: request.session.token.access_token.clone(),
     };
     marker.galaxy_depot.as_mut().unwrap().manifest_fingerprint =
         super::manager::planned_manifest_identity(&operation)?;
     marker.validate()?;
     operation.target_marker = marker;
+    request.session.validate()?;
     Ok(operation)
 }
 
@@ -233,7 +231,7 @@ fn validate(request: &PrepareDepotRequest<'_>) -> Result<()> {
     {
         bail!("acquired depot metadata does not match the selected build");
     }
-    if request.library_id.is_empty() || request.access_token.is_empty() {
+    if request.library_id.is_empty() {
         bail!("depot preparation requires library and authentication identity");
     }
     if request.build.generation != 2 {
@@ -547,8 +545,18 @@ mod tests {
             owned_dlc: Default::default(),
             selected_dlc: Default::default(),
         };
+        let session = crate::gog::depot_service::DepotSession::new(
+            crate::auth::Token {
+                access_token: "secret-access".into(),
+                refresh_token: "secret-refresh".into(),
+                user_id: "user".into(),
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+            },
+            (crate::online::account_session(), crate::auth::session()),
+        )
+        .unwrap();
         let operation = prepare(PrepareDepotRequest {
-            account_session: crate::online::account_session(),
+            session: &session,
             recovery_generation: crate::installation::recovery::generation(build.product_id),
             store: &store,
             acquisition: &acquisition,
@@ -559,7 +567,6 @@ mod tests {
             library_id: "library".into(),
             library_root: root.clone(),
             slug: "game".into(),
-            access_token: "secret".into(),
         })
         .unwrap();
         assert!(
@@ -590,6 +597,26 @@ mod tests {
         assert_eq!(cached.repository_id, "repository");
         assert_eq!(cached.sources.len(), 1);
         assert!(!format!("{operation:?}").contains("secret"));
+        let request = crate::gog::depot_service::PrepareOperationRequest {
+            build,
+            selection,
+            operation_id: "cached-op".into(),
+            kind: DepotOperationKind::Install,
+            library_id: "library".into(),
+            library_root: root.clone(),
+            slug: "game".into(),
+        };
+        assert!(!serde_json::to_string(&request).unwrap().contains("secret"));
+        let cached_operation = crate::gog::depot_service::prepare_operation(
+            &store,
+            &reqwest::blocking::Client::new(),
+            &session,
+            request,
+        )
+        .unwrap();
+        assert_eq!(cached_operation.account_session, session.account_session);
+        assert_eq!(cached_operation.access_token, "secret-access");
+        assert!(!format!("{cached_operation:?}").contains("secret"));
         let _ = std::fs::remove_dir_all(root);
     }
 

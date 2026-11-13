@@ -309,11 +309,12 @@ pub fn start(
     mut journal: MigrationJournal,
     destinations: Vec<SaveLocation>,
 ) -> std::sync::mpsc::Receiver<MigrationEvent> {
+    let session = (crate::online::account_session(), crate::auth::session());
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let backup = migration_root(&library, &journal.slug, &journal.operation_id)
             .unwrap_or_else(|_| library.join(".ludomere/save-migrations"));
-        let result = run(&library, &mut journal, &destinations, &sender);
+        let result = run(&library, &mut journal, &destinations, &sender, session);
         match result {
             Ok(()) => {
                 let _ = sender.send(MigrationEvent::Complete);
@@ -329,13 +330,38 @@ pub fn start(
     receiver
 }
 
+fn migration_authentication(
+    journal: &MigrationJournal,
+    session: (u64, u64),
+    load: impl FnOnce() -> Result<Option<crate::auth::Token>>,
+) -> Result<Option<crate::gog::depot_service::DepotSession>> {
+    if !matches!(journal.target, Some(MigrationTarget::Galaxy(_)))
+        || !matches!(
+            journal.phase,
+            MigrationPhase::BackedUp | MigrationPhase::Uninstalled
+        )
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        crate::online::account_session() == session.0 && crate::auth::session_is_current(session.1),
+        "The account changed. Sign in and restart the source migration."
+    );
+    Ok(Some(crate::gog::depot_service::DepotSession::new(
+        load()?.context("Sign in to GOG before replacing this installation")?,
+        session,
+    )?))
+}
+
 fn run(
     library: &Path,
     journal: &mut MigrationJournal,
     destinations: &[SaveLocation],
     events: &std::sync::mpsc::Sender<MigrationEvent>,
+    session: (u64, u64),
 ) -> Result<()> {
     let _activity = crate::profile_reset::begin_activity("installation migration")?;
+    let authentication = migration_authentication(journal, session, crate::auth::load_saved_token)?;
     let old = journal
         .old_game
         .clone()
@@ -391,12 +417,15 @@ fn run(
         crate::compatibility::preflight_windows(Some(journal.product_id))?;
     }
     if journal.phase == MigrationPhase::BackedUp {
-        uninstall(&old, library)?;
+        if let Some(authentication) = &authentication {
+            authentication.validate()?;
+        }
+        uninstall(&old, library, authentication.as_ref())?;
         set_phase(library, journal, MigrationPhase::Uninstalled)?;
         let _ = events.send(MigrationEvent::Phase(MigrationPhase::Uninstalled));
     }
     if journal.phase == MigrationPhase::Uninstalled {
-        install(target, journal.product_id)?;
+        install(target, journal.product_id, authentication.as_ref())?;
         set_phase(library, journal, MigrationPhase::Installed)?;
         let _ = events.send(MigrationEvent::Phase(MigrationPhase::Installed));
     }
@@ -413,7 +442,11 @@ fn run(
     Ok(())
 }
 
-fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> {
+fn uninstall(
+    game: &crate::domain::InstalledGame,
+    library: &Path,
+    authentication: Option<&crate::gog::depot_service::DepotSession>,
+) -> Result<()> {
     super::validate_game_library(
         &crate::storage::read_config()?,
         &game.library_id,
@@ -434,6 +467,9 @@ fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> 
     {
         bail!("source migration installation identity is inconsistent");
     }
+    if let Some(authentication) = authentication {
+        authentication.validate()?;
+    }
     if marker.source == crate::domain::InstallationSource::OfflineInstaller {
         let handle = super::start_uninstallation(game.clone());
         loop {
@@ -453,12 +489,18 @@ fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> 
         &game.library_id,
         &game.installation_directory,
     )?;
+    if let Some(authentication) = authentication {
+        authentication.validate()?;
+    }
     if game.installation_directory.exists() {
         fs::remove_dir_all(&game.installation_directory)?;
     }
     if let Some(compatibility) = &game.compatibility {
         let prefix = crate::compatibility::prefix_path(library, &compatibility.prefix_slug);
         reject_symlink_ancestors(&prefix)?;
+        if let Some(authentication) = authentication {
+            authentication.validate()?;
+        }
         if prefix.exists() {
             fs::remove_dir_all(prefix)?;
         }
@@ -466,7 +508,11 @@ fn uninstall(game: &crate::domain::InstalledGame, library: &Path) -> Result<()> 
     Ok(())
 }
 
-fn install(target: MigrationTarget, product_id: i64) -> Result<()> {
+fn install(
+    target: MigrationTarget,
+    product_id: i64,
+    authentication: Option<&crate::gog::depot_service::DepotSession>,
+) -> Result<()> {
     match target {
         MigrationTarget::Offline {
             game,
@@ -496,6 +542,7 @@ fn install(target: MigrationTarget, product_id: i64) -> Result<()> {
             crate::gog::depot_service::start_operation(
                 &store,
                 &reqwest::blocking::Client::new(),
+                authentication.context("Sign in to GOG before installing the replacement")?,
                 request,
             )?;
             loop {
@@ -522,6 +569,103 @@ fn install(target: MigrationTarget, product_id: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn galaxy_journal() -> MigrationJournal {
+        serde_json::from_value(serde_json::json!({
+            "operation_id": "migration", "product_id": 7, "slug": "game",
+            "phase": "backed_up", "locations": [],
+            "target": {"Galaxy": {
+                "build": {
+                    "build_id": "build", "product_id": 7, "operating_system": "linux",
+                    "tags": [], "public": true, "generation": 2,
+                    "repository_url": "unused", "currently_returned": true,
+                    "first_seen_at": 0, "last_seen_at": 0
+                },
+                "selection": {"language": "en", "owned_dlc": [], "selected_dlc": []},
+                "operation_id": "depot", "kind": "install", "library_id": "library",
+                "library_root": "/synthetic", "slug": "game"
+            }}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_restores_authentication_once_only_before_galaxy_installation() {
+        let mut journal = galaxy_journal();
+        let expected = (crate::online::account_session(), crate::auth::session());
+        let loads = std::cell::Cell::new(0);
+        for phase in [MigrationPhase::BackedUp, MigrationPhase::Uninstalled] {
+            journal.phase = phase;
+            let authentication = migration_authentication(&journal, expected, || {
+                loads.set(loads.get() + 1);
+                Ok(Some(crate::auth::Token {
+                    access_token: "migration-access-sentinel".into(),
+                    refresh_token: "migration-refresh-sentinel".into(),
+                    user_id: "user".into(),
+                    expires_at: chrono::Utc::now().timestamp() + 3600,
+                }))
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(authentication.account_session, expected.0);
+        }
+        assert_eq!(loads.get(), 2);
+        assert!(
+            !serde_json::to_string(&journal)
+                .unwrap()
+                .contains("sentinel")
+        );
+        for phase in [
+            MigrationPhase::Installed,
+            MigrationPhase::Restoring,
+            MigrationPhase::Complete,
+        ] {
+            journal.phase = phase;
+            assert!(
+                migration_authentication(&journal, expected, || {
+                    panic!("save-only phases must not access credentials")
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
+        journal.phase = MigrationPhase::BackedUp;
+        assert!(migration_authentication(&journal, expected, || Ok(None)).is_err());
+        assert_eq!(journal.phase, MigrationPhase::BackedUp);
+        assert!(
+            migration_authentication(&journal, (expected.0.wrapping_add(1), expected.1), || {
+                panic!("stale migration must not load credentials")
+            })
+            .is_err()
+        );
+        journal.target = None;
+        assert!(
+            migration_authentication(&journal, expected, || {
+                panic!("non-Galaxy migration must not access credentials")
+            })
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated single-test process: revokes auth during synthetic credential load"]
+    fn migration_revoked_during_restoration_keeps_original_phase() {
+        let journal = galaxy_journal();
+        let expected = (crate::online::account_session(), crate::auth::session());
+        let result = migration_authentication(&journal, expected, || {
+            crate::auth::invalidate_session();
+            Ok(Some(crate::auth::Token {
+                access_token: "inert".into(),
+                refresh_token: "inert".into(),
+                user_id: "user".into(),
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+            }))
+        });
+        assert!(result.is_err());
+        assert_eq!(journal.phase, MigrationPhase::BackedUp);
+        assert_eq!(crate::online::account_session(), expected.0);
+    }
 
     fn temp() -> PathBuf {
         std::env::temp_dir().join(format!(

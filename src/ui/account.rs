@@ -227,6 +227,7 @@ pub(super) fn begin_account_exchange(w: &Rc<Widgets>, model: &Rc<RefCell<AppMode
     }
     // A new login must not lend its credentials to an older game's cloud callbacks.
     auth::invalidate_session();
+    model.borrow_mut().account_token = None;
     let epoch = model.borrow().account_epoch;
     show_progress(w, "Signing in to GOG…");
     w.sign_in.set_sensitive(false);

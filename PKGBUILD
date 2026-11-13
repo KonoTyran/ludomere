@@ -1,5 +1,5 @@
 pkgname=ludomere
-pkgver=0.3.2
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='A native GOG library, download, and game manager for Linux.'
 arch=('x86_64')

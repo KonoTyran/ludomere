@@ -96,14 +96,26 @@ pub(crate) fn run_tracked(
     log: &Path,
     spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
 ) -> Result<()> {
+    run_tracked_with_policy(operation, stopped, name, log, ExitPolicy::Strict, spawn).map(|_| ())
+}
+
+fn run_tracked_with_policy(
+    operation: Option<&str>,
+    stopped: &impl Fn() -> bool,
+    name: &str,
+    log: &Path,
+    policy: ExitPolicy,
+    spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
+) -> Result<SetupExit> {
     if let Some(operation) = operation {
         let (_, record) = super::operation_journal::find_depot(operation)?;
         ensure_setup_quiescent(&record)?;
     }
-    run_guarded(
+    run_guarded_with_policy(
         stopped,
         name,
         log,
+        policy,
         |guard| {
             if let Some(operation) = operation {
                 write_setup_guard(operation, guard)?;
@@ -118,9 +130,20 @@ pub(super) fn run_guarded(
     stopped: &impl Fn() -> bool,
     name: &str,
     log: &Path,
-    mut persist: impl FnMut(Option<SetupProcessGuard>) -> Result<()>,
+    persist: impl FnMut(Option<SetupProcessGuard>) -> Result<()>,
     spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
 ) -> Result<()> {
+    run_guarded_with_policy(stopped, name, log, ExitPolicy::Strict, persist, spawn).map(|_| ())
+}
+
+fn run_guarded_with_policy(
+    stopped: &impl Fn() -> bool,
+    name: &str,
+    log: &Path,
+    policy: ExitPolicy,
+    mut persist: impl FnMut(Option<SetupProcessGuard>) -> Result<()>,
+    spawn: impl FnOnce() -> Result<crate::compatibility::CompatibilityProcess>,
+) -> Result<SetupExit> {
     ensure!(!stopped(), "Required setup cancelled before starting");
     let boot = boot_identity()?;
     // Arm durably before spawn. An unknown same-boot group cannot be assumed safe
@@ -150,7 +173,7 @@ pub(super) fn run_guarded(
         persist(None)?;
         return Err(error);
     }
-    let result = wait_process(&mut process, stopped, name, log);
+    let result = wait_process_with_policy(&mut process, stopped, name, log, policy);
     // Any inspection error is uncertain, so attempt a controlled drain before removing
     // the durable guard. Failure leaves it armed for both in-process and restart recovery.
     if !matches!(process.group_running(), Ok(false)) {
@@ -491,13 +514,16 @@ pub(crate) fn apply(
                     let root = verified_root(entry, prepared, &stopped)?;
                     ensure!(!stopped(), "Dependency setup cancelled");
                     let command = command(entry, &root, context)?;
-                    run_tracked(
-                        context.operation_id.as_deref(),
-                        &stopped,
-                        &entry.name,
-                        &context.log_path,
-                        || Ok(backend.run_executable(command)?),
-                    )
+                    run_native_dependency(entry, command, context, &stopped, |request, policy| {
+                        run_tracked_with_policy(
+                            context.operation_id.as_deref(),
+                            &stopped,
+                            &entry.name,
+                            &context.log_path,
+                            policy,
+                            || Ok(backend.run_executable(request)?),
+                        )
+                    })
                 }
             },
         )?;
@@ -611,6 +637,89 @@ fn command(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitPolicy {
+    Strict,
+    WindowsInstaller,
+}
+
+impl ExitPolicy {
+    fn for_dependency(entry: &Dependency) -> Self {
+        match &entry.method {
+            Method::Msi { .. } => Self::WindowsInstaller,
+            Method::Exe { path, .. }
+                if entry.id == "dotNet45"
+                    && Path::new(path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.eq_ignore_ascii_case("NDP452-KB2901907-x86-x64-AllOS-ENU.exe")
+                        }) =>
+            {
+                Self::WindowsInstaller
+            }
+            _ => Self::Strict,
+        }
+    }
+
+    fn classify(self, status: std::process::ExitStatus) -> Option<SetupExit> {
+        if status.success() {
+            Some(SetupExit::Complete)
+        } else if self == Self::WindowsInstaller && matches!(status.code(), Some(194 | 105)) {
+            // Documented Windows installer success codes 3010/1641, truncated by Unix.
+            // This contract does not apply to arbitrary executables or Winetricks.
+            Some(SetupExit::RestartRequired)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupExit {
+    Complete,
+    RestartRequired,
+}
+
+fn run_native_dependency(
+    entry: &Dependency,
+    invocation: CompatibilityRunRequest,
+    context: &ActionContext,
+    stopped: &impl Fn() -> bool,
+    mut run: impl FnMut(CompatibilityRunRequest, ExitPolicy) -> Result<SetupExit>,
+) -> Result<()> {
+    let policy = ExitPolicy::for_dependency(entry);
+    run(invocation, policy)?;
+    if policy == ExitPolicy::WindowsInstaller {
+        ensure!(
+            !stopped(),
+            "Dependency setup cancelled before prefix restart"
+        );
+        crate::compatibility::append_step_log(
+            &context.log_path,
+            "Required dependency completed; finalizing Windows installer setup with a prefix restart",
+        )?;
+        // UMU uses this directory as WINEPREFIX; its pfx link points back to it.
+        // -r processes pending renames/RunOnce without launching ordinary startup items.
+        // Also restart after exit zero: a retry may report already installed after a
+        // previous restart failed. Never checkpoint that deferred work as complete.
+        run(
+            CompatibilityRunRequest {
+                prefix: context.prefix.clone(),
+                profile: context.profile.clone(),
+                executable: context.prefix.join("drive_c/windows/system32/wineboot.exe"),
+                arguments: vec!["-r".into()],
+                working_directory: Some(context.prefix.clone()),
+                log_path: context.log_path.clone(),
+                background: true,
+            },
+            ExitPolicy::Strict,
+        )
+        .context("Completing the required Windows prefix restart; retry dependency setup")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct UnsuccessfulExit(String);
 impl std::fmt::Display for UnsuccessfulExit {
@@ -626,6 +735,16 @@ pub(crate) fn wait_process(
     name: &str,
     log: &Path,
 ) -> Result<()> {
+    wait_process_with_policy(process, stopped, name, log, ExitPolicy::Strict).map(|_| ())
+}
+
+fn wait_process_with_policy(
+    process: &mut crate::compatibility::CompatibilityProcess,
+    stopped: &impl Fn() -> bool,
+    name: &str,
+    log: &Path,
+    policy: ExitPolicy,
+) -> Result<SetupExit> {
     loop {
         if stopped() {
             process
@@ -635,7 +754,7 @@ pub(crate) fn wait_process(
             return Err(crate::download::depot::DepotCancelled.into());
         }
         if let Some(status) = process.try_wait()? {
-            if !status.success() {
+            let Some(outcome) = policy.classify(status) else {
                 if process.group_running()? {
                     process
                         .stop()
@@ -648,9 +767,9 @@ pub(crate) fn wait_process(
                     log.display()
                 ))
                 .into());
-            }
+            };
             if !process.group_running()? {
-                return Ok(());
+                return Ok(outcome);
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -660,6 +779,301 @@ pub(crate) fn wait_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_exit_codes_are_limited_to_documented_native_installers() {
+        use std::os::unix::process::ExitStatusExt;
+        let entry = |id: &str, method| Dependency {
+            id: id.into(),
+            name: ".NET Framework".into(),
+            manifest_id: String::new(),
+            manifest_bytes: Vec::new(),
+            method,
+        };
+        let exe = |path: &str| Method::Exe {
+            path: path.into(),
+            args: vec!["/q".into(), "/norestart".into()],
+        };
+        for (dependency, expected) in [
+            (
+                entry(
+                    "dotNet45",
+                    exe("dotnet/NDP452-KB2901907-x86-x64-AllOS-ENU.exe"),
+                ),
+                ExitPolicy::WindowsInstaller,
+            ),
+            (
+                entry("dotNet45", exe("ndp452-kb2901907-x86-x64-allos-enu.exe")),
+                ExitPolicy::WindowsInstaller,
+            ),
+            (
+                entry(
+                    "MSI",
+                    Method::Msi {
+                        path: "setup.msi".into(),
+                        args: vec![],
+                    },
+                ),
+                ExitPolicy::WindowsInstaller,
+            ),
+            (
+                entry("other", exe("NDP452-KB2901907-x86-x64-AllOS-ENU.exe")),
+                ExitPolicy::Strict,
+            ),
+            (entry("dotNet45", exe("other.exe")), ExitPolicy::Strict),
+            (
+                entry(
+                    "dotNet45",
+                    exe("NDP452-KB2901907-x86-x64-AllOS-ENU.exe.other"),
+                ),
+                ExitPolicy::Strict,
+            ),
+            (
+                entry(
+                    "dotNet45",
+                    Method::ScriptInterpreter {
+                        path: "NDP452-KB2901907-x86-x64-AllOS-ENU.exe".into(),
+                        args: vec![],
+                    },
+                ),
+                ExitPolicy::Strict,
+            ),
+            (entry("DirectX", exe("DXSETUP.exe")), ExitPolicy::Strict),
+            (entry("dotNet45", Method::GameFiles), ExitPolicy::Strict),
+        ] {
+            let policy = ExitPolicy::for_dependency(&dependency);
+            assert_eq!(policy, expected);
+            assert_eq!(
+                policy.classify(std::process::ExitStatus::from_raw(0)),
+                Some(SetupExit::Complete)
+            );
+            for code in [194, 105] {
+                assert_eq!(
+                    policy.classify(std::process::ExitStatus::from_raw(code << 8)),
+                    (policy == ExitPolicy::WindowsInstaller).then_some(SetupExit::RestartRequired),
+                );
+            }
+            for code in [1, 66, 67, 108, 255] {
+                assert_eq!(
+                    policy.classify(std::process::ExitStatus::from_raw(code << 8)),
+                    None
+                );
+            }
+            assert_eq!(
+                policy.classify(std::process::ExitStatus::from_raw(libc::SIGTERM)),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn native_dependency_receipt_requires_completed_prefix_restart() {
+        use std::cell::Cell;
+        for scenario in [
+            "complete",
+            "restart",
+            "restart_failed",
+            "cancelled_before_restart",
+            "cancelled_after_restart",
+            "installer_failed",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let prefix = root.path().join("prefix");
+            fs::create_dir_all(prefix.join("drive_c/windows/system32")).unwrap();
+            for registry in ["system.reg", "user.reg"] {
+                fs::write(prefix.join(registry), "WINE REGISTRY Version 2\n").unwrap();
+            }
+            std::os::unix::fs::symlink(".", prefix.join("pfx")).unwrap();
+            let context = ActionContext {
+                operation_id: None,
+                product_id: 7,
+                app: root.path().join("game"),
+                support: root.path().join("support"),
+                prefix: prefix.clone(),
+                windows_app: "L:\\game".into(),
+                profile: crate::compatibility::UmuProfile::fallback(),
+                log_path: root.path().join("log"),
+                galaxy_setup: None,
+            };
+            let entry = Dependency {
+                id: "dotNet45".into(),
+                name: ".NET Framework 4.5.2".into(),
+                manifest_id: String::new(),
+                manifest_bytes: Vec::new(),
+                method: Method::Exe {
+                    path: "NDP452-KB2901907-x86-x64-AllOS-ENU.exe".into(),
+                    args: vec!["/q".into(), "/norestart".into()],
+                },
+            };
+            let cancelled = Cell::new(false);
+            let stopped = || cancelled.get();
+            let mut calls = 0;
+            let receipt = prefix.join(".ludomere-gog-dependencies.json");
+            let key = format!("{}:gog-native-v1", entry.identity());
+            let result = complete_step(&prefix, key.clone(), &stopped, || {
+                run_native_dependency(
+                    &entry,
+                    command(&entry, root.path(), &context)?,
+                    &context,
+                    &stopped,
+                    |request, policy| {
+                        calls += 1;
+                        assert!(
+                            !receipt.exists(),
+                            "no receipt before all required work finishes"
+                        );
+                        if calls == 1 {
+                            assert_eq!(policy, ExitPolicy::WindowsInstaller);
+                            if scenario == "installer_failed" {
+                                anyhow::bail!("synthetic installer failure");
+                            }
+                            if scenario == "cancelled_before_restart" {
+                                cancelled.set(true);
+                            }
+                            return Ok(if scenario == "complete" {
+                                SetupExit::Complete
+                            } else {
+                                SetupExit::RestartRequired
+                            });
+                        }
+                        assert_eq!(calls, 2);
+                        assert_eq!(policy, ExitPolicy::Strict);
+                        assert_eq!(request.prefix, prefix);
+                        assert_eq!(
+                            request.executable,
+                            prefix.join("drive_c/windows/system32/wineboot.exe")
+                        );
+                        assert_eq!(request.arguments, ["-r"]);
+                        assert_eq!(request.profile, context.profile);
+                        assert_eq!(request.log_path, context.log_path);
+                        assert_eq!(request.working_directory, Some(prefix.clone()));
+                        assert!(request.background);
+                        if scenario == "restart_failed" {
+                            anyhow::bail!("synthetic restart failure");
+                        }
+                        if scenario == "cancelled_after_restart" {
+                            cancelled.set(true);
+                        }
+                        Ok(SetupExit::Complete)
+                    },
+                )
+            });
+            let success = matches!(scenario, "complete" | "restart");
+            assert_eq!(result.is_ok(), success, "{scenario}");
+            assert_eq!(receipt.exists(), success, "{scenario}");
+            assert_eq!(
+                calls,
+                if matches!(scenario, "cancelled_before_restart" | "installer_failed") {
+                    1
+                } else {
+                    2
+                }
+            );
+            if success {
+                complete_step(&prefix, key, &stopped, || {
+                    anyhow::bail!("completed setup must not rerun")
+                })
+                .unwrap();
+            } else if scenario == "restart_failed" {
+                let mut retried = 0;
+                complete_step(&prefix, key, &stopped, || {
+                    run_native_dependency(
+                        &entry,
+                        command(&entry, root.path(), &context)?,
+                        &context,
+                        &stopped,
+                        |_, _| {
+                            retried += 1;
+                            assert!(!receipt.exists());
+                            // An already-installed retry may return zero; it still
+                            // needs to finish the failed prefix restart.
+                            Ok(SetupExit::Complete)
+                        },
+                    )
+                })
+                .unwrap();
+                assert_eq!(retried, 2);
+                assert!(receipt.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn windows_installer_exit_waits_for_children_and_honors_cancellation() {
+        use std::cell::Cell;
+        for (policy, cancel) in [
+            (ExitPolicy::WindowsInstaller, false),
+            (ExitPolicy::WindowsInstaller, true),
+            (ExitPolicy::Strict, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let completed = root.path().join("child-completed");
+            let ready = root.path().join("child-ready");
+            let release = root.path().join("release-child");
+            let started = Cell::new(false);
+            let polls = Cell::new(0);
+            let mut guards = Vec::new();
+            let result = run_guarded_with_policy(
+                &|| {
+                    if !started.get() {
+                        return false;
+                    }
+                    if cancel {
+                        return true;
+                    }
+                    polls.set(polls.get() + 1);
+                    if polls.get() == 2 {
+                        // The first wait poll must retain the live child despite
+                        // its parent's accepted 194. Only then let it complete.
+                        fs::write(&release, b"release").unwrap();
+                    }
+                    false
+                },
+                "inert installer",
+                &root.path().join("log"),
+                policy,
+                |guard| {
+                    guards.push(guard);
+                    Ok(())
+                },
+                || {
+                    let mut command = std::process::Command::new("python3");
+                    command.args(["-I", "-c", "import os,sys,time\nif os.fork() == 0:\n with open(sys.argv[2], 'w') as file: file.write('ready')\n deadline = time.monotonic() + 10\n while not os.path.exists(sys.argv[3]):\n  if time.monotonic() >= deadline: os._exit(2)\n  time.sleep(0.01)\n with open(sys.argv[1], 'w') as file: file.write('completed')\n os._exit(0)\nos._exit(194)\n"]);
+                    command.args([&completed, &ready, &release]);
+                    let mut process = crate::compatibility::CompatibilityProcess::spawn(
+                        command,
+                        &root.path().join("log"),
+                    )?;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !ready.exists() || process.try_wait()?.is_none() {
+                        if std::time::Instant::now() >= deadline {
+                            process.stop()?;
+                            anyhow::bail!("inert installer did not establish the child handshake");
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert_eq!(process.try_wait()?.unwrap().code(), Some(194));
+                    started.set(true);
+                    Ok(process)
+                },
+            );
+            assert!(guards.first().unwrap().as_ref().unwrap().group.is_none());
+            let group = guards[1].as_ref().unwrap().group.unwrap();
+            assert!(guards.last().unwrap().is_none());
+            assert!(!crate::compatibility::CompatibilityProcess::group_is_running(group).unwrap());
+            if policy == ExitPolicy::WindowsInstaller && !cancel {
+                assert_eq!(result.unwrap(), SetupExit::RestartRequired);
+                assert!(polls.get() >= 2);
+                assert!(
+                    completed.is_file(),
+                    "accepted exit must not kill pending child work"
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(!completed.exists());
+            }
+        }
+    }
 
     #[test]
     fn component_progress_counts_verified_checkpoints_but_not_failed_components() {

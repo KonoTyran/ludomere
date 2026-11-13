@@ -1,6 +1,47 @@
 use crate::{domain::GalaxyBuild, state::StateStore};
 use anyhow::{Result, bail};
 
+#[derive(Clone)]
+pub struct DepotSession {
+    pub(crate) token: crate::auth::Token,
+    pub(crate) account_session: u64,
+    auth_session: u64,
+}
+
+impl DepotSession {
+    pub fn new(token: crate::auth::Token, expected: (u64, u64)) -> Result<Self> {
+        let session = Self {
+            token,
+            account_session: expected.0,
+            auth_session: expected.1,
+        };
+        session.validate()?;
+        Ok(session)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.account_session == crate::online::account_session()
+                && crate::auth::session_is_current(self.auth_session),
+            "The account changed or signed out. Sign in and reopen the Depot operation."
+        );
+        anyhow::ensure!(
+            !self.token.access_token.is_empty()
+                && !self.token.user_id.is_empty()
+                && self.token.expires_at > chrono::Utc::now().timestamp(),
+            "The GOG session expired or is unavailable. Sign in again and retry the Depot operation."
+        );
+        Ok(())
+    }
+
+    pub fn commit<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::online::with_account_session(self.account_session, || {
+            self.validate()?;
+            operation()
+        })
+    }
+}
+
 pub struct BranchPassword(String);
 
 impl BranchPassword {
@@ -71,9 +112,11 @@ impl std::error::Error for ServiceError {}
 pub fn list_builds(
     store: &StateStore,
     client: &reqwest::blocking::Client,
+    session: &DepotSession,
     request: &BuildRequest,
 ) -> Result<Vec<GalaxyBuild>> {
     let builds = list_with(
+        session,
         request,
         || {
             request
@@ -93,11 +136,7 @@ pub fn list_builds(
         |password| {
             crate::gog::builds::fetch_authenticated_generation(
                 client,
-                crate::auth::load_saved_token()?
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("sign in to GOG to list Galaxy builds"))?
-                    .access_token
-                    .as_str(),
+                &session.token.access_token,
                 password,
                 request.product_id,
                 &request.platform,
@@ -115,10 +154,13 @@ pub fn list_builds(
                 request.product_id,
                 branch,
                 password,
+                session.account_session,
+                || session.validate(),
             )
         },
     )?;
-    store.observe_galaxy_builds(request.product_id, &request.platform, &builds)?;
+    session
+        .commit(|| store.observe_galaxy_builds(request.product_id, &request.platform, &builds))?;
     Ok(builds)
 }
 
@@ -144,12 +186,11 @@ pub struct PrepareOperationRequest {
 pub fn prepare_operation(
     store: &StateStore,
     client: &reqwest::blocking::Client,
+    session: &DepotSession,
     request: PrepareOperationRequest,
 ) -> Result<crate::installation::DepotOperationRequest> {
-    let account_session = crate::online::account_session();
+    session.validate()?;
     let recovery_generation = crate::installation::recovery::generation(request.build.product_id);
-    let token = crate::auth::load_saved_token()?
-        .ok_or_else(|| anyhow::anyhow!("sign in to GOG to prepare a Galaxy depot operation"))?;
     let acquisition = crate::installation::depot_planner::load_cached_acquisition(
         store,
         &request.build,
@@ -157,16 +198,18 @@ pub fn prepare_operation(
     )?
     .map(Ok)
     .unwrap_or_else(|| {
+        session.validate()?;
         crate::gog::depot_acquisition::acquire(
             client,
-            &token.access_token,
+            &session.token.access_token,
             &request.build,
             &request.selection,
         )
     })?;
+    session.validate()?;
     crate::installation::depot_planner::prepare(
         crate::installation::depot_planner::PrepareDepotRequest {
-            account_session,
+            session,
             recovery_generation,
             store,
             acquisition: &acquisition,
@@ -177,7 +220,6 @@ pub fn prepare_operation(
             library_id: request.library_id,
             library_root: request.library_root,
             slug: request.slug,
-            access_token: token.access_token,
         },
     )
 }
@@ -185,10 +227,12 @@ pub fn prepare_operation(
 pub fn start_operation(
     store: &StateStore,
     client: &reqwest::blocking::Client,
+    session: &DepotSession,
     request: PrepareOperationRequest,
 ) -> Result<String> {
-    let operation = prepare_operation(store, client, request)?;
+    let operation = prepare_operation(store, client, session, request)?;
     let operation_id = operation.operation_id.clone();
+    session.validate()?;
     if !crate::installation::enqueue_depot_operation(operation) {
         bail!("Galaxy depot operation conflicts with active work or could not be persisted");
     }
@@ -271,6 +315,7 @@ pub fn resolve_operation_build<'a>(
 }
 
 fn list_with<L, F, S>(
+    session: &DepotSession,
     request: &BuildRequest,
     load: L,
     mut fetch: F,
@@ -281,6 +326,11 @@ where
     F: FnMut(Option<&str>) -> Result<Vec<GalaxyBuild>>,
     S: FnOnce(&str) -> Result<()>,
 {
+    session.validate()?;
+    anyhow::ensure!(
+        request.user_id == session.token.user_id,
+        "The account changed. Reopen the Depot operation."
+    );
     if !matches!(request.generation, 1 | 2) {
         bail!("unsupported Galaxy build-list generation");
     }
@@ -296,6 +346,7 @@ where
     } else {
         None
     };
+    session.validate()?;
     let password = supplied.or(saved.as_deref());
     let builds = fetch(password).map_err(|error| {
         let kind = error
@@ -321,6 +372,7 @@ where
             _ => error,
         }
     })?;
+    session.validate()?;
     if let Some(password) = supplied {
         save(password)?;
     }
@@ -334,6 +386,19 @@ mod tests {
         cell::{Cell, RefCell},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn session() -> DepotSession {
+        DepotSession::new(
+            crate::auth::Token {
+                access_token: "access-sentinel".into(),
+                refresh_token: "refresh-sentinel".into(),
+                user_id: "user".into(),
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+            },
+            (crate::online::account_session(), crate::auth::session()),
+        )
+        .unwrap()
+    }
 
     fn request(password: Option<&str>) -> BuildRequest {
         BuildRequest {
@@ -351,9 +416,98 @@ mod tests {
     }
 
     #[test]
+    fn invalid_depot_sessions_cannot_access_branch_credentials_or_fetch() {
+        for invalid in 0..6 {
+            let mut session = session();
+            match invalid {
+                0 => session.token.access_token.clear(),
+                1 => session.token.user_id.clear(),
+                2 => session.token.expires_at = chrono::Utc::now().timestamp(),
+                3 => session.account_session = session.account_session.wrapping_add(1),
+                4 => session.auth_session = session.auth_session.wrapping_add(1),
+                _ => session.token.user_id = "different-account".into(),
+            }
+            let error = list_with(
+                &session,
+                &request(None),
+                || panic!("invalid session must not load a branch password"),
+                |_| panic!("invalid session must not fetch builds"),
+                |_| panic!("invalid session must not persist a branch password"),
+            )
+            .unwrap_err();
+            assert!(!format!("{error:?}").contains("sentinel"));
+        }
+    }
+
+    #[test]
+    fn expired_review_cannot_enter_a_commit() {
+        let mut session = session();
+        session.token.expires_at = chrono::Utc::now().timestamp() - 1;
+        assert!(
+            session
+                .commit(|| -> Result<()> { panic!("expired session must not enter persistence") })
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated single-test process: revokes the global auth session; no keyring/network"]
+    fn revocation_after_branch_load_prevents_fetch() {
+        let session = session();
+        let online_session = crate::online::account_session();
+        assert!(
+            list_with(
+                &session,
+                &request(None),
+                || {
+                    crate::auth::invalidate_session();
+                    Ok(Some("branch-sentinel".into()))
+                },
+                |_| panic!("revoked session must not send the loaded password"),
+                |_| panic!("revoked session must not persist a password"),
+            )
+            .is_err()
+        );
+        assert_eq!(crate::online::account_session(), online_session);
+    }
+
+    #[test]
+    #[ignore = "isolated single-test process: revokes the global auth session; no keyring/network"]
+    fn revocation_after_fetch_prevents_password_and_observation_commits() {
+        let session = session();
+        assert!(
+            list_with(
+                &session,
+                &request(Some("branch-sentinel")),
+                || panic!("supplied password must not read storage"),
+                |_| {
+                    crate::auth::invalidate_session();
+                    Ok(Vec::new())
+                },
+                |_| panic!("revoked session must not persist a password"),
+            )
+            .is_err()
+        );
+        assert!(
+            session
+                .commit(|| -> Result<()> { panic!("revoked session must not observe builds") })
+                .is_err()
+        );
+        assert!(
+            DepotSession::new(
+                session.token,
+                (crate::online::account_session(), crate::auth::session()),
+            )
+            .is_err(),
+            "the current generation is itself signed out"
+        );
+    }
+
+    #[test]
     fn reuses_saved_and_saves_supplied_only_after_success() {
         let seen = RefCell::new(String::new());
         list_with(
+            &session(),
             &request(None),
             || Ok(Some("saved".into())),
             |password| {
@@ -367,6 +521,7 @@ mod tests {
 
         let saved = RefCell::new(None);
         list_with(
+            &session(),
             &request(Some("new")),
             || panic!(),
             |_| Ok(Vec::new()),
@@ -383,6 +538,7 @@ mod tests {
     fn failed_auth_never_saves_and_reports_saved_context() {
         let called = Cell::new(false);
         let error = list_with(
+            &session(),
             &request(Some("secret")),
             || panic!(),
             |_| {
@@ -400,6 +556,7 @@ mod tests {
         assert!(!format!("{error:?}").contains("secret"));
 
         let error = list_with(
+            &session(),
             &request(None),
             || Ok(Some("old".into())),
             |_| {
@@ -420,6 +577,7 @@ mod tests {
         let debug_request = request(Some("password-sentinel"));
         assert!(!format!("{debug_request:?}").contains("password-sentinel"));
         let error = list_with(
+            &session(),
             &request(None),
             || Ok(None),
             |_| {

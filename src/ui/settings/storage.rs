@@ -16,13 +16,106 @@ struct InstalledStorageItem {
     size: u64,
 }
 
+#[cfg(test)]
+type StorageInspectionResult = anyhow::Result<(
+    Option<(u64, u64)>,
+    Vec<InstalledStorageItem>,
+    u64,
+    u64,
+    Vec<crate::storage::GameDirectoryIssue>,
+)>;
+
+#[cfg(test)]
+thread_local! {
+    static STORAGE_INSPECTIONS: RefCell<Option<Vec<mpsc::Sender<StorageInspectionResult>>>> = const { RefCell::new(None) };
+    static STORAGE_INSPECTION_DELAYS: RefCell<std::collections::VecDeque<mpsc::Receiver<()>>> = const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
 #[derive(Clone)]
 struct StorageListView {
     list: gtk::ListBox,
     checks: Rc<RefCell<HashMap<i64, gtk::CheckButton>>>,
     count: gtk::Label,
-    selected: gtk::Label,
-    move_button: gtk::Button,
+    update_selection: Rc<dyn Fn()>,
+}
+
+fn connect_move_selection(
+    items: &Rc<RefCell<Vec<InstalledStorageItem>>>,
+    checks: &Rc<RefCell<HashMap<i64, gtk::CheckButton>>>,
+    libraries: &Rc<RefCell<Vec<GameLibrary>>>,
+    target: &gtk::DropDown,
+    selected: &gtk::Label,
+    button: &gtk::Button,
+    moving: &Rc<std::cell::Cell<bool>>,
+) -> Rc<dyn Fn()> {
+    let update: Rc<dyn Fn()> = {
+        let items = items.clone();
+        let checks = Rc::downgrade(checks);
+        let libraries = libraries.clone();
+        let target = target.downgrade();
+        let selected = selected.downgrade();
+        let button = button.downgrade();
+        let moving = moving.clone();
+        Rc::new(move || {
+            let (Some(checks), Some(target), Some(selected), Some(button)) = (
+                checks.upgrade(),
+                target.upgrade(),
+                selected.upgrade(),
+                button.upgrade(),
+            ) else {
+                return;
+            };
+            let items = items.borrow();
+            let checks = checks.borrow();
+            let chosen = items
+                .iter()
+                .filter(|item| {
+                    checks
+                        .get(&item.game.product_id)
+                        .is_some_and(gtk::CheckButton::is_active)
+                })
+                .collect::<Vec<_>>();
+            let count = chosen.len();
+            selected.set_label(&if count == 0 {
+                "No games selected".to_owned()
+            } else {
+                format!("{count} game{} selected", if count == 1 { "" } else { "s" })
+            });
+            let libraries = libraries.borrow();
+            let destination = libraries.get(target.selected() as usize);
+            let reason = if moving.get() {
+                Some("Wait for the current move to finish.")
+            } else if chosen.is_empty() {
+                Some("Select at least one game to move.")
+            } else if chosen.iter().any(|item| {
+                item.game.compatibility.is_some()
+                    || item
+                        .game
+                        .installer_operating_system
+                        .as_deref()
+                        .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+            }) {
+                Some(
+                    "Windows games cannot be moved here because their compatibility prefix would also need to move. Uninstall and reinstall into the other library.",
+                )
+            } else if let Some(destination) = destination {
+                chosen
+                    .iter()
+                    .all(|item| item.game.library_id == destination.id)
+                    .then_some("Choose a different destination library.")
+            } else {
+                Some("Choose a destination library.")
+            };
+            button.set_sensitive(reason.is_none());
+            button.set_tooltip_text(reason);
+        })
+    };
+    target.connect_selected_notify({
+        let update = update.clone();
+        move |_| update()
+    });
+    update();
+    update
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -171,6 +264,7 @@ fn build_storage_section(
             .unwrap_or(0) as u32,
     );
     let library_menu = gtk::MenuButton::new();
+    library_menu.set_widget_name("storage-library-menu");
     library_menu.set_hexpand(true);
     library_menu.add_css_class("storage-library-menu");
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -181,6 +275,7 @@ fn build_storage_section(
     selected_mount.add_css_class("storage-library-path");
     toolbar.append(&selected_mount);
     let capacity = gtk::Label::new(Some("Calculating storage…"));
+    capacity.set_widget_name("storage-capacity");
     capacity.add_css_class("storage-capacity-label");
     toolbar.append(&capacity);
     toolbar.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
@@ -202,12 +297,18 @@ fn build_storage_section(
         let popover = library_popover.clone();
         let add = add.clone();
         Rc::new(move || {
+            if model.borrow().logout_pending {
+                return;
+            }
+            let epoch = model.borrow().account_epoch;
+            let session = (online::account_session(), auth::session());
             while let Some(child) = choices.first_child() {
                 choices.remove(&child);
             }
             let mut labels = Vec::new();
             for (index, entry) in libraries.borrow().iter().cloned().enumerate() {
                 let row = gtk::Button::new();
+                row.set_widget_name(&format!("storage-library-choice-{index}"));
                 row.add_css_class("flat");
                 row.add_css_class("storage-library-choice");
                 let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -241,15 +342,45 @@ fn build_storage_section(
                 choices.append(&row);
             }
             choices.append(&add);
+            #[cfg(test)]
+            if STORAGE_INSPECTIONS.with_borrow(Option::is_some) {
+                return;
+            }
             let config = model.borrow().config.clone();
-            let epoch = model.borrow().account_epoch;
+            let activity = match crate::profile_reset::begin_activity("checking library choices") {
+                Ok(activity) => activity,
+                Err(error) => {
+                    for (_, label) in &labels {
+                        label.set_label("Inspection stopped");
+                        label.set_tooltip_text(Some(&error.to_string()));
+                    }
+                    return;
+                }
+            };
+            #[cfg(test)]
+            let delay = STORAGE_INSPECTION_DELAYS.with_borrow_mut(|delays| delays.pop_front());
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let _ = sender.send(crate::storage::inspect_libraries(&config));
+                let result = (|| {
+                    let _activity = activity;
+                    #[cfg(test)]
+                    if let Some(delay) = delay {
+                        delay.recv()?;
+                    }
+                    anyhow::ensure!(
+                        session == (online::account_session(), auth::session()),
+                        "Account changed; reopen Storage settings."
+                    );
+                    crate::storage::inspect_libraries(&config)
+                })();
+                let _ = sender.send(result);
             });
             let model = model.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
-                if model.borrow().account_epoch != epoch {
+                if model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                    || session != (online::account_session(), auth::session())
+                {
                     return glib::ControlFlow::Break;
                 }
                 match receiver.try_recv() {
@@ -289,6 +420,7 @@ fn build_storage_section(
     rebuild_library_choices();
 
     let path_label = gtk::Label::new(None);
+    path_label.set_widget_name("storage-inspection-status");
     path_label.set_xalign(0.0);
     path_label.add_css_class("storage-path-label");
     root.append(&path_label);
@@ -296,6 +428,7 @@ fn build_storage_section(
     path_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     path_label.set_selectable(true);
     let recheck = gtk::Button::with_label("Recheck library");
+    recheck.set_widget_name("storage-recheck");
     recheck.set_halign(gtk::Align::Start);
     root.append(&recheck);
     let game_issues = gtk::Box::new(gtk::Orientation::Vertical, 10);
@@ -368,6 +501,7 @@ fn build_storage_section(
         }
     });
     let usage_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    usage_row.append(&gtk::Label::new(Some("Drive usage")));
     usage.set_hexpand(true);
     usage_row.append(&usage);
     let manage_library = gtk::MenuButton::new();
@@ -398,7 +532,7 @@ fn build_storage_section(
     let (installers_legend, installers_size) =
         storage_legend_item("Installers", "storage-installers");
     let (extras_legend, extras_size) = storage_legend_item("Extras", "storage-extras");
-    let (others_legend, others_size) = storage_legend_item("Others", "storage-others");
+    let (others_legend, others_size) = storage_legend_item("Other", "storage-others");
     let (free_legend, free_size) = storage_legend_item("Free", "storage-free");
     for item in [
         games_legend,
@@ -410,6 +544,14 @@ fn build_storage_section(
         legend.append(&item);
     }
     root.append(&legend);
+    let usage_explanation = gtk::Label::new(Some(
+        "Capacity and free space cover the drive. Games, Installers and Extras count this library; Other is the remaining used or unavailable space.",
+    ));
+    usage_explanation.set_xalign(0.0);
+    usage_explanation.set_wrap(true);
+    usage_explanation.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    usage_explanation.add_css_class("dim-label");
+    root.append(&usage_explanation);
 
     let list_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let item_count = gtk::Label::new(Some("Installed games"));
@@ -455,12 +597,21 @@ fn build_storage_section(
 
     let items = Rc::new(RefCell::new(Vec::<InstalledStorageItem>::new()));
     let checks = Rc::new(RefCell::new(HashMap::<i64, gtk::CheckButton>::new()));
+    let moving = Rc::new(std::cell::Cell::new(false));
+    let update_selection = connect_move_selection(
+        &items,
+        &checks,
+        &libraries,
+        &target,
+        &selected,
+        &move_button,
+        &moving,
+    );
     let list_view = StorageListView {
         list: list.clone(),
         checks: checks.clone(),
         count: item_count.clone(),
-        selected: selected.clone(),
-        move_button: move_button.clone(),
+        update_selection: update_selection.clone(),
     };
     let refresh = {
         let list_view = list_view.clone();
@@ -496,9 +647,33 @@ fn build_storage_section(
         let w = w.clone();
         let recheck = recheck.downgrade();
         Rc::new(move || {
+            if model.borrow().logout_pending {
+                path_label
+                    .set_label("Account change in progress. Recheck library when it finishes.");
+                if let Some(recheck) = recheck.upgrade() {
+                    recheck.set_label("Recheck library");
+                    recheck.set_sensitive(true);
+                }
+                return;
+            }
+            let epoch = model.borrow().account_epoch;
+            let session = (online::account_session(), auth::session());
             request.set(request.get().wrapping_add(1));
+            if let Some(recheck) = recheck.upgrade() {
+                recheck.set_sensitive(false);
+                recheck.set_label("Checking library…");
+            }
             footer.set_sensitive(false);
             *usage_values.borrow_mut() = StorageBreakdown::default();
+            for label in [
+                &games_size,
+                &installers_size,
+                &extras_size,
+                &others_size,
+                &free_size,
+            ] {
+                label.set_label("—");
+            }
             usage.queue_draw();
             while let Some(child) = game_issues.first_child() {
                 game_issues.remove(&child);
@@ -507,6 +682,9 @@ fn build_storage_section(
             let Some(selected_library) =
                 libraries.borrow().get(library.selected() as usize).cloned()
             else {
+                if let Some(recheck) = recheck.upgrade() {
+                    recheck.set_label("Recheck library");
+                }
                 manage_library.set_sensitive(false);
                 selected_mount.set_label("Choose or add a directory");
                 path_label
@@ -540,81 +718,121 @@ fn build_storage_section(
             let recovery_library_id = selected_library.id.clone();
             let titles = model_game_display_data(&model.borrow());
             let config = model.borrow().config.clone();
-            let epoch = model.borrow().account_epoch;
+            let activity = match crate::profile_reset::begin_activity("inspecting selected library")
+            {
+                Ok(activity) => activity,
+                Err(error) => {
+                    path_label.set_label(&format!("Could not inspect library: {error}"));
+                    capacity.set_label("Storage information unavailable");
+                    if let Some(recheck) = recheck.upgrade() {
+                        recheck.set_label("Recheck library");
+                        recheck.set_sensitive(true);
+                    }
+                    return;
+                }
+            };
             let generation = request.get();
             let (sender, receiver) = mpsc::channel();
-            std::thread::spawn(move || {
-                let result = (|| -> anyhow::Result<_> {
-                    let inspection = crate::storage::inspect_library_status(
-                        &config,
-                        kind,
-                        &selected_library.id,
-                    )?;
-                    match inspection.compatibility {
-                        crate::storage::LibraryCompatibility::Compatible => {}
-                        crate::storage::LibraryCompatibility::Incompatible(reason)
-                        | crate::storage::LibraryCompatibility::Unavailable(reason) => {
-                            anyhow::bail!(reason)
-                        }
-                    }
-                    let storage = filesystem_storage(&selected_library.path);
-                    let store = StateStore::open()?;
-                    let games = if kind == crate::config::LibraryKind::GameFiles {
-                        crate::installation::reconcile_installed_games(&store, &all_libraries)?
-                            .into_iter()
-                            .filter_map(|mut game| {
-                                let (library_id, directory) =
-                                    crate::installation::resolve_installation_directory(
-                                        &game,
-                                        &all_libraries,
-                                    )?;
-                                if library_id != selected_library.id {
-                                    return None;
-                                }
-                                game.library_id = library_id;
-                                game.installation_directory = directory;
-                                let (title, artwork) =
-                                    titles.get(&game.product_id).cloned().unwrap_or_else(|| {
-                                        (format!("Product {}", game.product_id), None)
-                                    });
-                                let size = directory_size(&game.installation_directory);
-                                Some(InstalledStorageItem {
-                                    game,
-                                    title,
-                                    artwork,
-                                    size,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
-                    let managed = store.managed_files()?;
-                    let installers = managed
-                        .iter()
-                        .filter(|file| {
-                            file.present
-                                && matches!(
-                                    file.kind,
-                                    ArtifactKind::Installer | ArtifactKind::Patch
-                                )
-                                && file.path.starts_with(&selected_library.path)
-                        })
-                        .map(|file| file.size)
-                        .sum::<u64>();
-                    let extras = managed
-                        .iter()
-                        .filter(|file| {
-                            file.present
-                                && file.kind == ArtifactKind::Extra
-                                && file.path.starts_with(&selected_library.path)
-                        })
-                        .map(|file| file.size)
-                        .sum::<u64>();
-                    Ok((storage, games, installers, extras, inspection.game_issues))
-                })();
-                let _ = sender.send(result);
+            #[cfg(test)]
+            let captured = STORAGE_INSPECTIONS.with_borrow_mut(|requests| {
+                if let Some(requests) = requests {
+                    requests.push(sender.clone());
+                    true
+                } else {
+                    false
+                }
             });
+            #[cfg(not(test))]
+            let captured = false;
+            if !captured {
+                #[cfg(test)]
+                let delay = STORAGE_INSPECTION_DELAYS.with_borrow_mut(|delays| delays.pop_front());
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<_> {
+                        let _activity = activity;
+                        #[cfg(test)]
+                        if let Some(delay) = delay {
+                            delay.recv()?;
+                        }
+                        anyhow::ensure!(
+                            session == (online::account_session(), auth::session()),
+                            "Account changed; reopen Storage settings."
+                        );
+                        let inspection = crate::storage::inspect_library_status(
+                            &config,
+                            kind,
+                            &selected_library.id,
+                        )?;
+                        match inspection.compatibility {
+                            crate::storage::LibraryCompatibility::Compatible => {}
+                            crate::storage::LibraryCompatibility::Incompatible(reason)
+                            | crate::storage::LibraryCompatibility::Unavailable(reason) => {
+                                anyhow::bail!(reason)
+                            }
+                        }
+                        let storage = filesystem_storage(&selected_library.path);
+                        anyhow::ensure!(
+                            session == (online::account_session(), auth::session()),
+                            "Account changed; reopen Storage settings."
+                        );
+                        let store = StateStore::open()?;
+                        let games = if kind == crate::config::LibraryKind::GameFiles {
+                            crate::installation::reconcile_installed_games(&store, &all_libraries)?
+                                .into_iter()
+                                .filter_map(|mut game| {
+                                    let (library_id, directory) =
+                                        crate::installation::resolve_installation_directory(
+                                            &game,
+                                            &all_libraries,
+                                        )?;
+                                    if library_id != selected_library.id {
+                                        return None;
+                                    }
+                                    game.library_id = library_id;
+                                    game.installation_directory = directory;
+                                    let (title, artwork) =
+                                        titles.get(&game.product_id).cloned().unwrap_or_else(
+                                            || (format!("Product {}", game.product_id), None),
+                                        );
+                                    let size = directory_size(&game.installation_directory);
+                                    Some(InstalledStorageItem {
+                                        game,
+                                        title,
+                                        artwork,
+                                        size,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        let managed = store.managed_files()?;
+                        let installers = managed
+                            .iter()
+                            .filter(|file| {
+                                file.present
+                                    && matches!(
+                                        file.kind,
+                                        ArtifactKind::Installer | ArtifactKind::Patch
+                                    )
+                                    && file.path.starts_with(&selected_library.path)
+                            })
+                            .map(|file| file.size)
+                            .sum::<u64>();
+                        let extras = managed
+                            .iter()
+                            .filter(|file| {
+                                file.present
+                                    && file.kind == ArtifactKind::Extra
+                                    && file.path.starts_with(&selected_library.path)
+                            })
+                            .map(|file| file.size)
+                            .sum::<u64>();
+                        Ok((storage, games, installers, extras, inspection.game_issues))
+                    })();
+                    let _ = sender.send(result);
+                });
+            }
             let capacity = capacity.clone();
             let usage = usage.clone();
             let usage_values = usage_values.clone();
@@ -634,10 +852,31 @@ fn build_storage_section(
             let w = w.clone();
             let recheck = recheck.clone();
             glib::timeout_add_local(Duration::from_millis(100), move || {
-                if model.borrow().account_epoch != epoch || request.get() != generation {
+                if request.get() != generation {
                     return glib::ControlFlow::Break;
                 }
-                match receiver.try_recv() {
+                if model.borrow().account_epoch != epoch
+                    || model.borrow().logout_pending
+                    || session != (online::account_session(), auth::session())
+                {
+                    if let Some(recheck) = recheck.upgrade() {
+                        recheck.set_label("Recheck library");
+                        recheck.set_sensitive(true);
+                    }
+                    path_label.set_label(
+                        "Account changed. Recheck library to inspect the current account.",
+                    );
+                    capacity.set_label("Storage information unavailable");
+                    return glib::ControlFlow::Break;
+                }
+                let result = receiver.try_recv();
+                if !matches!(&result, Err(mpsc::TryRecvError::Empty))
+                    && let Some(recheck) = recheck.upgrade()
+                {
+                    recheck.set_label("Recheck library");
+                    recheck.set_sensitive(true);
+                }
+                match result {
                     Ok(Ok((storage, games, installers, extras, issues))) => {
                         path_label.set_label(if issues.is_empty() { "Compatible" } else { "Library available. Some game folders need attention; other games remain usable." });
                         game_issues.set_visible(!issues.is_empty());
@@ -1046,8 +1285,8 @@ fn build_storage_section(
         let update_library = update_library.clone();
         let status = path_label.clone();
         let progress = move_progress.clone();
-        let moving = Rc::new(std::cell::Cell::new(false));
-        move |button| {
+        let moving = moving.clone();
+        move |_| {
             if moving.get() {
                 status.set_label("Moving game files… Please wait for the current move to finish.");
                 return;
@@ -1098,7 +1337,7 @@ fn build_storage_section(
             confirmation.add_responses(&[("cancel", "Cancel"), ("move", "Move")]);
             confirmation.set_response_appearance("move", adw::ResponseAppearance::Suggested);
             confirmation.set_default_response(Some("move"));
-            let button = button.clone();
+            let update_selection = update_selection.clone();
             let update_library = update_library.clone();
             let model = model.clone();
             let epoch = model.borrow().account_epoch;
@@ -1110,8 +1349,8 @@ fn build_storage_section(
                 if response != "move" || model.borrow().account_epoch != epoch || model.borrow().logout_pending {
                     return;
                 }
-                button.set_sensitive(false);
                 moving.set(true);
+                update_selection();
                 status.set_label("Moving game files… This may take several minutes.");
                 progress.set_visible(true);
                 progress.pulse();
@@ -1144,17 +1383,17 @@ fn build_storage_section(
                     })();
                     let _ = sender.send(result);
                 });
-                let button = button.clone();
+                let update_selection = update_selection.clone();
                 let update_library = update_library.clone();
                 glib::timeout_add_local(Duration::from_millis(100), move || {
                     if model.borrow().account_epoch != epoch || model.borrow().logout_pending {
-                        moving.set(false); progress.set_visible(false); button.set_sensitive(true);
+                        moving.set(false); progress.set_visible(false); update_selection();
                         return glib::ControlFlow::Break;
                     }
                     match receiver.try_recv() {
                         Ok(Ok(())) => {
                             moving.set(false); progress.set_visible(false);
-                            button.set_sensitive(true);
+                            update_selection();
                             update_library();
                             super::refresh_installed_state_after_library_change(&w, &model);
                             status.set_label("Games moved successfully. Refreshing the library…");
@@ -1168,12 +1407,12 @@ fn build_storage_section(
                             update_library();
                             super::refresh_installed_state_after_library_change(&w, &model);
                             show_status(&w, &format!("Could not move all selected games: {error:#}. Some files may have moved; both libraries have been refreshed."));
-                            button.set_sensitive(true);
+                            update_selection();
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => { progress.pulse(); glib::ControlFlow::Continue },
                         Err(mpsc::TryRecvError::Disconnected) => {
-                            moving.set(false); progress.set_visible(false); button.set_sensitive(true);
+                            moving.set(false); progress.set_visible(false); update_selection();
                             status.set_label("Moving stopped unexpectedly. Recheck both libraries before trying again.");
                             update_library();
                             super::refresh_installed_state_after_library_change(&w, &model);
@@ -1225,6 +1464,7 @@ fn storage_legend_item(title: &str, color_class: &str) -> (gtk::Box, gtk::Label)
     title.add_css_class("storage-legend-title");
     item.append(&title);
     let size = gtk::Label::new(Some("0 B"));
+    size.set_widget_name(color_class);
     size.add_css_class("storage-legend-size");
     item.append(&size);
     (item, size)
@@ -1289,27 +1529,11 @@ fn render_storage_items(view: &StorageListView, items: &[InstalledStorageItem], 
         view.checks
             .borrow_mut()
             .insert(item.game.product_id, check.clone());
-        let checks = view.checks.clone();
-        let selected = view.selected.clone();
-        let move_button = view.move_button.clone();
-        check.connect_toggled(move |_| {
-            let count = checks
-                .borrow()
-                .values()
-                .filter(|check| check.is_active())
-                .count();
-            let text = if count == 0 {
-                "No games selected".to_owned()
-            } else {
-                format!("{count} game{} selected", if count == 1 { "" } else { "s" })
-            };
-            selected.set_label(&text);
-            move_button.set_sensitive(count > 0);
-        });
+        let update_selection = view.update_selection.clone();
+        check.connect_toggled(move |_| update_selection());
         view.list.append(&row);
     }
-    view.selected.set_label("No games selected");
-    view.move_button.set_sensitive(false);
+    (view.update_selection)();
 }
 
 fn format_stored_playtime(seconds: u64) -> String {
@@ -1333,36 +1557,6 @@ fn filesystem_storage(path: &Path) -> Option<(u64, u64)> {
         fs2::total_space(path).ok()?,
         fs2::available_space(path).ok()?,
     ))
-}
-
-pub(in crate::ui) fn filesystem_mount_point(path: &Path) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
-        if let Ok(mounts) = fs::read_to_string("/proc/self/mountinfo")
-            && let Some(mount) = mounts
-                .lines()
-                .filter_map(|line| line.split(" - ").next())
-                .filter_map(|prefix| prefix.split_whitespace().nth(4))
-                .map(decode_mount_path)
-                .filter(|mount| canonical.starts_with(mount))
-                .max_by_key(|mount| mount.as_os_str().len())
-        {
-            return mount.display().to_string();
-        }
-    }
-    path.display().to_string()
-}
-
-#[cfg(target_os = "linux")]
-fn decode_mount_path(value: &str) -> PathBuf {
-    PathBuf::from(
-        value
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\"),
-    )
 }
 
 fn directory_size(path: &Path) -> u64 {
@@ -1614,6 +1808,578 @@ fn copy_directory(source: &Path, destination: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "requires private p361 HOME/all XDG, GTK and D-Bus; no file moves or helpers"]
+    fn move_controls_require_eligible_selection_and_preserve_busy_state() {
+        let home = std::env::var("HOME").unwrap();
+        assert!(home.starts_with("/tmp/ludomere-p361-"));
+        let root = Path::new(&home).parent().unwrap();
+        for key in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(Path::new(&std::env::var_os(key).unwrap()).starts_with(root));
+        }
+        adw::init().unwrap();
+        let libraries = Rc::new(RefCell::new(
+            ["source", "target"]
+                .into_iter()
+                .map(|id| GameLibrary {
+                    id: id.into(),
+                    name: id.into(),
+                    path: root.join(id),
+                    default: id == "source",
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let items = Rc::new(RefCell::new([(1, "linux", "source"), (2, "WiNdOwS", "source"), (3, "linux", "target")]
+            .into_iter().map(|(id, os, library)| InstalledStorageItem {
+                game: serde_json::from_value(serde_json::json!({
+                    "product_id":id, "library_id":library,
+                    "installation_directory":root.join(library).join(format!("game-{id}")),
+                    "installer_files":[], "installer_complete":true, "installer_operating_system":os,
+                    "launch_arguments":[], "state":"installed", "playtime_seconds":0,
+                    "created_at":1, "updated_at":1
+                })).unwrap(), title: format!("Synthetic game {id}"), artwork: None, size: 0,
+            }).collect::<Vec<_>>()));
+        let checks = Rc::new(RefCell::new(HashMap::new()));
+        let target = gtk::DropDown::from_strings(&["Source", "Target"]);
+        let selected = gtk::Label::new(None);
+        let button = gtk::Button::with_label("Move");
+        let moving = Rc::new(std::cell::Cell::new(false));
+        let update = connect_move_selection(
+            &items, &checks, &libraries, &target, &selected, &button, &moving,
+        );
+        let view = StorageListView {
+            list: gtk::ListBox::new(),
+            checks: checks.clone(),
+            count: gtk::Label::new(None),
+            update_selection: update.clone(),
+        };
+        render_storage_items(&view, &items.borrow(), 1);
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.MoveEligibilityTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.append(&view.list);
+        content.append(&target);
+        content.append(&selected);
+        content.append(&button);
+        window.set_content(Some(&content));
+        window.present();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !button.is_mapped() && std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(button.is_mapped());
+        let native = checks.borrow()[&1].clone();
+        let windows = checks.borrow()[&2].clone();
+        let already_at_target = checks.borrow()[&3].clone();
+        assert!(!button.is_sensitive());
+        assert_eq!(selected.text(), "No games selected");
+        assert_eq!(
+            target.selected(),
+            0,
+            "eligibility must not select a destination"
+        );
+        native.set_active(true);
+        assert!(!button.is_sensitive());
+        assert_eq!(selected.text(), "1 game selected");
+        assert_eq!(
+            button.tooltip_text().as_deref(),
+            Some("Choose a different destination library.")
+        );
+        target.set_selected(1);
+        assert!(button.is_sensitive());
+        assert!(button.tooltip_text().is_none());
+        // A nonempty DropDown autoselects; invalid set_selected does not clear it.
+        let names = target
+            .model()
+            .unwrap()
+            .downcast::<gtk::StringList>()
+            .unwrap();
+        names.splice(0, names.n_items(), &[]);
+        assert_eq!(target.selected(), gtk::INVALID_LIST_POSITION);
+        assert!(!button.is_sensitive());
+        assert_eq!(
+            button.tooltip_text().as_deref(),
+            Some("Choose a destination library.")
+        );
+        names.splice(0, 0, &["Source", "Target"]);
+        target.set_selected(1);
+        already_at_target.set_active(true);
+        assert!(
+            button.is_sensitive(),
+            "existing backend permits a mixed selection with a game to move"
+        );
+        native.set_active(false);
+        assert!(!button.is_sensitive());
+        already_at_target.set_active(false);
+        windows.set_active(true);
+        assert!(!button.is_sensitive());
+        assert!(
+            button
+                .tooltip_text()
+                .unwrap()
+                .contains("compatibility prefix")
+        );
+        native.set_active(true);
+        assert!(
+            !button.is_sensitive(),
+            "a Windows selection must explain the existing refusal"
+        );
+        windows.set_active(false);
+        assert!(button.is_sensitive());
+        moving.set(true);
+        update();
+        assert!(!button.is_sensitive());
+        target.set_selected(0);
+        target.set_selected(1);
+        native.set_active(false);
+        native.set_active(true);
+        assert!(
+            !button.is_sensitive(),
+            "selection callbacks must not override active Move"
+        );
+        assert_eq!(
+            button.tooltip_text().as_deref(),
+            Some("Wait for the current move to finish.")
+        );
+        moving.set(false);
+        update();
+        assert!(button.is_sensitive());
+        // Compatibility metadata alone is also refused by the existing click-time policy.
+        items.borrow_mut()[0].game.compatibility =
+            Some(crate::compatibility::GameCompatibilityPreferences {
+                backend: crate::compatibility::CompatibilityBackendKind::Umu,
+                prefix_slug: "synthetic".into(),
+                profile: crate::compatibility::UmuProfile::fallback(),
+                pending_profile: None,
+            });
+        native.set_active(false);
+        native.set_active(true);
+        assert!(!button.is_sensitive());
+        assert!(button.tooltip_text().unwrap().contains("Windows games"));
+        items.borrow_mut()[0].game.compatibility = None;
+        moving.set(true);
+        update();
+        render_storage_items(&view, &items.borrow(), 0);
+        assert!(!button.is_sensitive());
+        assert_eq!(
+            button.tooltip_text().as_deref(),
+            Some("Wait for the current move to finish.")
+        );
+        moving.set(false);
+        update();
+        assert!(!button.is_sensitive());
+        assert_eq!(selected.text(), "No games selected");
+        assert_eq!(
+            button.tooltip_text().as_deref(),
+            Some("Select at least one game to move.")
+        );
+        assert!(
+            libraries
+                .borrow()
+                .iter()
+                .all(|library| !library.path.exists()),
+            "presentation must never move or create files"
+        );
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG under /tmp/ludomere-p357-, GTK and D-Bus"]
+    fn storage_inspection_admission_tracks_activity_and_rejects_stale_workers() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p357-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn delay_inspections() -> [mpsc::Sender<()>; 2] {
+            std::array::from_fn(|_| {
+                let (sender, receiver) = mpsc::channel();
+                STORAGE_INSPECTION_DELAYS.with_borrow_mut(|delays| delays.push_back(receiver));
+                sender
+            })
+        }
+        fn assert_both_registered() {
+            let error = crate::profile_reset::reserve().err().unwrap().to_string();
+            assert!(error.contains("checking library choices"), "{error}");
+            assert!(error.contains("inspecting selected library"), "{error}");
+            assert!(STORAGE_INSPECTION_DELAYS.with_borrow(|delays| delays.is_empty()));
+        }
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("games");
+        fs::create_dir(&library).unwrap();
+        let config = Config {
+            game_libraries: vec![GameLibrary {
+                id: "test".into(),
+                name: "Test".into(),
+                path: library,
+                default: true,
+            }],
+            offline_libraries: vec![],
+            extras_libraries: vec![],
+            ..Config::default()
+        };
+        let database = crate::identity::database();
+        assert!(database.starts_with(std::env::var("XDG_DATA_HOME").unwrap()));
+        assert!(
+            !database.exists(),
+            "fixture requires a fresh synthetic profile"
+        );
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.StorageLifecycleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let w = Rc::new(window::create_widgets(&app, &config));
+        let model = Rc::new(RefCell::new(AppModel {
+            config,
+            ..AppModel::default()
+        }));
+        let delayed = delay_inspections();
+        let page = build_storage_page(
+            &w.window,
+            &w,
+            &model,
+            crate::config::LibraryKind::GameFiles,
+            "Game Library",
+        );
+        let recheck = find_named_descendant(page.upcast_ref(), "storage-recheck")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let status = find_named_descendant(page.upcast_ref(), "storage-inspection-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        w.window.set_content(Some(&page));
+        w.window.present();
+        assert_both_registered();
+        assert!(!recheck.is_sensitive());
+        // Dropping the test-only wait channels exercises real worker failure and release.
+        drop(delayed);
+        wait(|| recheck.is_sensitive());
+        wait(|| crate::profile_reset::reserve().is_ok());
+        assert!(status.text().starts_with("Incompatible or unavailable:"));
+        assert_eq!(recheck.label().as_deref(), Some("Recheck library"));
+        assert!(!database.exists());
+
+        let delayed = delay_inspections();
+        recheck.emit_clicked();
+        assert_both_registered();
+        auth::invalidate_session();
+        for sender in delayed {
+            sender.send(()).unwrap();
+        }
+        wait(|| crate::profile_reset::reserve().is_ok());
+        wait(|| recheck.is_sensitive());
+        assert!(
+            !database.exists(),
+            "stale workers must stop before either DB open"
+        );
+        assert_eq!(
+            status.text(),
+            "Account changed. Recheck library to inspect the current account."
+        );
+        // Settings is reused after authentication changes. An explicit Recheck
+        // admits the current session on this same page, without automatic work.
+        recheck.emit_clicked();
+        wait(|| recheck.is_sensitive());
+        wait(|| crate::profile_reset::reserve().is_ok());
+        assert_eq!(status.text(), "Compatible");
+        assert!(database.is_file());
+        assert_eq!(w.window.content().as_ref(), Some(page.upcast_ref()));
+        let frozen = crate::profile_reset::reserve().unwrap();
+        recheck.emit_clicked();
+        assert!(recheck.is_sensitive());
+        assert_eq!(recheck.label().as_deref(), Some("Recheck library"));
+        assert!(status.text().starts_with("Could not inspect library:"));
+        drop(frozen);
+
+        model.borrow_mut().logout_pending = true;
+        recheck.emit_clicked();
+        assert!(recheck.is_sensitive());
+        assert_eq!(
+            status.text(),
+            "Account change in progress. Recheck library when it finishes."
+        );
+        assert!(crate::profile_reset::reserve().is_ok());
+        model.borrow_mut().logout_pending = false;
+        let delayed = delay_inspections();
+        recheck.emit_clicked();
+        assert_both_registered();
+        model.borrow_mut().account_epoch += 1;
+        online::invalidate_library_session();
+        for sender in delayed {
+            sender.send(()).unwrap();
+        }
+        wait(|| crate::profile_reset::reserve().is_ok());
+        wait(|| recheck.is_sensitive());
+        assert_eq!(
+            status.text(),
+            "Account changed. Recheck library to inspect the current account."
+        );
+        recheck.emit_clicked();
+        wait(|| recheck.is_sensitive());
+        wait(|| crate::profile_reset::reserve().is_ok());
+        assert_eq!(status.text(), "Compatible");
+        assert_eq!(w.window.content().as_ref(), Some(page.upcast_ref()));
+        assert!(STORAGE_INSPECTION_DELAYS.with_borrow(|delays| delays.is_empty()));
+        w.window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, GTK and D-Bus; inspection results are synthetic"]
+    fn recheck_feedback_tracks_current_request_and_clears_stale_totals() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p350-")
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        install_css();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() && std::time::Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.StorageFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let config = Config {
+            game_libraries: (0..2)
+                .map(|index| GameLibrary {
+                    id: index.to_string(),
+                    name: format!("Fixture {index}"),
+                    path: std::env::temp_dir().join(format!("synthetic-library-{index}")),
+                    default: index == 0,
+                })
+                .collect(),
+            ..Config::default()
+        };
+        let w = Rc::new(window::create_widgets(&app, &config));
+        let model = Rc::new(RefCell::new(AppModel {
+            config,
+            ..AppModel::default()
+        }));
+        STORAGE_INSPECTIONS.with_borrow_mut(|requests| {
+            assert!(requests.is_none());
+            *requests = Some(Vec::new());
+        });
+        let page = build_storage_page(
+            &w.window,
+            &w,
+            &model,
+            crate::config::LibraryKind::GameFiles,
+            "Game Library",
+        );
+        w.window.set_content(Some(&page));
+        w.window.present();
+        let recheck = find_named_descendant(page.upcast_ref(), "storage-recheck")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let menu = find_named_descendant(page.upcast_ref(), "storage-library-menu")
+            .and_downcast::<gtk::MenuButton>()
+            .unwrap();
+        let status = find_named_descendant(page.upcast_ref(), "storage-inspection-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let capacity = find_named_descendant(page.upcast_ref(), "storage-capacity")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let totals = [
+            "storage-games",
+            "storage-installers",
+            "storage-extras",
+            "storage-others",
+            "storage-free",
+        ]
+        .map(|name| {
+            find_named_descendant(page.upcast_ref(), name)
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+        });
+        wait(|| recheck.is_mapped());
+        assert!(!recheck.is_sensitive());
+        assert_eq!(recheck.label().as_deref(), Some("Checking library…"));
+        assert!(totals.iter().all(|label| label.text() == "—"));
+        assert!(menu.is_sensitive());
+        assert!(menu.grab_focus());
+        let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
+        let generation = model.borrow().detail_generation;
+        assert_eq!(
+            STORAGE_INSPECTIONS.with_borrow(|requests| requests.as_ref().unwrap().len()),
+            1
+        );
+        let stale = STORAGE_INSPECTIONS
+            .with_borrow_mut(|requests| requests.as_mut().unwrap().pop().unwrap());
+        // Changing libraries remains possible while the old inspection is pending.
+        find_named_descendant(
+            menu.popover().unwrap().upcast_ref(),
+            "storage-library-choice-1",
+        )
+        .and_downcast::<gtk::Button>()
+        .unwrap()
+        .emit_clicked();
+        let current = STORAGE_INSPECTIONS
+            .with_borrow_mut(|requests| requests.as_mut().unwrap().pop().unwrap());
+        stale
+            .send(Ok((Some((9000, 1)), vec![], 8000, 0, vec![])))
+            .unwrap();
+        // Receiver closure proves the old generation was rejected, without a disk/timing race.
+        wait(|| {
+            stale
+                .send(Err(anyhow::anyhow!("stale inspection")))
+                .is_err()
+        });
+        assert!(!recheck.is_sensitive());
+        assert_eq!(recheck.label().as_deref(), Some("Checking library…"));
+        assert!(totals.iter().all(|label| label.text() == "—"));
+        current
+            .send(Ok((Some((1000, 600)), vec![], 120, 40, vec![])))
+            .unwrap();
+        wait(|| recheck.is_sensitive());
+        assert_eq!(recheck.label().as_deref(), Some("Recheck library"));
+        assert_eq!(status.text(), "Compatible");
+        assert_eq!(
+            capacity.text(),
+            format!("{} free of {}", human_size(600), human_size(1000))
+        );
+        for (label, bytes) in totals.iter().zip([0, 120, 40, 240, 600]) {
+            assert_eq!(label.text(), human_size(bytes));
+        }
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focus);
+        assert_eq!(model.borrow().detail_generation, generation);
+        assert_eq!(w.window.content().as_ref(), Some(page.upcast_ref()));
+
+        recheck.emit_clicked();
+        assert!(!recheck.is_sensitive());
+        assert!(totals.iter().all(|label| label.text() == "—"));
+        STORAGE_INSPECTIONS
+            .with_borrow_mut(|requests| requests.as_mut().unwrap().pop().unwrap())
+            .send(Err(anyhow::anyhow!("Synthetic unavailable library")))
+            .unwrap();
+        wait(|| recheck.is_sensitive());
+        assert!(status.text().contains("Synthetic unavailable library"));
+        assert!(totals.iter().all(|label| label.text() == "—"));
+
+        recheck.emit_clicked();
+        drop(
+            STORAGE_INSPECTIONS
+                .with_borrow_mut(|requests| requests.as_mut().unwrap().pop().unwrap()),
+        );
+        wait(|| recheck.is_sensitive());
+        assert!(status.text().contains("inspection stopped unexpectedly"));
+        assert!(totals.iter().all(|label| label.text() == "—"));
+
+        recheck.emit_clicked();
+        STORAGE_INSPECTIONS
+            .with_borrow_mut(|requests| requests.as_mut().unwrap().pop().unwrap())
+            .send(Ok((None, vec![], 120, 40, vec![])))
+            .unwrap();
+        wait(|| recheck.is_sensitive());
+        assert_eq!(capacity.text(), "Storage information unavailable");
+        assert!(totals.iter().all(|label| label.text() == "—"));
+
+        recheck.emit_clicked();
+        let old_account = STORAGE_INSPECTIONS
+            .with_borrow_mut(|requests| requests.as_mut().unwrap().pop().unwrap());
+        model.borrow_mut().account_epoch += 1;
+        wait(|| {
+            old_account
+                .send(Err(anyhow::anyhow!("old account")))
+                .is_err()
+        });
+        assert!(recheck.is_sensitive());
+        assert_eq!(recheck.label().as_deref(), Some("Recheck library"));
+        assert_eq!(
+            status.text(),
+            "Account changed. Recheck library to inspect the current account."
+        );
+        assert!(!status.text().contains("old account"));
+        assert!(totals.iter().all(|label| label.text() == "—"));
+
+        let empty_model = Rc::new(RefCell::new(AppModel {
+            config: Config {
+                game_libraries: vec![],
+                ..Config::default()
+            },
+            ..AppModel::default()
+        }));
+        let empty = build_storage_page(
+            &w.window,
+            &w,
+            &empty_model,
+            crate::config::LibraryKind::GameFiles,
+            "Game Library",
+        );
+        w.window.set_content(Some(&empty));
+        let empty_recheck = find_named_descendant(empty.upcast_ref(), "storage-recheck")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        wait(|| empty_recheck.is_mapped());
+        assert!(!empty_recheck.is_sensitive());
+        assert_eq!(empty_recheck.label().as_deref(), Some("Recheck library"));
+        assert!(
+            find_named_descendant(empty.upcast_ref(), "storage-inspection-status")
+                .and_downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+                .contains("No library configured")
+        );
+        assert!(STORAGE_INSPECTIONS.with_borrow(|requests| requests.as_ref().unwrap().is_empty()));
+        STORAGE_INSPECTIONS.with_borrow_mut(|requests| *requests = None);
+        w.window.destroy();
+    }
 
     #[test]
     fn directory_size_and_copy_preserve_nested_files() {

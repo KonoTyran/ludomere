@@ -958,18 +958,11 @@ impl DetailSection {
 
 pub fn section_ready(product_id: i64, section: DetailSection) -> Result<bool> {
     let store = crate::state::StateStore::open()?;
-    if !store
-        .enrichment_observation(product_id, section.source())?
-        .is_some_and(|(status, checked)| {
-            status == "available"
-                && chrono::Utc::now().timestamp().saturating_sub(checked)
-                    < if matches!(section, DetailSection::Acquisition | DetailSection::Builds) {
-                        300
-                    } else {
-                        7 * 24 * 60 * 60
-                    }
-        })
-    {
+    if !section_observation_current(
+        store.enrichment_observation(product_id, section.source())?,
+        section,
+        chrono::Utc::now().timestamp(),
+    ) {
         return Ok(false);
     }
     let Some(game) = store.cached_product_game(product_id)? else {
@@ -980,6 +973,47 @@ pub fn section_ready(product_id: i64, section: DetailSection) -> Result<bool> {
             .into_iter()
             .flatten()
             .all(|path| path.is_file()))
+}
+
+fn section_observation_current(
+    observation: Option<(String, i64)>,
+    section: DetailSection,
+    now: i64,
+) -> bool {
+    observation.is_some_and(|(status, checked)| {
+        status == "available"
+            && now.saturating_sub(checked)
+                < if matches!(section, DetailSection::Acquisition | DetailSection::Builds) {
+                    300
+                } else {
+                    7 * 24 * 60 * 60
+                }
+    })
+}
+
+pub(crate) fn cached_library_ready_sections(
+    store: &crate::state::StateStore,
+    product_id: i64,
+) -> Vec<DetailSection> {
+    let mut ready = [DetailSection::Metadata, DetailSection::Acquisition]
+        .into_iter()
+        .filter(|section| {
+            store
+                .enrichment_observation(product_id, section.source())
+                .map(|observation| {
+                    section_observation_current(
+                        observation,
+                        *section,
+                        chrono::Utc::now().timestamp(),
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if !ready.is_empty() && !matches!(store.cached_product_game(product_id), Ok(Some(_))) {
+        ready.clear();
+    }
+    ready
 }
 
 pub fn invalidate_section_cache(product_id: i64, section: DetailSection) -> Result<()> {
@@ -2451,6 +2485,138 @@ pub(crate) fn normalize_asset_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_readiness_preserves_exact_ttls_and_observation_statuses() {
+        let now = 1_000_000;
+        for (section, ttl) in [
+            (DetailSection::Product, 604_800),
+            (DetailSection::Metadata, 604_800),
+            (DetailSection::Artwork, 604_800),
+            (DetailSection::Acquisition, 300),
+            (DetailSection::Builds, 300),
+        ] {
+            for (checked, expected) in [
+                (now - ttl + 1, true),
+                (now - ttl, false),
+                (now + 1, true),
+                (i64::MIN, false),
+            ] {
+                assert_eq!(
+                    section_observation_current(Some(("available".into(), checked)), section, now),
+                    expected,
+                    "{section:?} checked at {checked}",
+                );
+            }
+            assert!(!section_observation_current(None, section, now));
+            for status in ["not_found", "failed", ""] {
+                assert!(!section_observation_current(
+                    Some((status.into(), now)),
+                    section,
+                    now,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn cached_library_readiness_preserves_independent_errors_and_product_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let store = crate::state::StateStore::open_at(&path).unwrap();
+        store
+            .cache_core_library(
+                &[Game {
+                    product_id: 1,
+                    title: "Synthetic game".into(),
+                    ..Default::default()
+                }],
+                &[1],
+                &[1],
+                &[],
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let sections = [DetailSection::Metadata, DetailSection::Acquisition];
+        assert!(cached_library_ready_sections(&store, 1).is_empty());
+        for section in sections {
+            store
+                .record_enrichment_observation(1, section.source(), "available")
+                .unwrap();
+        }
+        assert_eq!(cached_library_ready_sections(&store, 1), sections);
+
+        for expired in sections {
+            connection
+                .execute(
+                    "UPDATE enrichment_observations SET checked_at = 0 WHERE source = ?1",
+                    [expired.source()],
+                )
+                .unwrap();
+            assert_eq!(
+                cached_library_ready_sections(&store, 1),
+                sections
+                    .into_iter()
+                    .filter(|section| *section != expired)
+                    .collect::<Vec<_>>(),
+            );
+            store
+                .record_enrichment_observation(1, expired.source(), "available")
+                .unwrap();
+        }
+        store
+            .record_enrichment_observation(1, DetailSection::Metadata.source(), "not_found")
+            .unwrap();
+        assert_eq!(
+            cached_library_ready_sections(&store, 1),
+            [DetailSection::Acquisition]
+        );
+        store
+            .clear_enrichment_observation(1, DetailSection::Metadata.source())
+            .unwrap();
+        assert_eq!(
+            cached_library_ready_sections(&store, 1),
+            [DetailSection::Acquisition]
+        );
+
+        for corrupt in sections {
+            store
+                .record_enrichment_observation(1, corrupt.source(), "available")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE enrichment_observations SET checked_at = 'invalid' WHERE source = ?1",
+                    [corrupt.source()],
+                )
+                .unwrap();
+            assert!(store.enrichment_observation(1, corrupt.source()).is_err());
+            assert_eq!(
+                cached_library_ready_sections(&store, 1),
+                sections
+                    .into_iter()
+                    .filter(|section| *section != corrupt)
+                    .collect::<Vec<_>>(),
+            );
+            store
+                .record_enrichment_observation(1, corrupt.source(), "available")
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE products SET metadata_json = '{' WHERE product_id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(store.cached_product_game(1).is_err());
+        assert!(cached_library_ready_sections(&store, 1).is_empty());
+        for section in sections {
+            store
+                .record_enrichment_observation(42, section.source(), "available")
+                .unwrap();
+        }
+        assert!(store.cached_product_game(42).unwrap().is_none());
+        assert!(cached_library_ready_sections(&store, 42).is_empty());
+    }
 
     #[test]
     fn account_generation_reads_do_not_wait_for_commit_but_invalidation_does() {

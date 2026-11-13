@@ -74,6 +74,12 @@ The existing DirectX and supported Visual C++ compatibility recipes continue thr
 other supported dependencies use GOG's declared installer and arguments through UMU. Successful
 setup is recorded for the selected prefix, dependency revision and installation method. Resume
 retries unfinished work and reuses intact cached files; recreating a prefix requires setup again.
+
+Native MSI dependencies and the supported .NET Framework 4.5.2 installer finish with a restart
+inside the game's Wine prefix, including when they report documented restart-required success
+codes. Setup is recorded only after the installer processes stop and the prefix restart succeeds.
+This does not reboot the host; a failed prefix restart leaves setup available to retry.
+
 If an active launch detects a safely recoverable Windows setup failure, a **Repair Windows setup**
 dialog opens. Confirm repair to retain the old environment as a backup; exact paths and diagnostics
 are available under **Details**. If you have left the launch view, the notification area keeps a
@@ -263,12 +269,12 @@ Python, python-xlib, and python-urllib3. Arch supplies development headers with 
 A graphical session and session D-Bus are needed to run the application. Login additionally needs
 an unlocked Secret Service provider, such as GNOME Keyring or a compatible desktop keyring;
 installing libsecret alone does not provide that service.
-During explicit sign-in, Ludomere detects the session's standard Secret Service. If none is
-running or activatable but KDE advertises its compatibility service, Ludomere requests normal
-D-Bus activation and checks the standard interface again. It does not change wallet settings or
-bypass a disabled API. Unavailable services, activation failures, denied wallet access, and
-duplicate login entries have distinct safe errors; successful secure credential storage remains
-required before sign-in completes.
+During explicit sign-in and saved-login restoration, Ludomere first detects the session's standard
+Secret Service. If none is running or activatable but KDE advertises its compatibility service,
+Ludomere requests normal D-Bus activation and checks the standard interface again. It does not
+change wallet settings or bypass a disabled API. Unavailable services, activation failures, denied
+wallet access, and duplicate login entries have distinct safe errors; successful secure credential
+storage remains required before sign-in completes.
 
 The package includes a private [UMU Launcher](https://github.com/Open-Wine-Components/umu-launcher)
 1.4.4 and [Comet](https://github.com/imLinguin/comet) v0.3.2 with its Windows service helper.

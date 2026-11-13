@@ -42,17 +42,22 @@ pub fn save(
     product_id: i64,
     branch: &str,
     password: &str,
+    account_session: u64,
+    check_session: impl Fn() -> Result<()>,
 ) -> Result<()> {
-    let key = load_or_create_key()?;
+    let key = load_or_create_key(&check_session)?;
     let (nonce, ciphertext) = encrypt(&key, user_id, product_id, branch, password)?;
-    store.save_galaxy_branch_credential(
-        user_id,
-        product_id,
-        branch,
-        FORMAT_VERSION,
-        &nonce,
-        &ciphertext,
-    )
+    crate::online::with_account_session(account_session, || {
+        check_session()?;
+        store.save_galaxy_branch_credential(
+            user_id,
+            product_id,
+            branch,
+            FORMAT_VERSION,
+            &nonce,
+            &ciphertext,
+        )
+    })
 }
 
 pub fn load(
@@ -103,11 +108,15 @@ fn load_key() -> Result<Option<[u8; 32]>> {
     }
 }
 
-fn load_or_create_key() -> Result<[u8; 32]> {
-    if let Some(key) = load_key()? {
+fn load_or_create_key(check_session: &impl Fn() -> Result<()>) -> Result<[u8; 32]> {
+    check_session()?;
+    let key = load_key()?;
+    check_session()?;
+    if let Some(key) = key {
         return Ok(key);
     }
     let key = ChaCha20Poly1305::generate_key(&mut OsRng);
+    check_session()?;
     entry()?.set_password(&serde_json::to_string(key.as_slice())?)?;
     Ok(key.into())
 }

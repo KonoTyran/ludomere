@@ -727,6 +727,10 @@ fn queue_galaxy(
     language_change: bool,
     offered: Option<(&crate::domain::GalaxyBuild, u64)>,
 ) -> Result<bool> {
+    let authentication = crate::gog::depot_service::DepotSession::new(
+        token.clone(),
+        (session, crate::auth::session()),
+    )?;
     let provenance = marker
         .galaxy_depot
         .as_ref()
@@ -748,6 +752,7 @@ fn queue_galaxy(
         })
         .transpose()?
         .flatten();
+    authentication.validate()?;
     let builds = crate::gog::builds::fetch_authenticated_generation(
         client,
         &token.access_token,
@@ -756,6 +761,7 @@ fn queue_galaxy(
         platform,
         2,
     )?;
+    authentication.validate()?;
     let build = if language_change {
         builds
             .iter()
@@ -842,6 +848,7 @@ fn queue_galaxy(
     }
     let acquisition =
         crate::gog::depot_acquisition::acquire(client, &token.access_token, build, &selection)?;
+    authentication.validate()?;
     validate_language(
         &acquisition.repository.depots,
         game.product_id,
@@ -858,7 +865,7 @@ fn queue_galaxy(
     crate::online::with_account_session(session, || Ok(()))?;
     let request = crate::installation::depot_planner::prepare(
         crate::installation::depot_planner::PrepareDepotRequest {
-            account_session: session,
+            session: &authentication,
             recovery_generation,
             store,
             acquisition: &acquisition,
@@ -873,7 +880,6 @@ fn queue_galaxy(
             library_id: library.id.clone(),
             library_root: library.path.clone(),
             slug: game.slug.clone(),
-            access_token: token.access_token.clone(),
         },
     )?;
     let _manual_gate = offered
@@ -899,6 +905,7 @@ fn queue_galaxy(
         );
     }
     crate::online::with_account_session(session, || {
+        authentication.validate()?;
         ensure!(
             !crate::installation::is_game_running(game.product_id)
                 && !busy(store, game.product_id)?,

@@ -328,27 +328,26 @@ fn load_cached_library(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
     let (sender, receiver) = mpsc::channel();
     let (ready_sender, ready_receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = StateStore::open().map(|store| {
-            store
-                .normalized_games()
-                .ok()
-                .filter(|games| !games.is_empty())
-                .unwrap_or_else(|| store.cached_online_games().unwrap_or_default())
-        });
-        let ids = result
-            .as_ref()
-            .map(|games| games.iter().map(|game| game.product_id).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let _ = sender.send(result);
         let mut ready = Vec::new();
-        for id in ids {
-            for scope in [
-                online::DetailSection::Metadata,
-                online::DetailSection::Acquisition,
-            ] {
-                if online::section_ready(id, scope).unwrap_or(false) {
-                    ready.push((id, scope));
+        match StateStore::open() {
+            Ok(store) => {
+                let games = store
+                    .normalized_games()
+                    .ok()
+                    .filter(|games| !games.is_empty())
+                    .unwrap_or_else(|| store.cached_online_games().unwrap_or_default());
+                let ids = games.iter().map(|game| game.product_id).collect::<Vec<_>>();
+                let _ = sender.send(Ok(games));
+                for id in ids {
+                    ready.extend(
+                        online::cached_library_ready_sections(&store, id)
+                            .into_iter()
+                            .map(|section| (id, section)),
+                    );
                 }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
             }
         }
         let _ = ready_sender.send(ready);
@@ -1152,6 +1151,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     sidebar.append(&count);
 
     let home_grid = gtk::FlowBox::builder()
+        .activate_on_single_click(true)
         .valign(gtk::Align::Start)
         .halign(gtk::Align::Fill)
         .homogeneous(false)
@@ -1167,6 +1167,15 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     home_grid.set_margin_top(24);
     home_grid.set_margin_bottom(24);
     let home_scroll = gtk::ScrolledWindow::builder().child(&home_grid).build();
+    let home_no_results = adw::StatusPage::builder()
+        .title("No matching games")
+        .description("Try a different search or adjust your filters.")
+        .icon_name("system-search-symbolic")
+        .visible(false)
+        .build();
+    let home_content = gtk::Overlay::new();
+    home_content.set_child(Some(&home_scroll));
+    home_content.add_overlay(&home_no_results);
     let collections = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let collections_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1190,7 +1199,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
 
     let content = gtk::Stack::new();
     content.set_transition_type(gtk::StackTransitionType::Crossfade);
-    content.add_named(&home_scroll, Some("home"));
+    content.add_named(&home_content, Some("home"));
     content.add_named(&collections_scroll, Some("collections"));
     content.add_named(&details_scroll, Some("details"));
     content.add_named(&downloads_scroll, Some("downloads"));
@@ -1289,6 +1298,10 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
     download_percent.set_visible(false);
     download_heading.append(&download_percent);
     download_content.append(&download_heading);
+    let windows_check = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    windows_check.set_widget_name("windows-requirements-progress");
+    windows_check.set_visible(false);
+    download_content.append(&windows_check);
     let download_status_progress = gtk::ProgressBar::new();
     download_status_progress.set_visible(false);
     download_status_progress.set_valign(gtk::Align::Center);
@@ -1329,6 +1342,7 @@ pub(super) fn create_widgets(app: &adw::Application, config: &Config) -> Widgets
         download_status_progress,
         game_list,
         home_grid,
+        home_no_results,
         collections,
         content,
         empty,
@@ -1583,10 +1597,41 @@ pub(super) fn connect_actions(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                 .map_or(true, |state| game_matches_library_filters(&state, id))
         });
     }
+    {
+        let widgets = w.clone();
+        let model = model.clone();
+        w.home_grid.connect_child_activated(move |grid, child| {
+            if !child.is_mapped()
+                || !child.is_child_visible()
+                || child.parent().as_ref() != Some(grid.upcast_ref())
+            {
+                return;
+            }
+            let Some(id) = child
+                .child()
+                .and_then(|card| card.widget_name().parse::<i64>().ok())
+            else {
+                return;
+            };
+            if model.try_borrow().is_ok_and(|state| {
+                !state.logout_pending && game_matches_library_filters(&state, id)
+            }) {
+                show_game(&widgets, &model, id, None);
+            }
+        });
+    }
     let home_action = gio::SimpleAction::new("home", None);
     {
         let w = w.clone();
-        home_action.connect_activate(move |_, _| w.content.set_visible_child_name("home"));
+        let model = model.clone();
+        home_action.connect_activate(move |_, _| {
+            let page = if model.borrow().games.is_empty() {
+                "empty"
+            } else {
+                "home"
+            };
+            w.content.set_visible_child_name(page);
+        });
     }
 
     connect_check_filter(w, model, &w.favorite_filter, |m, active| {
@@ -1629,12 +1674,6 @@ pub(super) fn connect_actions(w: &Rc<Widgets>, model: &Rc<RefCell<AppModel>>) {
                 } else {
                     options.string(selected).map(|value| value.to_string())
                 };
-                if state.language_filter.is_some() {
-                    state.query.clear();
-                }
-            }
-            if selected != 0 && !w.search.text().is_empty() {
-                w.search.set_text("");
             }
             refresh_filters(&w, &model.borrow());
         });

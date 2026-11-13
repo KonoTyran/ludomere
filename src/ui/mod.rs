@@ -489,6 +489,7 @@ struct Widgets {
     download_status_progress: gtk::ProgressBar,
     game_list: gtk::ListBox,
     home_grid: gtk::FlowBox,
+    home_no_results: adw::StatusPage,
     collections: gtk::Box,
     content: gtk::Stack,
     empty: adw::StatusPage,
@@ -559,13 +560,23 @@ fn find_named_descendant(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
     None
 }
 
-fn refresh_managed_detail_labels(window: &adw::ApplicationWindow, product_id: i64) {
-    let Ok(store) = StateStore::open() else {
-        return;
-    };
-    let Ok(files) = store.managed_files() else {
-        return;
-    };
+fn load_managed_detail_summary(
+    store: &StateStore,
+    product_id: i64,
+) -> anyhow::Result<(usize, u64)> {
+    let files = store.managed_files_for_products(&[product_id])?;
+    Ok(managed_detail_summary(
+        &files,
+        &store.download_jobs()?,
+        product_id,
+    ))
+}
+
+fn managed_detail_summary(
+    files: &[crate::state::ManagedFileRecord],
+    jobs: &[DownloadJobRecord],
+    product_id: i64,
+) -> (usize, u64) {
     let present = files
         .iter()
         .filter(|file| file.product_id == product_id && file.present)
@@ -579,49 +590,142 @@ fn refresh_managed_detail_labels(window: &adw::ApplicationWindow, product_id: i6
         .iter()
         .filter(|file| file.kind == ArtifactKind::Installer)
         .count();
-    if let Ok(jobs) = store.download_jobs() {
-        for job in jobs
+    for job in jobs
+        .iter()
+        .filter(|job| job.product_id == product_id && job.state == "complete")
+    {
+        let installer = job
+            .artifacts
             .iter()
-            .filter(|job| job.product_id == product_id && job.state == "complete")
-        {
-            let installer = job
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.kind == ArtifactKind::Installer);
-            for path in job.completed_files.iter().filter(|path| path.is_file()) {
-                if paths.insert(path.clone()) {
-                    bytes += path.metadata().map_or(0, |metadata| metadata.len());
-                    installers += usize::from(installer);
-                }
+            .any(|artifact| artifact.kind == ArtifactKind::Installer);
+        for path in &job.completed_files {
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            if paths.insert(path.clone()) {
+                bytes += metadata.len();
+                installers += usize::from(installer);
             }
         }
     }
-    let root = window.clone().upcast::<gtk::Widget>();
-    if let Some(label) =
-        find_named_descendant(&root, &format!("managed-files-summary-{product_id}"))
-            .and_downcast::<gtk::Label>()
-    {
-        let available = label
-            .text()
-            .split(" · ")
-            .next()
-            .unwrap_or("Files available")
-            .to_owned();
-        label.set_label(&format!(
-            "{available} · {installers} local installers · {} on disk",
-            human_size(bytes)
-        ));
-    }
-    if let Some(label) =
-        find_named_descendant(&root, &format!("managed-product-subtitle-{product_id}"))
-            .and_downcast::<gtk::Label>()
-    {
-        let text = label.text();
-        let prefix = text
-            .rsplit_once(" · ")
-            .map_or(text.as_str(), |(prefix, _)| prefix);
-        label.set_label(&format!("{prefix} · {}", human_size(bytes)));
-    }
+    (installers, bytes)
+}
+
+fn managed_detail_refresher(
+    window: &adw::ApplicationWindow,
+    model: Option<&Rc<RefCell<AppModel>>>,
+    page: &gtk::Box,
+    product_id: i64,
+) -> Rc<dyn Fn()> {
+    let session = (online::account_session(), auth::session());
+    let model = model.map(|model| {
+        let state = model.borrow();
+        (
+            Rc::downgrade(model),
+            state.account_epoch,
+            state.detail_generation,
+        )
+    });
+    let window = window.downgrade();
+    let page = page.downgrade();
+    let current: Rc<dyn Fn() -> bool> = Rc::new({
+        let window = window.clone();
+        move || {
+            session == (online::account_session(), auth::session())
+                && window.upgrade().is_some_and(|window| {
+                    window.is_visible()
+                        && page.upgrade().is_some_and(|page| page.is_ancestor(&window))
+                })
+                && model.as_ref().is_none_or(|(model, epoch, generation)| {
+                    model.upgrade().is_some_and(|model| {
+                        let model = model.borrow();
+                        !model.logout_pending
+                            && model.account_epoch == *epoch
+                            && model.detail_generation == *generation
+                    })
+                })
+        }
+    });
+    let revision = Rc::new(std::cell::Cell::new(0_u64));
+    Rc::new(move || {
+        if !current() {
+            return;
+        }
+        let Some(window) = window.upgrade() else {
+            return;
+        };
+        let labels = ["managed-files-summary", "managed-product-subtitle"].map(|name| {
+            find_named_descendant(window.upcast_ref(), &format!("{name}-{product_id}"))
+                .and_downcast::<gtk::Label>()
+                .map(|label| label.downgrade())
+        });
+        if labels.iter().all(Option::is_none) {
+            return;
+        }
+        let Ok(activity) = crate::profile_reset::begin_activity("loading downloaded file summary")
+        else {
+            return;
+        };
+        let request = revision.get().wrapping_add(1);
+        revision.set(request);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let _activity = activity;
+                anyhow::ensure!(
+                    session == (online::account_session(), auth::session()),
+                    "Account changed; reopen the game."
+                );
+                load_managed_detail_summary(&StateStore::open()?, product_id)
+            })();
+            let _ = sender.send(result);
+        });
+        let current = current.clone();
+        let revision = revision.clone();
+        let window = window.downgrade();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            if !current() || revision.get() != request {
+                return glib::ControlFlow::Break;
+            }
+            let (installers, bytes) = match receiver.try_recv() {
+                Ok(Ok(summary)) => summary,
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                _ => return glib::ControlFlow::Break,
+            };
+            let Some(window) = window.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            for (index, label) in labels.iter().enumerate() {
+                let Some(label) = label
+                    .as_ref()
+                    .and_then(glib::WeakRef::upgrade)
+                    .filter(|label| label.is_ancestor(&window))
+                else {
+                    continue;
+                };
+                let text = label.text();
+                if index == 0 {
+                    let available = text.split(" · ").next().unwrap_or("Files available");
+                    label.set_label(&format!(
+                        "{available} · {installers} local installers · {} on disk",
+                        human_size(bytes)
+                    ));
+                } else {
+                    let prefix = text
+                        .rsplit_once(" · ")
+                        .map_or(text.as_str(), |(prefix, _)| prefix);
+                    label.set_label(&format!(
+                        "{prefix} · Downloaded files: {}",
+                        human_size(bytes)
+                    ));
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    })
 }
 
 fn adjust_downloaded_collection_count(label: &gtk::Label, change: i32) {
@@ -662,6 +766,7 @@ impl Widgets {
             download_status_progress: self.download_status_progress.clone(),
             game_list: self.game_list.clone(),
             home_grid: self.home_grid.clone(),
+            home_no_results: self.home_no_results.clone(),
             collections: self.collections.clone(),
             content: self.content.clone(),
             empty: self.empty.clone(),
@@ -761,6 +866,7 @@ const CSS: &str = r#"
 .game-grid flowboxchild:hover,
 .game-grid flowboxchild:active,
 .game-grid flowboxchild:selected { background: transparent; box-shadow: none; outline: none; padding: 0; }
+.game-grid flowboxchild:focus-visible { outline: 2px solid @accent_color; outline-offset: 2px; border-radius: 8px; }
 .game-state-running label { color: #71d28b; }
 .game-state-downloading label { color: #62a8e5; }
 .game-state-installed label { color: #ffffff; }
@@ -972,8 +1078,8 @@ const CSS: &str = r#"
 .download-status-icon { min-width: 24px; min-height: 24px; }
 .downloads-title { font-size: 1.8em; font-weight: 800; }
 .download-section-heading { margin-top: 8px; }
-.download-section-heading separator { margin-top: 10px; }
 .downloads-empty { padding: 6px 14px 24px; color: alpha(@window_fg_color, .60); }
+.downloads-empty-queue > .downloads-empty { padding-bottom: 0; }
 .download-active-card { padding: 18px; background: alpha(@card_bg_color, .75); border: 1px solid alpha(@borders, .55); border-radius: 10px; }
 .active-transfer-header { min-height: 174px; background: #08121d; border: 1px solid alpha(@borders, .55); border-radius: 10px; }
 .active-transfer-background { background: #08121d; }
@@ -990,6 +1096,261 @@ const CSS: &str = r#"
 .download-disk-progress progress { background: #73c76b; }
 .download-queue-row { padding: 12px; border-bottom: 1px solid alpha(@borders, .35); }
 "#;
+
+#[cfg(test)]
+mod managed_detail_summary_tests {
+    use super::*;
+
+    #[test]
+    fn managed_summary_counts_product_files_and_deduplicates_legacy_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let store = StateStore::open_at(&database).unwrap();
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let managed = root.path().join("managed.exe");
+        let legacy = root.path().join("legacy.exe");
+        let extra = root.path().join("extra.pdf");
+        std::fs::write(&managed, b"managed").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        std::fs::write(&extra, b"extra").unwrap();
+        for (path, product, kind, size, present) in [
+            (managed.clone(), 42, "installer", 7, true),
+            (root.path().join("recorded-extra"), 42, "extra", 10, true),
+            (root.path().join("absent"), 42, "installer", 100, false),
+            (root.path().join("other"), 43, "installer", 1000, true),
+        ] {
+            connection.execute(
+                "INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,present) VALUES (?1,?2,'fixture',?3,'fixture',?4,?5)",
+                rusqlite::params![path.to_str().unwrap(), product, kind, size, present],
+            ).unwrap();
+        }
+        let installer: RemoteArtifact = serde_json::from_value(serde_json::json!({
+            "product_id":42,"kind":"installer","name":"Fixture","download_path":"/fixture"
+        }))
+        .unwrap();
+        for (id, product, artifacts, state, files) in [
+            (
+                "complete",
+                42,
+                vec![installer.clone()],
+                DownloadState::Complete,
+                vec![
+                    managed,
+                    legacy.clone(),
+                    legacy.clone(),
+                    root.path().join("missing"),
+                    root.path().to_owned(),
+                ],
+            ),
+            (
+                "duplicate",
+                42,
+                vec![installer.clone()],
+                DownloadState::Complete,
+                vec![legacy],
+            ),
+            (
+                "extra",
+                42,
+                vec![],
+                DownloadState::Complete,
+                vec![extra.clone()],
+            ),
+            (
+                "paused",
+                42,
+                vec![installer.clone()],
+                DownloadState::Paused,
+                vec![extra.clone()],
+            ),
+            (
+                "other",
+                43,
+                vec![installer],
+                DownloadState::Complete,
+                vec![extra],
+            ),
+        ] {
+            store
+                .save_download_job(&crate::state::DownloadJobUpdate {
+                    job_id: id,
+                    product_id: product,
+                    title: "Fixture",
+                    artifacts: &artifacts,
+                    destination: root.path(),
+                    state,
+                    bytes_downloaded: 0,
+                    total_bytes: None,
+                    completed_files: &files,
+                    error: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(load_managed_detail_summary(&store, 42).unwrap(), (2, 28));
+        assert_eq!(load_managed_detail_summary(&store, 99).unwrap(), (0, 0));
+        connection.execute("DROP TABLE download_jobs", []).unwrap();
+        assert!(load_managed_detail_summary(&store, 42).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, D-Bus and GTK; uses only synthetic profile data"]
+    fn managed_summary_worker_preserves_responsiveness_and_rejects_stale_views() {
+        let home = std::env::var("HOME").unwrap();
+        assert!(home.starts_with("/tmp/ludomere-p329-"));
+        let fixture_root = std::path::Path::new(&home).parent().unwrap();
+        for variable in [
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::path::Path::new(&std::env::var_os(variable).unwrap())
+                    .starts_with(fixture_root),
+                "{variable} must stay inside the synthetic profile"
+            );
+        }
+        assert!(
+            crate::identity::database().starts_with(std::env::var_os("XDG_DATA_HOME").unwrap())
+        );
+        adw::init().unwrap();
+        fn pump() {
+            let until = std::time::Instant::now() + Duration::from_millis(100);
+            while std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn finish_workers() {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(reservation) = crate::profile_reset::reserve() {
+                    drop(reservation);
+                    break;
+                }
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.ManagedSummaryTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let summary = gtk::Label::new(Some("5 available · old"));
+        summary.set_widget_name("managed-files-summary-42");
+        let subtitle = gtk::Label::new(Some("Game · Linux · Downloaded files: old"));
+        subtitle.set_widget_name("managed-product-subtitle-42");
+        page.append(&summary);
+        page.append(&subtitle);
+        window.set_content(Some(&page));
+        window.present();
+        pump();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        drop(StateStore::open().unwrap());
+        let connection = rusqlite::Connection::open(crate::identity::database()).unwrap();
+        connection.execute("INSERT INTO managed_files(path,product_id,product_slug,artifact_kind,filename,size,present) VALUES ('fixture',42,'fixture','installer','fixture',7,1)", []).unwrap();
+        let refresh = managed_detail_refresher(&window, Some(&model), &page, 42);
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let heartbeat = Rc::new(std::cell::Cell::new(false));
+        glib::idle_add_local_once({
+            let heartbeat = heartbeat.clone();
+            move || heartbeat.set(true)
+        });
+        refresh();
+        pump();
+        assert!(heartbeat.get());
+        assert_eq!(summary.text(), "5 available · old");
+        connection.execute_batch("COMMIT").unwrap();
+        finish_workers();
+        // Queue a newer request while the first result is still waiting on GTK.
+        connection
+            .execute("UPDATE managed_files SET size=19", [])
+            .unwrap();
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        refresh();
+        pump();
+        assert_eq!(summary.text(), "5 available · old");
+        connection.execute_batch("COMMIT").unwrap();
+        finish_workers();
+        pump();
+        assert_eq!(
+            summary.text(),
+            format!(
+                "5 available · 1 local installers · {} on disk",
+                human_size(19)
+            )
+        );
+        assert_eq!(
+            subtitle.text(),
+            format!("Game · Linux · Downloaded files: {}", human_size(19))
+        );
+
+        connection
+            .execute("UPDATE managed_files SET present=0", [])
+            .unwrap();
+        for _ in 0..2 {
+            refresh();
+            finish_workers();
+            pump();
+            assert_eq!(
+                subtitle.text(),
+                format!("Game · Linux · Downloaded files: {}", human_size(0))
+            );
+            assert_eq!(
+                summary.text(),
+                format!(
+                    "5 available · 0 local installers · {} on disk",
+                    human_size(0)
+                )
+            );
+        }
+
+        for case in 0..6 {
+            summary.set_label("5 available · old");
+            let refresh = managed_detail_refresher(&window, Some(&model), &page, 42);
+            refresh();
+            finish_workers();
+            match case {
+                0 => model.borrow_mut().detail_generation += 1,
+                1 => model.borrow_mut().account_epoch += 1,
+                2 => model.borrow_mut().logout_pending = true,
+                3 => window.set_content(gtk::Widget::NONE),
+                4 => page.remove(&summary),
+                _ => auth::invalidate_session(),
+            }
+            pump();
+            assert_eq!(summary.text(), "5 available · old", "stale case {case}");
+            // Old callbacks must also refuse to schedule against replacement views.
+            refresh();
+            pump();
+            assert_eq!(summary.text(), "5 available · old");
+            model.borrow_mut().logout_pending = false;
+            window.set_content(Some(&page));
+            if summary.parent().is_none() {
+                page.append(&summary);
+            }
+        }
+        let refresh = managed_detail_refresher(&window, Some(&model), &page, 42);
+        connection.execute("DROP TABLE download_jobs", []).unwrap();
+        refresh();
+        finish_workers();
+        pump();
+        assert_eq!(summary.text(), "5 available · old");
+        drop(connection);
+        let reset = crate::profile_reset::reserve_for_sign_out().unwrap();
+        std::fs::remove_file(crate::identity::database()).unwrap();
+        refresh();
+        pump();
+        assert!(!crate::identity::database().exists());
+        drop(reset);
+        window.close();
+    }
+}
 
 #[cfg(test)]
 mod historical_filename_tests {

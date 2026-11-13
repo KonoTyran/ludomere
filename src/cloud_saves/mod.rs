@@ -210,11 +210,22 @@ pub fn discover_and_store_for_session(
 ) -> Result<CloudSaveDiscovery> {
     ensure_session(session)?;
     let store = crate::state::StateStore::open()?;
-    match discover(game, stored_locations) {
+    #[cfg(test)]
+    let discovery = TEST_DISCOVERIES.with(|results| {
+        results.borrow_mut().as_mut().map(|results| {
+            results
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("Missing inert cloud discovery")))
+        })
+    });
+    #[cfg(test)]
+    let discovery = discovery.unwrap_or_else(|| discover(game, stored_locations));
+    #[cfg(not(test))]
+    let discovery = discover(game, stored_locations);
+    match discovery {
         Ok(discovery) => {
             ensure_session(session)?;
-            store.set_cloud_save_discovery(game.product_id, &discovery)?;
-            Ok(discovery)
+            store.set_cloud_save_discovery(game.product_id, &discovery)
         }
         Err(error) => {
             ensure_session(session)?;
@@ -232,6 +243,11 @@ pub fn discover_and_store_for_session(
             Err(error)
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DISCOVERIES: std::cell::RefCell<Option<std::collections::VecDeque<Result<CloudSaveDiscovery>>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn windows_builds(
@@ -335,6 +351,99 @@ pub fn sync_for_session(mut request: CloudSyncRequest, session: u64) -> Result<C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires private p379 HOME and XDG roots; no network or helper"]
+    fn discovery_backend_returns_current_overrides_and_preserves_failure() {
+        for name in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(name)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p379-"),
+                "{name} must be private"
+            );
+        }
+        let store = crate::state::StateStore::open().unwrap();
+        let game: InstalledGame = serde_json::from_value(serde_json::json!({
+            "product_id": 9379001, "library_id": "inert", "installation_directory": "/inert/not-created",
+            "primary_executable": null, "installer_files": [], "installer_complete": true,
+            "installer_operating_system": "windows", "launch_arguments": [], "state": "installed", "playtime_seconds": 0, "created_at": 1, "updated_at": 1
+        })).unwrap();
+        let saved = vec![CloudSaveLocation {
+            name: "current".into(),
+            path: std::path::PathBuf::from("/inert/current"),
+            remote_namespace: "current".into(),
+            user_override: true,
+        }];
+        store
+            .set_cloud_save_locations(game.product_id, &saved)
+            .unwrap();
+        TEST_DISCOVERIES
+            .with(|results| *results.borrow_mut() = Some(std::collections::VecDeque::new()));
+        for availability in [
+            CloudSaveAvailability::Supported,
+            CloudSaveAvailability::Unsupported,
+            CloudSaveAvailability::Unavailable,
+        ] {
+            TEST_DISCOVERIES.with(|results| {
+                results
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .push_back(Ok(CloudSaveDiscovery {
+                        availability,
+                        metadata_build_id: Some("inert-build".into()),
+                        checked_at: 123,
+                        ..Default::default()
+                    }))
+            });
+            let returned =
+                discover_and_store_for_session(&game, &[], crate::auth::session()).unwrap();
+            assert_eq!(returned.locations, saved);
+            assert_eq!(returned.availability, availability);
+            assert_eq!(
+                store.cloud_save_record(game.product_id).unwrap().locations,
+                saved
+            );
+        }
+        TEST_DISCOVERIES.with(|results| {
+            results
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .push_back(Err(anyhow::anyhow!("inert discovery failed")))
+        });
+        assert_eq!(
+            discover_and_store_for_session(&game, &[], crate::auth::session())
+                .unwrap_err()
+                .to_string(),
+            "inert discovery failed"
+        );
+        let record = store.cloud_save_record(game.product_id).unwrap();
+        assert_eq!(record.locations, saved);
+        assert_eq!(record.availability, CloudSaveAvailability::Unknown);
+        assert_eq!(record.metadata_build_id.as_deref(), Some("inert-build"));
+        assert_eq!(record.metadata_checked_at, Some(123));
+        assert_eq!(
+            record.metadata_error.as_deref(),
+            Some("inert discovery failed")
+        );
+        assert_eq!(
+            discover_and_store_for_session(&game, &[], crate::auth::session())
+                .unwrap_err()
+                .to_string(),
+            "Missing inert cloud discovery",
+            "exhaustion stays in the inert backend mode"
+        );
+    }
 
     #[test]
     fn cloud_operations_exclude_concurrent_sync_for_the_same_product() {

@@ -824,10 +824,23 @@ mod tests {
         assert!(commit_retention_with_config(&store, cross_root, "replacement", &changed).is_err());
         assert!(older.iter().all(|path| path.is_file()));
         let pending = prepare();
-        std::fs::remove_file(&older[1]).unwrap();
-        symlink(&replacement[1], &older[1]).unwrap();
+        // A changed verified replacement blocks retention before any older file is removed.
+        std::fs::rename(&replacement[1], replacement[1].with_extension("held")).unwrap();
+        symlink(&older[1], &replacement[1]).unwrap();
         assert!(commit_retention_with_config(&store, pending, "replacement", &config).is_err());
-        assert!(older[0].exists());
+        assert!(
+            older
+                .iter()
+                .all(|path| std::fs::read(path).unwrap() == b"inert fixture")
+        );
+        assert!(
+            std::fs::symlink_metadata(&replacement[1])
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&replacement[1]).unwrap();
+        std::fs::rename(replacement[1].with_extension("held"), &replacement[1]).unwrap();
         assert!(
             replacement
                 .iter()
@@ -836,6 +849,40 @@ mod tests {
         assert_eq!(
             store.download_job("job").unwrap().unwrap().completed_files,
             older
+        );
+        assert_eq!(
+            store
+                .download_job("replacement")
+                .unwrap()
+                .unwrap()
+                .completed_files,
+            replacement
+        );
+        let pending = prepare();
+        std::fs::rename(&older[1], older[1].with_extension("held")).unwrap();
+        symlink(&replacement[1], &older[1]).unwrap();
+        let result = commit_retention_with_config(&store, pending, "replacement", &config).unwrap();
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(!older[0].exists());
+        assert!(
+            std::fs::symlink_metadata(&older[1])
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(older[1].with_extension("held")).unwrap(),
+            b"inert fixture"
+        );
+        assert!(
+            replacement
+                .iter()
+                .all(|path| std::fs::read(path).unwrap() == b"inert fixture")
+        );
+        assert_eq!(
+            store.download_job("job").unwrap().unwrap().completed_files,
+            older[1..]
         );
         assert_eq!(
             store
@@ -1092,9 +1139,14 @@ mod tests {
             1
         );
         std::fs::write(extras_root.join("unrecognized.txt"), b"preserve").unwrap();
+        let available = inspect_kind(&store, &config, 7, LibraryKind::Extras).unwrap();
+        assert_eq!(available.count(), 1);
+        assert!(available.blocked_libraries().is_empty());
+        std::os::unix::fs::symlink(root.path(), extras_root.join(".ludomere-staging")).unwrap();
         let blocked = inspect_kind(&store, &config, 7, LibraryKind::Extras).unwrap();
         assert_eq!(blocked.count(), 0);
         assert_eq!(blocked.blocked_libraries().len(), 1);
+        std::fs::remove_file(extras_root.join(".ludomere-staging")).unwrap();
         assert_eq!(
             delete_locked(&store, offline, false, &config)
                 .unwrap()
@@ -1104,6 +1156,10 @@ mod tests {
         assert!(installers.iter().all(|path| !path.exists()));
         assert_eq!(std::fs::read(extra).unwrap(), b"inert fixture");
         assert_eq!(std::fs::read(payload).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::read(extras_root.join("unrecognized.txt")).unwrap(),
+            b"preserve"
+        );
     }
 
     #[test]
@@ -1141,6 +1197,8 @@ mod tests {
         assert_eq!(store.download_install_intents().unwrap().len(), 1);
         std::fs::rename(&files[1], files[1].with_extension("held")).unwrap();
         symlink(&outside, &files[1]).unwrap();
+        let staging = config.offline_libraries[0].path.join(".ludomere-staging");
+        symlink(root.path(), &staging).unwrap();
         let result = delete_locked(&store, snapshot.clone(), false, &config).unwrap();
         assert_eq!(result.deleted, 0);
         assert_eq!(result.failures.len(), 2);
@@ -1149,11 +1207,29 @@ mod tests {
             store.download_job("job").unwrap().unwrap().completed_files,
             files
         );
+        std::fs::remove_file(staging).unwrap();
+        // Once the root is safe, unchanged owned files can be removed independently.
+        let result = delete_locked(&store, snapshot.clone(), false, &config).unwrap();
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(!files[0].exists());
+        assert!(
+            std::fs::symlink_metadata(&files[1])
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserve other");
+        assert_eq!(
+            store.download_job("job").unwrap().unwrap().completed_files,
+            files[1..]
+        );
         std::fs::remove_file(&files[1]).unwrap();
         std::fs::rename(files[1].with_extension("held"), &files[1]).unwrap();
-        let retried = delete_locked(&store, snapshot, false, &config).unwrap();
+        let retried =
+            delete_locked(&store, inspect(&store, &config, 7).unwrap(), false, &config).unwrap();
         assert!(retried.failures.is_empty());
-        assert_eq!(retried.deleted, 2);
+        assert_eq!(retried.deleted, 1);
         assert!(!files[1].exists());
         assert!(store.download_job("job").unwrap().is_none());
         assert!(store.favorites().unwrap().contains(&7));

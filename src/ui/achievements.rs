@@ -41,7 +41,7 @@ pub(super) fn achievement_page(model: &Rc<RefCell<AppModel>>, product_id: i64) -
             spinner.set_visible(false);
             refresh.set_sensitive(false);
             status.set_label(
-                "Account changed. Reopen this game to view the current account's achievements.",
+                "Account changed. Go to Home, then reopen this game to view the current account's achievements.",
             );
             glib::ControlFlow::Break
         });

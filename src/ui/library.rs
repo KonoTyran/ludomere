@@ -151,6 +151,9 @@ pub(super) fn rebuild_sidebar_presentation(w: &Widgets, model: &mut AppModel) {
             rows.insert(id, row);
         }
     }
+    // Clear each row's selected flag before detaching it; GTK clears the list's
+    // selected-row pointer on removal but retained rows can keep that flag.
+    w.game_list.unselect_all();
     while let Some(child) = w.game_list.first_child() {
         w.game_list.remove(&child);
     }
@@ -219,7 +222,11 @@ fn refresh_sidebar_visibility(w: &Widgets, model: &AppModel) -> usize {
             }
             let collapsed = model.collapsed_activity_sections.contains(&section.key);
             let state = if collapsed { "collapsed" } else { "expanded" };
-            let accessible = format!("{}, {matching} games, {state}", section.label);
+            let accessible = format!(
+                "{}, {matching} {}, {state}",
+                section.label,
+                if matching == 1 { "game" } else { "games" }
+            );
             row.update_property(&[gtk::accessible::Property::Label(&accessible)]);
             row.update_state(&[gtk::accessible::State::Expanded(Some(!collapsed))]);
             if let Some(label) = find_named_descendant(&row.upcast(), "activity-disclosure")
@@ -257,12 +264,6 @@ pub(super) fn connect_check_filter(
         {
             let mut state = model.borrow_mut();
             update(&mut state, active);
-            if active {
-                state.query.clear();
-            }
-        }
-        if active && !w.search.text().is_empty() {
-            w.search.set_text("");
         }
         refresh_filters(&w, &model.borrow());
         if active && (model.borrow().cloud_saves_only || model.borrow().achievements_only) {
@@ -369,24 +370,45 @@ pub(super) fn initialize_library_loading(w: &Widgets, model: &Rc<RefCell<AppMode
         let state = model.clone();
         popover.connect_show(move |_| request_filter_metadata(&widgets, &state, false));
     }
-    if let Some(scroll) = w
-        .home_grid
-        .ancestor(gtk::ScrolledWindow::static_type())
-        .and_downcast::<gtk::ScrolledWindow>()
-    {
-        let widgets = w.clone_refs();
-        scroll
-            .vadjustment()
-            .connect_value_changed(move |_| prioritize_grid_covers(&widgets));
-        let widgets = w.clone_refs();
-        scroll.connect_map(move |_| prioritize_grid_covers(&widgets));
-    }
+    connect_grid_cover_priorities(&w.home_grid, online::prioritize_covers);
     refresh_filters(w, &model.borrow());
 }
 
-fn prioritize_grid_covers(w: &Widgets) {
-    let Some(scroll) = w
-        .home_grid
+fn connect_grid_cover_priorities(grid: &gtk::FlowBox, publish: impl Fn(Vec<i64>) + 'static) {
+    let Some(scroll) = grid
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+    else {
+        return;
+    };
+    let publish: Rc<dyn Fn(Vec<i64>)> = Rc::new(publish);
+    let pending = Rc::new(std::cell::Cell::new(false));
+    scroll.vadjustment().connect_value_changed({
+        let grid = grid.downgrade();
+        let publish = publish.clone();
+        move |_| {
+            if pending.replace(true) {
+                return;
+            }
+            let pending = pending.clone();
+            let grid = grid.clone();
+            let publish = publish.clone();
+            glib::timeout_add_local_once(Duration::from_millis(75), move || {
+                pending.set(false);
+                if let Some(grid) = grid.upgrade() {
+                    prioritize_grid_covers(&grid, publish.as_ref());
+                }
+            });
+        }
+    });
+    grid.connect_map(move |grid| prioritize_grid_covers(grid, publish.as_ref()));
+}
+
+fn prioritize_grid_covers(grid: &gtk::FlowBox, publish: &dyn Fn(Vec<i64>)) {
+    if !grid.is_mapped() {
+        return;
+    }
+    let Some(scroll) = grid
         .ancestor(gtk::ScrolledWindow::static_type())
         .and_downcast::<gtk::ScrolledWindow>()
     else {
@@ -394,10 +416,10 @@ fn prioritize_grid_covers(w: &Widgets) {
     };
     let mut visible = Vec::new();
     let mut nearby = Vec::new();
-    let mut child = w.home_grid.first_child();
+    let mut child = grid.first_child();
     while let Some(widget) = child {
         child = widget.next_sibling();
-        if !widget.is_visible() {
+        if !widget.is_mapped() || !widget.is_child_visible() {
             continue;
         }
         let Some(card) = widget.first_child() else {
@@ -418,7 +440,234 @@ fn prioritize_grid_covers(w: &Widgets) {
         }
     }
     visible.extend(nearby);
-    online::prioritize_covers(visible);
+    publish(visible);
+}
+
+#[test]
+#[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+fn cover_priorities_coalesce_scrolls_and_preserve_geometry_and_lifetime() {
+    for key in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+    ] {
+        assert!(
+            std::env::var(key)
+                .unwrap()
+                .starts_with("/tmp/ludomere-p349-")
+        );
+    }
+    adw::init().unwrap();
+    gtk::Settings::default()
+        .unwrap()
+        .set_gtk_enable_animations(false);
+    fn wait(check: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() && std::time::Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(check());
+    }
+    fn settle() {
+        let elapsed = Rc::new(std::cell::Cell::new(false));
+        glib::timeout_add_local_once(Duration::from_millis(120), {
+            let elapsed = elapsed.clone();
+            move || elapsed.set(true)
+        });
+        wait(|| elapsed.get());
+    }
+    let window = gtk::Window::builder()
+        .default_width(700)
+        .default_height(500)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let search = gtk::Entry::new();
+    search.set_text("preserved query");
+    content.append(&search);
+    let stack = gtk::Stack::new();
+    stack.set_vexpand(true);
+    content.append(&stack);
+    let grid = gtk::FlowBox::builder()
+        .min_children_per_line(4)
+        .max_children_per_line(4)
+        .column_spacing(8)
+        .row_spacing(8)
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    let cards = (0..500)
+        .map(|id| {
+            let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            card.set_widget_name(&id.to_string());
+            card.set_size_request(120, 70);
+            card.append(&gtk::Label::new(Some(&format!("Game {id}"))));
+            grid.insert(&gtk::FlowBoxChild::builder().child(&card).build(), -1);
+            card
+        })
+        .collect::<Vec<_>>();
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&grid)
+        .build();
+    stack.add_named(&scroll, Some("home"));
+    stack.add_named(&gtk::Label::new(Some("Other page")), Some("details"));
+    stack.set_visible_child_name("home");
+    window.set_child(Some(&content));
+    let publications = Rc::new(RefCell::new(Vec::<Vec<i64>>::new()));
+    connect_grid_cover_priorities(&grid, {
+        let publications = publications.clone();
+        move |ids| publications.borrow_mut().push(ids)
+    });
+    let published_on_map = Rc::new(std::cell::Cell::new(false));
+    grid.connect_map({
+        let publications = publications.clone();
+        let published_on_map = published_on_map.clone();
+        move |_| published_on_map.set(!publications.borrow().is_empty())
+    });
+    window.present();
+    wait(|| grid.is_mapped() && cards[499].height() > 0 && scroll.vadjustment().upper() > 500.0);
+    settle();
+    assert!(
+        published_on_map.get(),
+        "mapping must publish without waiting for the scroll throttle"
+    );
+    assert!(search.grab_focus());
+    let focus = gtk::prelude::GtkWindowExt::focus(&window);
+    let selected = grid.selected_children();
+    let adjustment = scroll.vadjustment();
+    let maximum = adjustment.upper() - adjustment.page_size();
+    // Preserve the original inclusive viewport/nearby partition, in card order.
+    let expected = || {
+        let mut visible = Vec::new();
+        let mut nearby = Vec::new();
+        for (id, card) in cards.iter().enumerate() {
+            let wrapper = card.parent().unwrap();
+            if !wrapper.is_child_visible() || !wrapper.is_mapped() {
+                continue;
+            }
+            let bounds = card.compute_bounds(&scroll).unwrap();
+            let top = bounds.y();
+            let bottom = top + bounds.height();
+            let height = scroll.height() as f32;
+            if top <= height && bottom >= 0.0 {
+                visible.push(id as i64);
+            } else if top <= 2.0 * height && bottom >= -height {
+                nearby.push(id as i64);
+            }
+        }
+        assert!(!visible.is_empty());
+        visible.extend(nearby);
+        visible
+    };
+    adjustment.set_value(1.0);
+    settle();
+    for position in [0.0, maximum / 2.0, maximum] {
+        adjustment.set_value(position);
+        settle();
+        // The same collector is called directly at the end of an incremental rebuild.
+        let immediate = Rc::new(RefCell::new(Vec::new()));
+        prioritize_grid_covers(&grid, &|ids| *immediate.borrow_mut() = ids);
+        assert_eq!(*immediate.borrow(), expected());
+        assert_eq!(publications.borrow().last().unwrap(), &expected());
+    }
+    publications.borrow_mut().clear();
+    for index in 1..=20 {
+        adjustment.set_value(maximum * index as f64 / 25.0);
+    }
+    assert!(
+        publications.borrow().is_empty(),
+        "scroll notifications must not synchronously scan/publish"
+    );
+    wait(|| !publications.borrow().is_empty());
+    assert_eq!(
+        publications.borrow().len(),
+        1,
+        "a burst must have one trailing pass"
+    );
+    assert_eq!(
+        publications.borrow()[0],
+        expected(),
+        "the pass must read the final viewport"
+    );
+    settle();
+    assert_eq!(publications.borrow().len(), 1);
+    adjustment.set_value(maximum / 3.0);
+    wait(|| publications.borrow().len() == 2);
+    assert_eq!(
+        publications.borrow()[1],
+        expected(),
+        "pending must reset for subsequent movement"
+    );
+    assert_eq!(search.text(), "preserved query");
+    assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), focus);
+    assert_eq!(grid.selected_children(), selected);
+    assert_eq!(stack.visible_child_name().as_deref(), Some("home"));
+
+    grid.set_filter_func(|child| {
+        child
+            .child()
+            .unwrap()
+            .widget_name()
+            .parse::<usize>()
+            .unwrap()
+            .is_multiple_of(7)
+    });
+    settle();
+    adjustment.set_value((adjustment.upper() - adjustment.page_size()) / 2.0);
+    settle();
+    let filtered = Rc::new(RefCell::new(Vec::new()));
+    prioritize_grid_covers(&grid, &|ids| *filtered.borrow_mut() = ids);
+    assert_eq!(*filtered.borrow(), expected());
+    assert!(filtered.borrow().iter().all(|id| id % 7 == 0));
+    assert!(cards[1].parent().unwrap().is_visible());
+    assert!(!cards[1].parent().unwrap().is_child_visible());
+
+    publications.borrow_mut().clear();
+    adjustment.set_value(0.0);
+    stack.set_visible_child_name("details");
+    assert!(!grid.is_mapped());
+    settle();
+    assert!(
+        publications.borrow().is_empty(),
+        "pending work must not publish from hidden Home"
+    );
+    prioritize_grid_covers(&grid, &|_| panic!("hidden rebuild must not publish"));
+    stack.set_visible_child_name("home");
+    assert!(
+        !publications.borrow().is_empty(),
+        "remapping must refresh immediately"
+    );
+    settle();
+    assert_eq!(publications.borrow().last().unwrap(), &expected());
+    assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), focus);
+    assert_eq!(stack.visible_child_name().as_deref(), Some("home"));
+    assert_eq!(
+        grid.child_at_index(499).unwrap().child().as_ref(),
+        Some(cards[499].upcast_ref())
+    );
+
+    publications.borrow_mut().clear();
+    adjustment.set_value((adjustment.upper() - adjustment.page_size()) / 2.0);
+    let weak_grid = grid.downgrade();
+    window.destroy();
+    drop(window);
+    drop(content);
+    drop(stack);
+    drop(scroll);
+    drop(grid);
+    drop(cards);
+    // The adjustment is deliberately retained: its handler and timeout must own only a weak grid.
+    assert!(weak_grid.upgrade().is_none());
+    settle();
+    assert!(
+        publications.borrow().is_empty(),
+        "destroyed Home must not publish stale priorities"
+    );
+    drop(adjustment);
 }
 
 pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
@@ -470,6 +719,7 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
                     find_named_descendant(&card, "card-title").and_downcast::<gtk::Label>()
             {
                 title.set_label(&game.title);
+                widget.update_property(&[gtk::accessible::Property::Label(&game.title)]);
             }
         }
     }
@@ -520,7 +770,7 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
                 rebuild_sidebar_presentation(&w, &mut model.borrow_mut());
                 refresh_filters(&w, &model.borrow());
                 w.home_grid.invalidate_sort();
-                prioritize_grid_covers(&w);
+                prioritize_grid_covers(&w.home_grid, &online::prioritize_covers);
                 if w.filter_button
                     .popover()
                     .is_some_and(|popover| popover.is_visible())
@@ -553,15 +803,10 @@ pub(super) fn rebuild_library(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
                 model.borrow().cover_states.get(&game.product_id),
             );
             card.set_widget_name(&game.product_id.to_string());
-            let id = game.product_id;
-            let w2 = w.clone_refs();
-            let model = model.clone();
-            attach_game_context_menu(&card, &w, &model, id);
-            let click = gtk::GestureClick::new();
-            click.set_button(gtk::gdk::BUTTON_PRIMARY);
-            click.connect_released(move |_, _, _, _| show_game(&w2, &model, id, None));
-            card.add_controller(click);
-            w.home_grid.insert(&card, -1);
+            attach_game_context_menu(&card, &w, &model, game.product_id);
+            let child = gtk::FlowBoxChild::builder().child(&card).build();
+            child.update_property(&[gtk::accessible::Property::Label(&game.title)]);
+            w.home_grid.insert(&child, -1);
         }
         glib::ControlFlow::Continue
     });
@@ -662,15 +907,10 @@ pub(super) fn rebuild_home_grid(w: &Widgets, model: &Rc<RefCell<AppModel>>) {
             model.borrow().cover_states.get(&game.product_id),
         );
         card.set_widget_name(&game.product_id.to_string());
-        let id = game.product_id;
-        let widgets = w.clone_refs();
-        attach_game_context_menu(&card, w, model, id);
-        let model = model.clone();
-        let click = gtk::GestureClick::new();
-        click.set_button(gtk::gdk::BUTTON_PRIMARY);
-        click.connect_released(move |_, _, _, _| show_game(&widgets, &model, id, None));
-        card.add_controller(click);
-        w.home_grid.insert(&card, -1);
+        attach_game_context_menu(&card, w, model, game.product_id);
+        let child = gtk::FlowBoxChild::builder().child(&card).build();
+        child.update_property(&[gtk::accessible::Property::Label(&game.title)]);
+        w.home_grid.insert(&child, -1);
     }
     refresh_filters(w, &model.borrow());
 }
@@ -1320,6 +1560,683 @@ fn direct_game_filter_preserves_library_preferences_and_unknown_metadata() {
 
 #[test]
 #[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+fn home_native_activation_preserves_filters_and_accessible_titles() {
+    for key in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+    ] {
+        assert!(
+            std::env::var(key)
+                .unwrap()
+                .starts_with("/tmp/ludomere-p340-")
+        );
+    }
+    assert_eq!(std::env::var("GTK_A11Y").unwrap(), "test");
+    adw::init().unwrap();
+    gtk::Settings::default()
+        .unwrap()
+        .set_gtk_enable_animations(false);
+    install_css();
+    fn wait(check: impl Fn() -> bool) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() && std::time::Instant::now() < until {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(check());
+    }
+    fn assert_title(child: &gtk::FlowBoxChild, title: &str) {
+        let title = std::ffi::CString::new(title).unwrap();
+        // GTK's test API returns null on equality, otherwise an allocated diagnostic.
+        let mismatch: Option<glib::GString> = unsafe {
+            glib::translate::from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                child.as_ptr().cast(),
+                gtk::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL,
+                title.as_ptr(),
+            ))
+        };
+        assert_eq!(mismatch, None);
+        assert_eq!(child.accessible_role(), gtk::AccessibleRole::GridCell);
+    }
+    let app = adw::Application::builder()
+        .application_id("io.github.ludomere.GridKeyboardTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let w = Rc::new(window::create_widgets(&app, &Config::default()));
+    let model = Rc::new(RefCell::new(AppModel {
+        games: [(1, "Target Alpha"), (2, "Other game"), (3, "Target Zeta")]
+            .into_iter()
+            .map(|(product_id, title)| Game {
+                product_id,
+                title: title.into(),
+                ..Game::default()
+            })
+            .collect(),
+        section_states: (1..=3)
+            .flat_map(|id| {
+                [
+                    online::DetailSection::Product,
+                    online::DetailSection::Metadata,
+                    online::DetailSection::Artwork,
+                    online::DetailSection::Acquisition,
+                    online::DetailSection::Builds,
+                ]
+                .into_iter()
+                .map(move |section| ((id, section), SectionState::Ready))
+            })
+            .collect(),
+        ..AppModel::default()
+    }));
+    window::connect_actions(&w, &model);
+    let activations = Rc::new(std::cell::Cell::new(0));
+    w.home_grid.connect_child_activated({
+        let activations = activations.clone();
+        move |_, _| activations.set(activations.get() + 1)
+    });
+    w.window.present();
+    for full_rebuild in [false, true] {
+        if full_rebuild {
+            rebuild_home_grid(&w, &model);
+        } else {
+            rebuild_library(&w, &model);
+        }
+        w.content.set_visible_child_name("home");
+        wait(|| {
+            w.home_grid
+                .child_at_index(2)
+                .is_some_and(|child| child.is_mapped())
+        });
+        assert!(w.home_grid.activates_on_single_click());
+        let children = (0..3)
+            .map(|index| w.home_grid.child_at_index(index).unwrap())
+            .collect::<Vec<_>>();
+        for (child, game) in children.iter().zip(&model.borrow().games) {
+            assert_title(child, &game.title);
+            let card = child.child().unwrap();
+            assert!(!card.is_focusable());
+            let controllers = card.observe_controllers();
+            let clicks = (0..controllers.n_items())
+                .filter_map(|index| controllers.item(index).and_downcast::<gtk::GestureClick>())
+                .collect::<Vec<_>>();
+            assert_eq!(clicks.len(), 1);
+            assert_eq!(clicks[0].button(), gtk::gdk::BUTTON_SECONDARY);
+        }
+        w.search.set_text("Target");
+        w.search.emit_by_name::<()>("search-changed", &[]);
+        assert!(w.search.grab_focus());
+        let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
+        let generation = model.borrow().detail_generation;
+        refresh_filters(&w, &model.borrow());
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focus);
+        assert_eq!(model.borrow().detail_generation, generation);
+        assert_eq!(w.count.text(), "2 games");
+        assert!(!children[1].is_child_visible());
+        let allocated = Rc::new(std::cell::Cell::new(false));
+        w.home_grid.add_tick_callback({
+            let allocated = allocated.clone();
+            move |_, _| {
+                allocated.set(true);
+                glib::ControlFlow::Break
+            }
+        });
+        wait(|| allocated.get() && children[0].width() > 0 && children[2].width() > 0);
+        // Enter through FlowBox's native focus handler so it sets its cursor child.
+        assert!(w.home_grid.child_focus(gtk::DirectionType::TabForward));
+        assert!(children[0].has_focus());
+        w.home_grid.emit_by_name::<bool>(
+            "move-cursor",
+            &[&gtk::MovementStep::VisualPositions, &1_i32, &false, &false],
+        );
+        assert!(
+            children[2].has_focus(),
+            "native cursor movement must skip the filtered tile"
+        );
+        let before = activations.get();
+        // Invoke GtkFlowBoxChild's native activation signal, used by Enter and Space.
+        assert!(gtk::prelude::WidgetExt::activate(&children[2]));
+        assert_eq!(activations.get(), before + 1);
+        assert_eq!(model.borrow().selected, Some(3));
+        assert_eq!(model.borrow().detail_generation, generation + 1);
+        assert_eq!(w.content.visible_child_name().as_deref(), Some("details"));
+        assert_eq!(w.search.text(), "Target");
+        assert!(w.window.visible_dialog().is_none());
+
+        gio::prelude::ActionGroupExt::activate_action(&w.window, "home", None);
+        wait(|| children[0].is_mapped());
+        let generation = model.borrow().detail_generation;
+        w.home_grid
+            .emit_by_name::<()>("child-activated", &[&children[1]]);
+        assert_eq!(model.borrow().detail_generation, generation);
+        model.borrow_mut().logout_pending = true;
+        assert!(gtk::prelude::WidgetExt::activate(&children[0]));
+        assert_eq!(model.borrow().detail_generation, generation);
+        model.borrow_mut().logout_pending = false;
+        model.borrow_mut().games[0].title = "Target Alpha — full updated accessible title".into();
+        rebuild_library(&w, &model);
+        assert_eq!(w.home_grid.child_at_index(0), Some(children[0].clone()));
+        assert_title(&children[0], &model.borrow().games[0].title);
+        while glib::MainContext::default().iteration(false) {}
+        model.borrow_mut().games.remove(0);
+        w.home_grid
+            .emit_by_name::<()>("child-activated", &[&children[0]]);
+        assert_eq!(model.borrow().detail_generation, generation);
+        model.borrow_mut().games.insert(
+            0,
+            Game {
+                product_id: 1,
+                title: "Target Alpha".into(),
+                ..Game::default()
+            },
+        );
+        w.search.set_text("");
+        w.search.emit_by_name::<()>("search-changed", &[]);
+        assert_eq!(w.content.visible_child_name().as_deref(), Some("home"));
+    }
+    // Reuse this fixture's real detail renderer; these paths need not exist.
+    for configured in [None, Some(false), Some(true)] {
+        model.borrow_mut().config.offline_libraries = configured
+            .map(|default| crate::config::GameLibrary {
+                id: "synthetic-archives".into(),
+                name: "Archives".into(),
+                path: std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                    .join("absent-archives"),
+                default,
+            })
+            .into_iter()
+            .collect();
+        for dlc in [false, true] {
+            let mut game = DetailPageModel::game(model.borrow().games[0].clone(), false);
+            game.location = model
+                .borrow()
+                .config
+                .default_library(crate::config::LibraryKind::OfflineInstallers)
+                .map(|library| library.path.join("synthetic-game"))
+                .unwrap_or_default();
+            if dlc {
+                game.parent_id = Some(2);
+                game.parent_title = Some("Synthetic parent".into());
+                game.location = game.location.join("dlc/synthetic-addon");
+            }
+            let expected = if configured.is_some() {
+                game.location.display().to_string()
+            } else {
+                "Not configured".into()
+            };
+            assert!(
+                model
+                    .borrow()
+                    .config
+                    .game_libraries
+                    .iter()
+                    .all(|library| !game.location.starts_with(&library.path))
+            );
+            render_detail_page(&w, &model, game);
+            let mut pending = vec![w.details.clone().upcast::<gtk::Widget>()];
+            let mut facts = None;
+            while let Some(widget) = pending.pop() {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>()
+                    && label.text().contains("Default offline installer folder:")
+                {
+                    assert!(label.is_selectable() && label.wraps());
+                    facts = Some(label.text());
+                }
+                pending.extend(std::iter::successors(widget.first_child(), |child| {
+                    child.next_sibling()
+                }));
+            }
+            assert!(
+                facts
+                    .unwrap()
+                    .ends_with(&format!("Default offline installer folder: {expected}"))
+            );
+        }
+    }
+    model.borrow_mut().activity_sections = vec![SidebarSection {
+        key: ActivitySectionKey::NeverPlayed,
+        label: "Never played".into(),
+        members: vec![1, 2, 3],
+    }];
+    let row = activity_section_row(&model.borrow().activity_sections[0]);
+    w.game_list.append(&row);
+    for (query, expected) in [
+        ("absent", "Never played, 0 games, expanded"),
+        ("Other", "Never played, 1 game, expanded"),
+        ("Target", "Never played, 2 games, expanded"),
+    ] {
+        model.borrow_mut().query = query.into();
+        refresh_sidebar_visibility(&w, &model.borrow());
+        let expected = std::ffi::CString::new(expected).unwrap();
+        let mismatch: Option<glib::GString> = unsafe {
+            glib::translate::from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                row.as_ptr().cast(),
+                gtk::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL,
+                expected.as_ptr(),
+            ))
+        };
+        assert_eq!(mismatch, None);
+    }
+    w.window.destroy();
+}
+
+#[test]
+#[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+fn home_empty_results_preserve_filters_and_other_pages() {
+    assert!(
+        std::env::var("HOME")
+            .unwrap()
+            .starts_with("/tmp/ludomere-p334-")
+    );
+    adw::init().unwrap();
+    gtk::Settings::default()
+        .unwrap()
+        .set_gtk_enable_animations(false);
+    fn wait(check: impl Fn() -> bool) {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !check() && std::time::Instant::now() < until {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(check());
+    }
+    let app = adw::Application::builder()
+        .application_id("io.github.ludomere.EmptyResultsTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let w = Rc::new(window::create_widgets(&app, &Config::default()));
+    let model = Rc::new(RefCell::new(AppModel {
+        games: [(1, "Alpha"), (2, "Beta")]
+            .into_iter()
+            .map(|(product_id, title)| Game {
+                product_id,
+                title: title.into(),
+                ..Game::default()
+            })
+            .collect(),
+        section_states: (1..=2)
+            .map(|id| ((id, online::DetailSection::Metadata), SectionState::Ready))
+            .collect(),
+        ..AppModel::default()
+    }));
+    for game in &model.borrow().games {
+        let row = game_row(game, false, false);
+        row.set_widget_name(&game.product_id.to_string());
+        w.game_list.append(&row);
+        let card = gtk::Label::new(Some(&game.title));
+        card.set_widget_name(&game.product_id.to_string());
+        w.home_grid.insert(&card, -1);
+    }
+    window::connect_actions(&w, &model);
+    let home_scroll = w
+        .home_grid
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .unwrap();
+    let card = w.home_grid.first_child().unwrap();
+    w.window.present();
+    let drain = || {
+        while glib::MainContext::default().iteration(false) {}
+    };
+    wait(|| w.search.is_mapped());
+    assert!(w.search.grab_focus());
+    let focus = gtk::prelude::GtkWindowExt::focus(&w.window);
+    let search = |query: &str| {
+        w.search.set_text(query);
+        w.search.emit_by_name::<()>("search-changed", &[]);
+        drain();
+    };
+    search("absent");
+    wait(|| w.home_no_results.is_mapped());
+    assert_eq!(w.home_no_results.title(), "No matching games");
+    assert_eq!(w.count.text(), "0 games");
+    assert!(!w.home_grid.child_at_index(0).unwrap().is_child_visible());
+    assert!(!w.home_grid.child_at_index(1).unwrap().is_child_visible());
+    assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focus);
+    search("Alpha");
+    assert!(!w.home_no_results.is_visible());
+    assert_eq!(w.count.text(), "1 game");
+    w.favorite_filter.set_active(true);
+    assert!(w.home_no_results.is_visible());
+    model.borrow_mut().favorites.insert(1);
+    refresh_filters(&w, &model.borrow());
+    assert!(!w.home_no_results.is_visible());
+    search("Beta");
+    assert!(w.home_no_results.is_visible());
+    w.clear_filters.emit_clicked();
+    assert!(!w.home_no_results.is_visible());
+    assert_eq!(w.search.text(), "Beta");
+    assert_eq!(model.borrow().query, "Beta");
+    search("");
+    w.playable_toggle.set_active(true);
+    assert_eq!(w.count.text(), "0 games");
+    assert!(!w.home_no_results.is_visible());
+    assert!(w.home_grid.child_at_index(0).unwrap().is_child_visible());
+    w.playable_toggle.set_active(false);
+    {
+        let mut state = model.borrow_mut();
+        state.sidebar_sort_mode = SidebarSortMode::LastPlayed;
+        state.activity_sections = vec![SidebarSection {
+            key: ActivitySectionKey::NeverPlayed,
+            label: "Never played".into(),
+            members: vec![1, 2],
+        }];
+        state
+            .collapsed_activity_sections
+            .insert(ActivitySectionKey::NeverPlayed);
+    }
+    refresh_filters(&w, &model.borrow());
+    assert!(!w.home_no_results.is_visible());
+    model.borrow_mut().hidden_products = HashSet::from([1, 2]);
+    refresh_filters(&w, &model.borrow());
+    assert!(w.home_no_results.is_visible());
+    assert_eq!(w.home_no_results.title(), "No games to show");
+    assert!(
+        w.home_no_results
+            .description()
+            .unwrap()
+            .contains("Show hidden")
+    );
+    w.organization_filters
+        .first_child()
+        .and_downcast::<gtk::CheckButton>()
+        .unwrap()
+        .set_active(true);
+    assert!(!w.home_no_results.is_visible());
+    assert_eq!(w.home_grid.first_child(), Some(card));
+    assert_eq!(
+        w.home_grid.ancestor(gtk::ScrolledWindow::static_type()),
+        Some(home_scroll)
+    );
+
+    for (name, body) in [("details", &w.details), ("downloads", &w.downloads)] {
+        let tall_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        tall_content.set_height_request(2000);
+        body.append(&tall_content);
+        w.content.set_visible_child_name(name);
+        drain();
+        let scroll = body
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        wait(|| scroll.vadjustment().upper() > scroll.vadjustment().page_size() + 50.0);
+        scroll.vadjustment().set_value(50.0);
+        let offset = scroll.vadjustment().value();
+        assert!(offset > 0.0);
+        assert!(w.search.grab_focus());
+        let focused = gtk::prelude::GtkWindowExt::focus(&w.window);
+        search("absent");
+        assert!(w.home_no_results.is_visible());
+        assert!(!w.home_no_results.is_mapped());
+        assert_eq!(w.content.visible_child_name().as_deref(), Some(name));
+        assert_eq!(scroll.vadjustment().value(), offset);
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focused);
+        search("");
+    }
+    gio::prelude::ActionGroupExt::activate_action(&w.window, "home", None);
+    assert_eq!(w.content.visible_child_name().as_deref(), Some("home"));
+    model.borrow_mut().games.clear();
+    refresh_filters(&w, &model.borrow());
+    assert!(!w.home_no_results.is_visible());
+    for description in [
+        "Sign in to GOG to load your library.",
+        "No installable games were found on this GOG account.",
+    ] {
+        w.empty.set_description(Some(description));
+        gio::prelude::ActionGroupExt::activate_action(&w.window, "home", None);
+        assert_eq!(w.content.visible_child_name().as_deref(), Some("empty"));
+        assert_eq!(w.empty.description().as_deref(), Some(description));
+    }
+    w.window.destroy();
+}
+
+#[test]
+#[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
+fn filter_controls_preserve_search_and_intersect_in_either_order() {
+    assert!(
+        std::env::var("HOME")
+            .unwrap()
+            .starts_with("/tmp/ludomere-p325-")
+    );
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.ludomere.FilterSearchTest")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    app.register(gio::Cancellable::NONE).unwrap();
+    let w = Rc::new(window::create_widgets(&app, &Config::default()));
+    let mut matching = Game {
+        product_id: 1,
+        title: "Needle match".into(),
+        languages: vec!["English".into()],
+        platforms: crate::domain::Platforms {
+            linux: true,
+            ..Default::default()
+        },
+        ..Game::default()
+    };
+    let term = crate::domain::MetadataTerm {
+        provider_id: None,
+        name: "Adventure".into(),
+        slug: "adventure".into(),
+        source: crate::domain::MetadataSource::GamesDb,
+    };
+    matching.metadata.genres.push(term.clone());
+    matching.metadata.game_modes.push(term.clone());
+    matching.metadata.properties.push(term);
+    let model = Rc::new(RefCell::new(AppModel {
+        games: vec![
+            matching.clone(),
+            Game {
+                product_id: 2,
+                title: "Needle other".into(),
+                ..Game::default()
+            },
+            Game {
+                product_id: 3,
+                title: "Unrelated match".into(),
+                ..matching
+            },
+        ],
+        favorites: HashSet::from([1, 3]),
+        tags: HashMap::from([(1, vec!["Custom".into()]), (3, vec!["Custom".into()])]),
+        section_states: (1..=3)
+            .map(|id| ((id, online::DetailSection::Metadata), SectionState::Ready))
+            .collect(),
+        ..AppModel::default()
+    }));
+    for game in &model.borrow().games {
+        let row = game_row(game, false, false);
+        row.set_widget_name(&game.product_id.to_string());
+        w.game_list.append(&row);
+        let card = game_card(game, false, 140);
+        card.set_widget_name(&game.product_id.to_string());
+        w.home_grid.insert(&card, -1);
+    }
+    update_language_options(&w, &model.borrow());
+    update_metadata_filter_options(&w, &model);
+    organization::rebuild_filters(&w, &model);
+    window::connect_actions(&w, &model);
+    initialize_library_loading(&w, &model);
+    w.window.present();
+    while glib::MainContext::default().iteration(false) {}
+    let original_row = find_list_row(&w, "1").unwrap();
+    let original_card = w.home_grid.first_child().unwrap();
+    let page = w.content.visible_child_name();
+    w.game_list.select_row(Some(&original_row));
+    assert!(w.search.grab_focus());
+    let focused = gtk::prelude::GtkWindowExt::focus(&w.window);
+    let search = |query: &str| {
+        w.search.set_text(query);
+        w.search.emit_by_name::<()>("search-changed", &[]);
+    };
+    let assert_results = |expected: &[i64]| {
+        assert_eq!(w.search.text(), "Needle");
+        assert_eq!(model.borrow().query, "Needle");
+        assert!(w.search.is_visible() && w.search.is_sensitive());
+        assert_eq!(
+            w.count.label(),
+            format!(
+                "{} {}",
+                expected.len(),
+                if expected.len() == 1 { "game" } else { "games" }
+            )
+        );
+        for id in 1..=3 {
+            assert_eq!(
+                find_list_row(&w, &id.to_string())
+                    .unwrap()
+                    .is_child_visible(),
+                expected.contains(&id)
+            );
+            assert_eq!(
+                w.home_grid
+                    .child_at_index(id as i32 - 1)
+                    .unwrap()
+                    .is_child_visible(),
+                expected.contains(&id)
+            );
+        }
+        assert_eq!(find_list_row(&w, "1"), Some(original_row.clone()));
+        assert_eq!(w.game_list.selected_row(), Some(original_row.clone()));
+        assert_eq!(w.home_grid.first_child(), Some(original_card.clone()));
+        assert_eq!(w.content.visible_child_name(), page);
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&w.window), focused);
+    };
+    search("Needle");
+    assert_results(&[1, 2]);
+    for check in [&w.favorite_filter, &w.linux_filter] {
+        check.set_active(true);
+        assert_results(&[1]);
+        assert!(w.filter_chips.is_visible());
+        check.set_active(false);
+        assert_results(&[1, 2]);
+        search("");
+        check.set_active(true);
+        search("Needle");
+        assert_results(&[1]);
+        check.set_active(false);
+    }
+    w.language_filter.set_selected(1);
+    assert_results(&[1]);
+    w.language_filter.set_selected(0);
+    assert_results(&[1, 2]);
+    search("");
+    w.language_filter.set_selected(1);
+    search("Needle");
+    assert_results(&[1]);
+    w.language_filter.set_selected(0);
+    for container in [
+        &w.genre_theme_filter_box,
+        &w.game_mode_filter_box,
+        &w.property_filter_box,
+        &w.organization_filters,
+    ] {
+        let check = std::iter::successors(container.first_child(), |widget| widget.next_sibling())
+            .filter_map(|widget| widget.downcast::<gtk::CheckButton>().ok())
+            .find(|check| matches!(check.label().as_deref(), Some("Adventure" | "Custom")))
+            .unwrap();
+        check.set_active(true);
+        assert_results(&[1]);
+        check.set_active(false);
+        assert_results(&[1, 2]);
+        search("");
+        check.set_active(true);
+        search("Needle");
+        assert_results(&[1]);
+        check.set_active(false);
+        assert_results(&[1, 2]);
+    }
+    w.favorite_filter.set_active(true);
+    w.language_filter.set_selected(1);
+    assert_results(&[1]);
+    w.clear_filters.emit_clicked();
+    assert_results(&[1, 2]);
+    w.favorite_filter.set_active(true);
+    gtk::prelude::WidgetExt::activate_action(
+        &w.window,
+        "win.remove-library-filter",
+        Some(&"favorite".to_variant()),
+    )
+    .unwrap();
+    assert_results(&[1, 2]);
+    assert!(model.borrow().section_queue.is_empty());
+    assert!(model.borrow().section_active.is_empty());
+    // Exercise the actual count/status expressions with unknown metadata retained.
+    for id in [1, 2] {
+        model
+            .borrow_mut()
+            .section_states
+            .remove(&(id, online::DetailSection::Metadata));
+    }
+    for (query, games, candidates) in [
+        ("absent", "0 games", "0 candidates"),
+        ("Needle match", "1 game", "1 candidate"),
+        ("Needle", "2 games", "2 candidates"),
+    ] {
+        for metadata_filter in [false, true] {
+            {
+                let mut state = model.borrow_mut();
+                state.query = query.into();
+                state.cloud_saves_only = metadata_filter;
+            }
+            refresh_filters(&w, &model.borrow());
+            assert_eq!(
+                w.count.text(),
+                if metadata_filter {
+                    format!("{candidates} · results incomplete")
+                } else {
+                    format!("{games} · metadata search incomplete")
+                }
+            );
+        }
+    }
+    let status = find_named_descendant(
+        w.filter_button.popover().unwrap().upcast_ref(),
+        "filter-data-status",
+    )
+    .and_downcast::<gtk::Label>()
+    .unwrap();
+    assert_eq!(
+        status.text(),
+        "Loading filter data for 2 games. Results are incomplete."
+    );
+    model
+        .borrow_mut()
+        .section_states
+        .insert((2, online::DetailSection::Metadata), SectionState::Ready);
+    refresh_filters(&w, &model.borrow());
+    assert_eq!(
+        status.text(),
+        "Loading filter data for 1 game. Results are incomplete."
+    );
+    for (id, expected) in [
+        (
+            1,
+            "Filter data incomplete for 1 game; 1 failed. Unknown games remain candidates.",
+        ),
+        (
+            2,
+            "Filter data incomplete for 2 games; 2 failed. Unknown games remain candidates.",
+        ),
+    ] {
+        model.borrow_mut().section_states.insert(
+            (id, online::DetailSection::Metadata),
+            SectionState::Failed("Synthetic".into()),
+        );
+        refresh_filters(&w, &model.borrow());
+        assert_eq!(status.text(), expected);
+    }
+    assert!(!crate::identity::database().exists());
+    w.window.destroy();
+}
+
+#[test]
+#[ignore = "requires isolated HOME/all XDG, private GTK display and D-Bus"]
 fn filter_counts_reuse_matches_without_changing_rows_selection_or_collapsed_sections() {
     assert!(
         std::env::var("HOME")
@@ -1610,6 +2527,31 @@ pub(super) fn sidebar_row_visible(model: &AppModel, row: &gtk::ListBoxRow) -> bo
 pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
     let count = refresh_sidebar_visibility(w, model);
     w.home_grid.invalidate_filter();
+    // The sidebar's playable-only switch does not filter Home.
+    let no_results = !model.games.is_empty()
+        && count == 0
+        && !model
+            .games
+            .iter()
+            .any(|game| game_matches_filters(model, game));
+    w.home_no_results.set_visible(no_results);
+    if no_results {
+        let all_hidden = !model.show_hidden
+            && model
+                .games
+                .iter()
+                .all(|game| model.hidden_products.contains(&game.product_id));
+        w.home_no_results.set_title(if all_hidden {
+            "No games to show"
+        } else {
+            "No matching games"
+        });
+        w.home_no_results.set_description(Some(if all_hidden {
+            "Enable Show hidden in Filters to see your hidden games."
+        } else {
+            "Try a different search or adjust your filters."
+        }));
+    }
     let incomplete = model
         .games
         .iter()
@@ -1634,11 +2576,21 @@ pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
         || !model.property_filters.is_empty();
     w.count
         .set_label(&if incomplete > 0 && metadata_filter_active {
-            format!("{count} candidates · results incomplete")
+            format!(
+                "{count} {} · results incomplete",
+                if count == 1 {
+                    "candidate"
+                } else {
+                    "candidates"
+                }
+            )
         } else if incomplete > 0 && !model.query.is_empty() {
-            format!("{count} games · metadata search incomplete")
+            format!(
+                "{count} {} · metadata search incomplete",
+                if count == 1 { "game" } else { "games" }
+            )
         } else {
-            format!("{count} games")
+            format!("{count} {}", if count == 1 { "game" } else { "games" })
         });
     if let Some(popover) = w.filter_button.popover() {
         for name in [
@@ -1671,7 +2623,14 @@ pub(super) fn refresh_filters(w: &Widgets, model: &AppModel) {
         if let Some(label) = find_named_descendant(popover.upcast_ref(), "filter-data-status")
             .and_downcast::<gtk::Label>()
         {
-            label.set_label(&if incomplete == 0 { String::new() } else if failed > 0 { format!("Filter data incomplete for {incomplete} games; {failed} failed. Unknown games remain candidates.") } else { format!("Loading filter data for {incomplete} games. Results are incomplete.") });
+            let games = if incomplete == 1 { "game" } else { "games" };
+            label.set_label(&if incomplete == 0 {
+                String::new()
+            } else if failed > 0 {
+                format!("Filter data incomplete for {incomplete} {games}; {failed} failed. Unknown games remain candidates.")
+            } else {
+                format!("Loading filter data for {incomplete} {games}. Results are incomplete.")
+            });
             label.set_visible(incomplete > 0);
         }
         if let Some(retry) = find_named_descendant(popover.upcast_ref(), "filter-data-retry")
@@ -1812,8 +2771,6 @@ fn rebuild_filter_chips(w: &Widgets, model: &AppModel) {
         button.set_child(Some(&content));
         w.filter_chips.insert(&button, -1);
     }
-    w.search.set_visible(!active);
-    w.search.set_sensitive(!active);
     w.filter_chips.set_visible(active);
 }
 
@@ -1952,13 +2909,7 @@ pub(super) fn rebuild_metadata_filter_box(
             } else {
                 set.remove(&value);
             }
-            if check.is_active() {
-                state.query.clear();
-            }
             drop(state);
-            if check.is_active() && !widgets.search.text().is_empty() {
-                widgets.search.set_text("");
-            }
             refresh_filters(&widgets, &model.borrow());
             if check.is_active() {
                 request_filter_metadata(&widgets, &model, false);

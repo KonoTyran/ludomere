@@ -20,6 +20,7 @@ struct Preview {
     status: gtk::Label,
     retry: gtk::Button,
     alternatives: gtk::Box,
+    alternatives_expander: gtk::Expander,
     exact_library: RefCell<Option<String>>,
     prepare_recovery: gtk::Button,
     busy: Cell<bool>,
@@ -43,6 +44,9 @@ impl Preview {
         self.cleanup.set_active(false);
         self.cleanup.set_sensitive(false);
         self.retry.set_sensitive(false);
+        self.retry.set_visible(false);
+        self.alternatives_expander.set_visible(false);
+        self.alternatives_expander.set_expanded(false);
         self.prepare_recovery.set_visible(false);
         while let Some(child) = self.alternatives.first_child() {
             self.alternatives.remove(&child);
@@ -159,10 +163,17 @@ impl Preview {
                                     match downloads {
                                         Some(Ok(files)) => {
                                             preview.cleanup.set_sensitive(files.count() > 0);
-                                            preview.status.set_label(&format!("{} managed downloaded files ({})", files.count(), human_size(files.bytes())));
+                                            preview.status.set_label(&format!(
+                                                "{} managed downloaded files ({})",
+                                                files.count(),
+                                                human_size(files.bytes())
+                                            ));
                                             *preview.downloads.borrow_mut() = Some(files);
                                         }
-                                        Some(Err(error)) => preview.status.set_label(&notifications::failure_message("Downloaded files could not be checked. They will be kept; retry to enable optional cleanup.", &error)),
+                                        Some(Err(error)) => {
+                                            preview.status.set_label(&notifications::failure_message("Downloaded files could not be checked. They will be kept; retry to enable optional cleanup.", &error));
+                                            preview.retry.set_visible(true);
+                                        }
                                         None => {}
                                     }
                                 }
@@ -185,6 +196,8 @@ impl Preview {
                             dialog.set_response_enabled("uninstall", true);
                         }
                         Err(error) => {
+                            preview.retry.set_visible(true);
+                            preview.alternatives_expander.set_expanded(true);
                             preview.description.set_label("Nothing has been removed. Browse the files to inspect or back up saves, then review the available recovery options below.");
                             preview.status.set_label(&notifications::failure_message(
                                 "Could not prepare removal",
@@ -195,6 +208,9 @@ impl Preview {
                             );
                         }
                     }
+                    preview
+                        .alternatives_expander
+                        .set_visible(!alternatives.is_empty());
                     for (library, path) in alternatives {
                         let review = gtk::Button::with_label(&format!(
                             "Review File Reset — {}",
@@ -216,6 +232,7 @@ impl Preview {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     preview.busy.set(false);
                     preview.retry.set_sensitive(true);
+                    preview.retry.set_visible(true);
                     preview.status.set_label(
                         "The removal check stopped. Nothing was removed. Retry the check.",
                     );
@@ -376,7 +393,15 @@ fn show_removal_dialog(
     status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     status.set_selectable(true);
     let retry = gtk::Button::with_label("Retry removal check");
+    retry.set_widget_name("removal-check-retry");
+    retry.set_visible(false);
     let alternatives = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let alternatives_expander = gtk::Expander::builder()
+        .name("removal-options")
+        .label("Other removal options")
+        .child(&alternatives)
+        .visible(false)
+        .build();
     let prepare_recovery = gtk::Button::with_label("Prepare Recovery…");
     prepare_recovery.set_visible(false);
     let extra = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -395,7 +420,7 @@ fn show_removal_dialog(
     let browse = gtk::Button::with_label("Browse Local Files Before Removing");
     extra.append(&browse);
     extra.append(&retry);
-    extra.append(&alternatives);
+    extra.append(&alternatives_expander);
     extra.append(&prepare_recovery);
     dialog.set_extra_child(Some(&extra));
     let preview = Rc::new(Preview {
@@ -412,6 +437,7 @@ fn show_removal_dialog(
         status,
         retry,
         alternatives,
+        alternatives_expander,
         exact_library: RefCell::new(exact_library),
         prepare_recovery,
         busy: Cell::new(false),
@@ -774,6 +800,203 @@ fn run_recovery(preview: Rc<Preview>, plan: crate::installation::GameResetPlan) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG, D-Bus and GTK; synthetic previews only"]
+    fn normal_removal_keeps_recovery_available_and_retry_explains_failures() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p343-")
+            );
+        }
+        adw::init().unwrap();
+        gtk::Settings::default()
+            .unwrap()
+            .set_gtk_enable_animations(false);
+        install_css();
+        fn wait(check: impl Fn() -> bool) {
+            let until = std::time::Instant::now() + Duration::from_secs(8);
+            while !check() && std::time::Instant::now() < until {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn labels(widget: &gtk::Widget) -> String {
+            let mut result = widget
+                .downcast_ref::<gtk::Label>()
+                .map_or_else(String::new, |label| label.text().to_string());
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                result.push_str(&labels(&widget));
+                child = widget.next_sibling();
+            }
+            result
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.RemovalOptionsTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(800)
+            .default_height(600)
+            .build();
+        window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+        window.present();
+        for windows in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let library = root.path().join("games");
+            let directory = library.join("removal-fixture");
+            std::fs::create_dir_all(&directory).unwrap();
+            let config = Config {
+                game_libraries: vec![crate::config::GameLibrary {
+                    id: "fixture".into(),
+                    name: "Fixture".into(),
+                    path: library.clone(),
+                    default: true,
+                }],
+                ..Config::default()
+            };
+            config.save().unwrap();
+            let game = Game {
+                product_id: if windows { 9343002 } else { 9343001 },
+                slug: "removal-fixture".into(),
+                title: "Removal Fixture".into(),
+                ..Game::default()
+            };
+            let mut marker: crate::installation::InstallationMarker = serde_json::from_value(
+                serde_json::json!({"schema_version":1,"product_id":game.product_id,
+                    "slug":game.slug,"base":{"operating_system":"linux","installed_at":1},
+                    "launch":{"executable":"game.exe"}}),
+            )
+            .unwrap();
+            let prefix = crate::compatibility::prefix_path(&library, &game.slug);
+            if windows {
+                marker.schema_version = 2;
+                marker.base.operating_system = Some("windows".into());
+                marker.compatibility = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "backend":"umu","managed_by_ludomere":true,"prefix_slug":game.slug,
+                        "profile":crate::compatibility::UmuProfile::fallback()
+                    }))
+                    .unwrap(),
+                );
+                std::fs::create_dir_all(&prefix).unwrap();
+                crate::compatibility::write_ownership(&prefix, &game.slug).unwrap();
+                std::fs::write(prefix.join("synthetic-save"), "keep").unwrap();
+            }
+            std::fs::write(directory.join("game.exe"), "inert fixture payload").unwrap();
+            crate::installation::write_installation_marker(&marker, &directory).unwrap();
+            StateStore::open()
+                .unwrap()
+                .upsert_normalized_library(std::slice::from_ref(&game))
+                .unwrap();
+            let detail = DetailPageModel::game(game.clone(), false);
+            let model = Rc::new(RefCell::new(AppModel {
+                config: config.clone(),
+                games: vec![game],
+                ..AppModel::default()
+            }));
+            let dialog = show_uninstall_dialog(&window, &model, &detail, Rc::new(|| {}));
+            let retry = find_named_descendant(dialog.upcast_ref(), "removal-check-retry")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            let options = find_named_descendant(dialog.upcast_ref(), "removal-options")
+                .and_downcast::<gtk::Expander>()
+                .unwrap();
+            assert!(!retry.is_visible());
+            wait(|| dialog.is_response_enabled("uninstall"));
+            assert_eq!(dialog.response_label("uninstall"), "Uninstall");
+            assert!(!retry.is_visible());
+            assert!(options.is_visible() && !options.is_expanded());
+            assert_eq!(dialog.default_response().as_deref(), Some("cancel"));
+            assert_eq!(dialog.close_response(), "cancel");
+            let text = labels(dialog.upcast_ref());
+            assert!(text.contains("Browse Local Files Before Removing"));
+            assert!(text.contains("Downloaded files are kept unless selected below"));
+            if windows {
+                assert!(text.contains("including all saves and settings INSIDE it"));
+                assert!(text.contains(prefix.to_str().unwrap()));
+            }
+            options.set_expanded(true);
+            let review = options
+                .child()
+                .unwrap()
+                .first_child()
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            wait(|| review.is_mapped());
+            assert!(
+                review
+                    .label()
+                    .unwrap()
+                    .contains(directory.to_str().unwrap())
+            );
+            review.emit_clicked();
+            wait(|| dialog.is_response_enabled("uninstall"));
+            assert_eq!(dialog.response_label("uninstall"), "Remove files and reset");
+            assert!(labels(dialog.upcast_ref()).contains("ALL contents"));
+            assert!(labels(dialog.upcast_ref()).contains("prefixes are kept"));
+            assert!(directory.join("game.exe").exists());
+            if windows {
+                assert!(prefix.join("synthetic-save").exists());
+            }
+            dialog.close();
+            wait(|| window.visible_dialog().is_none());
+
+            let other = root.path().join("other-games");
+            std::fs::create_dir_all(other.join(&detail.slug)).unwrap();
+            model
+                .borrow_mut()
+                .config
+                .game_libraries
+                .push(crate::config::GameLibrary {
+                    id: "other".into(),
+                    name: "Other".into(),
+                    path: other,
+                    default: false,
+                });
+            model.borrow().config.save().unwrap();
+            let failed = show_uninstall_dialog(&window, &model, &detail, Rc::new(|| {}));
+            let retry = find_named_descendant(failed.upcast_ref(), "removal-check-retry")
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            let options = find_named_descendant(failed.upcast_ref(), "removal-options")
+                .and_downcast::<gtk::Expander>()
+                .unwrap();
+            wait(|| retry.is_visible() && retry.is_sensitive());
+            assert!(!failed.is_response_enabled("uninstall"));
+            assert!(options.is_visible() && options.is_expanded());
+            assert!(labels(failed.upcast_ref()).contains("Nothing has been removed"));
+            model.borrow_mut().config = config;
+            model.borrow().config.save().unwrap();
+            retry.emit_clicked();
+            assert!(!retry.is_visible());
+            wait(|| failed.is_response_enabled("uninstall"));
+            assert!(!retry.is_visible());
+            assert!(options.is_visible() && !options.is_expanded());
+            assert_eq!(failed.response_label("uninstall"), "Uninstall");
+            failed.close();
+            wait(|| window.visible_dialog().is_none());
+            assert!(directory.join("game.exe").exists());
+            if windows {
+                assert!(prefix.join("synthetic-save").exists());
+            }
+        }
+        window.destroy();
+    }
 
     #[test]
     #[ignore = "requires private HOME/all XDG, D-Bus and GTK display; removes only synthetic fixtures"]

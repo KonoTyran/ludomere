@@ -325,9 +325,13 @@ fn prepare(
             installer_complete: true,
             installer_operating_system: Some(plan.base.operating_system.clone()),
             installer_language: plan.base.language.clone(),
-            compatibility: preferences
-                .as_ref()
-                .and_then(|preferences| preferences.compatibility.clone()),
+            compatibility: if plan.base.operating_system == "windows" {
+                preferences
+                    .as_ref()
+                    .and_then(|preferences| preferences.compatibility.clone())
+            } else {
+                None
+            },
             primary_executable: None,
             launch_arguments: preferences
                 .map_or_else(Vec::new, |preferences| preferences.launch_arguments),
@@ -670,6 +674,104 @@ mod tests {
                 error: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME and all XDG directories under /tmp/ludomere-p352-"]
+    fn native_and_windows_plans_keep_saved_runtime_preferences_separate() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p352-"),
+                "{key}"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let choice = choice(&root.path().join("library"));
+        let preferences = crate::domain::GamePreferences {
+            product_id: 7,
+            launch_arguments: vec!["--retained".into()],
+            compatibility: Some(crate::compatibility::GameCompatibilityPreferences {
+                backend: crate::compatibility::CompatibilityBackendKind::Umu,
+                prefix_slug: "game".into(),
+                profile: crate::compatibility::UmuProfile::fallback(),
+                pending_profile: Some(crate::compatibility::UmuProfile {
+                    game_id: "umu-pending".into(),
+                    store: "gog".into(),
+                    source: crate::compatibility::UmuProfileSource::GogProductId,
+                }),
+            }),
+            ..Default::default()
+        };
+        store.upsert_game_preferences(&preferences).unwrap();
+        store.preserve_product_activity(7, Some(100), 123).unwrap();
+        for os in ["linux", "windows"] {
+            let mut request = request(&choice.config.game_libraries[0].path, 7, os);
+            request.artifacts[0].part_count = Some(2);
+            request.artifacts.push(RemoteArtifact {
+                part_number: Some(2),
+                download_path: format!("/installer/7/{os}/2"),
+                ..request.artifacts[0].clone()
+            });
+            let record = intent(&store, std::slice::from_ref(&request), &choice)
+                .unwrap()
+                .unwrap();
+            let plan: InstallPlan = serde_json::from_str(&record.plan_json).unwrap();
+            save_job(&store, &request, true);
+            if os == "windows" {
+                let job = store.download_job(&plan.base.job_id).unwrap().unwrap();
+                let files = job
+                    .completed_files
+                    .iter()
+                    .map(|path| {
+                        let renamed = path.with_extension("exe");
+                        std::fs::rename(path, &renamed).unwrap();
+                        renamed
+                    })
+                    .collect::<Vec<_>>();
+                store
+                    .save_download_job(&DownloadJobUpdate {
+                        job_id: &job.job_id,
+                        product_id: job.product_id,
+                        title: &job.title,
+                        artifacts: &job.artifacts,
+                        destination: &job.destination,
+                        state: DownloadState::Complete,
+                        bytes_downloaded: 8,
+                        total_bytes: Some(8),
+                        completed_files: &files,
+                        error: None,
+                    })
+                    .unwrap();
+            }
+            let (game, dlc) = prepare(&store, &plan).unwrap().unwrap();
+            assert!(dlc.is_empty());
+            assert_eq!(game.installer_files.len(), 2);
+            assert_eq!(game.installer_operating_system.as_deref(), Some(os));
+            assert_eq!(
+                game.compatibility,
+                if os == "windows" {
+                    preferences.compatibility.clone()
+                } else {
+                    None
+                }
+            );
+            assert_eq!(game.installation_directory, plan.library.path.join("game"));
+            assert_eq!(game.launch_arguments, preferences.launch_arguments);
+            assert_eq!(game.last_played_at, Some(100));
+            assert_eq!(game.playtime_seconds, 123);
+            assert_eq!(store.game_preferences(7).unwrap().unwrap(), preferences);
+        }
     }
 
     #[test]

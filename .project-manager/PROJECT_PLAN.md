@@ -1,5 +1,566 @@
 # Project plan
 
+## R112 release 0.4.0
+
+- P413 (complete, release_040; independent reviewer pr_inventory): all four Ludomere
+  metadata files now0.4.0; dependencies unchanged, AppStream history retained. Root reviewed
+  the exact diff; isolated full build passes.
+- P414 (complete, pr_inventory): hash-covered inventory of every upstream-diff behavior
+  reviewed for the PR, with delivered fixes distinguished from remaining manual coverage.
+- Root (complete): reviewed metadata, verification and inventory, committed/pushed d011c07,
+  and created upstream/main PR9. No package build/install or additional real-profile operations.
+
+## R111 interactive audit
+
+- P412 (complete, ui_critic; reviewer performance_audit): show Preparing reset… on the
+  recovery window's disabled Retry button while its existing worker validates/schedules reset;
+  restore Retry reset before re-enabling on error/disconnect. Three main.rs button label setters
+  only; keep original diagnostics and Close available. No actual reset, new fixture, state/
+  deletion/policy change or regular Settings reset change. Independent source/fmt/build gates.
+  Exact three-line independent source GO; fmt/build PASS. No real reset executed or claimed.
+
+- P411 (complete, file_summary; reviewers performance_audit/UI harness ui_critic):
+  current live927556d repeats P375 gtk_widget_is_ancestor critical after repair Start and before
+  component consent; canceled, no component/game mutation. Port only fail-closed old diagnostic
+  seams to isolated current source and genuine root-pointer staged X11 fixture/private profile/bus.
+  Require no DB/queue/helper/network, admission refusal even accidental consent Confirm, normal
+  animations and unique synthetic window. No production timing/focus patch or main integration
+  authorized before evidence. Root alone handles explicit display/auth path, actual pointer input
+  and screenshots; agents never inspect desktop/profile/auth material. Stop if scope grows.
+  Frozen cfg(test)-only diagnostic and root-only wrapper independently source-reviewed GO by
+  UI and safety reviewers. Root compilation/runtime gate underway; no main product changes.
+  Unchanged native-pointer reproducer repeatedly finds the critical; one isolated focus-clear
+  call before child replacement removes it in p411-2apbzu1s with every gate retained. Independent
+  production-source GO permits one-line main preview, existing consent regression and actual
+  repair/keyboard/Cancel gates. Diagnostic/stack-observer code stays out of main; cause bounded.
+  Final four-line candidate also focuses visible Cancel after replacement. Existing fixture now
+  matches production's presented-dialog lifecycle and asserts initial Cancel plus four native
+  traversal targets; p370a-iiba2nqc PASS. Real Coffee Tab/ShiftTab/Space Cancel passes without
+  setup or critical. Freshly compiled final pointer gate p411-hk_w2z0i PASS, warning absent and
+  focus retained in consent. Independent QA/safety GO; fresh consolidated build PASS at final
+  source (574 library, six integration, five Python tests, fmt/Clippy/build). Commit gate follows.
+
+- P410 (complete, ui_critic; reviewer file_summary): relabel shared Proton release-lookup/
+  download cancel button to Cancel, since root observed misleading Cancel download before any
+  runtime transfer. One literal in isolated proton.rs; no Comet change (its existing label is
+  accurate), tests or callback/policy change. Source/fmt/build and root loading screenshot gate.
+  Independent source GO; fmt/build PASS, live p410-proton-loading shows Cancel during release
+  metadata lookup. Existing Proton selection/runtime retained; no payload download initiated.
+
+- P408 (complete, performance_audit; reviewer file_summary): invalidate observed
+  download-completion feedback when its exact completed jobs disappear/change after managed
+  archive deletion. R111 real stale-status finding while another archive remains. details.rs
+  only, in-memory IDs plus existing actual-panel fixture; preserve installed Play, status
+  priority, automatic-install copy, unrelated jobs and page identity. No backend mutation or
+  GTK file/DB work; isolated source only, root gates. Independent proposal GO: invalidate whole
+  claim on any missing/noncomplete same-product ID, replace per new batch, preserve resets.
+  Actual timer fixture must retain product membership and test visible claim, not hidden text.
+  Frozen implementation independently GO; identical actual-panel fixture fails baseline at
+  expected disappearance wait p408-e7zxpkbe and passes reviewed production p408-gimihv_q.
+  Formatting/compilation/all-target Clippy PASS. No new backend or GTK I/O; live repeat pending.
+
+- P409 (complete, ui_critic; reviewer performance_audit): explain retained historical
+  Downloads graph when no featured transfer exists. One wrapping label in existing header,
+  keep graph/rates/queue/actions. Existing actual renderer fixture extends idle/paused/failed
+  assertions. No success/empty-queue claim, redesign or new framework; root visual gate.
+  Isolated downloads.rs only. Independent proposal GO; paused/failed precedence gate retains
+  positive history and queued-only positive-history case retains row/count. Root gates.
+  Independent implementation GO; actual renderer p378-_o_stb4z PASS normal/enlarged fonts.
+  Live history paragraph visible with zero current rates; graph/queue/actions retained.
+
+- P407 (complete, ui_critic; reviewer file_summary): place basic cloud enable/status/sync
+  controls before Export/manage in Properties. Root actual screenshot and bounded proposal
+  confirm discoverability issue. Move only final management-group attachment and existing
+  fixture's expected order in isolated game_settings.rs. Preserve callbacks, visibility,
+  hidden-page focus, consent and cloud operations. No new fixture/framework or actual data
+  access by agents; root runs focused loader gate and actual Windows/native presentation checks.
+  Independent source GO; private retained loader gate p369-_nplom9x PASS and root actual
+  Coffee basic-first/management-below plus native Gungeon explanation PASS; fmt/build PASS.
+
+- P406 (complete, ui_critic; reviewer file_summary): replace misleading success text claiming
+  live updates after forced Refresh with Follow off. One logs.rs literal: Saved launch output.
+  Preserve Follow/Refresh/read/paused/error semantics and P399 folder feedback. No new fixture
+  framework; source/fmt/build and existing private P399 actual-view regression are proportionate.
+  Independent one-literal review, fmt/compile and retained actual-reader gate p399-1jkhg1gq PASS.
+
+- P405 (complete, ui_critic; reviewer file_summary): show Installation directory as a
+  full-width selectable ActionRow subtitle instead of ellipsized suffix, matching existing
+  destination rows. Isolated game_settings.rs one-row presentation only; markup disabled,
+  native wrapping, no file I/O/identity/callback/generic-info-row change. Root actual normal/
+  narrow screenshot gate and source native wrapping check; stop if layout fails, no geometry
+  framework. Old label already selectable; claim improved readability, not newly enabled copy.
+  Independent native-resource/source review, fmt/build and actual950/680/561px layout PASS.
+  Full path wraps at enforced561px minimum and selects with Ctrl+A; Browse remains reachable.
+
+- P404 (complete, file_summary; reviewer ui_critic): distinct narrower successor to deferred
+  P393: remove explicit Rust ownership cycles in three management popup capture blocks. Strict
+  actual-builder never-opened release with retained harmless buttons/controller; separately
+  preserve mapped Hide/Favorite/submenu action and close order. No native mapped-release,
+  whole-window or eager-per-library-row savings claim. Independent narrower proposal GO;
+  root private gates, isolated files.rs only. P393 original mapped gate remains unmet.
+  Identical strict unopened test fails old production at weak-release wait (p404-ixo6aymj),
+  passes after weak captures (p404-pbsnm7lk). Separate mapped dispatch/order gate p404-c5c_3fnl
+  PASS; independent final source review/fmt/compile/Clippy PASS. Known private schema warnings.
+
+- P403 (complete, performance_audit; reviewer ui_critic): guard existing background archive chooser
+  polling across profile freeze/logout and stale/closed dialog results. Proposal preserves500ms
+  cadence, single worker, batching/fallbacks/actions; pre-spawn activity and original raw/model
+  generations, weak owners and post-refresh recheck. Isolated download_chooser.rs and focused
+  actual-wiring private test; no cache/event redesign or real account/reset/files. Independent
+  proposal review before implementation. The I/O was already off-thread, not a GTK migration.
+  Proposal independently approved; preserve raw counters, guard through send and post-setter
+  admission. Root gates actual wiring with private inert worker barriers plus P338 equivalence.
+  Final exact actual-wiring private gate p403-3132_dmv PASS after independently reviewed
+  fixture-only compatible-library correction. Strict assertions/production unchanged; first
+  failure retained. P338 matching/loader/presentation regressions PASS. Compile/fmt PASS.
+
+- P402 (complete, ui_critic; reviewer performance_audit): correct singular file count in
+  Properties archive category and its confirmation. Two strings only, preserve count/bytes/
+  delete consent and behavior; isolated files.rs, source/fmt/build and root one-file visual gate.
+  No new fixture framework or actual deletion. Retired-version copy workaround deferred in
+  favor of considering an in-place update, with no implementation authorized yet.
+  Independent source review/fmt/build PASS; actual one-file summary and confirmation verified,
+  confirmation canceled without deleting anything. Multi-file summary remains plural.
+
+- P401 (complete, ui_critic; reviewer performance_audit): generic new Properties window opens
+  General first, retaining explicit Cloud Saves access and selected page in an existing window.
+  Own isolated game_settings.rs navigation-array order only; source confirms sole generic caller.
+  Root actual native-game Properties/default/Cloud/reopen check, formatting/build; no new policy
+  or test framework. Feature/play-mode semantic deduplication remains deferred.
+  Root live p401-general-default.png and p401-existing-cloud-retained.png verify General first,
+  Cloud accessible and reused window retains Cloud. Source review/fmt/build PASS.
+
+- P400 (complete for bounded source coverage, performance_audit): cumulative R111 auth/credential,
+  installation/marker and download changes against5c0d5cb, focusing lifecycle/session, path/data
+  preservation and accidental GTK I/O. Report concrete severity/evidence and bounded fixes only;
+  distinguish authored sections from independent review, no blanket readiness declaration.
+  No product edits, actual data/credentials/desktop/helpers/network or Cargo; root handles gates.
+  No introduced blocker established; p400-assurance.md records independent vs own coverage and
+  inherited limits. Review correction: chooser polling already runs on a worker, including at
+  baseline5c0d5cb; the initial GTK-I/O residual statement was incorrect. No readiness claim.
+
+- P399 (complete, ui_critic; reviewer performance_audit): runtime-log folder opening
+  failure is overwritten by unrelated periodic reader success. Propose minimal distinct local
+  feedback in logs.rs using existing async launcher and guards; no polling-policy change,
+  actual desktop helper or generic feedback framework. Implementation only after source review;
+  use existing fixture/seam if possible, preserve Follow/selection/Copy behavior.
+  Independent proposal GO; exact shared completion with fail-closed synthetic launch outcomes,
+  real private reader updates to demonstrate feedback persistence. No runtime retry-policy change.
+  Final source GO includes recheck after feedback setters; private actual-reader/launch-outcome
+  gate p399-35yn4yyi PASS, fmt/compile/Clippy PASS. No actual file-manager failure induced.
+
+- P398 (complete, ui_critic; reviewer performance_audit): Downloads folder-button eligibility
+  uses nonempty path, not a GTK-thread directory stat; existing off-thread validation/launcher
+  reports missing/inaccessible paths on explicit click. Own isolated details.rs helper expression
+  and any already-existing pertinent fixture only, no new worker/cache/test framework. Empty
+  path stays disabled; all path safety preserved. Root accepts actionable error vs silent disabled
+  for nonempty missing destinations as bounded R111 feedback/performance improvement.
+  Independent exact one-expression/source-callsite review, formatting and build PASS.
+
+- P397 (complete, performance_audit; reviewer file_summary): operation-log refresh registers
+  activity before spawn and retains original session through profile I/O/publication. Own
+  isolated details.rs log worker and existing focused fixture only. Preserve partial results,
+  explicit Retry and loading-row ownership; no locks across I/O or cancellation/rollback claim.
+  No actual logs/account/reset by agents; root private gates/build.
+  Exact actual-worker/private persistence gate p255-3fwlcft_ PASS; fmt/compile/Clippy PASS.
+
+- P396 (complete, file_summary; reviewer ui_critic): guard generic async directory opening by
+  original raw auth/account and visible parent, reusing launch_validated_directory. Own isolated
+  widgets/file_open.rs plus focused inert launch fixture; preserve all config/path validation,
+  signed-out local use and error handling. No profile-activity redesign or new chooser; no real
+  file manager by agents. Root gates. Source-backed R111 unwanted delayed-focus finding.
+  Private exact helper gate p396-ttu00nkh, fmt/compile/Clippy PASS; no real file-manager activation.
+
+- P394 (complete, ui_critic; reviewer performance_audit): Add tag disabled for empty/whitespace,
+  native Enter submits same eligible action. Own organization.rs and existing synthetic fixture
+  in isolated checkout; retain backend/session guards, parent-busy refusal and tag semantics.
+  No actual tag changes by agents; root focused gates/build. Source-backed R111 UI no-op finding.
+  Actual private editor/SQLite regression p270-o18ygr8z PASS; fmt/Clippy/compile PASS.
+- P395 (complete, file_summary; reviewer ui_critic): clarify retired Achievements/Logs guidance to Home then reopen, matching
+  actual detail identity reset. Copy only, no automatic navigation or account rebinding.
+  Four literals in achievements.rs/logs.rs/details.rs only; no extra fixture or behavior change.
+  Both operation-log entry/result messages shortened to avoid additional unwrapped width.
+
+- P393 (blocked/deferred, file_summary; reviewer performance_audit): source-audit game-management popup strong
+  captures in close handlers (files.rs main/manage action loops) after unparented context use.
+  Bounded component-lifetime proposal only; no whole-window release claim or broad conversion.
+  Independent proposal GO: three weak-target blocks, unchanged signal/action/close ordering,
+  actual builder in existing focused fixture; preserve P385 file-row popup behavior.
+  Native baseline retains mapped popovers even without application builder. Original strict
+  mapped-component release gate is unmet; candidate not integrated. P404 is a separately
+  reviewed narrower explicit-cycle task, not a relabeling of this gate as passed.
+
+- P392 (complete, performance_audit; reviewer file_summary): tray recent-game menu/launch inspection
+  accesses profile without activity admission; bounded guards/session proposal separate from
+  P389 startup. Preserve signed-out local use, menu order and installedness; private fixtures
+  only, no actual reset/account or menu DB operations. No implementation before review.
+  Independent proposal GO, including repeated existing Windows foreground/detail check after
+  status setters. Isolated base de41bc5 retains completed P389; no startup lifecycle changes.
+  Private menu and strict foreground launch gates PASS; P389 regression retained. Root-only
+  synthetic X11/private-profile harness supplies focus absent from clientless Broadway.
+
+- P390 (complete, ui_critic; reviewer performance_audit): Maintenance metadata refresh local feedback and
+  repeat-click prevention using current sync state/generation. Proposal before edits; preserve
+  global refresh, signed-out reconciliation, terminal errors and weak Settings lifetime.
+  Independent proposal GO; settings.rs only. Signed-out local request acknowledgment retained,
+  no fabricated local completion/duplicate suppression. Exact inert-action GTK fixture required.
+  Review erratum: original proposal confused LIBRARY_SESSION with ACCOUNT_SESSION. Root and
+  both agents verified separate counters in online.rs236–297. No old draft integrated. Correct
+  design keeps original raw account/auth/epoch fixed and observes model sync_generation only;
+  no comparing sync_session to account_session or adopting a changed account. Fixtures must
+  model actual separate library/account generation APIs. Current-sync wording remains neutral.
+  Final private actual-control gate, real Settings refresh, fmt/Clippy/compile PASS; native
+  fixture container correction removes fixture row-focus criticals. Six-pixel feedback spacing.
+- P391 (complete, ui_critic; reviewer file_summary): prevent empty/whitespace tag Rename dismissing without action.
+  Narrow response sensitivity/entry hint, preserve backend guard/Delete/Cancel and account scope.
+  No tag model/persistence redesign; proportionate existing fixture if implementation authorized.
+  Existing mapped dialog/private persistence fixture PASS, fmt/Clippy/compile PASS.
+
+- P389 (complete, file_summary; reviewer performance_audit): source-proven blocking tray registration on GTK.
+  Return bounded worker/lifecycle proposal and proportionate private test design before edits.
+  Preserve close/quit, pending-start deduplication, command dispatch and late-handle cleanup.
+  No actual bus/account access, broad shutdown rewrite or configuration writer changes.
+  Independent proposal GO; worker owns registration and explicit shutdown, GTK only lifecycle
+  admission/readiness. Private held-driver gate, late cleanup and weak owner checks required.
+  Corrected private lifecycle gate PASS; fmt/Clippy/compile/build PASS. Real KDE tray startup,
+  window hide/Open and normal Close PASS without panic/GTK critical or tray-unavailable log.
+
+- P388 (deferred after failed live gate, performance_audit; reviewer ui_critic): make detail-tab overflow visibly
+  discoverable with native non-overlay horizontal scrolling only on this local scroller.
+  Source candidate approved within R111; no custom controls/key handlers/navigation semantics.
+  Root actual narrow/wide scrolling and existing control gates; stop if native cue is inadequate.
+  Isolated details.rs property only, no standalone fixture warranted for this presentation flag.
+  Traditional scrollbar clips tab labels at narrow width; candidate reverted, not committed.
+  No clearly justified one-property height correction; retain verified native navigation.
+
+- P387 (complete, file_summary; reviewer ui_critic): correct observed single-part file metadata to1 part,
+  preserving None/multipart/grouping semantics. Isolated files.rs expression only; no new fixture
+  for this copy change. Independent source review, formatting and exact build are proportional.
+- P386 (complete, performance_audit; reviewer ui_critic): inspect concrete Properties/Cloud ownership
+  cycles behind retained detached-page diagnostics; source-only bounded proposal before changes.
+  No inferred RSS diagnosis, whole-window refactor or actual account data. P322 critic reviews
+  only newly authorized app screenshots for remaining presentation observations.
+  Independent GO for two component weak-capture corrections only: inventory row and Advanced
+  popover/ancestor window. Exact private component-lifetime fixture, no whole-page release claim.
+  Private component retirement and retained P267/P369/P372/P379/P384 regressions PASS;
+  fmt/Clippy/compile PASS. Whole-page retention diagnostic remains true as expected.
+
+- P385 (complete, file_summary; proposal/reviewer performance_audit): close the selected
+  Files popover before forwarding its retained source action, preserving direct/unmounted proxies.
+  Root observed first confirmation click dismissing the old popup; cause is not yet proven.
+  Own isolated files.rs builder and existing private handoff fixtures only; weak popover capture,
+  no focus/delay workaround or callback policy changes. Private gates and actual first-pointer
+  Download/Delete confirmation gates PASS; wallpaper restored, game/three installers preserved.
+
+- P383 (complete, file_summary; proposal/reviewer performance_audit): move Files completion
+  plausibility checks off GTK without changing the predicate, transfer events or unmounted proxy
+  contract. Own isolated files.rs only; tracked request-local validation and truthful finalizing/
+  error feedback. Synthetic held-worker and actual proxy/terminal regression; no real agent data.
+- P384 (complete, ui_critic; proposal/reviewer performance_audit): move Cloud backup-folder
+  creation/validation off GTK, surface errors and guard original page/session through existing
+  explicit-action directory launcher. Own isolated game_settings.rs only; preserve offline use,
+  independent pending state and current metadata eligibility. No cloud policy/file-manager changes.
+  Root alone runs private tests and commits; implementation gates require independent review.
+
+- P322 (in_progress, ui_critic): human-oriented UI/control inventory and critique; source and sanitized
+  Ludomere screenshots first, isolated UI interaction later. No real profile/keyring/desktop access.
+  Return reproducible findings, expected behavior, severity and evidence; no product edits initially.
+- P323 (complete for initial findings, performance_audit): inspect UI thread work and large-library bottlenecks; report
+  concrete source evidence and bounded fixes. No real data or source edits until assigned.
+- P324 (complete for initial findings, reliability_audit): inspect downloads/installations/state propagation for defects,
+  especially offline/Depot behavior and stale/busy controls. Read-only source audit first.
+- P325 (complete, performance_audit): preserve search/filter intersections, keep search visible
+  and enabled with active chips; own library.rs/window.rs and focused same-file tests. P322 reviews.
+- P326 (complete, reliability_audit): Downloads featured selection must show active work before
+  paused/failed entries and show full featured errors. Own downloads.rs; begin after P325 build.
+- P328 (complete, reliability_audit; reviewer performance_audit): propagate current authenticated session through direct Depot actions, avoiding
+  redundant wallet reads. Independent proposal review requires auth/online-generation, expiry,
+  account-match and pre-persistence checks; no token serialization or new global cache.
+- P329 (complete, file_summary; reviewer ui_critic): move managed-file summary reads/stats off GTK with current-view,
+  session and request guards. Isolated checkout /tmp/ludomere-r111-file-summary at ec29d3d;
+  own ui/mod.rs helper and necessary call-site plumbing in ui/files.rs. No main-tree edits.
+- P330 (complete, reliability_audit; reviewer performance_audit): ensure saved-login reads use existing credential-provider discovery/activation,
+  not just interactive sign-in. Live KDE6.29 advertises org.kde.secretservicecompat; activation
+  restored org.freedesktop.secrets and user unlocked normally. No wallet configuration changes.
+- P331 (complete, reliability_audit; reviewer file_summary): investigate Coffee Talk's official .NET4.5.2
+  helper exit194 after successful DirectX setup. Verify Windows-to-Unix exit translation and
+  narrowly scoped success/reboot semantics before any implementation; no skipped requirements.
+- P333 (complete, ui_critic; reviewer performance_audit): bound full Downloads error text in its own
+  scroller so long real setup diagnostics cannot push controls out of view; preserve complete
+  selectable text. Mapped small-window regression required. No new modal or error truncation.
+- P332 (complete, ui_critic; reviewer file_summary): improve setup failure readability observed in real Coffee Talk
+  test; own isolated download_chooser.rs, concise pinned outcome and full selectable diagnostics,
+  terminal titles, no retry/execution/focus changes. Private fixtures only; root runs gates.
+- P327 (complete, performance_audit; reviewers file_summary/ui_critic): Depot cancellation confirmation/background cleanup and terminal failure handling;
+  inspect data impact before assigning minimal implementation. Preserve files on safety refusal.
+- P334 (complete, file_summary; reviewer ui_critic): show zero-result Home feedback in place, retain
+  existing truly empty/account messages and explicit Home navigation. Isolated overlay/widget work;
+  independent review, two focused GTK tests, formatting/Clippy/build PASS. No real-account agent access.
+- P335 (complete, file_summary; reviewer ui_critic): reuse cached-startup SQLite store and one product reconstruction
+  for Metadata/Acquisition readiness; preserve TTL/errors/receivers. Isolated online.rs and cached
+  worker only; root coordinates integration with P334. No schema or new cache framework.
+- P336 (complete for6b7328d, file_summary): prepare a private-profile consolidated build harness only;
+  root reviews and executes later. No real desktop, credentials, games or product edits.
+- P337 (complete, ui_critic; reviewer performance_audit): release the mutable model borrow before
+  sidebar filter invalidation after game exit. Live Coffee Talk Stop shows all rows despite query
+  and count. Also clear stale GTK selection flags before row reorder. Strict mapped regression,
+  independent re-review, formatting/Clippy/build PASS; preserve both sorts and navigation.
+- P338 (complete, performance_audit; reviewer file_summary): batch archive chooser job polling in an isolated checkout,
+  preserving canonical identity, latest-record/tie semantics and independent read failures.
+- P339 (complete, file_summary; reviewer performance_audit): label detail/DLC size as Downloaded files, retaining the
+  existing live summary replacement contract. Isolated details/mod strings and P329 regression.
+- P340 (complete, ui_critic; reviewer performance_audit): native Home grid activation, accessible full-title labels and
+  visible keyboard focus. Isolated library/window/narrow CSS; preserve mouse/context/filter behavior.
+- P341 (complete, file_summary; reviewer performance_audit): clear stale archive error styling on
+  new preparation and keep active Pause blue with proper terminal Play restoration. Isolated
+  files/details changes plus existing state-transition fixtures; no real agent data access.
+- P342 (complete, file_summary; reviewer performance_audit): remove chooser-open directory creation; query existing valid
+  destinations only and retain Unavailable state. Explicit missing-folder creation remains deferred
+  because libraries do not retain mount identity. Isolated chooser/helper regression only.
+- P343 (complete, ui_critic; reviewer file_summary): normal uninstall hides irrelevant Retry and collapses alternative
+  removal methods, expanding recovery after failure. Preserve Browse, all warnings and consent.
+- P344 (complete, ui_critic; reviewer file_summary): four existing uninstaller status strings explain following prompts in
+  the uninstaller window. No process, focus, detection or execution changes.
+- P345 (complete, file_summary; reviewer ui_critic): synchronize idle download-state class and reuse existing helper
+  for paused/failed archive restoration; isolated details-only transitions regression.
+- P346 (complete, performance_audit; corrective review file_summary/ui_critic): show full selected library and actual installation folder;
+  source-scope Galaxy feedback while preserving generic/offline failures and preparation behavior.
+- P347 (complete for source findings, file_summary): independent auth/session/cancellation/setup
+  assurance found cancellation's GTK admission can wait on another operation's persistence.
+- P348 (complete, performance_audit; reviewer file_summary): remove that blocking cancellation admission without dropping
+  recovery-generation, profile-activity or ownership safeguards; deterministic held-lock regression.
+- P349 (complete, performance_audit; reviewer file_summary): coalesce Home scroll cover-priority
+  scans, skip filtered/unmapped rows and retain latest viewport/lifetime safeguards. Own library.rs
+  in isolated checkout; source work-count evidence and strict mapped equivalence/lifecycle fixture.
+  No grid virtualization, backend queue redesign, real data or main edits before review.
+- P350 (complete, ui_critic; reviewer file_summary): prevent duplicate Recheck and stale Storage
+  totals; label busy/current results without navigation or changed scan semantics. Own storage.rs
+  isolated with deterministic GTK regression. Drive-scope wording, Move enablement and Collections
+  keyboard parity are separate pending proposals, not silently bundled into this correction.
+- P351 (complete, performance_audit; reviewer ui_critic): native keyboard activation/accessibility for
+  individual Collections game tiles, preserving collection membership and index-button behavior.
+  Isolated collections.rs and minimal style only; synthetic mapped lifecycle/accessibility gate.
+- P352 (complete, performance_audit; reviewer file_summary): committed explicit-Linux suppression
+  across auto-install/native completion/reconciliation and native-save Windows-preference retention.
+  Normalize only identified schema2/Linux/offline matching-managed-UMU/no-provenance shape in memory;
+  future/unknown shapes stay strict, Windows missing-prefix stays installed, unknown OS policy stays.
+  Own auto_install.rs, installation.rs, executor.rs, marker.rs in isolation; root alone reads real data.
+  Live follow-up additionally owns storage.rs: share pure read normalization after protected reads,
+  preserving bounded/no-follow admission and strict writes; actual admission regression required.
+- P353 (complete, ui_critic; reviewer file_summary): clarify that Storage capacity bar covers the
+  containing drive while managed category totals cover the selected library. Wording/layout only
+  in isolated storage.rs; preserve arithmetic/workers and P350 feedback; verify narrow layout.
+- P354 (complete, ui_critic; reviewer file_summary): reviewed initial Files worker conversion,
+  own isolated files.rs and necessary mod.rs summary seam. One scoped data preparation reused for
+  rows/totals, immediate loading and retryable failures, no initial GTK I/O or false empty actions.
+  Preserve session/auth/detail/local-revision/weak lifetime and pre-spawn profile guards; private
+  held-lock/heartbeat/state/lifecycle tests required. No later action-policy or generic framework.
+  Existing StateStore APIs swallow certain row/JSON decode failures; preserve that inherited
+  behavior rather than expand state.rs in this change, propagate returned errors and report the
+  persistence issue separately. Empty saved artifact lists must remain safe.
+- P355 (complete, performance_audit; proposal reviewer file_summary, implementation reviewer ui_critic): confirmed cached-offline and source
+  migration preference loss. Approved owned download_chooser.rs/game_settings.rs/executor.rs;
+  retain fresh-plan args/full saved runtime by explicit OS, authoritative empty saved rows, no
+  old executable/source copying. Keep pending profile without applying it; track cached preparation
+  before DB access and preserve sessions/migration guards. Actual synthetic save/refusal/completion
+  regressions; no real helpers/data. Separate case-insensitive dispatch proposal deferred.
+- P356 (in_progress, file_summary): source-only remaining Settings/account/file-control no-op and
+  busy feedback review; exclude P354 initial Files worker. Report proposals before changes.
+- P357 (complete, file_summary; reviewer performance_audit): fix confirmed selected-library
+  inspection activity gap from P356. Own isolated ui/settings/storage.rs; admit profile activity
+  before worker and recheck original sessions before DB reads/reconciliation. Preserve P350 and
+  current receiver semantics; delayed-worker/reset-drain fixture, no real data or reset protocol changes.
+  Source follow-up disproved the pure-filesystem premise for library-choice inspection: it too
+  opens StateStore. Include both worker admissions under the same bounded fix and tests.
+- P358 (complete diagnosis, file_summary): initial paused archive trash clicks unexplained; after
+  revisiting Downloads ordinary clicks show confirmation and cancellation removes test transfer,
+  retaining existing payload/two archives. Source finds no proven dead handler; no speculative fix.
+- P359 (complete, performance_audit; reviewer file_summary): refresh Account GOG session subtitle
+  from in-memory network/token/logout state using weak bounded updates, unchanged wording except
+  no authenticated display during logout. Own isolated settings.rs; no wallet/DB/network probes,
+  identity/action redesign or navigation. Actual row/state/destruction focused regression required.
+- P360 (complete assessment, implementation deferred, performance_audit): assess malformed game-preference JSON
+  silently becoming defaults, caller fallbacks and safe actionable recovery. No implementation,
+  raw private arguments/profile access, queue/catalog/schema changes or new API without review.
+  Strict parsing alone would abort whole reconciliation and leave Properties unable to repair;
+  require separate recoverable per-game policy before changes. Evidence p360-assessment.md.
+- P361 (complete, ui_critic; reviewer file_summary): reflect existing Storage Move eligibility
+  before click, including different target, selection, known Windows refusal and active Move.
+  Own isolated ui/settings/storage.rs, explanation tooltip and recompute on input changes;
+  preserve backend/click-time checks and no automatic destination choice. Synthetic controls only.
+- P362 (complete, performance_audit; reviewer file_summary): replace notification-popover
+  unrealize cleanup with guarded weak cleanup on its actual anchor's destruction. Independent
+  proposal review approves local GTK API fit; isolated notifications.rs only, no real data.
+  Require never-realized disposal, real detach/reinsert, mapped teardown and pending-timeout
+  regression without GTK children-left warning; preserve existing history and P359 fixtures.
+  Stop for review if destroy timing fails; no unsafe disposal or lifecycle framework expansion.
+- P363 (complete, ui_critic; reviewer file_summary): reviewed Branch Switch/Forget Password
+  eligibility feedback. Own isolated game_settings.rs; disable known current/Master/invalid no-ops
+  and preserve preparation/success handoff state across selection changes. Forget stays disabled
+  during preparation that may save a password. No credential probe or real data; synthetic actual
+  controls regression required, existing handlers/session/password semantics unchanged.
+- P364 (complete, performance_audit; reviewer ui_critic): Settings-local check busy/result feedback,
+  guarded duplicate clicks and weak click-time session-bound completion. Own isolated update_policies.rs.
+  Review rejects shared main progress clearing: keep pending feedback local and main terminal
+  notification policy unchanged. Already-running must not promise a notification. Synthetic actual
+  dispatch/lifecycle/redaction/order tests required; no backend policy/queue/cancel/timeout changes.
+- P365 (full identity fix deferred; narrowed P365a complete, file_summary; reviewer ui_critic):
+  full design rejected because global gate blocks launch edits for unrelated full downloads and
+  initially unknown marker forces close/reopen. P365a limited to atomic launch-only SQL preserving
+  unrelated raw preferences, plus unchanged initial autosave suppression. Own game_settings.rs/state.rs
+  only after reviewer acceptance; no sections field, new lock, marker/body invalidation or claim
+  that stale installation identity is fully fixed. No real data; preserve changed-save retries.
+- P366 (complete, file_summary; reviewer performance_audit): hide Account's empty reset-status
+  scroller with one-way own-visible binding to label. Own isolated settings.rs and existing P359
+  fixture: synthetic long error mapping/scroll/collapse, no actual Factory Reset or private screenshot.
+- P367 (complete, ui_critic; reviewer performance_audit): live native Repair fallback has edge-touching generic
+  text/blank title; Review Reinstallation reuses tiny inspection dialog and clips installer rows
+  while Install stays visible. Reviewed fix owns isolated download_chooser.rs; preserve
+  actual repair/reinstall/reset/Browse consent and data flow. Only specifically named app screenshots
+  authorized for critic, no profile access. Root cancelled without starting another installation.
+  Standard full-chooser dimensions/title, padded scrolling fallback and hidden terminal spinner;
+  require actual source-row viewport intersection/reachable controls, not only requested sizes.
+- P368 (complete, performance_audit; reviewer file_summary): independently approved repair
+  inspection lifecycle fix after P367. Own isolated download_chooser.rs; pre-spawn profile activity,
+  original raw auth/online generations and receiver rejection, preserving signed-out/offline local
+  inspection. No token lookup/network, mutex over I/O or claimed atomic cancellation of in-flight
+  reconciliation. Actual delayed worker/reset admission/stale/error/close fixtures required.
+- P369 (complete, file_summary; reviewer ui_critic): approved initial Cloud Saves local record
+  loading only, isolated game_settings.rs. Mechanically extract existing controls, one tracked
+  worker, explicit loading/error/Retry; raw original generations and weak original-window lifetime.
+  Hidden tab may populate, closed window may not; stale shell gives close/reopen guidance. Real
+  private reader-lock/heartbeat, errors/retry/missing/offline/native/session/activity/lifetime
+  fixtures plus existing cloud regression required. No metadata/network/policy/override changes.
+  Separate discovery/override races and smaller feedback findings await bounded follow-up review.
+- P370a (complete, ui_critic; reviewer performance_audit): independently approved required-
+  component consent layout only, isolated chooser. Header outside padded body, matching left
+  alignment/top-aligned list; preserve consent/actions/admission. Actual short/long text origin,
+  scrolling and400px parent controls fixture, no helper/queue/network/realdata execution.
+- P370b (complete, ui_critic; implementation reviewer file_summary): approved setup Details
+  counter wording only. Separate actual payload writes/full estimate, explain potential reuse,
+  scoped known-zero Depot downloads; dependencies/unknown-origin amounts are processed data, not
+  necessarily network traffic. No backend counter, completion, policy or inferred reuse changes.
+- P371 (complete diagnosis, no change, performance_audit): root BIT.TRIP consent lists MSVC2010 and
+  MSVC2010_x64 both mapped to vcrun2010. Source-only determine whether same recipe redundantly
+  executes and whether safe existing receipt semantics already avoid it. Exact prefix Winetricks
+  history already skips duplicate recipe while retaining separate required vendor receipts.
+  Root aggregate fresh-install log check confirms one vcrun2010 command. No speculative backend
+  deduplication, dependency skipping, actual agent data/helper access, source edits or tests.
+- P372 (complete, file_summary; proposal performance_audit, implementation reviewer ui_critic):
+  approved metadata Retry lifecycle after P369, isolated game_settings.rs. Capture original page
+  authenticated session, pre-spawn activity, explicit-session backend, weak current feedback and
+  receiver retirement before restoring Retry. Inert actual-handler pre-entry/result/reentry/
+  activity/lifetime fixture; preserve cached offline loader and all availability controls. No
+  actual cloud/data/helper access, new backend policy or override-race changes. Author starts
+  after finishing P370b independent review; root owns runtime gates.
+- P379 (complete, performance_audit; reviewer file_summary): Cloud save-folder override still opens/
+  writes SQLite on GTK and can race metadata discovery's stale locations. Source-only bounded
+  proposal for responsive save and preserving current explicit overrides across all discovery
+  writers. Trace transaction/session/reset semantics; no actual cloud/data/keyring access,
+  schema/backend policy changes. Independent proposal GO: atomic IMMEDIATE current-override
+  preservation plus committed effective return and tracked local saves; Choose/Retry share pending
+  admission through picker/save/receiver retirement, preserving offline local editing and reentry.
+  Own isolated state.rs/cloud_saves/mod.rs/game_settings.rs; root runs private tests after review.
+- P380 (complete, ui_critic; reviewer file_summary): live installed native Gungeon Overview labels its
+  Offline Installers path simply Location; determine intended semantics and a bounded truthful
+  presentation. Also assess singular sidebar count (1 games). Source-only proposal, no data,
+  schema or destination changes. Reviewed smallest optionA: label Default offline installer
+  folder, typed configuration presence for Not configured (base/DLC), direct singular wording.
+  Own isolated details.rs/library.rs existing expectations only; no new installed-folder feature.
+- P381 (complete for verified layout, performance_audit; proposal file_summary/reviewer ui_critic): actual app at minimum-width window clips gear/
+  favorite controls and right-side detail tabs while wide hero/status strip remains. Approved
+  app-only screenshot gungeon-narrow-window.png and source review; propose bounded responsive
+  presentation preserving primary actions/tabs/keyboard/scroll behavior. Independently approved
+  initial detail-only native tab viewport/local hhomogeneous=false; require measured action-row
+  reachability before acceptance, stop for review if more layout is needed. Own isolated details.rs;
+  no real profile/desktop/other screenshots/dependency/backend/global stack changes.
+  Independently approved follow-up owns files.rs header parenting only: title/count/folder top
+  row, four existing filter controls individually in a native wrapping FlowBox. No callback or
+  filter changes; root settled narrow/wide and native keyboard gates remain required.
+  Settled header/native-key gates pass, but real Download Complete clips actions. Independently
+  approved details-only extension moves existing status panel below unchanged primary row in
+  one styled vertical area; no status behavior changes. Root repeat geometry gate required.
+  Verification refinement: full synthetic detail renderer starts unrelated workers. Do not extract
+  production action assembly or add a broad test controller only for this presentation change.
+  Root will test actual narrow/wide action/tab reachability before commit; retain proportional
+  source/compile checks and existing safe regressions. Any remaining clipping still blocks acceptance.
+- P382 (reviewed proposal, ui_critic; reviewer file_summary): after tiny transfer Downloads retains a blank zero-rate
+  graph; manual Up-to-date modal keeps a disabled Update button. Assess bounded visibility/terminal
+  feedback corrections from source and named root screenshots only; no implementation, backend,
+  account policy, destructive actions or broader styling changes before review.
+  P382a(in_progress, ui_critic): independently approved idle-fallback positive-network-or-disk
+  sample predicate only, existing renderer variants; own isolated downloads.rs. Preserve featured
+  active/paused/error controls and sampling/history. P382b verified in isolated
+  details.rs manual-update presentation: hide unavailable terminal actions and stopped spinner;
+  preserve offer-before-enable and cleanup-before-reentry ordering. Root runtime, independent review.
+- P378 (complete, ui_critic; reviewer file_summary): human-style critique of root-approved app-only
+  downloads-real-history.png plus Downloads source. Assess idle/history readability, spacing,
+  action affordances and keyboard/accessibility. Proposed scoped natural-thickness dividers,
+  compact empty queue block, truthful Disk write rate label, and remove obsolete navigate-away
+  paused instruction. Independently approved minimal downloads.rs/mod.rs correction; preserve
+  graph/history/actions/shared Completed-empty style. One mapped normal/enlarged font fixture;
+  no other actual data/screenshots/desktop/runtime. Root owns integration and gates.
+- P377 (complete, performance_audit; reviewer file_summary): two setup-stage wording corrections
+  in chooser.rs only. Fresh install visibly says Saving repaired files; replace with Saving
+  game files. Cached prerequisite processing must say Preparing required components rather
+  than imply all bytes download. No phase/progress logic change, new abstraction or new tests;
+  existing setup fixture/fmt/Clippy/build are proportional. Root coordinates sequential gate.
+- P376 (complete, ui_critic; reviewer file_summary): approved GTK-blocking Branch Forget
+  correction in isolated game_settings.rs. Track SQLite-only worker, preserve raw-generation
+  offline forgetting with explicit identity, local Switch exclusion/Started and current-selection
+  restore. Stale eligibility persists across selection; refresh must re-read after signal-emitting
+  setters and Switch success feedback precedes refresh. Real synthetic SQLite heartbeat/key
+  isolation plus reentry/lifetime fixtures. No actual credentials/keyring/data or global locks.
+- P375 (complete assessment, live warning deferred, performance_audit; reviewer file_summary): repeated single GTK ancestor critical
+  around Coffee Talk Repair confirmation-to-components transition onb2629ce and5a05fe8,
+  with no observed failure. Independently approved one-stage animation-enabled actual-menu
+  diagnostic in isolated chooser.rs, fail-closed inspection and preparation, weak focus
+  observation; no product fix, actual data/desktop/log access, Cargo or helper execution.
+  Root exact diagnostic passes without warning after strict descendant-mapping wait. Clientless
+  Broadway throttles frames, not live pointer/X11 reproduction; no justified product fix.
+  Keep diagnostic isolated, no main integration/package installation or live-memory tracing.
+- P374 (complete, ui_critic; independent reviewer performance_audit): source-confirmed
+  Downloads write fraction uses full payload estimate although repairs reuse bytes. Assess
+  constructor/updater parity, truthful actual-write/estimate wording and phase-scoped activity
+  without changing counters or control policy. Independently approved downloads.rs-only fix:
+  actual materializing/extracting activity, retain finishing, neutral inactive/other-phase disk
+  counter, no fake completion fraction. Preserve valid phase-local fractions and actions;
+  pure/mapped private gates required, no actual data/helper/queue access.
+- P373 (complete, performance_audit; reviewer file_summary): approved narrow transient
+  Windows-check footer slot in isolated proton.rs/window.rs. Per-request weak label ownership,
+  one visible line with overlap-safe cleanup; remove progress/Ready history writes, preserve
+  actual errors/Finish setup and unrelated live/history labels. Inert actual-function/footer
+  concurrency/reentry/error/lifetime/compact geometry fixture; no actual helpers/data, backend
+  or UMU architecture changes. Missing optional slot must not block existing action dispatch.
+- Root owns real authenticated desktop testing, the transfer/disk budget, findings records,
+  task assignments, review and per-change commits. Any implementation gets bounded ownership;
+  other agents independently review changes. Do not duplicate shared-file work or run real helpers.
+- Main fast-forwarded to5c0d5cb; audit branch improvement/interactive-ux-audit-2026-10-06.
+  Start08:13:55 UTC, hard stop20:13:55 UTC. No push/PR/package/version requested.
+
+## R110 release 0.3.2 publication
+
+- P318 (complete, library_admission): project version metadata bump only; no dependencies.
+- P319 (complete, storage_audit): independent metadata/change review and isolated release-check
+  harness preparation. Root runs build checks and owns commit/push/new upstream PR.
+- P320 (complete, library_admission): investigate two cleanup test failures exposed by the
+  full release gate; correct only obsolete expectations or report actual safety regressions.
+- P321 (complete, storage_audit): independently review cleanup safety and prepare private
+  focused cleanup checks. Full release gate must pass before publication.
+- Root final tools/check.sh and cargo build --locked PASS; release commit4612df7 pushed
+  to origin/fix/library-root-tolerance-0.3.2 and upstream PR8 opened. Records-only closeout follows.
+- New branch fix/library-root-tolerance-0.3.2 starts at upstream f4bee36; upstream squashed PR7,
+  whose final tree equals previous branch HEAD. R109 dirty changes preserved without conflict.
+
+## R109 library admission without content-purity restrictions
+
+- P316 (complete, library_admission): minimal storage admission change, focused regressions,
+  updated README; remove only obsolete admission helpers. Preserve typed routing/deletion safety.
+- P317 (complete for scoped verification, storage_audit): independent source/security review and focused private tests;
+  no product edits. Root manages compile/records, no real profiles/files/helpers/full suite/pub.
+- Fifteen focused tests pass (eleven storage, two related storage UI filesystem helpers and two
+  cleanup tests). Final formatting, all-target Clippy -D warnings, diff check and build pass.
+
 ## R108 release verification and publication
 
 - P314 (complete, archive_refresh): bump project release metadata to 0.3.1; no dependency churn.

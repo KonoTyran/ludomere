@@ -120,9 +120,15 @@ impl Notifications {
             });
             widget.add_controller(motion);
         }
-        root.connect_unrealize({
-            let hover = hover.clone();
-            move |_| hover.unparent()
+        button.connect_destroy({
+            let hover = hover.downgrade();
+            move |_| {
+                if let Some(hover) = hover.upgrade()
+                    && hover.parent().is_some()
+                {
+                    hover.unparent();
+                }
+            }
         });
         button.connect_clicked({
             let window = window.downgrade();
@@ -313,6 +319,145 @@ fn prepend_notification(list: &gtk::Box, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires private HOME/all XDG/TMP, display and D-Bus; harness rejects GTK lifecycle warnings"]
+    fn notification_popover_follows_anchor_lifetime_and_survives_remapping() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p362-"),
+                "{key}"
+            );
+        }
+        adw::init().unwrap();
+        #[track_caller]
+        fn wait(check: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !check() && Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        fn pump(duration: Duration) {
+            let deadline = Instant::now() + duration;
+            while Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.NotificationLifecycleTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        for present in [false, true] {
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(600)
+                .default_height(300)
+                .build();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let focus = gtk::Entry::new();
+            content.append(&focus);
+            let compact = gtk::Label::new(None);
+            let notifications = Notifications::new(&window, &compact);
+            content.append(&notifications.root);
+            window.set_content(Some(&content));
+            let button = notifications
+                .root
+                .last_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            let weak_root = notifications.root.downgrade();
+            let weak_button = button.downgrade();
+            let weak_hover = notifications.hover.downgrade();
+            assert_eq!(
+                notifications.hover.parent().as_ref(),
+                Some(button.upcast_ref())
+            );
+            assert!(!notifications.root.is_realized());
+            if present {
+                window.present();
+                wait(|| notifications.root.is_mapped());
+                assert!(focus.grab_focus());
+                let original_focus = gtk::prelude::GtkWindowExt::focus(&window);
+                assert!(original_focus.is_some());
+                let motion = button
+                    .observe_controllers()
+                    .iter::<glib::Object>()
+                    .filter_map(Result::ok)
+                    .find_map(|object| object.downcast::<gtk::EventControllerMotion>().ok())
+                    .unwrap();
+                motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+                wait(|| notifications.hover.is_mapped());
+                assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), original_focus);
+                assert!(window.visible_dialog().is_none());
+                notifications.hover.popdown();
+                wait(|| !notifications.hover.is_mapped());
+
+                // Container removal really unrealizes the root; no lifecycle signals are fabricated.
+                content.remove(&notifications.root);
+                assert!(!notifications.root.is_realized());
+                assert_eq!(
+                    notifications.hover.parent().as_ref(),
+                    Some(button.upcast_ref())
+                );
+                content.append(&notifications.root);
+                wait(|| notifications.root.is_mapped());
+                motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+                wait(|| notifications.hover.is_mapped());
+                notifications.hover.popdown();
+                wait(|| !notifications.hover.is_mapped());
+
+                window.set_visible(false);
+                wait(|| !notifications.root.is_mapped());
+                assert_eq!(
+                    notifications.hover.parent().as_ref(),
+                    Some(button.upcast_ref())
+                );
+                window.present();
+                wait(|| notifications.root.is_mapped());
+                assert!(focus.grab_focus());
+                let original_focus = gtk::prelude::GtkWindowExt::focus(&window);
+                motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+                wait(|| notifications.hover.is_mapped());
+                assert_eq!(gtk::prelude::GtkWindowExt::focus(&window), original_focus);
+                assert!(window.visible_dialog().is_none());
+                assert_eq!(window.content().as_ref(), Some(content.upcast_ref()));
+
+                // Queue the production weak leave timeout, then destroy before it can run.
+                motion.emit_by_name::<()>("leave", &[]);
+            }
+            window.destroy();
+            drop(button);
+            drop(notifications);
+            drop(compact);
+            drop(focus);
+            drop(content);
+            drop(window);
+            wait(|| {
+                weak_root.upgrade().is_none()
+                    && weak_button.upgrade().is_none()
+                    && weak_hover.upgrade().is_none()
+            });
+            pump(Duration::from_millis(250));
+            assert!(weak_root.upgrade().is_none());
+            assert!(weak_button.upgrade().is_none());
+            assert!(weak_hover.upgrade().is_none());
+        }
+    }
 
     #[test]
     fn failure_details_keep_cause_chain_and_dependency_id_without_credentials() {

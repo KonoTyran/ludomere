@@ -86,6 +86,7 @@ enum SignInStage {
     Profile,
     Cleanup,
     Credentials,
+    SavedCredentials,
     Session,
 }
 
@@ -96,6 +97,7 @@ impl std::fmt::Display for SignInStage {
             Self::Profile => "GOG sign-in could not verify your account profile. Try signing in again.",
             Self::Cleanup => "GOG sign-in could not finish local sign-out cleanup. Retry sign-out cleanup before signing in again.",
             Self::Credentials => "GOG sign-in could not save your login in the system credential store. Check your desktop credential service, then try signing in again.",
+            Self::SavedCredentials => "GOG sign-in could not read your saved login from the system credential store. Check your desktop credential service, then try signing in again.",
             Self::Session => "The GOG session changed during sign-in. Try signing in again.",
         })
     }
@@ -138,7 +140,7 @@ impl std::error::Error for CredentialStoreIssue {}
 pub fn sign_in_error_message(error: &anyhow::Error) -> String {
     if matches!(
         error.downcast_ref::<SignInStage>(),
-        Some(SignInStage::Credentials)
+        Some(SignInStage::Credentials | SignInStage::SavedCredentials)
     ) {
         if let Some(issue) = error.downcast_ref::<CredentialStoreIssue>() {
             return issue.to_string();
@@ -329,21 +331,49 @@ pub fn refresh(token: &Token, expected: u64) -> Result<(Token, Profile)> {
 
 pub fn restore(expected: u64) -> Result<Option<(Token, Profile)>> {
     check_session(expected, false)?;
-    let Some(token) = load_saved_token()? else {
+    let Some(token) = load_saved_token_at(expected)? else {
         return Ok(None);
     };
     refresh(&token, expected).map(Some)
 }
 
 pub fn load_saved_token() -> Result<Option<Token>> {
-    load_saved_token_with(|| read_token(KEYRING_SERVICE))
+    load_saved_token_at(session())
 }
 
-fn load_saved_token_with(read: impl FnOnce() -> Result<Option<Token>>) -> Result<Option<Token>> {
-    let expected = session();
-    if SIGNED_OUT.load(Ordering::Acquire) != 0 || restoration_blocked()? {
+fn load_saved_token_at(expected: u64) -> Result<Option<Token>> {
+    load_saved_token_with(
+        expected,
+        |expected| {
+            check_session(expected, false)?;
+            let connection = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+                .map_err(|_| CredentialStoreIssue::Bus)?;
+            credential_service_owner(
+                &connection,
+                expected,
+                false,
+                std::time::Instant::now() + Duration::from_secs(5),
+            )?;
+            Ok(())
+        },
+        || read_token(KEYRING_SERVICE),
+    )
+    .context(SignInStage::SavedCredentials)
+}
+
+fn load_saved_token_with(
+    expected: u64,
+    prepare: impl FnOnce(u64) -> Result<()>,
+    read: impl FnOnce() -> Result<Option<Token>>,
+) -> Result<Option<Token>> {
+    if !session_is_current(expected) || restoration_blocked()? {
         return Ok(None);
     }
+    let prepared = prepare(expected);
+    if !session_is_current(expected) || restoration_blocked()? {
+        return Ok(None);
+    }
+    prepared?;
     let token = read()?;
     if !session_is_current(expected) || restoration_blocked()? {
         return Ok(None);
@@ -380,15 +410,23 @@ fn prepare_credential_store(expected: u64) -> Result<()> {
     prepare_credential_connection(&connection, expected, Duration::from_secs(120))
 }
 
-fn prepare_credential_connection(
+fn credential_service_owner(
     connection: &gio::DBusConnection,
     expected: u64,
-    prompt_timeout: Duration,
-) -> Result<()> {
+    explicit_login: bool,
+    deadline: std::time::Instant,
+) -> Result<String> {
     use gio::glib::variant::ToVariant;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let check = || -> Result<()> {
+        check_session(expected, explicit_login)?;
+        anyhow::ensure!(
+            explicit_login || !restoration_blocked()?,
+            SignInStage::Session
+        );
+        Ok(())
+    };
     let metadata = |method: &str, parameters: Option<&gio::glib::Variant>| {
-        check_session(expected, true)?;
+        check()?;
         let response = connection
             .call_sync(
                 Some("org.freedesktop.DBus"),
@@ -408,7 +446,7 @@ fn prepare_credential_connection(
                     CredentialStoreIssue::Bus
                 }
             })?;
-        check_session(expected, true)?;
+        check()?;
         Ok(response)
     };
     // KWallet may publish its compatibility name before the standard API name.
@@ -439,10 +477,20 @@ fn prepare_credential_connection(
             Some(&("org.freedesktop.secrets", 0u32).to_variant()),
         )?;
     }
-    let owner = metadata("GetNameOwner", Some(&standard))?
+    Ok(metadata("GetNameOwner", Some(&standard))?
         .get::<(String,)>()
         .ok_or(CredentialStoreIssue::Bus)?
-        .0;
+        .0)
+}
+
+fn prepare_credential_connection(
+    connection: &gio::DBusConnection,
+    expected: u64,
+    prompt_timeout: Duration,
+) -> Result<()> {
+    use gio::glib::variant::ToVariant;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let owner = credential_service_owner(connection, expected, true, deadline)?;
     let store = CredentialConnection {
         connection,
         expected,
@@ -1085,6 +1133,33 @@ mod tests {
         let connection =
             gio::DBusConnection::for_address_sync(&address, flags, None, gio::Cancellable::NONE)
                 .unwrap();
+        state.lock().unwrap().locked = true;
+        let reads = std::cell::Cell::new(0);
+        assert!(
+            load_saved_token_with(
+                session(),
+                |expected| {
+                    credential_service_owner(
+                        &connection,
+                        expected,
+                        false,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                    )?;
+                    Ok(())
+                },
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok(None)
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(reads.get(), 1);
+        assert!(
+            state.lock().unwrap().calls.is_empty(),
+            "stored-token provider discovery must not inspect collections or unlock them"
+        );
         for case in [
             Case::Unlocked,
             Case::EarlyCompleted,
@@ -1208,18 +1283,26 @@ mod tests {
         SIGNED_OUT.store(0, Ordering::Release);
         SIGN_OUT_DURABLE.store(false, Ordering::Release);
         assert!(
-            load_saved_token_with(|| panic!("old stored token must not be read"))
-                .unwrap()
-                .is_none()
+            load_saved_token_with(
+                session(),
+                |_| panic!("signed out must not prepare a provider"),
+                || panic!("old stored token must not be read")
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
             commit_credentials(1, true, || Err(anyhow::anyhow!("keyring unavailable"))).is_err()
         );
         assert!(marker.is_file());
         assert!(
-            load_saved_token_with(|| panic!("failed replacement must not enable restore"))
-                .unwrap()
-                .is_none()
+            load_saved_token_with(
+                session(),
+                |_| panic!("failed replacement must not prepare a provider"),
+                || panic!("failed replacement must not enable restore")
+            )
+            .unwrap()
+            .is_none()
         );
         let replaced = std::cell::Cell::new(false);
         commit_credentials(1, true, || {
@@ -1280,10 +1363,127 @@ mod tests {
     }
 
     #[test]
+    fn saved_token_provider_preparation_respects_restoration_barriers() {
+        use gio::glib::variant::ToVariant;
+        if run_in_private_process(
+            "auth::tests::saved_token_provider_preparation_respects_restoration_barriers",
+        ) {
+            return;
+        }
+        let expected = session();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let activated = std::cell::Cell::new(false);
+        assert!(
+            load_saved_token_with(
+                expected,
+                |captured| {
+                    assert_eq!(captured, expected);
+                    calls.borrow_mut().push("prepare");
+                    prepare_secret_service(|method, _| {
+                        Ok(match method {
+                            "NameHasOwner" => (activated.get(),).to_variant(),
+                            "ListActivatableNames" => {
+                                (vec!["org.kde.secretservicecompat"],).to_variant()
+                            }
+                            "StartServiceByName" => {
+                                activated.set(true);
+                                calls.borrow_mut().push("activate");
+                                (1u32,).to_variant()
+                            }
+                            _ => panic!("unexpected provider metadata call"),
+                        })
+                    })?;
+                    Ok(())
+                },
+                || {
+                    assert!(activated.get());
+                    calls.borrow_mut().push("read");
+                    Ok(None)
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(*calls.borrow(), ["prepare", "activate", "read"]);
+
+        let error = load_saved_token_with(
+            expected,
+            |_| Err(CredentialStoreIssue::Activation.into()),
+            || panic!("failed discovery must not read stored credentials"),
+        )
+        .unwrap_err()
+        .context(SignInStage::SavedCredentials);
+        assert!(sign_in_error_message(&error).contains("advertised desktop credential service"));
+        assert!(
+            load_saved_token_with(
+                expected.wrapping_add(1),
+                |_| panic!("stale restoration must not prepare a provider"),
+                || panic!("stale restoration must not read credentials"),
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let marker = signed_out_path();
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"signed out\n").unwrap();
+        assert!(
+            load_saved_token_with(
+                expected,
+                |_| panic!("durable sign-out must prevent provider activation"),
+                || panic!("durable sign-out must prevent credential reads"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            load_saved_token_with(
+                expected,
+                |_| {
+                    fs::write(&marker, b"signed out\n")?;
+                    Ok(())
+                },
+                || panic!("a barrier created during activation must prevent credential reads"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            load_saved_token_with(
+                expected,
+                |_| {
+                    invalidate_session();
+                    Ok(())
+                },
+                || panic!("revocation during activation must prevent credential reads"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            load_saved_token_with(
+                session(),
+                |_| panic!("the current signed-out generation must not activate a provider"),
+                || panic!("the current signed-out generation must not read credentials"),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn credential_service_detection_prefers_standard_and_only_activates_advertised_kde() {
         use gio::glib::variant::ToVariant;
         for (owned, names, after, expected, calls) in [
-            (true, vec![], false, None, vec!["NameHasOwner"]),
+            (
+                true,
+                vec!["org.kde.secretservicecompat"],
+                false,
+                None,
+                vec!["NameHasOwner"],
+            ),
             (
                 false,
                 vec!["org.freedesktop.secrets", "org.kde.secretservicecompat"],
@@ -1573,9 +1773,13 @@ mod tests {
         );
         assert!(!saved.get());
         assert!(
-            load_saved_token_with(|| panic!("tombstone must block keyring access"))
-                .unwrap()
-                .is_none()
+            load_saved_token_with(
+                session(),
+                |_| panic!("tombstone must block provider activation"),
+                || panic!("tombstone must block keyring access")
+            )
+            .unwrap()
+            .is_none()
         );
         let current = session();
         let failure = commit_credentials(current, true, || {
@@ -1593,15 +1797,19 @@ mod tests {
         assert!(!marker.exists());
         assert!(session_is_current(current));
         assert!(
-            load_saved_token_with(|| {
-                invalidate_session();
-                Ok(Some(Token {
-                    access_token: "inert".into(),
-                    refresh_token: "inert".into(),
-                    user_id: "fixture".into(),
-                    expires_at: 1,
-                }))
-            })
+            load_saved_token_with(
+                session(),
+                |_| Ok(()),
+                || {
+                    invalidate_session();
+                    Ok(Some(Token {
+                        access_token: "inert".into(),
+                        refresh_token: "inert".into(),
+                        user_id: "fixture".into(),
+                        expires_at: 1,
+                    }))
+                }
+            )
             .unwrap()
             .is_none()
         );

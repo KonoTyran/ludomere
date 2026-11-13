@@ -1,6 +1,125 @@
 # Project status
 
-Last meaningful update: 2026-10-03.
+Last meaningful update: 2026-10-06.
+
+## R112 complete — release 0.4.0 and PR
+
+- Audit branch pushed through19d64fa under the preceding explicit user request.
+- User now authorizes0.4.0 metadata and new upstream PR with all changes explained.
+- Upstream fetch remainsf4bee36; PR includes0.3.2 root-tolerance changes and82 audit fixes.
+- Version worker release_040 and independent inventory reviewer pr_inventory assigned.
+  Root owns isolated verification, records, commit/push and publication.
+- Four-file version change independently reviewed; root diff check and fresh isolated0.4.0
+  gate PASS: fmt, all-target Clippy-Dwarnings,574 library tests, six integration tests,
+  five Python tests and cargo build --locked.95 library tests remain opt-in; affected GTK
+  gates were exercised during the audit. Log:/tmp/ludomere-r111-full-build-y46dprrk/build.log.
+- Complete hash-covered change inventory reviewed at/tmp/ludomere-040-pr-inventory.md.
+  Released metadata commit d011c07 pushed with an exact post-commit build pass.
+  Upstream/main PR: https://github.com/KonoTyran/ludomere/pull/9. Grouped description covers
+  all delivered behavior, verification and outstanding manual/deferred work. No additional
+  product changes or actual-account tests were needed. This closeout changes records only.
+
+## R111 complete within the authorized window — interactive audit
+
+- Authorized window08:13:55–20:13:55 UTC on2026-10-06, or interruption/quota. Branch
+  improvement/interactive-ux-audit-2026-10-06. Root alone uses the actual wallet,
+  profile, desktop and game data. Normal cloud sync allowed; no deliberate cloud deletion.
+  No push, PR, version/schema change or package build/install. Quota reset cannot be controlled.
+- Verified82 separate audit change commits through71ecd7b, each exact post-commit cargo build PASS. Outcomes and failures
+  are retained in R111_AUDIT.md, task plan and git history. No exhaustive UI readiness claim.
+- Latest consolidated private build PASS on final P411 source: fmt, all-target Clippy-Dwarnings,
+  574 library tests, six integration tests, five Python helper tests and build.95 library tests
+  ignored by default; affected GTK gates run separately. Log:
+  /tmp/ludomere-r111-full-build-pd7d9sna/build.log. Fresh project artifacts; no real
+  account/helpers/network in gate. Earlier pinned927556d gate remains in audit history.
+- Latest verified fixes: responsive detail controls, first-click archive popups, tray startup/
+  shutdown and session admission, Maintenance progress, tag keyboard/validation, folder-origin
+  guards, operation-log activity, persistent log-folder errors, General-first Properties and
+  singular archive copy. P404 removes explicit unopened-menu capture cycles: same strict test
+  fails before/passes after, and mapped actions retain behavior. Each task's evidence is in plan/audit.
+- Final fix P411 is committed as71ecd7b. Its four-line focus handoff corrects
+  the reproduced repair-to-components warning and restores focus to visible Cancel. Final native-
+  pointer diagnostic, strict initial/traversal/layout regression and real Coffee keyboard Cancel
+  pass; independent QA/safety GO. Diagnostic code stays outside main. P408 exact completed-
+  batch feedback passes strict failing-before/passing-after and live deletion gates. P409 idle
+  graph explanation and P410 Proton Cancel wording pass focused/live gates and builds. P407
+  Cloud ordering, P403 chooser lifecycle and P405 full-path row are committed and verified.
+  P393 native mapped-popup retention is deferred/unmet; all temporary diagnostic
+  code removed. P404 is a separately approved narrower fix, not a pass of that old gate.
+  Root alone owns sequential Cargo/build/commit gates, actual-data access and records.
+- Audit work ended2026-10-06 before20:13:55 UTC; final source/build reviewed at20:01:44 UTC.
+  No product edits or live operations remain active. Actual Ludomere closed normally and all
+  synthetic test processes exited. This records-only closeout does not change the verified source
+  and receives an additional post-commit build; no push, PR or package operation is performed.
+- Actual test games: Gungeon, Coffee Talk, BIT.TRIP Runner only. Reserve16GB of40GB, covering
+  payloads/prefixes/cache/staging/repeats; BIT.TRIP official requirement100MB, measured payload
+  56.7MB/prefix409MB. All three rendered game screens and exited normally. Gungeon native
+  offline reinstall writes correct schema1; all three test archives were subsequently restored.
+  Coffee Depot repair succeeds.
+  No broad gameplay/controller/cold-wallet-start assertion. Saved-login discovery fixed P330;
+  user unlocked the already-advertised KDE provider, no wallet settings changed.
+- Recent live: Coffee Audit Test profile created in an empty slot, opening scene reached,
+  normal exit uploaded one28KB save; Properties records successful18:29UTC sync. Preserve it.
+  Gungeon archive pause/cancel first click passes; all three installers restored900.7MB.
+  Exact completed archive deletion now clears stale detail feedback without leaving the page.
+  Native manual update reports no update and preserves Play; Proton metadata loads normally.
+  Final repair review is warning-free and keyboard Cancel works; no components executed in it.
+- Open evidence/limits: earlier paused archive first trash click unexplained (P358); full stale
+  Properties installed identity deferred beyond P365a; malformed preference JSON recovery
+  deferred (P360); whole Cloud Properties page retention remains diagnostic (P386 only fixes
+  proven component cycles). P379 resolves override/discovery persistence race. No blanket claim
+  that all GTK warnings are absent. Private harness GSettings schema warnings remain nonfatal.
+  P375's reproduced consent-transition warning is corrected by P411; the stripped native stack
+  does not identify an internal GTK cause. Cloud Export remains unverified because its native
+  destination picker was unavailable to X11 automation; normal save synchronization passed.
+- Use normal game windowquit and app tray Close, not X11 windowclose. Agents never see actual
+  private profile/game data or raw diagnostic logs; specifically approved app-only screenshots
+  are exceptions. Durable artifacts and source/test evidence are linked in R111_AUDIT.md.
+
+## R110 complete — 0.3.2 release and new PR
+
+- User authorizes version bump, commit/push and new upstream PR for R109. PR7 is merged.
+  Fetched upstream f4bee36; its tree equals5f38199 despite squashed history. New branch
+  fix/library-root-tolerance-0.3.2 based directly on upstream/main preserves all R109 changes.
+  P318 version metadata, P319 review; root build/publication. No package work.
+- Version metadata and independent review pass. Full isolated release gate passed formatting
+  and Clippy but found two cleanup test failures (544 library tests passed). P320/P321 investigate
+  old whole-library rejection assumptions versus per-file cleanup guarantees before publication.
+  Evidence: /tmp/ludomere-r110-full-build.log; no user files or profiles used.
+- P320/P321 confirmed obsolete test assumptions, not a production cleanup regression. Tests now
+  distinguish unsafe-root refusal, changed verified-replacement refusal and safe partial cleanup
+  with a protected replaced old file. Fresh-snapshot retry, symlink targets, held originals,
+  installed payloads, preferences and job records are covered. Independent final diff review passes;
+  production cleanup code unchanged. Initial failure retained in /tmp/ludomere-r110-full-build-initial.log.
+  Final isolated tools/check.sh and cargo build --locked PASS on the frozen final source:
+  formatting, all-target Clippy, 546 library tests, six integration tests and five Python tests.
+  Opt-in ignored tests remain outside the default build gate. No package built or installed.
+- Release commit4612df7 pushed to origin/fix/library-root-tolerance-0.3.2 via existing GitHub CLI
+  HTTPS authentication (SSH unavailable). Tracking points to the fork branch. New upstream/main PR:
+  https://github.com/KonoTyran/ludomere/pull/8. This records-only closeout does not change tested code.
+
+## R109 implemented and verified — allow unrelated library files and folders
+
+- User supersedes earlier strict library-content policy: root extras/trash must not invalidate
+  configured libraries. P316 implements storage admission/README/tests; P317 independent review.
+  Keep actual path/deletion safety and typed destination selection, leave unrelated files alone.
+  Clean starting tree at5f38199, no version/package/publication requested; focused tests only.
+- Whole-library archive evidence/layout policing removed; obsolete archive traversal helpers
+  removed. Root validation retains identity/location/access and reserved infrastructure checks.
+  Full Game Files diagnostics skip unrelated entries, inspect metadata-associated games only,
+  and cap diagnostic traversal without rejecting a root merely for its entry count.
+- Independent source review passes. Compilation passes; thirteen focused private storage/cleanup
+  regressions pending, including extra/trash preservation and retained unsafe-path rejection.
+  Test-only cleanup expectation updated for new policy; no deletion behavior broadened.
+- Final fifteen focused tests PASS: eleven backend storage tests, two related storage-settings
+  filesystem helpers included by the filter, and two exact cleanup regressions. Extra/trash/foreign
+  root contents accepted and preserved, recognized-game diagnostics and path/deletion guards pass.
+- Independent review has no introduced blocker. Final fmt, all-target Clippy -D warnings,
+  git diff --check and cargo build --locked PASS. Evidence /tmp/ludomere-r109-*.log and
+  /tmp/ludomere-p317-{storage,typed-delete,safe-delete}-tests.log; reports
+  /tmp/ludomere-p316-report.md and /tmp/ludomere-p317-review.md. README updated.
+  Tests use private inert files/profiles only; no actual user library accessed. No full suite,
+  schema/version/package changes, commit or publication performed.
 
 ## R108 complete — 0.3.1 build, commit, push and PR comment
 

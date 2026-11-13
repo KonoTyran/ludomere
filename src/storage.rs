@@ -100,7 +100,6 @@ pub(crate) fn inspect_libraries_with_store(
 
 /// Root compatibility for targeted game refreshes, without inspecting sibling games.
 /// This omits Game Files child diagnostics; Storage uses the full inspection APIs.
-/// Offline Installers and Extras retain their full typed-content checks.
 pub(crate) fn inspect_libraries_for_refresh(
     config: &Config,
     store: &crate::state::StateStore,
@@ -191,7 +190,7 @@ fn inspect_with_evidence(
                 library,
                 evidence,
                 &mut game_issues,
-                inspect_game_children || kind != LibraryKind::GameFiles,
+                inspect_game_children,
             );
             LibraryStatus {
                 kind,
@@ -239,15 +238,10 @@ pub fn validate_library(config: &Config, kind: LibraryKind, id: &str) -> Result<
         .context("The selected library is no longer configured for this type")?;
     // Admission checks the selected root only. Config-wide overlap checks remain in
     // inspect_library, but unrelated archive trees need not be traversed for every launch.
-    let evidence = if kind == LibraryKind::GameFiles {
-        Vec::new()
-    } else {
-        library_evidence(&crate::state::StateStore::open()?, Some(&library.path))?
-    };
-    match library_compatibility(config, kind, library, &evidence, &mut Vec::new(), false) {
+    match library_compatibility(config, kind, library, &[], &mut Vec::new(), false) {
         LibraryCompatibility::Compatible => Ok(library.clone()),
         LibraryCompatibility::Incompatible(reason) => bail!(
-            "{} library is incompatible: {reason}. Correct its contents or choose another directory in Storage.",
+            "{} library is incompatible: {reason}. Correct its location or choose another directory in Storage.",
             kind.label()
         ),
         LibraryCompatibility::Unavailable(reason) => {
@@ -526,101 +520,69 @@ fn inspect_library(
             ));
         }
     }
-    if kind == LibraryKind::GameFiles {
-        for name in [
-            crate::identity::MARKER_DIRECTORY,
-            crate::identity::STAGING_DIRECTORY,
-        ] {
-            match fs::symlink_metadata(library.path.join(name)) {
-                Ok(metadata) => ensure!(
-                    metadata.is_dir() && !metadata.file_type().is_symlink(),
-                    "Library infrastructure must be a real directory, not a link"
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        // Check root accessibility without touching any sibling game's content.
-        fs::read_dir(&library.path)?;
-    }
-    for (path, actual) in evidence {
-        if kind != LibraryKind::GameFiles
-            && path.starts_with(&library.path)
-            && *actual != kind
-            && fs::symlink_metadata(path).is_ok()
-        {
-            return Ok(Some(format!(
-                "Contains recorded {} content",
-                actual.label()
-            )));
+    for name in [
+        crate::identity::MARKER_DIRECTORY,
+        crate::identity::STAGING_DIRECTORY,
+    ] {
+        match fs::symlink_metadata(library.path.join(name)) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "Library infrastructure must be a real directory, not a link"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    if kind == LibraryKind::GameFiles && !inspect_children {
+    // Admission checks accessibility, not the contents of unrelated folders.
+    let entries = fs::read_dir(&library.path)?;
+    if kind != LibraryKind::GameFiles || !inspect_children {
         return Ok(None);
     }
-    let mut budget = 100_000;
-    for entry in fs::read_dir(&library.path)? {
+    for entry in entries.take(100_000) {
         let entry = entry?;
-        ensure!(
-            budget > 0,
-            "Library inspection exceeds its bounded entry limit"
-        );
-        budget -= 1;
         let name = entry.file_name();
-        let entry_type = match entry.file_type() {
-            Ok(kind) => kind,
-            Err(error) if kind == LibraryKind::GameFiles => {
-                game_issues.push(GameDirectoryIssue {
-                    path: entry.path(),
-                    reason: format!("Could not inspect this game entry: {error}"),
-                });
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if !entry_type.is_dir() {
-            if kind == LibraryKind::GameFiles
-                && name != crate::identity::MARKER_DIRECTORY
-                && name != crate::identity::STAGING_DIRECTORY
-            {
-                game_issues.push(GameDirectoryIssue {
-                    path: entry.path(),
-                    reason: "This game entry is not a real directory; links are not followed"
-                        .into(),
-                });
-                continue;
-            }
-            return Ok(Some(
-                "Contains files or links outside a recognized product directory".into(),
-            ));
-        }
-        if name == crate::identity::STAGING_DIRECTORY {
+        if name == crate::identity::STAGING_DIRECTORY || name == crate::identity::MARKER_DIRECTORY {
             continue;
         }
-        if name == crate::identity::MARKER_DIRECTORY {
-            if kind == LibraryKind::GameFiles {
-                continue;
-            }
-            return Ok(Some(
-                "Contains Game Files infrastructure in an archive library".into(),
-            ));
+        let entry_type = entry.file_type();
+        // Only managed-game evidence warrants repair diagnostics. Arbitrary root
+        // files, trash, archives and unmarked folders are not broken games.
+        let mut metadata_paths = ["operation.json", "recovery.json", "retained.json", "json"]
+            .map(|suffix| {
+                library
+                    .path
+                    .join(".ludomere/staging")
+                    .join(format!("{}.{suffix}", name.to_string_lossy()))
+            })
+            .to_vec();
+        if entry_type.as_ref().is_ok_and(|kind| kind.is_dir()) {
+            metadata_paths.push(entry.path().join(crate::identity::MARKER_DIRECTORY));
         }
-        if kind == LibraryKind::GameFiles {
-            let result = inspect_game_directory(library, &entry.path(), evidence, &mut 100_000);
-            let reason = match result {
-                Ok(reason) => reason,
-                Err(error) => Some(error.to_string()),
-            };
-            if let Some(reason) = reason {
-                game_issues.push(GameDirectoryIssue {
-                    path: entry.path(),
-                    reason,
-                });
-            }
-        } else if let Some(reason) =
-            inspect_product(&entry.path(), kind, evidence, &mut budget, true)?
+        if !metadata_paths
+            .iter()
+            .any(|path| match fs::symlink_metadata(path) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
         {
-            return Ok(Some(reason));
+            continue;
+        }
+        let result = entry_type.map_err(anyhow::Error::from).and_then(|kind| {
+            ensure!(
+                kind.is_dir(),
+                "This game entry is not a real directory; links are not followed"
+            );
+            inspect_game_directory(library, &entry.path(), evidence, &mut 100_000)
+        });
+        let reason = match result {
+            Ok(reason) => reason,
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(reason) = reason {
+            game_issues.push(GameDirectoryIssue {
+                path: entry.path(),
+                reason,
+            });
         }
     }
     Ok(None)
@@ -676,9 +638,10 @@ fn inspect_game_directory(
         &library.path,
         &directory.join(".ludomere/installation.json"),
         4 * 1024 * 1024,
-    )?;
+    )?
+    .map(|marker| marker.normalize_loaded(directory))
+    .transpose()?;
     if let Some(marker) = &marker {
-        marker.validate()?;
         ensure!(
             marker.slug == name.to_string_lossy(),
             "Installation marker does not match its product directory"
@@ -965,96 +928,6 @@ fn plausible_payload(path: &Path, depth: usize, budget: &mut usize) -> Result<bo
     Ok(false)
 }
 
-fn inspect_product(
-    path: &Path,
-    kind: LibraryKind,
-    evidence: &[(PathBuf, LibraryKind)],
-    budget: &mut usize,
-    allow_dlc: bool,
-) -> Result<Option<String>> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        ensure!(
-            *budget > 0,
-            "Library inspection exceeds its bounded entry limit"
-        );
-        *budget -= 1;
-        let name = entry.file_name();
-        if name == crate::identity::MARKER_DIRECTORY {
-            return Ok(Some(
-                "Contains installed-game metadata in an archive library".into(),
-            ));
-        }
-        if !entry.file_type()?.is_dir() {
-            return Ok(Some(
-                "Archive content is outside the recognized category layout".into(),
-            ));
-        }
-        if name == "dlc" && allow_dlc {
-            for child in fs::read_dir(entry.path())? {
-                let child = child?;
-                ensure!(
-                    *budget > 0,
-                    "Library inspection exceeds its bounded entry limit"
-                );
-                *budget -= 1;
-                if !child.file_type()?.is_dir() {
-                    return Ok(Some(
-                        "DLC archive directory contains an unexpected file or link".into(),
-                    ));
-                }
-                if let Some(reason) = inspect_product(&child.path(), kind, evidence, budget, false)?
-                {
-                    return Ok(Some(reason));
-                }
-            }
-            continue;
-        }
-        let expected = match name.to_str() {
-            Some("installer" | "patch") => LibraryKind::OfflineInstallers,
-            Some("extra") => {
-                if evidence.iter().any(|(path, recorded)| {
-                    *recorded == LibraryKind::OfflineInstallers && path.starts_with(entry.path())
-                }) {
-                    LibraryKind::OfflineInstallers
-                } else {
-                    LibraryKind::Extras
-                }
-            }
-            _ => return Ok(Some("Contains an unknown archive category".into())),
-        };
-        if expected != kind {
-            return Ok(Some(format!("Contains {} content", expected.label())));
-        }
-        inspect_archive_files(&entry.path(), 0, budget)?;
-    }
-    Ok(None)
-}
-
-fn inspect_archive_files(path: &Path, depth: usize, budget: &mut usize) -> Result<()> {
-    ensure!(
-        depth <= 3,
-        "Archive directory is deeper than the managed layout"
-    );
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        ensure!(
-            *budget > 0,
-            "Library inspection exceeds its bounded entry limit"
-        );
-        *budget -= 1;
-        let metadata = entry.file_type()?;
-        ensure!(
-            metadata.is_file() || metadata.is_dir(),
-            "Archive contains an unsafe link or special file"
-        );
-        if metadata.is_dir() {
-            inspect_archive_files(&entry.path(), depth + 1, budget)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,7 +1081,95 @@ mod tests {
     }
 
     #[test]
-    fn targeted_refresh_checks_roots_and_archives_without_scanning_game_siblings() {
+    fn unrelated_contents_do_not_restrict_typed_library_admission() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = configured(root.path());
+        let mut evidence = Vec::new();
+        for kind in LibraryKind::ALL {
+            let library = &config.libraries(kind)[0];
+            fs::write(library.path.join("notes.txt"), b"preserve").unwrap();
+            for folder in [
+                ".Trash-1000/files",
+                "unrelated/nested",
+                "foreign/installer/windows/en",
+                "foreign/extra/any/en",
+            ] {
+                fs::create_dir_all(library.path.join(folder)).unwrap();
+                fs::write(library.path.join(folder).join("file.bin"), b"preserve").unwrap();
+            }
+            let foreign = library.path.join("foreign/extra/any/en/file.bin");
+            evidence.push((foreign, LibraryKind::Extras));
+            evidence.push((
+                library.path.join("foreign/installer/windows/en/file.bin"),
+                LibraryKind::OfflineInstallers,
+            ));
+            symlink(
+                root.path().join("absent"),
+                library.path.join("unrelated-link"),
+            )
+            .unwrap();
+            assert!(validate_library(&config, kind, &library.id).is_ok());
+            assert!(validate_path(&config, kind, &library.path.join("new-game/file")).is_ok());
+            for wrong_kind in LibraryKind::ALL.into_iter().filter(|other| *other != kind) {
+                assert!(
+                    validate_path(&config, wrong_kind, &library.path.join("new-game/file"))
+                        .is_err()
+                );
+            }
+        }
+        for inspect_children in [false, true] {
+            for status in inspect_with_evidence(&config, &evidence, inspect_children) {
+                assert_eq!(status.compatibility, LibraryCompatibility::Compatible);
+                assert!(status.game_issues.is_empty());
+                assert_eq!(
+                    fs::read(status.path.join("notes.txt")).unwrap(),
+                    b"preserve"
+                );
+                assert_eq!(
+                    fs::read(status.path.join(".Trash-1000/files/file.bin")).unwrap(),
+                    b"preserve"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_library_types_reject_unsafe_roots_and_infrastructure() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let config = configured(root.path());
+        let file = root.path().join("file");
+        fs::write(&file, b"preserve").unwrap();
+        let linked = root.path().join("linked");
+        symlink(&config.game_libraries[0].path, &linked).unwrap();
+        for kind in LibraryKind::ALL {
+            for path in [&file, &linked, &crate::identity::config_root()] {
+                let mut invalid = config.clone();
+                invalid.libraries_mut(kind)[0].path = path.clone();
+                assert!(validate_library(&invalid, kind, &invalid.libraries(kind)[0].id).is_err());
+            }
+            let library = &config.libraries(kind)[0];
+            for reserved in [
+                crate::identity::MARKER_DIRECTORY,
+                crate::identity::STAGING_DIRECTORY,
+            ] {
+                let path = library.path.join(reserved);
+                symlink(root.path(), &path).unwrap();
+                assert!(validate_library(&config, kind, &library.id).is_err());
+                fs::remove_file(&path).unwrap();
+            }
+            let escape = library.path.join("escape");
+            symlink(root.path(), &escape).unwrap();
+            assert!(validate_path(&config, kind, &escape.join("new-file")).is_err());
+            fs::remove_file(escape).unwrap();
+        }
+    }
+
+    #[test]
+    fn targeted_refresh_checks_roots_without_scanning_game_siblings() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = tempfile::tempdir().unwrap();
@@ -1218,6 +1179,8 @@ mod tests {
             let partial = config.game_libraries[0].path.join(format!("partial-{id}"));
             fs::create_dir(&partial).unwrap();
             fs::write(partial.join("incomplete.bin"), b"partial payload").unwrap();
+            fs::create_dir(partial.join(".ludomere")).unwrap();
+            fs::write(partial.join(".ludomere/installation.json"), b"{broken").unwrap();
         }
         let healthy = config.game_libraries[0].path.join("healthy");
         marker(&healthy);
@@ -1269,10 +1232,10 @@ mod tests {
         let full = inspect_libraries_with_store(&config, &store).unwrap();
         let targeted = inspect_libraries_for_refresh(&config, &store).unwrap();
         for index in [1, 2] {
-            assert!(matches!(
+            assert_eq!(
                 targeted[index].compatibility,
-                LibraryCompatibility::Incompatible(_)
-            ));
+                LibraryCompatibility::Compatible
+            );
             assert_eq!(targeted[index].compatibility, full[index].compatibility);
         }
         symlink(
@@ -1309,6 +1272,14 @@ mod tests {
         fs::create_dir(&terraria).unwrap();
         fs::write(terraria.join("partial.bin"), b"incomplete").unwrap();
         marker(&grim_dawn);
+        assert!(
+            inspect_with_evidence(&config, &[], true)[0]
+                .game_issues
+                .is_empty()
+        );
+        assert!(validate_path(&config, LibraryKind::GameFiles, &terraria).is_err());
+        fs::create_dir(terraria.join(".ludomere")).unwrap();
+        fs::write(terraria.join(".ludomere/installation.json"), b"{broken").unwrap();
         let check = || {
             let statuses = inspect_with_evidence(&config, &[], true);
             assert_eq!(statuses[0].compatibility, LibraryCompatibility::Compatible);
@@ -1337,9 +1308,6 @@ mod tests {
             assert!(validate_path(&config, LibraryKind::GameFiles, &terraria).is_err());
             assert!(validate_game_directory_location(&config, &terraria).is_ok());
         };
-        check();
-        fs::create_dir(terraria.join(".ludomere")).unwrap();
-        fs::write(terraria.join(".ludomere/installation.json"), b"{broken").unwrap();
         check();
         fs::create_dir_all(terraria.join("installer/windows/en")).unwrap();
         check();
@@ -1397,10 +1365,10 @@ mod tests {
                 .join(".ludomere/compatibility"),
         )
         .unwrap();
-        assert!(matches!(
+        assert_eq!(
             inspect_with_evidence(&config, &[], true)[2].compatibility,
-            LibraryCompatibility::Incompatible(_)
-        ));
+            LibraryCompatibility::Compatible
+        );
         fs::remove_dir_all(&game).unwrap();
         let nested = config.game_libraries[0]
             .path
@@ -1408,7 +1376,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("setup.exe"), b"inert").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[], true)[0]
+            inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
@@ -1503,10 +1471,11 @@ mod tests {
         fs::create_dir(&game).unwrap();
         fs::write(game.join("content.bin"), b"partial payload").unwrap();
         assert!(
-            !inspect_with_evidence(&config, &[], true)[0]
+            inspect_with_evidence(&config, &[], true)[0]
                 .game_issues
                 .is_empty()
         );
+        assert!(validate_path(&config, LibraryKind::GameFiles, &game).is_err());
         let path = library.join(".ludomere/staging/partial.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut files = (0..16_011)

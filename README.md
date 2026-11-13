@@ -74,6 +74,12 @@ The existing DirectX and supported Visual C++ compatibility recipes continue thr
 other supported dependencies use GOG's declared installer and arguments through UMU. Successful
 setup is recorded for the selected prefix, dependency revision and installation method. Resume
 retries unfinished work and reuses intact cached files; recreating a prefix requires setup again.
+
+Native MSI dependencies and the supported .NET Framework 4.5.2 installer finish with a restart
+inside the game's Wine prefix, including when they report documented restart-required success
+codes. Setup is recorded only after the installer processes stop and the prefix restart succeeds.
+This does not reboot the host; a failed prefix restart leaves setup available to retry.
+
 If an active launch detects a safely recoverable Windows setup failure, a **Repair Windows setup**
 dialog opens. Confirm repair to retain the old environment as a backup; exact paths and diagnostics
 are available under **Details**. If you have left the launch view, the notification area keeps a
@@ -112,8 +118,10 @@ Adding a game library refreshes installed state and sidebar colors without openi
 Storage separates **Game Files**, **Offline Installers**, and **Goodies & Extras**. Each type supports
 multiple directories and its own default. Only Game Files is required; optional types have no
 implicit fallback. Unsafe library roots (including overlapping paths or inaccessible directories)
-remain blocked with a reason. A partial, corrupt or unrecognized game folder is reported separately
-and does not disable other games in that Game Files library. Storage lists affected folders with
+remain blocked with a reason. Extra root files, unrelated folders, trash directories and foreign
+archives do not disable any library type. Partial or corrupt folders with Ludomere installation or
+operation metadata are reported separately and do not disable other games in that Game Files library.
+Storage lists affected folders with
 Browse Files and, for recognized account games, repair and confirmed file-reset actions. Unmatched
 folders can be inspected but are not adopted or deleted automatically.
 Use separate, nonoverlapping roots, for example sibling `Games`, `Installers`, and `Extras`
@@ -121,8 +129,8 @@ directories. Game Files contains installed game directories and Ludomere's `.lud
 infrastructure. Archive roots use the managed `<game>/installer`, `<game>/patch`, or
 `<game>/extra` category layout, with platform/language subdirectories when provided and
 `<game>/dlc/<dlc>/…` for DLC. Installer components such as language packs belong with Offline
-Installers. Archive libraries still require the matching managed layout; changing configuration does
-not convert mixed contents. No files are automatically moved or deleted.
+Installers. These types determine where Ludomere writes game data and downloads; existing unrelated
+contents do not need to match the managed layout. No files are automatically moved or deleted.
 Installation records are retained while a library is incompatible, and running games are not stopped.
 Already indexed files in configured archive libraries are rematched as game/DLC metadata arrives,
 using unambiguous filename, OS, language and known-size matches. Arbitrary flat folders are not
@@ -261,12 +269,12 @@ Python, python-xlib, and python-urllib3. Arch supplies development headers with 
 A graphical session and session D-Bus are needed to run the application. Login additionally needs
 an unlocked Secret Service provider, such as GNOME Keyring or a compatible desktop keyring;
 installing libsecret alone does not provide that service.
-During explicit sign-in, Ludomere detects the session's standard Secret Service. If none is
-running or activatable but KDE advertises its compatibility service, Ludomere requests normal
-D-Bus activation and checks the standard interface again. It does not change wallet settings or
-bypass a disabled API. Unavailable services, activation failures, denied wallet access, and
-duplicate login entries have distinct safe errors; successful secure credential storage remains
-required before sign-in completes.
+During explicit sign-in and saved-login restoration, Ludomere first detects the session's standard
+Secret Service. If none is running or activatable but KDE advertises its compatibility service,
+Ludomere requests normal D-Bus activation and checks the standard interface again. It does not
+change wallet settings or bypass a disabled API. Unavailable services, activation failures, denied
+wallet access, and duplicate login entries have distinct safe errors; successful secure credential
+storage remains required before sign-in completes.
 
 The package includes a private [UMU Launcher](https://github.com/Open-Wine-Components/umu-launcher)
 1.4.4 and [Comet](https://github.com/imLinguin/comet) v0.3.2 with its Windows service helper.
@@ -402,8 +410,8 @@ games continue. Interrupted operations remain recoverable after signing in. Fact
 automatic-resume records after their writers stop, while keeping downloaded and installed files.
 Reset retains a small identity receipt so incomplete game files remain recognizable without
 restoring automatic resume. Older partial Depot folders can also be recognized when a surviving
-journal matches their files. Unidentified folders and content in the wrong library type still
-require correction before the library can be used.
+journal matches their files. Unidentified folders and content in another library type do not block
+library use; selecting an existing game folder still requires its game-specific safety checks.
 If reset preparation cannot finish, the account stays signed out; use Factory Reset again to retry.
 Progress and full error details appear beside the Factory Reset button. An unavailable system
 credential store does not block local reset: its external login entry may remain, but a durable

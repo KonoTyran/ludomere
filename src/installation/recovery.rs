@@ -45,6 +45,17 @@ pub(crate) fn admit_generation(id: i64, generation: u64) -> Result<Admission> {
     );
     Ok(Admission { _guard: guard })
 }
+pub(crate) fn try_admit_generation(id: i64, expected: Option<u64>) -> Result<(Admission, u64)> {
+    let guard = ADMISSIONS
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("Game operations are busy; retry cancellation shortly"))?;
+    let generation = *guard.generations.get(&id).unwrap_or(&0);
+    ensure!(
+        !guard.blocked.contains(&id) && expected.is_none_or(|expected| expected == generation),
+        "Game recovery changed or is resetting these files; refresh before retrying cancellation"
+    );
+    Ok((Admission { _guard: guard }, generation))
+}
 pub(crate) fn current(id: i64, generation: u64) -> bool {
     let guard = ADMISSIONS.lock().unwrap();
     !guard.blocked.contains(&id) && *guard.generations.get(&id).unwrap_or(&0) == generation

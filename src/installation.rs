@@ -317,7 +317,15 @@ fn reconcile_discovered(
         let mut game = marker::game_from_marker(&found_marker, library_id, directory, executable);
         if let Some(preferences) = &preferences {
             game.launch_arguments = preferences.launch_arguments.clone();
-            game.compatibility = preferences.compatibility.clone();
+            match game.installer_operating_system.as_deref() {
+                Some(os) if os.eq_ignore_ascii_case("linux") => game.compatibility = None,
+                Some(os) if os.eq_ignore_ascii_case("windows") => {
+                    if preferences.compatibility.is_some() {
+                        game.compatibility = preferences.compatibility.clone();
+                    }
+                }
+                _ => game.compatibility = preferences.compatibility.clone(),
+            }
         }
         let (last_played, playtime) = store.product_activity(game.product_id)?;
         game.last_played_at = last_played;
@@ -350,7 +358,18 @@ pub fn save_game_preferences(
         product_id: game.product_id,
         executable_path,
         launch_arguments: game.launch_arguments.clone(),
-        compatibility: game.compatibility.clone(),
+        // Native runtime state must not erase retained Windows preferences.
+        compatibility: if game
+            .installer_operating_system
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case("linux"))
+        {
+            store
+                .game_preferences(game.product_id)?
+                .and_then(|preferences| preferences.compatibility)
+        } else {
+            game.compatibility.clone()
+        },
         created_at: game.created_at,
         updated_at: game.updated_at,
         ..Default::default()
@@ -836,6 +855,316 @@ mod tests {
     use super::*;
     use crate::domain::{DownloadPart, DownloadRevision};
     use std::{fs, time::SystemTime};
+
+    #[test]
+    #[ignore = "requires isolated HOME and all XDG directories under /tmp/ludomere-p352-"]
+    fn recovered_native_marker_passes_protected_launch_admission() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p352-"),
+                "{key}"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let library = GameLibrary {
+            id: "native".into(),
+            name: "Native".into(),
+            path: root.path().join("games"),
+            default: true,
+        };
+        let config = Config {
+            game_libraries: vec![library.clone()],
+            offline_libraries: vec![],
+            extras_libraries: vec![],
+            ..Default::default()
+        };
+        let directory = library.path.join("enter_the_gungeon");
+        let marker_path = marker::marker_path(&directory);
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        let executable = directory.join("start.sh");
+        fs::write(&executable, b"inert native payload; never execute").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mixed = serde_json::json!({
+            "schema_version": 2, "product_id": 7, "slug": "enter_the_gungeon",
+            "base": { "operating_system": "linux", "language": "English", "version": "2.1.9", "revision_id": null, "installed_at": 1791283470 },
+            "compatibility": { "backend": "umu", "managed_by_ludomere": true, "prefix_slug": "enter_the_gungeon", "profile": { "game_id": "umu-default", "store": "gog", "source": "default_fallback" } }
+        });
+        let bytes = serde_json::to_vec(&mixed).unwrap();
+        fs::write(&marker_path, &bytes).unwrap();
+        for _ in 0..2 {
+            // The actual first admission used by run_game, including storage's
+            // bounded, component-wise no-follow metadata read.
+            validate_game_library(&config, &library.id, &directory).unwrap();
+            let loaded = marker::load(&directory).unwrap().unwrap();
+            assert_eq!(loaded.schema_version, 1);
+            assert!(loaded.compatibility.is_none());
+            let game = marker::game_from_marker(
+                &loaded,
+                library.id.clone(),
+                directory.clone(),
+                Some(executable.clone()),
+            );
+            prefix_recovery::ensure_ready(&game).unwrap();
+            assert!(game.compatibility.is_none());
+            assert_eq!(fs::read(&marker_path).unwrap(), bytes);
+        }
+        let raw: marker::InstallationMarker = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            marker::write(&raw, &directory).is_err(),
+            "writer must remain strict"
+        );
+        assert_eq!(fs::read(&marker_path).unwrap(), bytes);
+        for (field, value, expected) in [
+            ("schema_version", serde_json::json!(3), "unsupported schema"),
+            ("slug", serde_json::json!("another_game"), "reinstall"),
+            ("dependencies", serde_json::json!(["dotnet"]), "reinstall"),
+        ] {
+            let mut rejected = mixed.clone();
+            rejected[field] = value;
+            let rejected = serde_json::to_vec(&rejected).unwrap();
+            fs::write(&marker_path, &rejected).unwrap();
+            let error = validate_game_library(&config, &library.id, &directory).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(fs::read(&marker_path).unwrap(), rejected);
+        }
+        // Canonical marker identities remain checked after normalization too.
+        let mut mismatch = mixed.clone();
+        mismatch["schema_version"] = serde_json::json!(1);
+        mismatch["compatibility"] = serde_json::Value::Null;
+        mismatch["slug"] = serde_json::json!("another_game");
+        fs::write(&marker_path, serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        assert!(
+            validate_game_library(&config, &library.id, &directory)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        for rejected in [b"malformed".to_vec(), vec![b' '; 4 * 1024 * 1024 + 1]] {
+            fs::write(&marker_path, &rejected).unwrap();
+            assert!(validate_game_library(&config, &library.id, &directory).is_err());
+            assert_eq!(fs::read(&marker_path).unwrap(), rejected);
+        }
+        fs::remove_file(&marker_path).unwrap();
+        let outside = root.path().join("outside.json");
+        fs::write(&outside, &bytes).unwrap();
+        symlink(&outside, &marker_path).unwrap();
+        assert!(validate_game_library(&config, &library.id, &directory).is_err());
+        fs::remove_file(&marker_path).unwrap();
+        fs::create_dir(&marker_path).unwrap();
+        assert!(validate_game_library(&config, &library.id, &directory).is_err());
+        fs::remove_dir(&marker_path).unwrap();
+        fs::remove_dir(marker_path.parent().unwrap()).unwrap();
+        let outside_directory = root.path().join("outside-marker");
+        fs::create_dir(&outside_directory).unwrap();
+        fs::write(outside_directory.join("installation.json"), &bytes).unwrap();
+        symlink(&outside_directory, marker_path.parent().unwrap()).unwrap();
+        assert!(validate_game_library(&config, &library.id, &directory).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), bytes);
+        assert_eq!(
+            fs::read(outside_directory.join("installation.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            b"inert native payload; never execute"
+        );
+        assert!(!library.path.join(".ludomere/compatibility").exists());
+    }
+
+    #[test]
+    #[ignore = "requires isolated HOME and all XDG directories under /tmp/ludomere-p352-"]
+    fn native_reconciliation_preserves_windows_preferences_and_os_boundaries() {
+        use crate::compatibility::{
+            CompatibilityBackendKind, GameCompatibilityPreferences, UmuProfile, UmuProfileSource,
+        };
+        use crate::domain::{GamePreferences, InstallationSource};
+        use std::os::unix::fs::PermissionsExt;
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p352-"),
+                "{key}"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::state::StateStore::open_at(&root.path().join("state.db")).unwrap();
+        let library = GameLibrary {
+            id: "test".into(),
+            name: "Test".into(),
+            path: root.path().join("games"),
+            default: true,
+        };
+        let proton_path = crate::identity::config_root().join("proton.json");
+        fs::create_dir_all(proton_path.parent().unwrap()).unwrap();
+        let proton_bytes = br#"{"default":"/inert/Proton","overrides":{"1":"/inert/Other"},"dll_overrides":{"1":{"dxgi":"native"}}}"#;
+        fs::write(&proton_path, proton_bytes).unwrap();
+        for (index, (os, mixed, saved)) in [
+            (Some("linux"), false, 2),
+            (Some("LiNuX"), true, 2),
+            (Some("linux"), false, 0),
+            (Some("windows"), false, 2),
+            (Some("windows"), false, 1),
+            (Some("windows"), false, 0),
+            (Some("unknown"), false, 2),
+            (None, false, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as i64 + 1;
+            let slug = format!("game-{id}");
+            let directory = library.path.join(&slug);
+            fs::create_dir_all(marker::marker_path(&directory).parent().unwrap()).unwrap();
+            let windows = os == Some("windows");
+            let linux = os.is_some_and(|os| os.eq_ignore_ascii_case("linux"));
+            let executable = directory.join(if windows {
+                format!("{slug}.exe")
+            } else {
+                "start.sh".into()
+            });
+            fs::write(&executable, b"inert payload").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let runtime = GameCompatibilityPreferences {
+                backend: CompatibilityBackendKind::Umu,
+                prefix_slug: slug.clone(),
+                profile: UmuProfile::fallback(),
+                pending_profile: None,
+            };
+            let mut stored_runtime = runtime.clone();
+            stored_runtime.profile.game_id = "umu-retained".into();
+            stored_runtime.pending_profile = Some(UmuProfile {
+                game_id: "umu-pending".into(),
+                store: "gog".into(),
+                source: UmuProfileSource::GogProductId,
+            });
+            if saved != 0 {
+                store
+                    .upsert_game_preferences(&GamePreferences {
+                        product_id: id,
+                        // Force full reconciliation to discover and save the executable.
+                        executable_path: None,
+                        compatibility: (saved == 2).then_some(stored_runtime.clone()),
+                        launch_arguments: vec!["--retained".into()],
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            store.set_favorite(id, true).unwrap();
+            store.add_tag(id, "Retained").unwrap();
+            store.preserve_product_activity(id, Some(100), 321).unwrap();
+            if saved != 0 {
+                store
+                    .set_game_update_preferences(
+                        id,
+                        Some(false),
+                        Some(true),
+                        Some(false),
+                        Some("pl"),
+                    )
+                    .unwrap();
+            }
+            let marker = marker::InstallationMarker {
+                schema_version: if windows || mixed { 2 } else { 1 },
+                product_id: id,
+                slug: slug.clone(),
+                base: marker::InstalledComponent {
+                    operating_system: os.map(str::to_owned),
+                    language: Some("English".into()),
+                    version: Some("2.1.9".into()),
+                    revision_id: None,
+                    installed_at: 1_791_283_470,
+                },
+                dlc: vec![],
+                compatibility: (windows || mixed).then(|| marker::InstalledCompatibility {
+                    backend: runtime.backend,
+                    managed_by_ludomere: true,
+                    prefix_slug: slug.clone(),
+                    profile: runtime.profile.clone(),
+                }),
+                source: InstallationSource::OfflineInstaller,
+                galaxy_depot: None,
+                launch: None,
+                dependencies: vec![],
+            };
+            let bytes = serde_json::to_vec(&marker).unwrap();
+            fs::write(marker::marker_path(&directory), &bytes).unwrap();
+            let expected_runtime = if linux {
+                None
+            } else if saved == 2 {
+                Some(stored_runtime.clone())
+            } else if windows {
+                Some(runtime.clone())
+            } else {
+                None
+            };
+            for _ in 0..2 {
+                let full =
+                    reconcile_installed_games(&store, std::slice::from_ref(&library)).unwrap();
+                let game = full.iter().find(|game| game.product_id == id).unwrap();
+                assert_eq!(game.compatibility, expected_runtime, "case {index}");
+                assert_eq!(game.primary_executable.as_ref(), Some(&executable));
+                assert_eq!(game.last_played_at, Some(100));
+                assert_eq!(game.playtime_seconds, 321);
+                let targeted = reconcile_installed_products(
+                    &store,
+                    std::slice::from_ref(&library),
+                    &[(id, slug.clone())],
+                    &HashMap::from([(id, game.clone())]),
+                )
+                .unwrap();
+                assert_eq!(targeted.len(), 1);
+                assert_eq!(targeted[0].compatibility, expected_runtime);
+                assert_eq!(targeted[0].primary_executable.as_ref(), Some(&executable));
+                if linux {
+                    let mut stale_plan = game.clone();
+                    stale_plan.compatibility = Some(runtime.clone());
+                    save_game_preferences(&store, &stale_plan).unwrap();
+                }
+                let preferences = store.game_preferences(id).unwrap().unwrap();
+                assert_eq!(
+                    preferences.compatibility,
+                    if linux {
+                        (saved == 2).then_some(stored_runtime.clone())
+                    } else {
+                        expected_runtime.clone()
+                    }
+                );
+                if saved != 0 {
+                    assert_eq!(preferences.launch_arguments, ["--retained"]);
+                    assert_eq!(preferences.auto_update_galaxy, Some(false));
+                    assert_eq!(preferences.auto_download_offline_installer, Some(true));
+                    assert_eq!(preferences.prune_superseded_installers, Some(false));
+                    assert_eq!(preferences.galaxy_language.as_deref(), Some("pl"));
+                }
+                assert!(store.favorites().unwrap().contains(&id));
+                assert_eq!(store.tags().unwrap()[&id], ["Retained"]);
+                assert_eq!(store.product_activity(id).unwrap(), (Some(100), 321));
+                assert_eq!(fs::read(marker::marker_path(&directory)).unwrap(), bytes);
+                assert_eq!(fs::read(&proton_path).unwrap(), proton_bytes);
+                assert!(!library.path.join(".ludomere/compatibility").exists());
+            }
+        }
+    }
 
     #[test]
     fn typed_library_operation_gates_preserve_mixed_content_and_separate_copies() {

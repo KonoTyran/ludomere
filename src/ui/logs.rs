@@ -16,6 +16,7 @@ struct Viewer {
     reading: gtk::Spinner,
     folder: gtk::Button,
     status: gtk::Label,
+    folder_status: gtk::Label,
     text: gtk::TextView,
     scroll: gtk::ScrolledWindow,
     logs: RefCell<Vec<RuntimeLog>>,
@@ -183,7 +184,7 @@ impl Viewer {
         } else if tail.text.is_empty() {
             "This launch has not written any output yet.".to_owned()
         } else {
-            "Saved launch output. Live updates appear while this tab is open.".to_owned()
+            "Saved launch output.".to_owned()
         });
         if self.follow.is_active() {
             let text = self.text.downgrade();
@@ -206,8 +207,10 @@ impl Viewer {
         self.refresh.set_sensitive(false);
         self.folder.set_sensitive(false);
         self.follow.set_sensitive(false);
+        self.folder_status.set_label("");
+        self.folder_status.set_visible(false);
         self.status
-            .set_label("Account changed. Reopen this game to view logs.");
+            .set_label("Account changed. Go to Home, then reopen this game to view logs.");
     }
 }
 
@@ -271,6 +274,14 @@ pub(super) fn runtime_log_view(
     status.set_wrap(true);
     status.set_selectable(true);
     root.append(&status);
+    let folder_status = gtk::Label::new(None);
+    folder_status.set_widget_name("runtime-log-folder-status");
+    folder_status.set_xalign(0.0);
+    folder_status.set_wrap(true);
+    folder_status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    folder_status.set_selectable(true);
+    folder_status.set_visible(false);
+    root.append(&folder_status);
     let text = gtk::TextView::new();
     text.set_widget_name("runtime-log-text");
     text.set_editable(false);
@@ -297,6 +308,7 @@ pub(super) fn runtime_log_view(
         reading,
         folder,
         status,
+        folder_status,
         text,
         scroll,
         logs: RefCell::new(Vec::new()),
@@ -367,21 +379,37 @@ pub(super) fn runtime_log_view(
         let viewer = Rc::downgrade(&viewer);
         move |_| {
             if let Some(viewer) = viewer.upgrade() && viewer.valid() && let Some(window) = viewer.window.upgrade() {
-                let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(crate::identity::runtime_logs())));
+                viewer.folder_status.set_label("");
+                viewer.folder_status.set_visible(false);
+                if !viewer.valid() {
+                    return;
+                }
                 let weak = Rc::downgrade(&viewer);
-                launcher.launch(Some(&window), gio::Cancellable::NONE, move |result| {
+                let finished = move |result: Result<(), glib::Error>| {
                     if let Some(viewer) = weak.upgrade() && viewer.valid() {
                         if let Err(error) = result {
                             let message = notifications::failure_message("Could not open the log folder. Check your desktop file manager and try again.", &error.to_string());
-                            viewer.status.set_label(&message);
+                            viewer.folder_status.set_label(&message);
+                            viewer.folder_status.set_visible(true);
                             viewer.folder.set_label("Retry opening log folder");
                             viewer.folder.set_tooltip_text(Some(&message));
                         } else {
+                            viewer.folder_status.set_label("");
+                            viewer.folder_status.set_visible(false);
                             viewer.folder.set_label("Open log folder");
                             viewer.folder.set_tooltip_text(None);
                         }
                     }
-                });
+                };
+                #[cfg(test)]
+                if let Some(result) = tests::FOLDER_RESULTS.with_borrow_mut(|pending| {
+                    pending.as_mut().map(|pending| pending.pop_front().expect("missing inert folder launch result"))
+                }) {
+                    glib::idle_add_local_once(move || finished(result));
+                    return;
+                }
+                let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(crate::identity::runtime_logs())));
+                launcher.launch(Some(&window), gio::Cancellable::NONE, finished);
             }
         }
     });
@@ -456,6 +484,217 @@ pub(super) fn runtime_log_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type FolderResult = Result<(), glib::Error>;
+
+    thread_local! {
+        pub(super) static FOLDER_RESULTS: RefCell<Option<VecDeque<FolderResult>>> = const { RefCell::new(None) };
+    }
+
+    #[test]
+    #[ignore = "requires private p399 HOME/all XDG/TMP and GTK; only synthetic logs, folder launches fail-closed inert"]
+    fn folder_failures_survive_real_reader_updates_and_clear_on_retry_or_retirement() {
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ] {
+            assert!(
+                std::env::var(key)
+                    .unwrap()
+                    .starts_with("/tmp/ludomere-p399-")
+            );
+        }
+        assert!(!crate::identity::database().exists());
+        assert!(!Config::path().exists());
+        FOLDER_RESULTS.with_borrow_mut(|pending| *pending = Some(VecDeque::new()));
+        adw::init().unwrap();
+        #[track_caller]
+        fn wait_until(check: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !check() && Instant::now() < deadline {
+                while glib::MainContext::default().iteration(false) {}
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(check());
+        }
+        let app = adw::Application::builder()
+            .application_id("io.github.ludomere.LogFolderFeedbackTest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .default_width(800)
+            .default_height(650)
+            .build();
+        let model = Rc::new(RefCell::new(AppModel::default()));
+        let path = crate::identity::runtime_logs().join("9399001.log");
+        assert!(path.starts_with(std::env::var("XDG_DATA_HOME").unwrap()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "initial output\n").unwrap();
+        let view = runtime_log_view(&window, &model, 9399001);
+        let folder = find_named_descendant(view.upcast_ref(), "runtime-log-folder")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let status = find_named_descendant(view.upcast_ref(), "runtime-log-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let folder_status = find_named_descendant(view.upcast_ref(), "runtime-log-folder-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let refresh = find_named_descendant(view.upcast_ref(), "runtime-log-refresh")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let copy = find_named_descendant(view.upcast_ref(), "runtime-log-copy")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let text = find_named_descendant(view.upcast_ref(), "runtime-log-text")
+            .and_downcast::<gtk::TextView>()
+            .unwrap();
+        let follow = status
+            .prev_sibling()
+            .unwrap()
+            .downcast::<gtk::CheckButton>()
+            .unwrap();
+        let buffer = text.buffer();
+        window.set_content(Some(&view));
+        window.present();
+        wait_until(|| folder.is_mapped() && folder.is_sensitive() && copy.is_sensitive());
+        assert!(!folder_status.get_visible());
+        let fail = || {
+            FOLDER_RESULTS.with_borrow_mut(|pending| {
+                pending.as_mut().unwrap().push_back(Err(glib::Error::new(
+                    gio::IOErrorEnum::Failed,
+                    "Synthetic file manager refused access_token=P399_SECRET",
+                )));
+            })
+        };
+        fail();
+        folder.emit_clicked();
+        wait_until(|| folder_status.is_mapped());
+        let message = folder_status.label();
+        assert!(message.contains("Synthetic file manager refused"));
+        assert!(!message.contains("P399_SECRET"));
+        assert!(folder_status.is_selectable());
+        assert!(folder_status.wraps());
+        assert_eq!(folder_status.wrap_mode(), gtk::pango::WrapMode::WordChar);
+        assert_eq!(folder.label().as_deref(), Some("Retry opening log folder"));
+        assert_eq!(folder.tooltip_text().as_deref(), Some(message.as_str()));
+        for output in [
+            "initial output\nsecond\n",
+            "initial output\nsecond\nthird\n",
+        ] {
+            std::fs::write(&path, output).unwrap();
+            wait_until(|| buffer.text(&buffer.start_iter(), &buffer.end_iter(), false) == output);
+            assert_eq!(folder_status.label(), message);
+            assert!(folder_status.is_mapped());
+            assert!(copy.is_sensitive());
+        }
+        // Ordinary polling preserves selection and the independent folder message.
+        buffer.select_range(&buffer.start_iter(), &buffer.iter_at_offset(7));
+        std::fs::write(&path, "initial output\nsecond\nthird\nfourth\n").unwrap();
+        wait_until(|| status.label().contains("Live view paused"));
+        let (start, end) = buffer.selection_bounds().unwrap();
+        assert_eq!(buffer.text(&start, &end, false), "initial");
+        assert_eq!(folder_status.label(), message);
+        follow.set_active(false);
+        refresh.emit_clicked();
+        wait_until(|| {
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .contains("fourth")
+        });
+        assert!(!follow.is_active());
+        assert_eq!(folder_status.label(), message);
+        assert!(folder_status.is_mapped());
+
+        FOLDER_RESULTS.with_borrow_mut(|pending| pending.as_mut().unwrap().push_back(Ok(())));
+        folder.emit_clicked();
+        assert!(folder_status.label().is_empty());
+        assert!(!folder_status.get_visible());
+        wait_until(|| folder.label().as_deref() == Some("Open log folder"));
+        assert!(folder.tooltip_text().is_none());
+        fail();
+        folder.emit_clicked();
+        wait_until(|| folder_status.is_mapped());
+        assert_eq!(folder_status.label(), message);
+        model.borrow_mut().account_epoch += 1;
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!folder.is_sensitive());
+        assert!(folder_status.label().is_empty());
+        assert!(!folder_status.get_visible());
+
+        // The queued completion shares production validity checks, so retirement wins.
+        let view = runtime_log_view(&window, &model, 9399001);
+        let folder = find_named_descendant(view.upcast_ref(), "runtime-log-folder")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let folder_status = find_named_descendant(view.upcast_ref(), "runtime-log-folder-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let status = find_named_descendant(view.upcast_ref(), "runtime-log-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        window.set_content(Some(&view));
+        wait_until(|| folder.is_mapped() && folder.is_sensitive());
+        fail();
+        folder.emit_clicked();
+        assert!(!folder_status.get_visible());
+        model.borrow_mut().account_epoch += 1;
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(!folder.is_sensitive());
+        assert!(folder_status.label().is_empty());
+        assert!(!folder_status.get_visible());
+        // Clearing previous feedback can synchronously retire the account before dispatch.
+        let view = runtime_log_view(&window, &model, 9399001);
+        let folder = find_named_descendant(view.upcast_ref(), "runtime-log-folder")
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        let folder_status = find_named_descendant(view.upcast_ref(), "runtime-log-folder-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        let status = find_named_descendant(view.upcast_ref(), "runtime-log-status")
+            .and_downcast::<gtk::Label>()
+            .unwrap();
+        window.set_content(Some(&view));
+        wait_until(|| folder.is_mapped() && folder.is_sensitive());
+        fail();
+        folder.emit_clicked();
+        wait_until(|| folder_status.is_mapped());
+        let retire = folder_status.connect_notify_local(Some("label"), {
+            let model = model.clone();
+            move |label, _| {
+                if label.label().is_empty() {
+                    model.borrow_mut().account_epoch += 1;
+                }
+            }
+        });
+        FOLDER_RESULTS.with_borrow_mut(|pending| pending.as_mut().unwrap().push_back(Ok(())));
+        folder.emit_clicked();
+        folder_status.disconnect(retire);
+        FOLDER_RESULTS.with_borrow_mut(|pending| {
+            let pending = pending.as_mut().unwrap();
+            assert_eq!(pending.len(), 1, "retired click must not dispatch a launch");
+            assert!(pending.pop_front().unwrap().is_ok());
+        });
+        wait_until(|| status.label().contains("Account changed"));
+        assert!(folder_status.label().is_empty());
+        assert!(!folder_status.get_visible());
+        assert!(
+            FOLDER_RESULTS
+                .with_borrow_mut(Option::take)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!crate::identity::database().exists());
+        assert!(!Config::path().exists());
+        window.destroy();
+    }
 
     #[test]
     #[ignore = "requires isolated HOME/XDG, Xvfb and private D-Bus"]
